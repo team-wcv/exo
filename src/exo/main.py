@@ -407,6 +407,13 @@ def main():
         os.environ["EXO_NO_BATCH"] = "1"
         logger.info("Continuous batching disabled (--no-batch)")
 
+    # Set trust_remote_code override env var for runner subprocesses
+    if args.trust_remote_code:
+        os.environ["EXO_TRUST_REMOTE_CODE"] = "1"
+        logger.warning(
+            "--trust-remote-code enabled: models may execute arbitrary code during loading"
+        )
+
     # Set FAST_SYNCH override env var for runner subprocesses
     if args.fast_synch is True:
         os.environ["EXO_FAST_SYNCH"] = "true"
@@ -457,6 +464,7 @@ class Args(FrozenModel):
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
     bootstrap_peers: list[str] = []
     libp2p_port: int
+    trust_remote_code: bool = False
 
     @classmethod
     def parse(cls) -> Self:
@@ -518,6 +526,11 @@ class Args(FrozenModel):
             "--no-batch",
             action="store_true",
             help="Disable continuous batching, use sequential generation",
+        )
+        parser.add_argument(
+            "--trust-remote-code",
+            action="store_true",
+            help="Allow models to execute custom code during tokenizer loading (security-sensitive, CLI-only)",
         )
         parser.add_argument(
             "--bootstrap-peers",
