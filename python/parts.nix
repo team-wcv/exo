@@ -358,7 +358,7 @@ let
     in
     {
       inherit venv;
-      editablePythonSet = pythonSet.overrideScope editableOverlay;
+      evenv = name: (pythonSet.overrideScope editableOverlay).mkVirtualEnv "${name}-editable-env" members // { exo = (members.exo or [ ]) ++ [ "dev" ]; };
       mkPythonScript = path: mkApp ''python ${path} "$@"'';
       mkExo = mkApp ''exo "$@"'';
     };
@@ -368,7 +368,7 @@ in
     { self', pkgs, unfreePkgs, lib, ... }:
     let
       inherit (pkgs.stdenv.hostPlatform) isLinux;
-      inherit (mkPythonSet { inherit self' pkgs lib; members = { exo = [ "mlx-cpu" ]; }; }) editablePythonSet mkExo;
+      inherit (mkPythonSet { inherit self' pkgs lib; members = { exo = [ "mlx-cpu" ]; }; }) evenv mkExo;
 
       # Virtual environment with dev dependencies for testing
       testVenv = (mkPythonSet {
@@ -389,12 +389,13 @@ in
         runtimeInputs = [ pkgs.python313 ];
         text = ''exec python ${path} "$@"'';
       };
-
+      cuda12Set = mkPythonSet { inherit self' lib; inherit (unfreePkgs.pkgsCuda.cudaPackages_12) pkgs; members = { exo = [ "mlx-cuda12" ]; }; };
+      cuda13Set = mkPythonSet { inherit self' lib; inherit (unfreePkgs.pkgsCuda.cudaPackages_13) pkgs; members = { exo = [ "mlx-cuda13" "vllm-cuda13" ]; }; };
     in
     {
       packages = {
         exo = mkExo "exo";
-        editableVenv = editablePythonSet.mkVirtualEnv "exo-dev-env" { exo = [ "dev" "mlx-cpu" ]; };
+        evenv = evenv "exo";
         # for running tests in ci
         exo-test-env = testVenv;
         exo-bench = mkBenchScript "exo-bench" (inputs.self + /bench/exo_bench.py);
@@ -403,8 +404,8 @@ in
         # used by ./tests/run_exo_on.sh
         exo-get-all-models-on-cluster = mkSimplePythonScript "exo-get-all-models-on-cluster" (inputs.self + /tests/get_all_models_on_cluster.py);
       } // lib.optionalAttrs isLinux {
-        exo-cuda-12 = (mkPythonSet { inherit self' lib; inherit (unfreePkgs.pkgsCuda.cudaPackages_12) pkgs; members = { exo = [ "mlx-cuda12" ]; }; }).mkExo "exo-cuda-12";
-        exo-cuda-13 = (mkPythonSet { inherit self' lib; inherit (unfreePkgs.pkgsCuda.cudaPackages_13) pkgs; members = { exo = [ "mlx-cuda13" "vllm-cuda13" ]; }; }).mkExo "exo-cuda-13";
+        exo-cuda-12 = cuda12Set.mkExo "exo-cuda-12";
+        exo-cuda-13 = cuda13Set.mkExo "exo-cuda-13";
       };
 
       checks = {
