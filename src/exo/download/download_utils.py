@@ -228,7 +228,9 @@ def _delete_model_path(path: Path, *, delete_symlink_target: bool) -> bool:
         path.unlink()
         if delete_symlink_target and target.exists():
             if not _looks_like_model_dir(target):
-                raise OSError(f"Refusing to delete symlink target that does not look like a model directory: {target}")
+                raise OSError(
+                    f"Refusing to delete symlink target that does not look like a model directory: {target}"
+                )
             shutil.rmtree(target, ignore_errors=False)
         return True
 
@@ -259,9 +261,7 @@ async def delete_model(model_id: ModelId) -> bool:
 
     # Clear cache from default dir
     cache_dir = EXO_DEFAULT_MODELS_DIR / "caches" / normalized
-    await asyncio.to_thread(
-        _delete_model_path, cache_dir, delete_symlink_target=False
-    )
+    await asyncio.to_thread(_delete_model_path, cache_dir, delete_symlink_target=False)
 
     return deleted
 

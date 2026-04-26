@@ -166,7 +166,9 @@ def _normalise_responses_tool(tool: dict[str, Any]) -> dict[str, Any]:
     name = tool.get("name", "")
     parameters = tool.get("parameters")
     if not isinstance(parameters, dict):
-        parameters = _custom_tool_parameters(tool) if tool.get("type") == "custom" else {}
+        parameters = (
+            _custom_tool_parameters(tool) if tool.get("type") == "custom" else {}
+        )
 
     return {
         "type": "function",

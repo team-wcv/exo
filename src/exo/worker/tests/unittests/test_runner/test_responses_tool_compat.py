@@ -15,8 +15,8 @@ from exo.api.types.openai_responses import (
     ReasoningInputItem,
     ResponsesRequest,
 )
-from exo.worker.runner.llm_inference.tool_parsers import _coerce_tool_calls_to_schema
 from exo.shared.types.chunks import TokenChunk, ToolCallChunk
+from exo.worker.runner.llm_inference.tool_parsers import _coerce_tool_calls_to_schema
 
 
 @pytest.mark.asyncio
