@@ -256,7 +256,7 @@ async function extractPdfContent(
     const canvas = new OffscreenCanvas(viewport.width, viewport.height);
     const ctx = canvas.getContext("2d");
     if (ctx) {
-      await page.render({ canvasContext: ctx as any, viewport }).promise;
+      await page.render({ canvas, canvasContext: ctx, viewport } as any).promise;
       const blob = await canvas.convertToBlob({
         type: "image/jpeg",
         quality: 0.8,

@@ -213,6 +213,8 @@
       const [shardTag] = getTaggedValue(firstShardWrapped);
       if (shardTag === "PipelineShardMetadata") sharding = "Pipeline";
       else if (shardTag === "TensorShardMetadata") sharding = "Tensor";
+      else if (shardTag === "AsymmetricTensorShardMetadata")
+        sharding = "Asymmetric Tensor";
       else if (shardTag === "PrefillDecodeShardMetadata")
         sharding = "Prefill/Decode";
     }
@@ -336,7 +338,6 @@
                   bind:value={editingName}
                   onkeydown={handleEditKeydown}
                   class="w-full bg-exo-black/60 border border-exo-yellow/30 rounded px-2 py-1.5 text-xs text-exo-light-gray focus:outline-none focus:border-exo-yellow/50 mb-2"
-                  autofocus
                 />
                 <div class="flex gap-2">
                   <button

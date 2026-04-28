@@ -282,6 +282,22 @@
 
   // ── Steps 1-5 animation state: cinematic SVG story ──
   const SIMULATED_STUDIO_GB = 256; // simulated Mac Studio memory
+
+  // User device info from topology — uses /node_id to find our own node
+  const userDeviceInfo = $derived.by(() => {
+    if (!data || Object.keys(data.nodes).length === 0) {
+      return { name: "MacBook Pro", memoryGB: 36, deviceType: "macbook pro" };
+    }
+    const ourNode = localNodeId ? data.nodes[localNodeId] : undefined;
+    const node = ourNode ?? Object.values(data.nodes)[0];
+    const totalMem =
+      node.macmon_info?.memory?.ram_total ?? node.system_info?.memory ?? 0;
+    const memGB = Math.round(totalMem / (1024 * 1024 * 1024));
+    const name = node.friendly_name || "Your Mac";
+    const modelId = (node.system_info?.model_id || "macbook pro").toLowerCase();
+    return { name, memoryGB: memGB || 36, deviceType: modelId };
+  });
+
   const onboardingCombinedGB = $derived(
     userDeviceInfo.memoryGB + SIMULATED_STUDIO_GB,
   );
@@ -307,21 +323,6 @@
       deduped.push(m);
     }
     return deduped.slice(0, 3);
-  });
-
-  // User device info from topology — uses /node_id to find our own node
-  const userDeviceInfo = $derived.by(() => {
-    if (!data || Object.keys(data.nodes).length === 0) {
-      return { name: "MacBook Pro", memoryGB: 36, deviceType: "macbook pro" };
-    }
-    const ourNode = localNodeId ? data.nodes[localNodeId] : undefined;
-    const node = ourNode ?? Object.values(data.nodes)[0];
-    const totalMem =
-      node.macmon_info?.memory?.ram_total ?? node.system_info?.memory ?? 0;
-    const memGB = Math.round(totalMem / (1024 * 1024 * 1024));
-    const name = node.friendly_name || "Your Mac";
-    const modelId = (node.system_info?.model_id || "macbook pro").toLowerCase();
-    return { name, memoryGB: memGB || 36, deviceType: modelId };
   });
 
   let showContinueButton = $state(false);
@@ -895,7 +896,7 @@
   type InstanceMeta = "MlxRing" | "MlxJaccl";
 
   // Launch defaults persistence
-  const LAUNCH_DEFAULTS_KEY = "exo-launch-defaults-v2";
+  const LAUNCH_DEFAULTS_KEY = "exo-launch-defaults-v3";
   interface LaunchDefaults {
     modelId: string | null;
     sharding: "Pipeline" | "Tensor";
@@ -935,10 +936,9 @@
     const defaults = loadLaunchDefaults();
     if (!defaults) return;
 
-    // Apply sharding and instance type unconditionally
+    // Apply sharding unconditionally. Runtime stays at the safe default unless
+    // the user explicitly changes it in the current session.
     selectedSharding = defaults.sharding;
-    selectedInstanceType =
-      defaults.instanceType === "MlxRing" ? "MlxRing" : "MlxJaccl";
 
     // Apply minNodes if valid (between 1 and maxNodes)
     if (
@@ -1425,6 +1425,7 @@
   }
 
   function handleModelPickerSelect(modelId: string) {
+    clearPreviewNodeFilter(false);
     selectPreviewModel(modelId);
     setSelectedChatModel(modelId);
     saveLaunchDefaults();
@@ -2094,6 +2095,8 @@
       const [shardTag] = getTagged(firstShardWrapped);
       if (shardTag === "PipelineShardMetadata") sharding = "Pipeline";
       else if (shardTag === "TensorShardMetadata") sharding = "Tensor";
+      else if (shardTag === "AsymmetricTensorShardMetadata")
+        sharding = "Asymmetric Tensor";
       else if (shardTag === "PrefillDecodeShardMetadata")
         sharding = "Prefill/Decode";
     }
@@ -5006,7 +5009,7 @@
             <!-- Node Filter Indicator (top-right corner) -->
             {#if isFilterActive()}
               <button
-                onclick={clearPreviewNodeFilter}
+                onclick={() => clearPreviewNodeFilter()}
                 class="absolute top-2 right-2 flex items-center gap-1.5 px-2 py-1 bg-exo-dark-gray/80 border border-exo-yellow/40 rounded text-exo-yellow hover:border-exo-yellow/60 transition-colors cursor-pointer backdrop-blur-sm"
                 title="Clear filter"
               >

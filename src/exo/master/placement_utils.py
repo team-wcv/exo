@@ -10,6 +10,7 @@ from exo.shared.types.profiling import MemoryUsage, NodeNetworkInfo
 from exo.shared.types.topology import Cycle, RDMAConnection, SocketConnection
 from exo.shared.types.worker.runners import RunnerId, ShardAssignments
 from exo.shared.types.worker.shards import (
+    AsymmetricTensorShardMetadata,
     CfgShardMetadata,
     PipelineShardMetadata,
     Sharding,
@@ -273,6 +274,74 @@ def get_shard_assignments_for_tensor_parallel(
     return shard_assignments
 
 
+def get_shard_assignments_for_asymmetric_tensor_parallel(
+    model_card: ModelCard,
+    cycle: Cycle,
+    node_memory: Mapping[NodeId, MemoryUsage],
+) -> ShardAssignments:
+    """Create shard assignments for asymmetric tensor parallelism.
+
+    Each node gets a ratio of weights proportional to its available memory.
+    All nodes compute every layer simultaneously.
+    """
+    total_layers = model_card.n_layers
+    world_size = len(cycle)
+
+    ordered_nodes = list(cycle)
+
+    # The placement layer orders the cycle so rank 0 is both the largest-memory
+    # node and socket-reachable for distributed initialization.
+    total_available = sum(
+        node_memory[node_id].ram_available.in_bytes for node_id in ordered_nodes
+    )
+    memory_fractions = [
+        node_memory[node_id].ram_available.in_bytes / total_available
+        for node_id in ordered_nodes
+    ]
+
+    from exo.worker.engines.mlx.asymmetric_parallel import find_valid_ratios
+
+    ratios = find_valid_ratios(
+        memory_fractions=memory_fractions,
+        hidden_size=model_card.hidden_size,
+        num_attention_heads=model_card.hidden_size // 128,
+        num_key_value_heads=model_card.num_key_value_heads or 2,
+    )
+    if ratios is None:
+        raise ValueError(
+            f"No valid asymmetric ratio found for hidden_size={model_card.hidden_size}"
+        )
+
+    runner_to_shard: dict[RunnerId, ShardMetadata] = {}
+    node_to_runner: dict[NodeId, RunnerId] = {}
+    rank_zero_ratio = ratios[0]
+
+    for i, node_id in enumerate(ordered_nodes):
+        shard = AsymmetricTensorShardMetadata(
+            model_card=model_card,
+            device_rank=i,
+            world_size=world_size,
+            start_layer=0,
+            end_layer=total_layers,
+            n_layers=total_layers,
+            ratio=rank_zero_ratio,
+        )
+        runner_id = RunnerId()
+        runner_to_shard[runner_id] = shard
+        node_to_runner[node_id] = runner_id
+
+    logger.info(
+        f"Asymmetric TP: ratios={[f'{r:.0%}' for r in ratios]} "
+        f"across {world_size} nodes"
+    )
+
+    return ShardAssignments(
+        model_id=model_card.model_id,
+        runner_to_shard=runner_to_shard,
+        node_to_runner=node_to_runner,
+    )
+
+
 def get_shard_assignments(
     model_card: ModelCard,
     cycle: Cycle,
@@ -290,6 +359,12 @@ def get_shard_assignments(
             return get_shard_assignments_for_tensor_parallel(
                 model_card=model_card,
                 cycle=cycle,
+            )
+        case Sharding.AsymmetricTensor:
+            return get_shard_assignments_for_asymmetric_tensor_parallel(
+                model_card=model_card,
+                cycle=cycle,
+                node_memory=node_memory,
             )
 
 
@@ -400,13 +475,11 @@ def _fallback_interface_ips(node_network: NodeNetworkInfo) -> list[str]:
 def _is_candidate_host_ip(ip: str) -> bool:
     if ":" in ip:
         return False
-    if ip.startswith("127.") or ip == "0.0.0.0":
-        return False
-    return True
+    return not (ip.startswith("127.") or ip == "0.0.0.0")
 
 
 def _address_priority(ip: str) -> int:
-    if ip.startswith("192.168.") or ip.startswith("10."):
+    if ip.startswith(("192.168.", "10.")):
         return 0
     if ip.startswith("172."):
         try:
