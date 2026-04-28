@@ -154,6 +154,7 @@
     style="left: {hoveredToken.x}px; top: {hoveredToken.y}px; transform: translate(-50%, -100%);"
     onmouseenter={handleTooltipEnter}
     onmouseleave={handleTooltipLeave}
+    role="tooltip"
   >
     <div
       class="bg-gray-900/95 backdrop-blur-sm border border-gray-700/50 rounded-xl shadow-xl p-3 text-sm min-w-48"
