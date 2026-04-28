@@ -13,6 +13,6 @@ pr:
 ---
 
 - Why this branch exists: prepare upstream exo PR #1821 for safe integration into the team-wcv fork.
-- Changed paths: placement, shard metadata, MLX loading, asymmetric MLX sharding, placement previews, focused tests, and PR #6 stability/dashboard fixes.
-- Validation run: targeted ruff, basedpyright, focused pytest, and dashboard svelte-check.
+- Changed paths: placement, shard metadata, MLX loading, asymmetric MLX sharding, placement previews, focused tests, PR #6 stability/dashboard fixes, and topology model-share badges for asymmetric tensor and pipeline shards.
+- Validation run: targeted ruff, basedpyright, focused pytest, and dashboard svelte-check (`npm run check`).
 - Known follow-ups: real two-node Apple Silicon distributed generation test before enabling automatic asymmetric placement broadly.

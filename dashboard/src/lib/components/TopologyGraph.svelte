@@ -46,7 +46,7 @@
     return [keys[0], record[keys[0]]];
   }
 
-  function getAsymmetricModelShareByNode(): Map<string, number> {
+  function getModelShareByNode(): Map<string, number> {
     const shares = new Map<string, number>();
 
     for (const instanceWrapped of Object.values(instanceData)) {
@@ -70,25 +70,40 @@
       )) {
         const shardWrapped = shardAssignments.runnerToShard[runnerId];
         const [shardTag, shardValue] = getTaggedValue(shardWrapped);
-        if (
-          shardTag !== "AsymmetricTensorShardMetadata" ||
-          !shardValue ||
-          typeof shardValue !== "object"
-        ) {
+        if (!shardValue || typeof shardValue !== "object") continue;
+
+        if (shardTag === "AsymmetricTensorShardMetadata") {
+          const shard = shardValue as {
+            deviceRank?: number;
+            ratio?: number;
+            worldSize?: number;
+          };
+          if (shard.worldSize !== 2 || typeof shard.ratio !== "number") {
+            continue;
+          }
+
+          const share = shard.deviceRank === 0 ? shard.ratio : 1 - shard.ratio;
+          shares.set(nodeId, share);
           continue;
         }
 
-        const shard = shardValue as {
-          deviceRank?: number;
-          ratio?: number;
-          worldSize?: number;
-        };
-        if (shard.worldSize !== 2 || typeof shard.ratio !== "number") {
-          continue;
-        }
+        if (shardTag === "PipelineShardMetadata") {
+          const shard = shardValue as {
+            startLayer?: number;
+            endLayer?: number;
+            nLayers?: number;
+          };
+          if (
+            typeof shard.startLayer !== "number" ||
+            typeof shard.endLayer !== "number" ||
+            typeof shard.nLayers !== "number" ||
+            shard.nLayers <= 0
+          ) {
+            continue;
+          }
 
-        const share = shard.deviceRank === 0 ? shard.ratio : 1 - shard.ratio;
-        shares.set(nodeId, share);
+          shares.set(nodeId, (shard.endLayer - shard.startLayer) / shard.nLayers);
+        }
       }
     }
 
@@ -225,7 +240,7 @@
     const nodes = data.nodes || {};
     const edges = data.edges || [];
     const nodeIds = Object.keys(nodes);
-    const asymmetricModelShareByNode = getAsymmetricModelShareByNode();
+    const modelShareByNode = getModelShareByNode();
 
     const rect = svgContainer.getBoundingClientRect();
     const width = rect.width;
@@ -622,7 +637,7 @@
       const isFilteredOut =
         filteredNodes.size > 0 && !filteredNodes.has(nodeInfo.id);
       const isHovered = hoveredNodeId === nodeInfo.id && !isInFilter;
-      const asymmetricShare = asymmetricModelShareByNode.get(nodeInfo.id);
+      const modelShare = modelShareByNode.get(nodeInfo.id);
 
       // Holographic wireframe colors - bright yellow for filter, subtle yellow for hover, grey for filtered out
       const wireColor = isInFilter
@@ -1198,8 +1213,8 @@
           .text(` (${ramUsagePercent.toFixed(0)}%)`);
       }
 
-      if (asymmetricShare !== undefined) {
-        const sharePercent = Math.round(asymmetricShare * 100);
+      if (modelShare !== undefined) {
+        const sharePercent = Math.round(modelShare * 100);
         const badgeY =
           nodeInfo.y +
           iconBaseHeight / 2 +
@@ -1242,7 +1257,7 @@
         let debugLabelY =
           nodeInfo.y +
           iconBaseHeight / 2 +
-          (asymmetricShare !== undefined
+          (modelShare !== undefined
             ? showFullLabels
               ? 52
               : 38
