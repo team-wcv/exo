@@ -30,8 +30,8 @@ from exo.shared.types.events import (
 )
 from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import MemoryUsage, NodeNetworkInfo
-from exo.shared.types.topology import SocketConnection
 from exo.shared.types.tasks import Task, TaskId, TaskStatus
+from exo.shared.types.topology import SocketConnection
 from exo.shared.types.worker.downloads import (
     DownloadCompleted,
     DownloadFailed,
@@ -179,19 +179,10 @@ def place_instance(
             )
         smallest_cycles = smallest_rdma_cycles
 
-    cycles_with_leaf_nodes: list[Cycle] = [
-        cycle
-        for cycle in smallest_cycles
-        if any(topology.node_is_leaf(node_id) for node_id in cycle)
-    ]
-
     resolved_download_status = download_status or {}
-    candidate_cycles = (
-        cycles_with_leaf_nodes if cycles_with_leaf_nodes != [] else smallest_cycles
-    )
 
     selected_cycle = max(
-        candidate_cycles,
+        smallest_cycles,
         key=lambda cycle: (
             _cycle_download_score(
                 cycle, command.model_card.model_id, resolved_download_status
@@ -200,6 +191,7 @@ def place_instance(
                 (node_memory[node_id].ram_available for node_id in cycle),
                 start=Memory(),
             ),
+            any(topology.node_is_leaf(node_id) for node_id in cycle),
         ),
     )
     selected_cycle = _prefer_socket_reachable_rank_zero(selected_cycle, topology)
