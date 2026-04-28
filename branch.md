@@ -8,8 +8,8 @@ orchestraitor:
   ticket: none
   task_url: none
 pr:
-  url: pending
-  state: pending
+  url: https://github.com/team-wcv/exo/pull/5
+  state: open
 ---
 
 - Why this branch exists: prepare upstream exo PR #1821 for safe integration into the team-wcv fork.
