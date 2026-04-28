@@ -282,6 +282,22 @@
 
   // ── Steps 1-5 animation state: cinematic SVG story ──
   const SIMULATED_STUDIO_GB = 256; // simulated Mac Studio memory
+
+  // User device info from topology — uses /node_id to find our own node
+  const userDeviceInfo = $derived.by(() => {
+    if (!data || Object.keys(data.nodes).length === 0) {
+      return { name: "MacBook Pro", memoryGB: 36, deviceType: "macbook pro" };
+    }
+    const ourNode = localNodeId ? data.nodes[localNodeId] : undefined;
+    const node = ourNode ?? Object.values(data.nodes)[0];
+    const totalMem =
+      node.macmon_info?.memory?.ram_total ?? node.system_info?.memory ?? 0;
+    const memGB = Math.round(totalMem / (1024 * 1024 * 1024));
+    const name = node.friendly_name || "Your Mac";
+    const modelId = (node.system_info?.model_id || "macbook pro").toLowerCase();
+    return { name, memoryGB: memGB || 36, deviceType: modelId };
+  });
+
   const onboardingCombinedGB = $derived(
     userDeviceInfo.memoryGB + SIMULATED_STUDIO_GB,
   );
@@ -307,21 +323,6 @@
       deduped.push(m);
     }
     return deduped.slice(0, 3);
-  });
-
-  // User device info from topology — uses /node_id to find our own node
-  const userDeviceInfo = $derived.by(() => {
-    if (!data || Object.keys(data.nodes).length === 0) {
-      return { name: "MacBook Pro", memoryGB: 36, deviceType: "macbook pro" };
-    }
-    const ourNode = localNodeId ? data.nodes[localNodeId] : undefined;
-    const node = ourNode ?? Object.values(data.nodes)[0];
-    const totalMem =
-      node.macmon_info?.memory?.ram_total ?? node.system_info?.memory ?? 0;
-    const memGB = Math.round(totalMem / (1024 * 1024 * 1024));
-    const name = node.friendly_name || "Your Mac";
-    const modelId = (node.system_info?.model_id || "macbook pro").toLowerCase();
-    return { name, memoryGB: memGB || 36, deviceType: modelId };
   });
 
   let showContinueButton = $state(false);

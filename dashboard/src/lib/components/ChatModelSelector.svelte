@@ -289,19 +289,11 @@
             <!-- Info tooltip -->
             <div class="ml-auto flex-shrink-0">
               <span
-                role="button"
-                tabindex="-1"
+                role="img"
+                aria-label={rec.label}
                 class="text-exo-light-gray/40 hover:text-exo-light-gray transition-colors cursor-help inline-flex"
                 onmouseenter={(e: MouseEvent) => showTooltip(rec.category, e)}
                 onmouseleave={() => hideTooltip()}
-                onclick={(e: MouseEvent) => {
-                  e.stopPropagation();
-                  if (hoveredTooltip === rec.category) {
-                    hideTooltip();
-                  } else {
-                    showTooltip(rec.category, e);
-                  }
-                }}
               >
                 <svg
                   class="w-3.5 h-3.5"

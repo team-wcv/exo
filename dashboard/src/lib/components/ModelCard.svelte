@@ -30,6 +30,16 @@
     modelIdOverride?: string | null;
   }
 
+  type DebugConnection = {
+    ip: string;
+    iface: string | null;
+    from: string;
+    to: string;
+    midX: number;
+    midY: number;
+    arrow: string;
+  };
+
   let {
     model,
     isLaunching = false,
@@ -42,6 +52,8 @@
     apiPreview = null,
     modelIdOverride = null,
   }: Props = $props();
+
+  let expandedNodes = $state<Set<string>>(new Set());
 
   // Estimate memory requirements from model name
   // Uses regex with word boundaries to avoid false matches like '4bit' matching '4b'
@@ -687,7 +699,7 @@
             {@const allConnections =
               isDebugMode && usedNodes.length > 1
                 ? (() => {
-                    const conns: Array = [];
+                    const conns: DebugConnection[] = [];
                     for (let i = 0; i < usedNodes.length; i++) {
                       for (let j = i + 1; j < usedNodes.length; j++) {
                         const n1 = usedNodes[i];
