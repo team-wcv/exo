@@ -31,7 +31,16 @@ def entrypoint(
     else:
         os.environ["MLX_METAL_FAST_SYNCH"] = "1"
 
-    logger.info(f"Fast synch flag: {os.environ['MLX_METAL_FAST_SYNCH']}")
+    runner_context = (
+        f"instance_id={bound_instance.instance.instance_id} "
+        f"runner_id={bound_instance.bound_runner_id} "
+        f"node_id={bound_instance.bound_node_id} "
+        f"model_id={bound_instance.bound_shard.model_card.model_id}"
+    )
+    logger.info(
+        f"Runner bootstrap starting {runner_context} "
+        f"fast_synch={os.environ['MLX_METAL_FAST_SYNCH']}"
+    )
 
     # Import main after setting global logger - this lets us just import logger from this module
     try:
@@ -41,6 +50,7 @@ def entrypoint(
             runner = ImageRunner(
                 bound_instance, event_sender, task_receiver, cancel_receiver
             )
+            logger.info(f"Starting image runner main loop {runner_context}")
             runner.main()
         else:
             from exo.worker.engines.mlx.patches import apply_mlx_patches
@@ -51,13 +61,15 @@ def entrypoint(
             runner = Runner(
                 bound_instance, event_sender, task_receiver, cancel_receiver
             )
+            logger.info(f"Starting text runner main loop {runner_context}")
             runner.main()
 
     except ClosedResourceError:
         logger.warning("Runner communication closed unexpectedly")
     except Exception as e:
         logger.opt(exception=e).warning(
-            f"Runner {bound_instance.bound_runner_id} crashed with critical exception {e}"
+            f"Runner {bound_instance.bound_runner_id} crashed with critical exception {e} "
+            f"{runner_context}"
         )
         event_sender.send(
             RunnerStatusUpdated(
@@ -72,4 +84,4 @@ def entrypoint(
         finally:
             event_sender.join()
             task_receiver.join()
-            logger.info("bye from the runner")
+            logger.info(f"bye from the runner {runner_context}")
