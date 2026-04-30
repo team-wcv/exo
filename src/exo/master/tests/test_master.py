@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Sequence
 
 import anyio
@@ -24,6 +25,7 @@ from exo.shared.types.events import (
     LocalForwarderEvent,
     NodeGatheredInfo,
     TaskCreated,
+    TestEvent,
 )
 from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import (
@@ -43,6 +45,7 @@ from exo.shared.types.worker.instances import (
 )
 from exo.shared.types.worker.shards import PipelineShardMetadata, Sharding
 from exo.utils.channels import channel
+from exo.utils.disk_event_log import DiskEventLog
 
 
 @pytest.mark.asyncio
@@ -229,3 +232,53 @@ async def test_master():
 
         ev_send.close()
         await master.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_master_event_log_is_scoped_to_session(tmp_path: Path):
+    node_id = NodeId("master-node")
+    session_id = SessionId(master_node_id=node_id, election_clock=1)
+
+    stale_log = DiskEventLog(tmp_path / "master")
+    stale_log.append(TestEvent())
+    stale_log.close()
+
+    ge_sender, global_event_receiver = channel[GlobalForwarderEvent]()
+    _, co_receiver = channel[ForwarderCommand]()
+    local_event_sender, le_receiver = channel[LocalForwarderEvent]()
+    fcds, _fcdr = channel[ForwarderDownloadCommand]()
+    ev_send, _ev_recv = channel[Event]()
+
+    master = Master(
+        node_id,
+        session_id,
+        event_sender=ev_send,
+        global_event_sender=ge_sender,
+        local_event_receiver=le_receiver,
+        command_receiver=co_receiver,
+        download_command_sender=fcds,
+        event_log_root=tmp_path,
+    )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(master.run)
+        await local_event_sender.send(
+            LocalForwarderEvent(
+                origin_idx=0,
+                origin=SystemId("Worker"),
+                session=session_id,
+                event=TestEvent(),
+            )
+        )
+
+        events: list[GlobalForwarderEvent] = []
+        while not events:
+            events = global_event_receiver.collect()
+            await anyio.sleep(0.001)
+
+        assert len(events) == 1
+        assert events[0].origin_idx == 0
+
+        ev_send.close()
+        await master.shutdown()
+        tg.cancel_scope.cancel()

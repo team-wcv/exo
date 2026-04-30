@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import anyio
 from loguru import logger
@@ -80,6 +81,7 @@ class Master:
         local_event_receiver: Receiver[LocalForwarderEvent],
         global_event_sender: Sender[GlobalForwarderEvent],
         download_command_sender: Sender[ForwarderDownloadCommand],
+        event_log_root: Path = EXO_EVENT_LOG_DIR,
     ):
         self.node_id = node_id
         self.session_id = session_id
@@ -93,7 +95,9 @@ class Master:
         self.event_sender = event_sender
         self._system_id = SystemId()
         self._multi_buffer = MultiSourceBuffer[SystemId, Event]()
-        self._event_log = DiskEventLog(EXO_EVENT_LOG_DIR / "master")
+        self._event_log = DiskEventLog(
+            event_log_root / "master" / _session_log_dir_name(session_id)
+        )
         self._pending_traces: dict[TaskId, dict[int, list[TraceEventData]]] = {}
         self._expected_ranks: dict[TaskId, set[int]] = {}
 
@@ -458,7 +462,10 @@ class Master:
         await self.event_sender.send(
             TracesMerged(task_id=task_id, traces=all_trace_data)
         )
-
         del self._pending_traces[task_id]
         if task_id in self._expected_ranks:
             del self._expected_ranks[task_id]
+
+
+def _session_log_dir_name(session_id: SessionId) -> str:
+    return f"{session_id.master_node_id}-{session_id.election_clock}"
