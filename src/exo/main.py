@@ -282,7 +282,15 @@ class Node:
                         self.api.unpause(result.won_clock)
 
     async def _diagnostic_snapshot_loop(self) -> None:
-        interval_seconds = float(os.getenv("EXO_DIAGNOSTIC_SNAPSHOT_SECONDS", "15"))
+        interval_value = os.getenv("EXO_DIAGNOSTIC_SNAPSHOT_SECONDS", "15")
+        try:
+            interval_seconds = float(interval_value)
+        except ValueError:
+            logger.warning(
+                "Invalid EXO_DIAGNOSTIC_SNAPSHOT_SECONDS value "
+                f"{interval_value!r}; using default 15s"
+            )
+            interval_seconds = 15.0
         if interval_seconds <= 0:
             logger.info("Cluster diagnostic snapshots disabled")
             return
