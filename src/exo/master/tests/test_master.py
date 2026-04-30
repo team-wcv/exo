@@ -6,7 +6,7 @@ import anyio
 import pytest
 from loguru import logger
 
-from exo.master.main import Master
+from exo.master.main import _MAX_MASTER_SESSION_LOG_DIRS, Master
 from exo.routing.router import get_node_id_keypair
 from exo.shared.models.model_cards import ModelCard, ModelTask
 from exo.shared.types.commands import (
@@ -282,3 +282,38 @@ async def test_master_event_log_is_scoped_to_session(tmp_path: Path):
         ev_send.close()
         await master.shutdown()
         tg.cancel_scope.cancel()
+
+
+def test_master_prunes_old_session_log_directories(tmp_path: Path):
+    node_id = NodeId("master-node")
+    master_log_root = tmp_path / "master"
+    master_log_root.mkdir()
+
+    for clock in range(_MAX_MASTER_SESSION_LOG_DIRS + 3):
+        session_dir = master_log_root / f"{node_id}-{clock}"
+        session_dir.mkdir()
+        (session_dir / "events.bin").write_text("event", encoding="utf-8")
+
+    current_session = SessionId(master_node_id=node_id, election_clock=99)
+    ge_sender, _global_event_receiver = channel[GlobalForwarderEvent]()
+    _, co_receiver = channel[ForwarderCommand]()
+    _, le_receiver = channel[LocalForwarderEvent]()
+    fcds, _fcdr = channel[ForwarderDownloadCommand]()
+    ev_send, _ev_recv = channel[Event]()
+
+    master = Master(
+        node_id,
+        current_session,
+        event_sender=ev_send,
+        global_event_sender=ge_sender,
+        local_event_receiver=le_receiver,
+        command_receiver=co_receiver,
+        download_command_sender=fcds,
+        event_log_root=tmp_path,
+    )
+
+    session_dirs = [path for path in master_log_root.iterdir() if path.is_dir()]
+    assert len(session_dirs) == _MAX_MASTER_SESSION_LOG_DIRS
+    assert (master_log_root / f"{node_id}-99").exists()
+
+    master._event_log.close()

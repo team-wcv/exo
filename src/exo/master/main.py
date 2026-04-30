@@ -1,3 +1,4 @@
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -69,6 +70,8 @@ from exo.utils.disk_event_log import DiskEventLog
 from exo.utils.event_buffer import MultiSourceBuffer
 from exo.utils.task_group import TaskGroup
 
+_MAX_MASTER_SESSION_LOG_DIRS = 5
+
 
 class Master:
     def __init__(
@@ -95,6 +98,9 @@ class Master:
         self.event_sender = event_sender
         self._system_id = SystemId()
         self._multi_buffer = MultiSourceBuffer[SystemId, Event]()
+        _prune_master_session_log_dirs(
+            event_log_root / "master", _session_log_dir_name(session_id)
+        )
         self._event_log = DiskEventLog(
             event_log_root / "master" / _session_log_dir_name(session_id)
         )
@@ -469,3 +475,24 @@ class Master:
 
 def _session_log_dir_name(session_id: SessionId) -> str:
     return f"{session_id.master_node_id}-{session_id.election_clock}"
+
+
+def _prune_master_session_log_dirs(master_log_root: Path, current_session_dir: str) -> None:
+    """Keep master session log directories bounded across elections."""
+    if not master_log_root.exists():
+        return
+
+    session_dirs = [
+        path
+        for path in master_log_root.iterdir()
+        if path.is_dir() and path.name != current_session_dir
+    ]
+    session_dirs.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    for old_dir in session_dirs[_MAX_MASTER_SESSION_LOG_DIRS - 1 :]:
+        try:
+            shutil.rmtree(old_dir)
+            logger.info(f"Pruned old master event log directory: {old_dir}")
+        except OSError as exc:
+            logger.opt(exception=exc).warning(
+                f"Failed to prune old master event log directory: {old_dir}"
+            )
