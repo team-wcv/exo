@@ -847,7 +847,7 @@ class AppStore {
     this.hasStartedChat = true;
     this.isTopologyMinimized = true;
     this.isSidebarOpen = true; // Auto-open sidebar when chatting
-    this.thinkingEnabled = conversation.enableThinking ?? true;
+    this.thinkingEnabled = conversation.enableThinking ?? false;
     this.refreshConversationModelFromInstances();
 
     // Sync global selection to the loaded conversation's model so reactive
@@ -2047,7 +2047,7 @@ class AppStore {
   /**
    * Whether thinking is enabled for the current conversation
    */
-  thinkingEnabled = $state(true);
+  thinkingEnabled = $state(false);
 
   /**
    * Selected model for chat (can be set by the UI)
