@@ -1,15 +1,18 @@
 # pyright: reportPrivateUsage=false
 
+from collections.abc import AsyncGenerator
 from types import MethodType
-from typing import Any
+from typing import Any, cast
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
 from exo.api.main import API
-from exo.shared.models.model_cards import ModelCard, ModelTask
+from exo.shared.models.model_cards import ModelCard, ModelTask, add_to_card_cache
+from exo.shared.types.chunks import TokenChunk
 from exo.shared.types.commands import TextGeneration
-from exo.shared.types.common import Host, ModelId, NodeId
+from exo.shared.types.common import CommandId, Host, ModelId, NodeId
 from exo.shared.types.memory import Memory
 from exo.shared.types.state import State
 from exo.shared.types.text_generation import (
@@ -70,6 +73,41 @@ def _api_with_instances(
         return None
 
     api._trigger_notify_user_to_download_model = MethodType(_noop_notify, api)
+    return api
+
+
+def _route_api_with_instances(
+    instances: dict[InstanceId, MlxRingInstance],
+) -> API:
+    api = _api_with_instances(instances)
+    api.app = FastAPI()
+    for instance in instances.values():
+        add_to_card_cache(_model_card(instance.shard_assignments.model_id))
+
+    async def _capture_send(
+        self: API,
+        task_params: TextGenerationTaskParams,
+        target_instance_id: InstanceId | None = None,
+    ) -> TextGeneration:
+        return TextGeneration(
+            task_params=task_params, target_instance_id=target_instance_id
+        )
+
+    async def _finite_token_stream(
+        _self: API, _command_id: CommandId
+    ) -> AsyncGenerator[TokenChunk, None]:
+        yield TokenChunk(
+            model=ModelId("mlx-community/Test-Model-4bit"),
+            token_id=0,
+            text="hello",
+            usage=None,
+            finish_reason="stop",
+        )
+
+    api._send_text_generation_with_images = MethodType(_capture_send, api)
+    api._token_chunk_stream = MethodType(_finite_token_stream, api)
+    api._setup_exception_handlers()
+    api._setup_routes()
     return api
 
 
@@ -184,3 +222,99 @@ def test_unknown_agent_endpoint_returns_404_before_dispatch() -> None:
         )
 
     assert exception_info.value.status_code == 404
+
+
+def test_http_provider_routes_list_agent_endpoints() -> None:
+    model_id = ModelId("mlx-community/Test-Model-4bit")
+    instance_id = InstanceId("instance-one")
+    api = _route_api_with_instances({instance_id: _instance(model_id, instance_id)})
+    client = TestClient(api.app)
+
+    providers_response = client.get("/v1/providers")
+    agents_response = client.get("/agents")
+
+    assert providers_response.status_code == 200
+    assert agents_response.status_code == 200
+    assert providers_response.json() == agents_response.json()
+    providers_payload = cast(dict[str, object], providers_response.json())
+    providers = cast(list[dict[str, object]], providers_payload["data"])
+    provider_names = [provider["name"] for provider in providers]
+    assert "default" in provider_names
+    assert f"inst-{instance_id}" in provider_names
+
+
+def test_http_agent_models_returns_backing_model() -> None:
+    model_id = ModelId("mlx-community/Test-Model-4bit")
+    instance_id = InstanceId("instance-one")
+    api = _route_api_with_instances({instance_id: _instance(model_id, instance_id)})
+    client = TestClient(api.app)
+
+    response = client.get(f"/agents/inst-{instance_id}/v1/models")
+
+    assert response.status_code == 200
+    payload = cast(dict[str, object], response.json())
+    models = cast(list[dict[str, object]], payload["data"])
+    assert models == [
+        {
+            "id": str(model_id),
+            "object": "model",
+            "created": models[0]["created"],
+            "owned_by": "exo",
+            "hugging_face_id": str(model_id),
+            "name": model_id.short(),
+            "description": "",
+            "context_length": 0,
+            "tags": [],
+            "storage_size_megabytes": 1,
+            "supports_tensor": True,
+            "tasks": ["TextGeneration"],
+            "is_custom": False,
+            "family": "",
+            "quantization": "",
+            "base_model": "",
+            "capabilities": [],
+        }
+    ]
+
+
+def test_http_unknown_agent_chat_returns_404_before_dispatch() -> None:
+    api = _route_api_with_instances({})
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/agents/missing/v1/chat/completions",
+        json={"model": "missing-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["message"] == "Agent endpoint not found: missing"
+
+
+def test_http_agent_responses_reports_resolved_model() -> None:
+    model_id = ModelId("mlx-community/Test-Model-4bit")
+    instance_id = InstanceId("instance-one")
+    api = _route_api_with_instances({instance_id: _instance(model_id, instance_id)})
+    client = TestClient(api.app)
+
+    response = client.post(
+        f"/agents/inst-{instance_id}/v1/responses",
+        json={"model": "ignored-request-model", "input": "hello"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == str(model_id)
+
+
+def test_http_default_endpoint_preserves_body_model_routing() -> None:
+    model_id = ModelId("mlx-community/Test-Model-4bit")
+    instance_id = InstanceId("instance-one")
+    api = _route_api_with_instances({instance_id: _instance(model_id, instance_id)})
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/agents/default/v1/chat/completions",
+        json={"model": str(model_id), "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == str(model_id)
