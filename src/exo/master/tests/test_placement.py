@@ -50,6 +50,26 @@ from exo.shared.types.worker.shards import (
 )
 
 
+def create_jaccl_node_network(
+    thunderbolt_ip_address: str,
+    ethernet_ip_address: str = "192.168.1.10",
+) -> NodeNetworkInfo:
+    return NodeNetworkInfo(
+        interfaces=[
+            NetworkInterfaceInfo(
+                name="en1",
+                ip_address=thunderbolt_ip_address,
+                interface_type="thunderbolt",
+            ),
+            NetworkInterfaceInfo(
+                name="en9",
+                ip_address=ethernet_ip_address,
+                interface_type="ethernet",
+            ),
+        ]
+    )
+
+
 @pytest.fixture
 def instance() -> Instance:
     return MlxRingInstance(
@@ -389,18 +409,14 @@ def test_tensor_rdma_backend_connectivity_matrix(
         node_c: create_node_memory(500),
     }
 
-    ethernet_interface = NetworkInterfaceInfo(
-        name="en0",
-        ip_address="10.0.0.1",
-    )
     ethernet_conn = SocketConnection(
         sink_multiaddr=Multiaddr(address="/ip4/10.0.0.1/tcp/8000")
     )
 
     node_network = {
-        node_a: NodeNetworkInfo(interfaces=[ethernet_interface]),
-        node_b: NodeNetworkInfo(interfaces=[ethernet_interface]),
-        node_c: NodeNetworkInfo(interfaces=[ethernet_interface]),
+        node_a: create_jaccl_node_network("192.168.0.1"),
+        node_b: create_jaccl_node_network("192.168.0.2"),
+        node_c: create_jaccl_node_network("192.168.0.5"),
     }
 
     topology.add_node(node_a)
@@ -535,8 +551,8 @@ def test_qwen3_5_tensor_auto_upgrade_requires_opt_in(
             small_node: create_node_memory(48_000_000_000),
         },
         {
-            large_node: create_node_network(),
-            small_node: create_node_network(),
+            large_node: create_jaccl_node_network("192.168.0.1"),
+            small_node: create_jaccl_node_network("192.168.0.2"),
         },
     )
     instance_without_opt_in = next(iter(placements_without_opt_in.values()))
@@ -561,8 +577,8 @@ def test_qwen3_5_tensor_auto_upgrade_requires_opt_in(
             small_node: create_node_memory(48_000_000_000),
         },
         {
-            large_node: create_node_network(),
-            small_node: create_node_network(),
+            large_node: create_jaccl_node_network("192.168.0.1"),
+            small_node: create_jaccl_node_network("192.168.0.2"),
         },
     )
 
@@ -868,20 +884,8 @@ def test_jaccl_placement_uses_advertised_lan_ip_for_rdma_coordinator(
         node_b: create_node_memory(1000),
     }
     node_network = {
-        node_a: NodeNetworkInfo(
-            interfaces=[
-                NetworkInterfaceInfo(
-                    name="en9", ip_address="192.168.1.10", interface_type="ethernet"
-                )
-            ]
-        ),
-        node_b: NodeNetworkInfo(
-            interfaces=[
-                NetworkInterfaceInfo(
-                    name="en9", ip_address="192.168.1.11", interface_type="ethernet"
-                )
-            ]
-        ),
+        node_a: create_jaccl_node_network("192.168.0.1", "192.168.1.10"),
+        node_b: create_jaccl_node_network("192.168.0.2", "192.168.1.11"),
     }
     command = PlaceInstance(
         sharding=Sharding.Tensor,
@@ -900,6 +904,70 @@ def test_jaccl_placement_uses_advertised_lan_ip_for_rdma_coordinator(
         coordinator.startswith("192.168.1.")
         for coordinator in instance.jaccl_coordinators.values()
     )
+
+
+def test_jaccl_placement_requires_repaired_thunderbolt_ipv4_paths(
+    model_card: ModelCard,
+) -> None:
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(2))
+    )
+
+    node_network = {
+        node_a: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en1",
+                    ip_address="169.254.1.10",
+                    interface_type="thunderbolt",
+                )
+            ]
+        ),
+        node_b: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en1",
+                    ip_address="169.254.1.11",
+                    interface_type="thunderbolt",
+                )
+            ]
+        ),
+    }
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    with pytest.raises(ValueError, match="bb rdma repair all"):
+        place_instance(
+            command,
+            topology,
+            {},
+            {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
+            node_network,
+        )
 
 
 def test_placement_prefers_socket_reachable_rank_zero(
