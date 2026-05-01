@@ -9,7 +9,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from exo.api.main import API
-from exo.shared.models.model_cards import ModelCard, ModelTask, add_to_card_cache
+from exo.api.types import ModelList
+from exo.shared.models.model_cards import ModelCard, ModelTask
 from exo.shared.types.chunks import TokenChunk
 from exo.shared.types.commands import TextGeneration
 from exo.shared.types.common import CommandId, Host, ModelId, NodeId
@@ -81,8 +82,6 @@ def _route_api_with_instances(
 ) -> API:
     api = _api_with_instances(instances)
     api.app = FastAPI()
-    for instance in instances.values():
-        add_to_card_cache(_model_card(instance.shard_assignments.model_id))
 
     async def _capture_send(
         self: API,
@@ -243,11 +242,18 @@ def test_http_provider_routes_list_agent_endpoints() -> None:
     assert f"inst-{instance_id}" in provider_names
 
 
-def test_http_agent_models_returns_backing_model() -> None:
+def test_http_agent_models_returns_backing_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     model_id = ModelId("mlx-community/Test-Model-4bit")
     instance_id = InstanceId("instance-one")
     api = _route_api_with_instances({instance_id: _instance(model_id, instance_id)})
     client = TestClient(api.app)
+
+    async def _fail_load(_: ModelId) -> ModelCard:
+        raise AssertionError("agent model listing should use active shard metadata")
+
+    monkeypatch.setattr(ModelCard, "load", _fail_load)
 
     response = client.get(f"/agents/inst-{instance_id}/v1/models")
 
@@ -275,6 +281,27 @@ def test_http_agent_models_returns_backing_model() -> None:
             "capabilities": [],
         }
     ]
+
+
+def test_http_default_agent_models_forwards_status_filter() -> None:
+    api = _route_api_with_instances({})
+    client = TestClient(api.app)
+    captured: dict[str, str | None] = {}
+
+    async def _capture_get_models(
+        _self: API,
+        status: str | None = None,
+    ) -> ModelList:
+        captured["status"] = status
+        return ModelList(data=[])
+
+    api.get_models = MethodType(_capture_get_models, api)
+
+    response = client.get("/agents/default/v1/models?status=downloaded")
+
+    assert response.status_code == 200
+    assert response.json() == {"object": "list", "data": []}
+    assert captured == {"status": "downloaded"}
 
 
 def test_http_unknown_agent_chat_returns_404_before_dispatch() -> None:

@@ -533,20 +533,44 @@ class API:
                 return candidate
         raise HTTPException(status_code=404, detail=f"Agent endpoint not found: {endpoint}")
 
-    async def get_agent_models(self, endpoint: str, request: Request) -> ModelList:
+    def _model_card_from_state(self, agent_endpoint: AgentEndpoint) -> ModelCard | None:
+        if agent_endpoint.target_instance_id is not None:
+            instance = self.state.instances.get(agent_endpoint.target_instance_id)
+            if instance is None:
+                return None
+            for shard in instance.shard_assignments.runner_to_shard.values():
+                return shard.model_card
+            return None
+
+        if agent_endpoint.model_id is None:
+            return None
+        for instance in self.state.instances.values():
+            if instance.shard_assignments.model_id != agent_endpoint.model_id:
+                continue
+            for shard in instance.shard_assignments.runner_to_shard.values():
+                return shard.model_card
+        return None
+
+    async def get_agent_models(
+        self,
+        endpoint: str,
+        request: Request,
+        status: str | None = Query(default=None),
+    ) -> ModelList:
         agent_endpoint = self._resolve_agent_endpoint(endpoint, request)
         if agent_endpoint.kind == "default":
-            return await self.get_models()
+            return await self.get_models(status=status)
         if agent_endpoint.model_id is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"Agent endpoint has no model: {endpoint}",
             )
+        card = self._model_card_from_state(agent_endpoint) or await ModelCard.load(
+            agent_endpoint.model_id
+        )
         return ModelList(
             data=[
-                self._model_list_model_from_card(
-                    await ModelCard.load(agent_endpoint.model_id)
-                )
+                self._model_list_model_from_card(card)
             ]
         )
 
