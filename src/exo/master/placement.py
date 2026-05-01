@@ -284,6 +284,9 @@ def place_instance(
             topology=topology,
         )
 
+    if instance_meta == InstanceMeta.MlxJaccl:
+        _validate_jaccl_thunderbolt_ipv4_paths(selected_cycle, node_network)
+
     # Single-node: force Pipeline/Ring (Tensor and Jaccl require multi-node)
     if len(selected_cycle) == 1:
         instance_meta = InstanceMeta.MlxRing
@@ -374,6 +377,42 @@ def _prefer_socket_reachable_rank_zero(cycle: Cycle, topology: Topology) -> Cycl
     if best_index == 0:
         return cycle
     return Cycle(node_ids=cycle.node_ids[best_index:] + cycle.node_ids[:best_index])
+
+
+def _validate_jaccl_thunderbolt_ipv4_paths(
+    cycle: Cycle,
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+) -> None:
+    missing_nodes = [
+        node_id
+        for node_id in cycle.node_ids
+        if not _has_jaccl_thunderbolt_ipv4(node_network.get(node_id))
+    ]
+    if missing_nodes:
+        raise ValueError(
+            "Requested RDMA (MlxJaccl), but the selected nodes do not advertise "
+            "MLX/JACCL Thunderbolt IPv4 peer paths. Run `bb rdma repair all` and "
+            "`bb rdma jaccl-status all`, then retry. Missing nodes: "
+            + ", ".join(str(node_id) for node_id in missing_nodes)
+        )
+
+
+def _has_jaccl_thunderbolt_ipv4(network_info: NodeNetworkInfo | None) -> bool:
+    if network_info is None:
+        return False
+    return any(
+        interface.interface_type == "thunderbolt"
+        and _is_routable_jaccl_ipv4(interface.ip_address)
+        for interface in network_info.interfaces
+    )
+
+
+def _is_routable_jaccl_ipv4(ip_address: str) -> bool:
+    if ":" in ip_address:
+        return False
+    if ip_address.startswith(("0.", "127.", "169.254.")):
+        return False
+    return len(ip_address.split(".")) == 4
 
 
 def _order_asymmetric_tensor_cycle(
