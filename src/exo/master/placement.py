@@ -133,6 +133,8 @@ def place_instance(
     node_memory: Mapping[NodeId, MemoryUsage],
     node_network: Mapping[NodeId, NodeNetworkInfo],
     required_nodes: set[NodeId] | None = None,
+    allowed_nodes: set[NodeId] | None = None,
+    allow_single_node_total_memory: bool = False,
     download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
 ) -> dict[InstanceId, Instance]:
     sharding = command.sharding
@@ -147,8 +149,17 @@ def place_instance(
             for cycle in candidate_cycles
             if required_nodes.issubset(cycle.node_ids)
         ]
+    if allowed_nodes is not None:
+        candidate_cycles = [
+            cycle
+            for cycle in candidate_cycles
+            if set(cycle.node_ids).issubset(allowed_nodes)
+        ]
     cycles_with_sufficient_memory = filter_cycles_by_memory(
-        candidate_cycles, node_memory, command.model_card.storage_size
+        candidate_cycles,
+        node_memory,
+        command.model_card.storage_size,
+        allow_single_node_total_memory=allow_single_node_total_memory,
     )
     if len(cycles_with_sufficient_memory) == 0:
         raise ValueError("No cycles found with sufficient memory")
@@ -289,8 +300,13 @@ def place_instance(
         instance_meta = InstanceMeta.MlxRing
         sharding = Sharding.Pipeline
 
+    placement_node_memory = (
+        _node_memory_with_total_capacity(selected_cycle, node_memory)
+        if allow_single_node_total_memory and len(selected_cycle) == 1
+        else node_memory
+    )
     shard_assignments = get_shard_assignments(
-        command.model_card, selected_cycle, sharding, node_memory
+        command.model_card, selected_cycle, sharding, placement_node_memory
     )
 
     cycle_digraph: Topology = topology.get_subgraph_from_nodes(selected_cycle.node_ids)
@@ -374,6 +390,20 @@ def _prefer_socket_reachable_rank_zero(cycle: Cycle, topology: Topology) -> Cycl
     if best_index == 0:
         return cycle
     return Cycle(node_ids=cycle.node_ids[best_index:] + cycle.node_ids[:best_index])
+
+
+def _node_memory_with_total_capacity(
+    cycle: Cycle,
+    node_memory: Mapping[NodeId, MemoryUsage],
+) -> Mapping[NodeId, MemoryUsage]:
+    return {
+        node_id: (
+            memory_usage.model_copy(update={"ram_available": memory_usage.ram_total})
+            if node_id in cycle.node_ids
+            else memory_usage
+        )
+        for node_id, memory_usage in node_memory.items()
+    }
 
 
 def _order_asymmetric_tensor_cycle(

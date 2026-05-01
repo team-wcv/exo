@@ -23,6 +23,8 @@ def filter_cycles_by_memory(
     cycles: list[Cycle],
     node_memory: Mapping[NodeId, MemoryUsage],
     required_memory: Memory,
+    *,
+    allow_single_node_total_memory: bool = False,
 ) -> list[Cycle]:
     filtered_cycles: list[Cycle] = []
     for cycle in cycles:
@@ -30,12 +32,27 @@ def filter_cycles_by_memory(
             continue
 
         total_mem = sum(
-            (node_memory[node_id].ram_available for node_id in cycle.node_ids),
+            (
+                _placement_memory_for_node(
+                    node_memory[node_id],
+                    use_total_memory=allow_single_node_total_memory
+                    and len(cycle) == 1,
+                )
+                for node_id in cycle.node_ids
+            ),
             start=Memory(),
         )
         if total_mem >= required_memory:
             filtered_cycles.append(cycle)
     return filtered_cycles
+
+
+def _placement_memory_for_node(
+    memory_usage: MemoryUsage,
+    *,
+    use_total_memory: bool,
+) -> Memory:
+    return memory_usage.ram_total if use_total_memory else memory_usage.ram_available
 
 
 def get_smallest_cycles(
