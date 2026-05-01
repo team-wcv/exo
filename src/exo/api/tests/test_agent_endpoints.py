@@ -9,12 +9,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from exo.api.main import API
-from exo.api.types import ModelList
+from exo.api.types import CreateInstanceParams, ModelList
 from exo.shared.models.model_cards import ModelCard, ModelTask
 from exo.shared.types.chunks import TokenChunk
-from exo.shared.types.commands import TextGeneration
+from exo.shared.types.commands import Command, CreateInstance, TextGeneration
 from exo.shared.types.common import CommandId, Host, ModelId, NodeId
 from exo.shared.types.memory import Memory
+from exo.shared.types.profiling import MemoryUsage
 from exo.shared.types.state import State
 from exo.shared.types.text_generation import (
     InputMessage,
@@ -61,6 +62,15 @@ def _instance(model_id: ModelId, instance_id: InstanceId) -> MlxRingInstance:
         ),
         hosts_by_node={node_id: [Host(ip="127.0.0.1", port=1)]},
         ephemeral_port=1,
+    )
+
+
+def _memory_usage(*, available_mb: int, total_mb: int) -> MemoryUsage:
+    return MemoryUsage.from_bytes(
+        ram_total=Memory.from_mb(total_mb).in_bytes,
+        ram_available=Memory.from_mb(available_mb).in_bytes,
+        swap_total=0,
+        swap_available=0,
     )
 
 
@@ -145,6 +155,63 @@ def test_provider_list_includes_default_model_and_instance_endpoints() -> None:
         and provider.claude_base_url is None
         for provider in providers
     )
+
+
+@pytest.mark.asyncio
+async def test_create_instance_allows_single_node_total_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_id = ModelId("mlx-community/Test-Model-4bit")
+    instance = _instance(model_id, InstanceId("instance-one"))
+    api = _api_with_instances({})
+    api.state = State(
+        node_memory={
+            NodeId("node-one"): _memory_usage(available_mb=1_000, total_mb=2_000)
+        }
+    )
+    sent_commands: list[Command] = []
+
+    async def _load_model_card(_: ModelId) -> ModelCard:
+        return _model_card(model_id).model_copy(
+            update={"storage_size": Memory.from_mb(1_500)}
+        )
+
+    async def _capture_send(self: API, command: Command) -> None:
+        sent_commands.append(command)
+
+    monkeypatch.setattr(ModelCard, "load", _load_model_card)
+    api._send = MethodType(_capture_send, api)
+
+    response = await api.create_instance(CreateInstanceParams(instance=instance))
+
+    assert response.model_card.storage_size == Memory.from_mb(1_500)
+    assert len(sent_commands) == 1
+    assert isinstance(sent_commands[0], CreateInstance)
+    assert sent_commands[0].instance == instance
+
+
+@pytest.mark.asyncio
+async def test_create_instance_rejects_single_node_over_total_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_id = ModelId("mlx-community/Test-Model-4bit")
+    instance = _instance(model_id, InstanceId("instance-one"))
+    api = _api_with_instances({})
+    api.state = State(
+        node_memory={
+            NodeId("node-one"): _memory_usage(available_mb=1_000, total_mb=1_200)
+        }
+    )
+
+    async def _load_model_card(_: ModelId) -> ModelCard:
+        return _model_card(model_id).model_copy(
+            update={"storage_size": Memory.from_mb(1_500)}
+        )
+
+    monkeypatch.setattr(ModelCard, "load", _load_model_card)
+
+    with pytest.raises(HTTPException, match="Insufficient memory"):
+        await api.create_instance(CreateInstanceParams(instance=instance))
 
 
 @pytest.mark.asyncio

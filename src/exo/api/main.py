@@ -656,7 +656,19 @@ class API:
         instance = payload.instance
         model_card = await ModelCard.load(instance.shard_assignments.model_id)
         required_memory = model_card.storage_size
-        available_memory = self._calculate_total_available_memory()
+        placement_node_ids = list(instance.shard_assignments.node_to_runner)
+
+        if len(placement_node_ids) == 1:
+            node_id = placement_node_ids[0]
+            memory_usage = self.state.node_memory.get(node_id)
+            if memory_usage is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Missing memory information for placement node: {node_id}",
+                )
+            available_memory = memory_usage.ram_total
+        else:
+            available_memory = self._calculate_total_available_memory()
 
         if required_memory > available_memory:
             raise HTTPException(
