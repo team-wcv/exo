@@ -21,7 +21,11 @@ from exo.shared.types.events import (
 )
 from exo.shared.types.memory import Memory
 from exo.shared.types.multiaddr import Multiaddr
-from exo.shared.types.profiling import NetworkInterfaceInfo, NodeNetworkInfo
+from exo.shared.types.profiling import (
+    MemoryUsage,
+    NetworkInterfaceInfo,
+    NodeNetworkInfo,
+)
 from exo.shared.types.tasks import TaskId, TaskStatus, TextGeneration
 from exo.shared.types.text_generation import (
     InputMessage,
@@ -81,6 +85,15 @@ def place_instance_command(model_card: ModelCard) -> PlaceInstance:
         sharding=Sharding.Pipeline,
         instance_meta=InstanceMeta.MlxRing,
         min_nodes=1,
+    )
+
+
+def create_node_memory_with_total(*, available: int, total: int) -> MemoryUsage:
+    return MemoryUsage.from_bytes(
+        ram_total=total,
+        ram_available=available,
+        swap_total=0,
+        swap_available=0,
     )
 
 
@@ -254,6 +267,94 @@ def test_get_instance_placements_one_node_not_fit() -> None:
 
     with pytest.raises(ValueError, match="No cycles found with sufficient memory"):
         place_instance(cic, topology, {}, node_memory, node_network)
+
+
+def test_filtered_single_node_placement_can_use_total_memory_capacity() -> None:
+    topology = Topology()
+    selected_node = NodeId()
+    other_node = NodeId()
+    topology.add_node(selected_node)
+    topology.add_node(other_node)
+    topology.add_connection(
+        Connection(source=selected_node, sink=other_node, edge=create_socket_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=other_node, sink=selected_node, edge=create_socket_connection(2))
+    )
+    node_memory = {
+        selected_node: create_node_memory_with_total(available=1000, total=2000),
+        other_node: create_node_memory_with_total(available=2000, total=2000),
+    }
+    node_network = {
+        selected_node: create_node_network(),
+        other_node: create_node_network(),
+    }
+    command = place_instance_command(
+        ModelCard(
+            model_id=ModelId("test-model"),
+            storage_size=Memory.from_bytes(1500),
+            n_layers=10,
+            hidden_size=1000,
+            supports_tensor=True,
+            tasks=[ModelTask.TextGeneration],
+        ),
+    )
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        allowed_nodes={selected_node},
+        allow_single_node_total_memory=True,
+    )
+
+    instance = next(iter(placements.values()))
+    assert list(instance.shard_assignments.node_to_runner) == [selected_node]
+
+
+def test_filtered_single_node_placement_still_rejects_over_capacity_node() -> None:
+    topology = Topology()
+    selected_node = NodeId()
+    other_node = NodeId()
+    topology.add_node(selected_node)
+    topology.add_node(other_node)
+    topology.add_connection(
+        Connection(source=selected_node, sink=other_node, edge=create_socket_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=other_node, sink=selected_node, edge=create_socket_connection(2))
+    )
+    node_memory = {
+        selected_node: create_node_memory_with_total(available=1000, total=1200),
+        other_node: create_node_memory_with_total(available=2000, total=2000),
+    }
+    node_network = {
+        selected_node: create_node_network(),
+        other_node: create_node_network(),
+    }
+    command = place_instance_command(
+        ModelCard(
+            model_id=ModelId("test-model"),
+            storage_size=Memory.from_bytes(1500),
+            n_layers=10,
+            hidden_size=1000,
+            supports_tensor=True,
+            tasks=[ModelTask.TextGeneration],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="No cycles found with sufficient memory"):
+        place_instance(
+            command,
+            topology,
+            {},
+            node_memory,
+            node_network,
+            allowed_nodes={selected_node},
+            allow_single_node_total_memory=True,
+        )
 
 
 def test_get_transition_events_no_change(instance: Instance):

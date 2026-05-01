@@ -720,7 +720,7 @@ class API:
     ) -> PlacementPreviewResponse:
         seen: set[tuple[ModelId, Sharding, InstanceMeta, int]] = set()
         previews: list[PlacementPreview] = []
-        required_nodes = set(node_ids) if node_ids else None
+        allowed_nodes = set(node_ids) if node_ids else None
 
         if len(list(self.state.topology.list_nodes())) == 0:
             return PlacementPreviewResponse(previews=[])
@@ -758,7 +758,8 @@ class API:
                     node_network=self.state.node_network,
                     topology=self.state.topology,
                     current_instances=self.state.instances,
-                    required_nodes=required_nodes,
+                    allowed_nodes=allowed_nodes,
+                    allow_single_node_total_memory=allowed_nodes is not None,
                     download_status=self.state.downloads,
                 )
             except ValueError as exc:
