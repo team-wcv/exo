@@ -1,3 +1,5 @@
+# pyright: reportPrivateUsage=false
+
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
@@ -16,7 +18,7 @@ from exo.shared.types.commands import (
     PlaceInstance,
     TextGeneration,
 )
-from exo.shared.types.common import ModelId, NodeId, SessionId, SystemId
+from exo.shared.types.common import Host, ModelId, NodeId, SessionId, SystemId
 from exo.shared.types.events import (
     Event,
     GlobalForwarderEvent,
@@ -31,7 +33,8 @@ from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import (
     MemoryUsage,
 )
-from exo.shared.types.tasks import TaskStatus
+from exo.shared.types.state import State
+from exo.shared.types.tasks import TaskId, TaskStatus
 from exo.shared.types.tasks import TextGeneration as TextGenerationTask
 from exo.shared.types.text_generation import (
     InputMessage,
@@ -39,10 +42,12 @@ from exo.shared.types.text_generation import (
     TextGenerationTaskParams,
 )
 from exo.shared.types.worker.instances import (
+    InstanceId,
     InstanceMeta,
     MlxRingInstance,
     ShardAssignments,
 )
+from exo.shared.types.worker.runners import RunnerId
 from exo.shared.types.worker.shards import PipelineShardMetadata, Sharding
 from exo.utils.channels import channel
 from exo.utils.disk_event_log import DiskEventLog
@@ -317,3 +322,143 @@ def test_master_prunes_old_session_log_directories(tmp_path: Path):
     assert (master_log_root / f"{node_id}-99").exists()
 
     master._event_log.close()
+
+
+def _test_model_card(model_id: ModelId) -> ModelCard:
+    return ModelCard(
+        model_id=model_id,
+        n_layers=1,
+        storage_size=Memory.from_bytes(1),
+        hidden_size=1,
+        supports_tensor=True,
+        tasks=[ModelTask.TextGeneration],
+    )
+
+
+def _test_instance(model_id: ModelId, instance_id: InstanceId) -> MlxRingInstance:
+    node_id = NodeId(f"node-{instance_id}")
+    runner_id = RunnerId(f"runner-{instance_id}")
+    return MlxRingInstance(
+        instance_id=instance_id,
+        shard_assignments=ShardAssignments(
+            model_id=model_id,
+            runner_to_shard={
+                runner_id: PipelineShardMetadata(
+                    start_layer=0,
+                    end_layer=1,
+                    n_layers=1,
+                    model_card=_test_model_card(model_id),
+                    device_rank=0,
+                    world_size=1,
+                )
+            },
+            node_to_runner={node_id: runner_id},
+        ),
+        hosts_by_node={node_id: [Host(ip="127.0.0.1", port=1)]},
+        ephemeral_port=1,
+    )
+
+
+def _test_text_generation(
+    model_id: ModelId, target_instance_id: InstanceId | None = None
+) -> TextGeneration:
+    return TextGeneration(
+        task_params=TextGenerationTaskParams(
+            model=model_id,
+            input=[
+                InputMessage(role="user", content=InputMessageContent("hello")),
+            ],
+        ),
+        target_instance_id=target_instance_id,
+    )
+
+
+def _master_with_state(state: State) -> Master:
+    master = Master.__new__(Master)
+    master.state = state
+    return master
+
+
+def test_text_generation_without_target_keeps_least_loaded_selection() -> None:
+    model_id = ModelId("test-model")
+    busy_instance_id = InstanceId("busy-instance")
+    idle_instance_id = InstanceId("idle-instance")
+    busy_task_id = TaskId("busy-task")
+    master = _master_with_state(
+        State(
+            instances={
+                busy_instance_id: _test_instance(model_id, busy_instance_id),
+                idle_instance_id: _test_instance(model_id, idle_instance_id),
+            },
+            tasks={
+                busy_task_id: TextGenerationTask(
+                    task_id=busy_task_id,
+                    command_id=CommandId("busy-command"),
+                    instance_id=busy_instance_id,
+                    task_status=TaskStatus.Pending,
+                    task_params=_test_text_generation(model_id).task_params,
+                )
+            },
+        )
+    )
+
+    assert (
+        master._select_text_generation_instance(_test_text_generation(model_id))
+        == idle_instance_id
+    )
+
+
+def test_text_generation_with_target_instance_uses_that_instance() -> None:
+    model_id = ModelId("test-model")
+    target_instance_id = InstanceId("target-instance")
+    other_instance_id = InstanceId("other-instance")
+    master = _master_with_state(
+        State(
+            instances={
+                target_instance_id: _test_instance(model_id, target_instance_id),
+                other_instance_id: _test_instance(model_id, other_instance_id),
+            }
+        )
+    )
+
+    assert (
+        master._select_text_generation_instance(
+            _test_text_generation(
+                model_id, target_instance_id=target_instance_id
+            )
+        )
+        == target_instance_id
+    )
+
+
+def test_text_generation_with_invalid_target_does_not_create_task() -> None:
+    master = _master_with_state(State())
+
+    with pytest.raises(ValueError, match="No instance found for target"):
+        master._select_text_generation_instance(
+            _test_text_generation(
+                ModelId("test-model"),
+                target_instance_id=InstanceId("missing-instance"),
+            )
+        )
+
+
+def test_text_generation_with_target_model_mismatch_does_not_create_task() -> None:
+    target_instance_id = InstanceId("target-instance")
+    master = _master_with_state(
+        State(
+            instances={
+                target_instance_id: _test_instance(
+                    ModelId("served-model"), target_instance_id
+                )
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="serves served-model, not requested-model"):
+        master._select_text_generation_instance(
+            _test_text_generation(
+                ModelId("requested-model"),
+                target_instance_id=target_instance_id,
+            )
+        )

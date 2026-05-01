@@ -55,6 +55,22 @@ class ModelList(BaseModel):
     data: list[ModelListModel]
 
 
+class AgentEndpoint(BaseModel):
+    name: str
+    kind: Literal["default", "model", "instance"]
+    openai_base_url: str
+    claude_base_url: str | None
+    model_id: ModelId | None
+    target_instance_id: InstanceId | None
+    active: bool
+    description: str
+
+
+class AgentEndpointList(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[AgentEndpoint]
+
+
 class ChatCompletionMessageText(BaseModel):
     type: Literal["text"] = "text"
     text: str
