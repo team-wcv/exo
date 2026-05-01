@@ -23,6 +23,7 @@ class TestCommand(BaseCommand):
 
 class TextGeneration(BaseCommand):
     task_params: TextGenerationTaskParams
+    target_instance_id: InstanceId | None = None
 
 
 class ImageGeneration(BaseCommand):
