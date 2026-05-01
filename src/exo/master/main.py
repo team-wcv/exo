@@ -125,6 +125,40 @@ class Master:
         logger.info("Stopping Master")
         self._tg.cancel_tasks()
 
+    def _select_text_generation_instance(self, command: TextGeneration) -> InstanceId:
+        if command.target_instance_id is not None:
+            target_instance = self.state.instances.get(command.target_instance_id)
+            if target_instance is None:
+                raise ValueError(
+                    f"No instance found for target {command.target_instance_id}"
+                )
+            if target_instance.shard_assignments.model_id != command.task_params.model:
+                raise ValueError(
+                    "Target instance "
+                    f"{command.target_instance_id} serves "
+                    f"{target_instance.shard_assignments.model_id}, "
+                    f"not {command.task_params.model}"
+                )
+            return command.target_instance_id
+
+        instance_task_counts: dict[InstanceId, int] = {}
+        for instance in self.state.instances.values():
+            if instance.shard_assignments.model_id == command.task_params.model:
+                task_count = sum(
+                    1
+                    for task in self.state.tasks.values()
+                    if task.instance_id == instance.instance_id
+                )
+                instance_task_counts[instance.instance_id] = task_count
+
+        if not instance_task_counts:
+            raise ValueError(f"No instance found for model {command.task_params.model}")
+
+        return sorted(
+            instance_task_counts.keys(),
+            key=lambda instance_id: instance_task_counts[instance_id],
+        )[0]
+
     async def _command_processor(self) -> None:
         with self.command_receiver as commands:
             async for forwarder_command in commands:
@@ -138,30 +172,8 @@ class Master:
                         case TestCommand():
                             pass
                         case TextGeneration():
-                            for instance in self.state.instances.values():
-                                if (
-                                    instance.shard_assignments.model_id
-                                    == command.task_params.model
-                                ):
-                                    task_count = sum(
-                                        1
-                                        for task in self.state.tasks.values()
-                                        if task.instance_id == instance.instance_id
-                                    )
-                                    instance_task_counts[instance.instance_id] = (
-                                        task_count
-                                    )
-
-                            if not instance_task_counts:
-                                raise ValueError(
-                                    f"No instance found for model {command.task_params.model}"
-                                )
-
-                            available_instance_ids = sorted(
-                                instance_task_counts.keys(),
-                                key=lambda instance_id: instance_task_counts[
-                                    instance_id
-                                ],
+                            selected_instance_id = (
+                                self._select_text_generation_instance(command)
                             )
 
                             task_id = TaskId()
@@ -171,7 +183,7 @@ class Master:
                                     task=TextGenerationTask(
                                         task_id=task_id,
                                         command_id=command.command_id,
-                                        instance_id=available_instance_ids[0],
+                                        instance_id=selected_instance_id,
                                         task_status=TaskStatus.Pending,
                                         task_params=command.task_params,
                                     ),
