@@ -488,13 +488,13 @@ class API:
         )
         for model_id in model_ids:
             name = self._model_endpoint_name(model_id)
-            openai_base_url, claude_base_url = self._endpoint_urls(origin, name)
+            openai_base_url, _claude_base_url = self._endpoint_urls(origin, name)
             endpoints.append(
                 AgentEndpoint(
                     name=name,
                     kind="model",
                     openai_base_url=openai_base_url,
-                    claude_base_url=claude_base_url,
+                    claude_base_url=None,
                     model_id=model_id,
                     target_instance_id=None,
                     active=True,
@@ -506,13 +506,13 @@ class API:
             self.state.instances.items(), key=lambda item: str(item[0])
         ):
             name = self._instance_endpoint_name(instance_id)
-            openai_base_url, claude_base_url = self._endpoint_urls(origin, name)
+            openai_base_url, _claude_base_url = self._endpoint_urls(origin, name)
             endpoints.append(
                 AgentEndpoint(
                     name=name,
                     kind="instance",
                     openai_base_url=openai_base_url,
-                    claude_base_url=claude_base_url,
+                    claude_base_url=None,
                     model_id=instance.shard_assignments.model_id,
                     target_instance_id=instance_id,
                     active=True,

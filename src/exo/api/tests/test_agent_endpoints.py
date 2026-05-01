@@ -91,10 +91,12 @@ def test_provider_list_includes_default_model_and_instance_endpoints() -> None:
 
     assert providers[0].name == "default"
     assert providers[0].openai_base_url == "http://testserver/v1"
+    assert providers[0].claude_base_url == "http://testserver"
     assert any(
         provider.kind == "model"
         and provider.model_id == model_id
         and provider.target_instance_id is None
+        and provider.claude_base_url is None
         for provider in providers
     )
     assert any(
@@ -103,6 +105,7 @@ def test_provider_list_includes_default_model_and_instance_endpoints() -> None:
         and provider.target_instance_id == instance_id
         and provider.openai_base_url
         == "http://testserver/agents/inst-instance-one/v1"
+        and provider.claude_base_url is None
         for provider in providers
     )
 

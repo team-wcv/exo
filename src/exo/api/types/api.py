@@ -59,7 +59,7 @@ class AgentEndpoint(BaseModel):
     name: str
     kind: Literal["default", "model", "instance"]
     openai_base_url: str
-    claude_base_url: str
+    claude_base_url: str | None
     model_id: ModelId | None
     target_instance_id: InstanceId | None
     active: bool
