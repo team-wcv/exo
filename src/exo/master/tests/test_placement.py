@@ -26,6 +26,7 @@ from exo.shared.types.profiling import (
     MemoryUsage,
     NetworkInterfaceInfo,
     NodeNetworkInfo,
+    NodeRdmaCtlStatus,
 )
 from exo.shared.types.tasks import TaskId, TaskStatus, TextGeneration
 from exo.shared.types.text_generation import (
@@ -569,8 +570,21 @@ def test_tensor_rdma_backend_connectivity_matrix(
         min_nodes=1,
     )
 
+    node_rdma_ctl = {
+        node_a: NodeRdmaCtlStatus(enabled=True),
+        node_b: NodeRdmaCtlStatus(enabled=True),
+        node_c: NodeRdmaCtlStatus(enabled=True),
+    }
+
     # act
-    placements = place_instance(cic, topology, {}, node_memory, node_network)
+    placements = place_instance(
+        cic,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        node_rdma_ctl=node_rdma_ctl,
+    )
 
     # assert
     assert len(placements) == 1
@@ -610,7 +624,6 @@ def test_tensor_rdma_backend_connectivity_matrix(
         else:
             ip_part = coordinator.split(":")[0]
             assert len(ip_part.split(".")) == 4
-
 
 def test_qwen3_5_tensor_auto_upgrade_requires_opt_in(
     monkeypatch: pytest.MonkeyPatch,
@@ -1491,6 +1504,129 @@ def test_placement_prefers_socket_reachable_rank_zero(
     runner_id = instance.shard_assignments.node_to_runner[listener]
     shard = instance.shard_assignments.runner_to_shard[runner_id]
     assert shard.device_rank == 0
+
+
+def _build_three_node_rdma_topology() -> tuple[
+    Topology, NodeId, NodeId, NodeId, dict[NodeId, NodeNetworkInfo]
+]:
+    topology = Topology()
+    node_a = NodeId()
+    node_b = NodeId()
+    node_c = NodeId()
+
+    ethernet_interface = NetworkInterfaceInfo(name="en0", ip_address="10.0.0.1")
+    ethernet_conn = SocketConnection(
+        sink_multiaddr=Multiaddr(address="/ip4/10.0.0.1/tcp/8000")
+    )
+    node_network = {
+        node_a: NodeNetworkInfo(interfaces=[ethernet_interface]),
+        node_b: NodeNetworkInfo(interfaces=[ethernet_interface]),
+        node_c: NodeNetworkInfo(interfaces=[ethernet_interface]),
+    }
+
+    for node_id in (node_a, node_b, node_c):
+        topology.add_node(node_id)
+
+    for source, sink, iface in (
+        (node_a, node_b, 3),
+        (node_b, node_a, 3),
+        (node_b, node_c, 4),
+        (node_c, node_b, 4),
+        (node_a, node_c, 5),
+        (node_c, node_a, 5),
+    ):
+        topology.add_connection(
+            Connection(source=source, sink=sink, edge=create_rdma_connection(iface))
+        )
+
+    for source, sink in (
+        (node_a, node_b),
+        (node_b, node_c),
+        (node_c, node_a),
+        (node_a, node_c),
+        (node_b, node_a),
+        (node_c, node_b),
+    ):
+        topology.add_connection(
+            Connection(source=source, sink=sink, edge=ethernet_conn)
+        )
+
+    return topology, node_a, node_b, node_c, node_network
+
+
+def test_place_mlx_jaccl_rejects_when_a_node_has_rdma_ctl_disabled(
+    model_card: ModelCard,
+) -> None:
+    model_card = model_card.model_copy(
+        update={"n_layers": 12, "storage_size": Memory.from_bytes(1500)}
+    )
+    topology, node_a, node_b, node_c, node_network = _build_three_node_rdma_topology()
+    node_memory = {
+        node_a: create_node_memory(500),
+        node_b: create_node_memory(500),
+        node_c: create_node_memory(500),
+    }
+    node_rdma_ctl = {
+        node_a: NodeRdmaCtlStatus(enabled=True),
+        node_b: NodeRdmaCtlStatus(enabled=True),
+        node_c: NodeRdmaCtlStatus(enabled=False),
+    }
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=3,
+    )
+
+    with pytest.raises(
+        ValueError, match="Requested RDMA \\(MlxJaccl\\) but no RDMA-connected cycles"
+    ):
+        place_instance(
+            command,
+            topology,
+            {},
+            node_memory,
+            node_network,
+            node_rdma_ctl=node_rdma_ctl,
+        )
+
+
+def test_place_mlx_jaccl_rejects_when_node_rdma_ctl_missing(
+    model_card: ModelCard,
+) -> None:
+    model_card = model_card.model_copy(
+        update={"n_layers": 12, "storage_size": Memory.from_bytes(1500)}
+    )
+    topology, node_a, node_b, node_c, node_network = _build_three_node_rdma_topology()
+    node_memory = {
+        node_a: create_node_memory(500),
+        node_b: create_node_memory(500),
+        node_c: create_node_memory(500),
+    }
+    node_rdma_ctl = {
+        node_a: NodeRdmaCtlStatus(enabled=True),
+        node_b: NodeRdmaCtlStatus(enabled=True),
+    }
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=3,
+    )
+
+    with pytest.raises(
+        ValueError, match="Requested RDMA \\(MlxJaccl\\) but no RDMA-connected cycles"
+    ):
+        place_instance(
+            command,
+            topology,
+            {},
+            node_memory,
+            node_network,
+            node_rdma_ctl=node_rdma_ctl,
+        )
 
 
 def _make_task(
