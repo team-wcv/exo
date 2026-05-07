@@ -43,13 +43,29 @@ class MlxBuilder(Builder):
     cancel_receiver: MpReceiver[TaskId]
     inference_model: Model | None = None
     tokenizer: TokenizerWrapper | None = None
+    # ``group`` is the *target subgroup* (excludes the drafter rank when
+    # asymmetric). Pipeline / tensor / batch collectives all run on it,
+    # so existing call sites that pass ``self.group`` work unchanged
+    # under both symmetric and asymmetric placement.
     group: mx.distributed.Group | None = None
+    # The full parent group (size == target world + 1 when asymmetric).
+    # Reserved for ``RemoteTransport`` send/recv between target rank 0
+    # and the drafter rank. ``None`` for single-device builds and for
+    # symmetric multi-rank builds (where ``group`` is the parent).
+    parent_group: mx.distributed.Group | None = None
+    drafter_rank_in_parent: int | None = None
     vision_processor: VisionProcessor | None = None
     draft_model: Model | None = None
     draft_model_id: ModelId | None = None
 
     def connect(self, bound_instance: BoundInstance) -> None:
-        self.group = initialize_mlx(bound_instance)
+        split = initialize_mlx(bound_instance)
+        self.group = split.target_subgroup
+        # When symmetric, parent and target_subgroup are the same group;
+        # leave ``parent_group`` as None so callers can branch on
+        # ``parent_group is not None`` to mean "asymmetric drafter".
+        self.parent_group = split.parent if split.is_asymmetric else None
+        self.drafter_rank_in_parent = split.drafter_rank_in_parent
 
     def load(self, bound_instance: BoundInstance) -> Generator[ModelLoadingResponse]:
         (
@@ -67,6 +83,8 @@ class MlxBuilder(Builder):
             del self.tokenizer
         with contextlib.suppress(NameError, AttributeError):
             del self.group
+        with contextlib.suppress(NameError, AttributeError):
+            del self.parent_group
         with contextlib.suppress(NameError, AttributeError):
             del self.draft_model
 

@@ -5,8 +5,9 @@ import sys
 import tempfile
 import time
 from collections.abc import Generator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast, final
 
 if TYPE_CHECKING:
     from exo.worker.engines.mlx.vision import VisionProcessor
@@ -104,13 +105,31 @@ class HostList(RootModel[list[str]]):
         return cls(root=[str(host) for host in hosts])
 
 
+def _bound_rank(bound_instance: BoundInstance) -> int:
+    """Rank of this runner inside the parent ``mx.distributed`` group.
+
+    Target ranks read this from their bound shard metadata; the drafter
+    rank reads it from :class:`DrafterPlacement` since the drafter has
+    no target shard.
+    """
+    if bound_instance.is_drafter_rank:
+        placement = bound_instance.instance.drafter_placement
+        assert placement is not None  # type narrowed by is_drafter_rank
+        return placement.drafter_rank
+    return bound_instance.bound_shard.device_rank
+
+
 def mlx_distributed_init(
     bound_instance: BoundInstance,
 ) -> mx.distributed.Group:
+    """Initialize MLX distributed for this rank's parent group.
+
+    The parent group spans every rank declared by the instance: target
+    ranks plus, for asymmetric placement, the trailing drafter rank.
+    Target ranks split off into a subgroup at runtime via
+    :func:`initialize_mlx`; this helper just brings up the parent.
     """
-    Initialize MLX distributed.
-    """
-    rank = bound_instance.bound_shard.device_rank
+    rank = _bound_rank(bound_instance)
     logger.info(f"Starting initialization for rank {rank}")
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -179,17 +198,83 @@ def mlx_distributed_init(
         return group
 
 
-def initialize_mlx(
-    bound_instance: BoundInstance,
-) -> mx.distributed.Group:
+@final
+@dataclass(frozen=True)
+class MlxGroupSplit:
+    """Parent ``mx.distributed`` group split into target subgroup + (optional) drafter rank.
+
+    Symmetric placement: ``parent is target_subgroup`` (all ranks are
+    target ranks; ``drafter_rank_in_parent`` is ``None``).
+
+    Asymmetric placement: ``parent`` spans N+1 ranks (N target + 1
+    drafter at rank ``parent.size() - 1``). Target ranks see a
+    ``target_subgroup`` of size N for tensor / pipeline collectives;
+    the drafter rank sees a size-1 subgroup that it never uses.
+    ``parent`` is reserved for ``RemoteTransport.send/recv`` between
+    target rank 0 and the drafter rank.
+
+    The drafter rank is always last in the parent group, by placement
+    convention. This avoids needing to broadcast the drafter rank index
+    out of band -- callers can read it from the instance metadata
+    (``DrafterPlacement.drafter_rank``) and trust that it equals
+    ``parent.size() - 1``.
+    """
+
+    parent: mx.distributed.Group
+    target_subgroup: mx.distributed.Group
+    drafter_rank_in_parent: int | None
+
+    @property
+    def is_asymmetric(self) -> bool:
+        return self.drafter_rank_in_parent is not None
+
+
+# Color values for ``mx.distributed.Group.split``. Target ranks use
+# ``COLOR_TARGET`` so they end up in one subgroup; the drafter rank
+# uses ``COLOR_DRAFTER`` so it ends up alone in a size-1 subgroup that
+# it doesn't use (``split`` is a collective so every rank must call
+# it).
+COLOR_TARGET: Final = 0
+COLOR_DRAFTER: Final = 1
+
+
+def initialize_mlx(bound_instance: BoundInstance) -> MlxGroupSplit:
+    """Bring up the parent group and split off a target subgroup.
+
+    For symmetric placement (no drafter) returns a split where parent
+    and target subgroup are the same object. For asymmetric placement
+    returns three things in one struct: the parent (used for drafter
+    IPC), the target subgroup (used for tensor / pipeline collectives),
+    and the drafter rank index in the parent group.
+    """
     # should we unseed it?
     # TODO: pass in seed from params
     mx.random.seed(42)
 
-    assert len(bound_instance.instance.shard_assignments.node_to_runner) > 1, (
-        "Tried to initialize mlx for a single node instance"
+    parent_size = bound_instance.instance.parent_group_size
+    assert parent_size > 1, (
+        f"Tried to initialize mlx for a single-rank instance "
+        f"(parent_group_size={parent_size}); the single-device runner skips "
+        "mx.distributed entirely."
     )
-    return mlx_distributed_init(bound_instance)
+    parent = mlx_distributed_init(bound_instance)
+    placement = bound_instance.instance.drafter_placement
+    if placement is None:
+        return MlxGroupSplit(
+            parent=parent,
+            target_subgroup=parent,
+            drafter_rank_in_parent=None,
+        )
+
+    drafter_rank = placement.drafter_rank
+    my_rank = parent.rank()
+    color = COLOR_DRAFTER if my_rank == drafter_rank else COLOR_TARGET
+    target_subgroup = parent.split(color, key=my_rank)
+    return MlxGroupSplit(
+        parent=parent,
+        target_subgroup=target_subgroup,
+        drafter_rank_in_parent=drafter_rank,
+    )
 
 
 EXO_DISABLE_DRAFTER_ENV = "EXO_DISABLE_DRAFTER"
