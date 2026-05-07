@@ -188,6 +188,30 @@ class GenerationStats(BaseModel):
     generation_tokens: int
     peak_memory_usage: Memory
     prefix_cache_hit: Literal["none", "partial", "exact"] = "none"
+    # Speculative-decoding telemetry. ``drafter_model_id`` is set whenever
+    # speculative decoding actually ran for this request (drafter loaded *and*
+    # not short-circuited by the short-skip threshold). ``accepted_draft_tokens``
+    # counts ``stream_generate`` outputs with ``from_draft=True``: those are
+    # tokens the drafter proposed *and* the target accepted. The user-facing
+    # speedup is approximately ``accepted_draft_tokens / generation_tokens``.
+    drafter_model_id: str | None = None
+    accepted_draft_tokens: int = 0
+    # K used for speculative_generate_step (None when drafter didn't run).
+    num_draft_tokens: int | None = None
+
+    @property
+    def drafter_acceptance_fraction(self) -> float | None:
+        """Fraction of *generated* tokens that came from the drafter.
+
+        ``None`` when no drafter ran for the request. This is a slight
+        misnomer relative to the speculative-decoding literature -- the true
+        acceptance rate would divide by the drafter's proposal count, which
+        ``stream_generate`` doesn't surface -- but it is the metric that
+        directly maps to wall-clock speedup, so it's what we display.
+        """
+        if self.drafter_model_id is None or self.generation_tokens == 0:
+            return None
+        return self.accepted_draft_tokens / self.generation_tokens
 
 
 class ImageGenerationStats(BaseModel):

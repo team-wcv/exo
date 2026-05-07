@@ -298,6 +298,18 @@
                   <span class="text-exo-light-gray/50">tok/s</span>{/if}
               </span>
             {/if}
+            {#if message.drafterStats}
+              <span
+                class="text-xs text-exo-light-gray/80 font-mono ml-2"
+                title={`Drafter: ${message.drafterStats.modelId}\nAccepted: ${message.drafterStats.acceptedDraftTokens}/${message.drafterStats.generationTokens}${message.drafterStats.numDraftTokens !== null ? `\nK=${message.drafterStats.numDraftTokens}` : ""}`}
+              >
+                <span class="text-exo-light-gray/50">SPEC</span>
+                {(message.drafterStats.acceptanceFraction * 100).toFixed(0)}%{#if message.drafterStats.numDraftTokens !== null}<span
+                    class="text-exo-light-gray/30 mx-1">•</span
+                  ><span class="text-exo-light-gray/50">K=</span
+                  >{message.drafterStats.numDraftTokens}{/if}
+              </span>
+            {/if}
           </div>
         {:else}
           <!-- User message header -->

@@ -594,6 +594,7 @@ def mlx_generate(
     on_generation_token: Callable[[], None] | None = None,
     vision_processor: VisionProcessor | None = None,
     draft_model: Model | None = None,
+    drafter_model_id: ModelId | None = None,
     num_draft_tokens: int | None = None,
     drafter_min_output_tokens: int | None = None,
 ) -> Generator[GenerationResponse]:
@@ -770,6 +771,11 @@ def mlx_generate(
     generated_text_parts: list[str] = []
     generation_start_time = time.perf_counter()
     usage: Usage | None = None
+    # Speculative decoding telemetry (item 4). `from_draft_count` is the
+    # number of tokens stream_generate flagged as drafter-accepted; we report
+    # it on the final GenerationStats so dashboards / clients can A/B
+    # configurations on real traffic.
+    from_draft_count = 0
     logger.info("Starting decode")
     mx_barrier(group)
 
@@ -804,6 +810,8 @@ def mlx_generate(
     ):
         generated_text_parts.append(out.text)
         accumulated_text += out.text
+        if getattr(out, "from_draft", False):
+            from_draft_count += 1
 
         # Check for stop sequences
         text = out.text
@@ -828,12 +836,26 @@ def mlx_generate(
 
         stats: GenerationStats | None = None
         if is_done:
+            # Drafter telemetry: only stamp the id when speculation actually
+            # ran for this request. `effective_draft_model is not None` is
+            # the source of truth -- short-skip and distributed paths zero
+            # it out, so we don't spuriously surface a drafter that didn't
+            # contribute.
+            telemetry_drafter_id: str | None = None
+            telemetry_k: int | None = None
+            if effective_draft_model is not None and drafter_model_id is not None:
+                telemetry_drafter_id = str(drafter_model_id)
+                telemetry_k = num_draft_tokens
+
             stats = GenerationStats(
                 prompt_tps=float(prefill_tps or out.prompt_tps),
                 generation_tps=float(out.generation_tps),
                 prompt_tokens=int(prefill_tokens + out.prompt_tokens),
                 generation_tokens=int(out.generation_tokens),
                 peak_memory_usage=Memory.from_gb(out.peak_memory),
+                drafter_model_id=telemetry_drafter_id,
+                accepted_draft_tokens=from_draft_count,
+                num_draft_tokens=telemetry_k,
             )
             if not stop_matched and out.finish_reason not in get_args(FinishReason):
                 logger.warning(

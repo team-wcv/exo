@@ -29,7 +29,11 @@ from exo.worker.runner.llm_inference.batch_generator import (
 )
 
 
-def _build_mlx_builder(*, draft_model: Model | None) -> MlxBuilder:
+def _build_mlx_builder(
+    *,
+    draft_model: Model | None,
+    draft_model_id: ModelId | None = None,
+) -> MlxBuilder:
     fake_tokenizer = MagicMock(spec=TokenizerWrapper)
     fake_tokenizer.has_tool_calling = False
     fake_tokenizer.tool_call_start = None
@@ -45,6 +49,7 @@ def _build_mlx_builder(*, draft_model: Model | None) -> MlxBuilder:
         group=None,
         vision_processor=None,
         draft_model=draft_model,
+        draft_model_id=draft_model_id,
     )
 
 
@@ -73,10 +78,38 @@ def test_mlx_builder_forces_sequential_when_drafter_loaded(
     """When a drafter model is present, BatchGenerator can't use it, so we must
     fall back to SequentialGenerator regardless of EXO_NO_BATCH."""
     monkeypatch.delenv("EXO_NO_BATCH", raising=False)
+    monkeypatch.delenv("EXO_NUM_DRAFT_TOKENS", raising=False)
+    monkeypatch.delenv("EXO_DRAFTER_MIN_OUTPUT_TOKENS", raising=False)
     fake_drafter = cast(Model, MagicMock())
-    builder = _build_mlx_builder(draft_model=fake_drafter)
+    drafter_id = ModelId("mlx-community/test-drafter")
+    builder = _build_mlx_builder(draft_model=fake_drafter, draft_model_id=drafter_id)
 
     engine = builder.build()
 
     assert isinstance(engine, SequentialGenerator)
     assert engine.draft_model is fake_drafter
+    assert engine.draft_model_id == drafter_id
+    # Defaults should be applied so dashboards see the actual K in use.
+    assert engine.num_draft_tokens is not None and engine.num_draft_tokens >= 2
+    assert (
+        engine.drafter_min_output_tokens is not None
+        and engine.drafter_min_output_tokens > 0
+    )
+
+
+def test_mlx_builder_honours_env_overrides_for_drafter_tuning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXO_NUM_DRAFT_TOKENS", "7")
+    monkeypatch.setenv("EXO_DRAFTER_MIN_OUTPUT_TOKENS", "32")
+    fake_drafter = cast(Model, MagicMock())
+    builder = _build_mlx_builder(
+        draft_model=fake_drafter,
+        draft_model_id=ModelId("mlx-community/test-drafter"),
+    )
+
+    engine = builder.build()
+
+    assert isinstance(engine, SequentialGenerator)
+    assert engine.num_draft_tokens == 7
+    assert engine.drafter_min_output_tokens == 32

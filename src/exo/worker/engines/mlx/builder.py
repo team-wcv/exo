@@ -44,6 +44,7 @@ class MlxBuilder(Builder):
     group: mx.distributed.Group | None = None
     vision_processor: VisionProcessor | None = None
     draft_model: Model | None = None
+    draft_model_id: ModelId | None = None
 
     def connect(self, bound_instance: BoundInstance) -> None:
         self.group = initialize_mlx(bound_instance)
@@ -54,6 +55,7 @@ class MlxBuilder(Builder):
             self.tokenizer,
             self.vision_processor,
             self.draft_model,
+            self.draft_model_id,
         ) = yield from load_mlx_items(bound_instance, self.group)
 
     def close(self) -> None:
@@ -136,6 +138,7 @@ class MlxBuilder(Builder):
                 event_sender=self.event_sender,
                 vision_processor=vision_processor,
                 draft_model=self.draft_model,
+                draft_model_id=self.draft_model_id,
                 num_draft_tokens=num_draft_tokens,
                 drafter_min_output_tokens=drafter_min_output_tokens,
             )

@@ -292,6 +292,14 @@ export interface PrefillProgress {
   startedAt: number;
 }
 
+export interface DrafterStats {
+  modelId: string;
+  acceptedDraftTokens: number;
+  generationTokens: number;
+  numDraftTokens: number | null;
+  acceptanceFraction: number; // accepted / generation_tokens
+}
+
 export interface Message {
   id: string;
   role: "user" | "assistant" | "system";
@@ -301,6 +309,7 @@ export interface Message {
   attachments?: MessageAttachment[];
   ttftMs?: number; // Time to first token in ms (for assistant messages)
   tps?: number; // Tokens per second (for assistant messages)
+  drafterStats?: DrafterStats; // Speculative-decoding telemetry for this turn
   requestType?: "chat" | "image-generation" | "image-editing";
   sourceImageDataUrl?: string; // For image editing regeneration
   tokens?: TokenData[];
@@ -538,6 +547,7 @@ class AppStore {
   // Performance metrics
   ttftMs = $state<number | null>(null); // Time to first token in ms
   tps = $state<number | null>(null); // Tokens per second
+  drafterStats = $state<DrafterStats | null>(null);
   totalTokens = $state<number>(0); // Total tokens in current response
   prefillProgress = $state<PrefillProgress | null>(null);
 
@@ -1676,6 +1686,7 @@ class AppStore {
     this.currentResponse = prefixText;
     this.ttftMs = null;
     this.tps = null;
+    this.drafterStats = null;
     this.totalTokens = tokensToKeep.length;
 
     try {
@@ -1831,9 +1842,25 @@ class AppStore {
         },
         {
           generation_stats: (data) => {
-            const stats = data as { generation_tps: number };
+            const stats = data as {
+              generation_tps: number;
+              generation_tokens?: number;
+              drafter_model_id?: string | null;
+              accepted_draft_tokens?: number;
+              num_draft_tokens?: number | null;
+            };
             if (stats.generation_tps > 0) {
               this.tps = stats.generation_tps;
+            }
+            if (stats.drafter_model_id && stats.generation_tokens && stats.generation_tokens > 0) {
+              this.drafterStats = {
+                modelId: stats.drafter_model_id,
+                acceptedDraftTokens: stats.accepted_draft_tokens ?? 0,
+                generationTokens: stats.generation_tokens,
+                numDraftTokens: stats.num_draft_tokens ?? null,
+                acceptanceFraction:
+                  (stats.accepted_draft_tokens ?? 0) / stats.generation_tokens,
+              };
             }
           },
         },
@@ -1852,6 +1879,7 @@ class AppStore {
           m.tokens = [...collectedTokens];
           if (this.ttftMs !== null) m.ttftMs = this.ttftMs;
           if (this.tps !== null) m.tps = this.tps;
+          if (this.drafterStats !== null) m.drafterStats = this.drafterStats;
         });
         this.syncActiveMessagesIfNeeded(targetConversationId);
         this.persistConversation(targetConversationId);
@@ -2044,9 +2072,25 @@ class AppStore {
         },
         {
           generation_stats: (data) => {
-            const stats = data as { generation_tps: number };
+            const stats = data as {
+              generation_tps: number;
+              generation_tokens?: number;
+              drafter_model_id?: string | null;
+              accepted_draft_tokens?: number;
+              num_draft_tokens?: number | null;
+            };
             if (stats.generation_tps > 0) {
               this.tps = stats.generation_tps;
+            }
+            if (stats.drafter_model_id && stats.generation_tokens && stats.generation_tokens > 0) {
+              this.drafterStats = {
+                modelId: stats.drafter_model_id,
+                acceptedDraftTokens: stats.accepted_draft_tokens ?? 0,
+                generationTokens: stats.generation_tokens,
+                numDraftTokens: stats.num_draft_tokens ?? null,
+                acceptanceFraction:
+                  (stats.accepted_draft_tokens ?? 0) / stats.generation_tokens,
+              };
             }
           },
         },
@@ -2103,6 +2147,7 @@ class AppStore {
     // Clear stats when model changes
     this.ttftMs = null;
     this.tps = null;
+    this.drafterStats = null;
   }
 
   /**
@@ -2305,6 +2350,7 @@ class AppStore {
     this.currentResponse = "";
     this.ttftMs = null;
     this.tps = null;
+    this.drafterStats = null;
     this.totalTokens = 0;
 
     // Build attachments from files
@@ -2655,11 +2701,31 @@ class AppStore {
             };
           },
           generation_stats: (data) => {
-            const stats = data as { generation_tps: number };
+            const stats = data as {
+              generation_tps: number;
+              generation_tokens?: number;
+              drafter_model_id?: string | null;
+              accepted_draft_tokens?: number;
+              num_draft_tokens?: number | null;
+            };
 
             if (stats.generation_tps > 0) {
               this.tps = stats.generation_tps;
               serverTpsReceived = true;
+            }
+            if (
+              stats.drafter_model_id &&
+              stats.generation_tokens &&
+              stats.generation_tokens > 0
+            ) {
+              this.drafterStats = {
+                modelId: stats.drafter_model_id,
+                acceptedDraftTokens: stats.accepted_draft_tokens ?? 0,
+                generationTokens: stats.generation_tokens,
+                numDraftTokens: stats.num_draft_tokens ?? null,
+                acceptanceFraction:
+                  (stats.accepted_draft_tokens ?? 0) / stats.generation_tokens,
+              };
             }
           },
         },
@@ -2694,6 +2760,9 @@ class AppStore {
             }
             if (this.tps !== null) {
               msg.tps = this.tps;
+            }
+            if (this.drafterStats !== null) {
+              msg.drafterStats = this.drafterStats;
             }
           },
         );
@@ -3260,6 +3329,7 @@ class AppStore {
     // Clear performance stats
     this.ttftMs = null;
     this.tps = null;
+    this.drafterStats = null;
   }
 
   /**

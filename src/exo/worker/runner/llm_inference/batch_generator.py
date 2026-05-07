@@ -130,6 +130,9 @@ class SequentialGenerator(Engine):
     # `mlx_generate` itself enforces ``draft_model=None`` whenever ``group is
     # not None``; this field is only ever populated for single-device runners.
     draft_model: Model | None = None
+    # The chosen drafter's ModelId. Used for telemetry (GenerationStats) so
+    # dashboards can attribute speedup to a specific drafter.
+    draft_model_id: ModelId | None = None
     # K (num_draft_tokens) for speculative_generate_step. None falls back to
     # the env var EXO_NUM_DRAFT_TOKENS, then DEFAULT_NUM_DRAFTER_TOKENS.
     num_draft_tokens: int | None = None
@@ -335,6 +338,7 @@ class SequentialGenerator(Engine):
             group=self.group,
             vision_processor=self.vision_processor,
             draft_model=self.draft_model,
+            drafter_model_id=self.draft_model_id,
             num_draft_tokens=self.num_draft_tokens,
             drafter_min_output_tokens=self.drafter_min_output_tokens,
         )

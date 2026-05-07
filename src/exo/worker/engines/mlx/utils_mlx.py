@@ -319,7 +319,13 @@ def load_mlx_items(
 ) -> Generator[
     ModelLoadingResponse,
     None,
-    tuple[Model, TokenizerWrapper, "VisionProcessor | None", Model | None],
+    tuple[
+        Model,
+        TokenizerWrapper,
+        "VisionProcessor | None",
+        Model | None,
+        ModelId | None,
+    ],
 ]:
     target_card = bound_instance.bound_shard.model_card
     target_size = get_weights_size(bound_instance.bound_shard)
@@ -345,6 +351,7 @@ def load_mlx_items(
     set_wired_limit_for_model(combined_size)
 
     drafter_model: Model | None = None
+    drafter_id: ModelId | None = None
 
     if group is None:
         logger.info(f"Single device used for {bound_instance.instance}")
@@ -370,7 +377,7 @@ def load_mlx_items(
 
         drafter_pair = _maybe_load_drafter(target_card)
         if drafter_pair is not None:
-            _, drafter_model = drafter_pair
+            drafter_id, drafter_model = drafter_pair
 
     else:
         logger.info("Starting distributed init")
@@ -408,7 +415,7 @@ def load_mlx_items(
     else:
         vision_processor = None
 
-    return cast(Model, model), tokenizer, vision_processor, drafter_model
+    return cast(Model, model), tokenizer, vision_processor, drafter_model, drafter_id
 
 
 def shard_and_load(
