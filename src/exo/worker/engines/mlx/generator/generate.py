@@ -811,11 +811,27 @@ def mlx_generate(
     # (group is None). Distributed speculative is not yet plumbed; passing a
     # draft_model alongside a non-trivial group would be a no-op, so we drop
     # it explicitly to make the caller contract clear.
+    #
+    # Per-request override (item 9): `task.use_drafter=False` opts out of
+    # speculative decoding for this request only; `task.num_draft_tokens`
+    # overrides the runner's configured K. Both default to None which means
+    # "use the runner default".
+    request_use_drafter = task.use_drafter
+    request_num_draft_tokens = task.num_draft_tokens
+
+    request_draft_model = (
+        draft_model if request_use_drafter is not False else None
+    )
+    effective_num_draft_tokens = (
+        request_num_draft_tokens
+        if request_num_draft_tokens is not None
+        else num_draft_tokens
+    )
     effective_draft_model, spec_kwargs = resolve_speculative_decoding(
-        draft_model=draft_model,
+        draft_model=request_draft_model,
         group=group,
         max_tokens=max_tokens,
-        num_draft_tokens=num_draft_tokens,
+        num_draft_tokens=effective_num_draft_tokens,
         drafter_min_output_tokens=drafter_min_output_tokens,
     )
 
@@ -934,7 +950,7 @@ def mlx_generate(
             telemetry_k: int | None = None
             if effective_draft_model is not None and drafter_model_id is not None:
                 telemetry_drafter_id = str(drafter_model_id)
-                telemetry_k = num_draft_tokens
+                telemetry_k = effective_num_draft_tokens
 
             stats = GenerationStats(
                 prompt_tps=float(prefill_tps or out.prompt_tps),

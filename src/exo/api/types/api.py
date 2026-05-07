@@ -276,6 +276,11 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
     user: str | None = None
+    # Speculative-decoding per-request overrides (item 9). These are exo
+    # extensions to the OpenAI Chat Completions schema -- standard clients
+    # ignore unknown fields and get the runner's defaults.
+    use_drafter: bool | None = None
+    num_draft_tokens: int | None = None
 
 
 class BenchChatCompletionRequest(ChatCompletionRequest):

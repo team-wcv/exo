@@ -134,6 +134,16 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
 
     prefill_endpoint: str | None = None
 
+    # Speculative-decoding per-request overrides (item 9). Both default to
+    # `None`, which means "use the runner's configured defaults". Setting
+    # `use_drafter=False` forces non-speculative decoding for this request
+    # only -- useful for latency-sensitive paths where the drafter's prefill
+    # overhead isn't worth the throughput win. `num_draft_tokens` lets the
+    # client tune K per-request (e.g. raise K for long completions, lower
+    # for short structured outputs).
+    use_drafter: bool | None = None
+    num_draft_tokens: int | None = None
+
     def with_card_sampling_defaults(self) -> "TextGenerationTaskParams":
         from exo.shared.models.model_cards import get_card
 
