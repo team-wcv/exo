@@ -317,10 +317,34 @@ def place_instance(
             topology=topology,
         )
 
-    # Single-node: force Pipeline/Ring (Tensor and Jaccl require multi-node)
+    # Single-node target cycle requires Pipeline sharding (PP=1). The
+    # backend choice depends on whether an asymmetric drafter rank will
+    # extend the parent ``mx.distributed`` group beyond size 1: ring lacks
+    # ``Group.split`` / ``send/recv`` so an N+1=2 parent group cannot use
+    # it; jaccl supports both. We therefore peek at drafter eligibility
+    # before locking the backend, then re-run the full drafter selection
+    # below with the (possibly upgraded) ``instance_meta``.
     if len(selected_cycle) == 1:
-        instance_meta = InstanceMeta.MlxRing
         sharding = Sharding.Pipeline
+        will_attempt_asymmetric_drafter = (
+            bool(command.model_card.drafter_eligible_nodes)
+            and bool(command.model_card.drafter_model_ids)
+            and any(
+                node_id in topology.list_nodes()
+                and node_id not in selected_cycle.node_ids
+                for node_id in command.model_card.drafter_eligible_nodes
+            )
+        )
+        if not will_attempt_asymmetric_drafter:
+            instance_meta = InstanceMeta.MlxRing
+        elif instance_meta == InstanceMeta.MlxRing:
+            # User asked for ring but the model declares an asymmetric
+            # drafter on a separate node. Auto-upgrade to jaccl since ring
+            # cannot support the parent group's split + send/recv path.
+            # If jaccl reachability fails downstream, drafter selection
+            # emits a degradation event and target falls back to ring
+            # symmetric (no drafter), restoring V1 ring behavior.
+            instance_meta = InstanceMeta.MlxJaccl
 
     placement_node_memory = (
         _node_memory_with_total_capacity(selected_cycle, node_memory)
@@ -341,6 +365,18 @@ def place_instance(
         instance_id=instance_id,
         on_drafter_placement_degraded=on_drafter_placement_degraded,
     )
+
+    # If the auto-upgrade to MlxJaccl above didn't yield a drafter (e.g.
+    # no RDMA path to the eligible node), revert to MlxRing for the
+    # symmetric single-rank target. The degradation event was already
+    # emitted by ``_select_drafter_placement``; the user's instance
+    # still completes, just without speculative decoding.
+    if (
+        len(selected_cycle) == 1
+        and instance_meta == InstanceMeta.MlxJaccl
+        and drafter_placement is None
+    ):
+        instance_meta = InstanceMeta.MlxRing
 
     # Asymmetric placement extends the parent ``mx.distributed`` group to
     # include the drafter rank as the last rank. Subgraph + connectivity

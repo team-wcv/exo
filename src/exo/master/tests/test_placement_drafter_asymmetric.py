@@ -106,8 +106,73 @@ def _bidi_rdma(topology: Topology, a: NodeId, b: NodeId, iface: int) -> None:
     )
 
 
-def test_asymmetric_ring_places_drafter_on_eligible_node() -> None:
-    """Single-node target + reachable eligible drafter node => asymmetric ring."""
+def test_asymmetric_single_node_target_auto_upgrades_to_jaccl() -> None:
+    """Single-node target + RDMA-reachable drafter => asymmetric jaccl.
+
+    Single-rank target requires Pipeline sharding, but the parent group
+    spans 2 ranks (1 target + 1 drafter) and ring backend lacks
+    ``Group.split`` / ``send/recv``. Placement therefore auto-upgrades
+    ``MlxRing`` -> ``MlxJaccl`` whenever asymmetric drafter placement
+    will succeed, so the parent group can use jaccl for the drafter
+    transport.
+    """
+    target_node, drafter_node = NodeId(), NodeId()
+    topology = Topology()
+    topology.add_node(target_node)
+    topology.add_node(drafter_node)
+    _bidi_socket(topology, target_node, drafter_node, ip=2)
+    _bidi_rdma(topology, target_node, drafter_node, iface=4)
+
+    card = _drafter_aware_card(
+        storage_bytes=20_000_000_000, eligible_nodes=[drafter_node]
+    )
+    command = PlaceInstance(
+        sharding=Sharding.Pipeline,
+        instance_meta=InstanceMeta.MlxRing,
+        command_id=CommandId(),
+        model_card=card,
+        min_nodes=1,
+    )
+    degradations: list[DrafterPlacementDegraded] = []
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        {
+            target_node: create_node_memory(64_000_000_000),
+            drafter_node: create_node_memory(32_000_000_000),
+        },
+        {
+            target_node: create_node_network(),
+            drafter_node: create_node_network(),
+        },
+        on_drafter_placement_degraded=degradations.append,
+    )
+
+    assert len(placements) == 1
+    assert not degradations
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxJacclInstance)
+    assert instance.drafter_placement is not None
+    placement = instance.drafter_placement
+    assert placement.drafter_node_id == drafter_node
+    assert placement.drafter_model_id == ModelId("mlx-community/gemma-4-e2b-it-8bit")
+    assert placement.drafter_rank == 1  # target=1 rank, drafter is last (rank 1)
+    assert instance.parent_group_size == 2
+    assert len(instance.shard_assignments.runner_to_shard) == 1
+
+
+def test_asymmetric_ring_socket_only_falls_back_to_symmetric_ring() -> None:
+    """Single-node target + ring + drafter eligible but only socket reach.
+
+    Ring backend can't run asymmetric (no split / send/recv). Auto-upgrade
+    to jaccl fails because there's no RDMA path to the drafter node, so
+    drafter selection emits a degradation event and placement reverts to
+    symmetric ``MlxRing`` (no drafter). The user's request still completes;
+    they get a non-speculative ring instance and a loud degradation event
+    pointing at the missing RDMA edge.
+    """
     target_node, drafter_node = NodeId(), NodeId()
     topology = Topology()
     topology.add_node(target_node)
@@ -142,18 +207,14 @@ def test_asymmetric_ring_places_drafter_on_eligible_node() -> None:
     )
 
     assert len(placements) == 1
-    assert not degradations
     instance = next(iter(placements.values()))
     assert isinstance(instance, MlxRingInstance)
-    assert instance.drafter_placement is not None
-    placement = instance.drafter_placement
-    assert placement.drafter_node_id == drafter_node
-    assert placement.drafter_model_id == ModelId("mlx-community/gemma-4-e2b-it-8bit")
-    assert placement.drafter_rank == 1  # target=1 rank, drafter is last (rank 1)
-    assert instance.parent_group_size == 2
-    assert len(instance.shard_assignments.runner_to_shard) == 1
-    assert drafter_node in instance.hosts_by_node
-    assert target_node in instance.hosts_by_node
+    assert instance.drafter_placement is None
+    assert len(degradations) == 1
+    assert (
+        degradations[0].reason
+        == DrafterPlacementDegradationReason.NoReachablePathFromTargetRankZero
+    )
 
 
 def test_asymmetric_jaccl_places_drafter_with_rdma_reachability() -> None:
@@ -384,12 +445,18 @@ def test_asymmetric_degrades_when_eligible_node_in_target_cycle(
 
 
 def test_asymmetric_degrades_when_drafter_node_lacks_memory() -> None:
-    """Drafter node reachable but below memory floor (~6GB) => degrade."""
+    """Drafter node reachable but below memory floor (~6GB) => degrade.
+
+    RDMA-reachable so jaccl auto-upgrade is viable, but memory check
+    rejects the candidate. Single-node target therefore reverts to
+    symmetric MlxRing without drafter.
+    """
     target_node, drafter_node = NodeId(), NodeId()
     topology = Topology()
     topology.add_node(target_node)
     topology.add_node(drafter_node)
     _bidi_socket(topology, target_node, drafter_node, ip=8)
+    _bidi_rdma(topology, target_node, drafter_node, iface=40)
 
     card = _drafter_aware_card(
         storage_bytes=20_000_000_000, eligible_nodes=[drafter_node]
@@ -419,6 +486,7 @@ def test_asymmetric_degrades_when_drafter_node_lacks_memory() -> None:
     )
 
     instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxRingInstance)
     assert instance.drafter_placement is None
     assert len(degradations) == 1
     assert (
@@ -472,7 +540,12 @@ def test_empty_drafter_eligible_nodes_preserves_legacy_behaviour() -> None:
 def test_asymmetric_with_multiple_eligible_nodes_picks_first_reachable() -> None:
     """When multiple eligible nodes are listed, placement picks the first
     reachable (in card order). Earlier candidates that fail reachability
-    are skipped silently (the search is best-effort, not first-fail)."""
+    are skipped silently (the search is best-effort, not first-fail).
+
+    Single-node target auto-upgrades to jaccl, so the reachable drafter
+    needs an RDMA edge (not just a socket edge); the unreachable drafter
+    has no edges at all.
+    """
     target_node = NodeId()
     unreachable_drafter = NodeId()
     reachable_drafter = NodeId()
@@ -480,8 +553,9 @@ def test_asymmetric_with_multiple_eligible_nodes_picks_first_reachable() -> None
     topology.add_node(target_node)
     topology.add_node(unreachable_drafter)
     topology.add_node(reachable_drafter)
-    # Only reachable_drafter has a socket edge to target.
+    # Only reachable_drafter has socket + RDMA edges to target.
     _bidi_socket(topology, target_node, reachable_drafter, ip=20)
+    _bidi_rdma(topology, target_node, reachable_drafter, iface=50)
 
     card = _drafter_aware_card(
         storage_bytes=20_000_000_000,
@@ -520,12 +594,19 @@ def test_asymmetric_with_multiple_eligible_nodes_picks_first_reachable() -> None
 
 
 def test_asymmetric_round_trip_serialization() -> None:
-    """An asymmetric instance round-trips through pydantic serialisation."""
+    """An asymmetric instance round-trips through pydantic serialisation.
+
+    Single-node target auto-upgrades to ``MlxJaccl`` for the asymmetric
+    parent group (ring lacks split + send/recv), so the round-trip is
+    exercised on ``MlxJacclInstance`` here. RDMA edges to the drafter
+    node make the auto-upgrade viable.
+    """
     target_node, drafter_node = NodeId(), NodeId()
     topology = Topology()
     topology.add_node(target_node)
     topology.add_node(drafter_node)
     _bidi_socket(topology, target_node, drafter_node, ip=30)
+    _bidi_rdma(topology, target_node, drafter_node, iface=60)
 
     card = _drafter_aware_card(
         storage_bytes=20_000_000_000, eligible_nodes=[drafter_node]
@@ -552,11 +633,11 @@ def test_asymmetric_round_trip_serialization() -> None:
         },
     )
     instance = next(iter(placements.values()))
-    assert isinstance(instance, MlxRingInstance)
+    assert isinstance(instance, MlxJacclInstance)
     assert instance.drafter_placement is not None
 
     dumped = instance.model_dump()
-    rehydrated = MlxRingInstance.model_validate(dumped)
+    rehydrated = MlxJacclInstance.model_validate(dumped)
     assert rehydrated == instance
     assert rehydrated.drafter_placement is not None
     assert (
