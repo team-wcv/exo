@@ -109,6 +109,7 @@ class Worker:
                 tg.start_soon(self._forward_info, info_recv)
                 tg.start_soon(self.plan_step)
                 tg.start_soon(self._event_applier)
+                tg.start_soon(self._reconcile_instance_backoff)
                 tg.start_soon(self._poll_connection_updates)
         finally:
             # Actual shutdown code - waits for all tasks to complete before executing.
@@ -178,6 +179,17 @@ class Worker:
 
                 if isinstance(event, CustomModelCardDeleted):
                     await delete_custom_card(event.model_id)
+
+    async def _reconcile_instance_backoff(self) -> None:
+        while True:
+            await anyio.sleep(1)
+            self._reconcile_instance_backoff_once()
+
+    def _reconcile_instance_backoff_once(self) -> None:
+        live_instances = set(self.state.instances)
+        for instance_id in self._instance_backoff.tracked_keys():
+            if instance_id not in live_instances:
+                self._instance_backoff.reset(instance_id)
 
     async def plan_step(self):
         while True:
