@@ -636,29 +636,30 @@ def mlx_generate(
         kv_prefix_cache = None
 
     # When the drafter participates we run a self-contained spec-decoding
-    # path below: we hand mlx_lm fresh plain KVCache lists for both target
-    # and drafter and let its `speculative_generate_step._prefill` do prompt
-    # ingestion. Reasons:
-    #   - mlx_lm's spec_step trims and re-extends each cache every round.
-    #     ``RotatingKVCache`` (gemma-4's default for sliding-window layers)
-    #     rotates its underlying KV buffer on every trim, slowing generation
-    #     by ~750x. Plain KVCache trades unbounded growth (fine for typical
-    #     request lengths) for cheap trim semantics.
-    #   - exo's pre-existing prefill / prefix-cache machinery operates on the
-    #     model's native cache types (rotating + plain mix). Threading those
-    #     through spec_step's trim-heavy path inherits the same rotating-cache
-    #     slowdown, so we bypass it on the spec path.
-    # Distributed runs do not pass the drafter through to mlx_lm, so this
-    # branch only applies to single-device.
+    # path: we hand mlx_lm a freshly built native cache pair (target+drafter)
+    # and let ``speculative_generate_step._prefill`` ingest the prompt itself.
+    #
+    # Why bypass exo's own prefill/prefix-cache plumbing here:
+    #   * ``speculative_generate_step._prefill`` does not consult cache offsets;
+    #     it always processes ``prompt[:y.size-1]``. If exo's prefill has
+    #     already populated the target cache, mlx_lm would re-ingest the same
+    #     prompt on top, doubling the cache and producing garbage logits.
+    #   * Native caches (RotatingKVCache for sliding-window layers + KVCache
+    #     for global-attention layers) are exactly what mlx_lm expects. Each
+    #     cache exposes ``make_mask`` returning bounded-shape masks (or a
+    #     ``"causal"`` sentinel), which avoids per-round Metal kernel
+    #     recompiles. Forcing plain KVCache for sliding-window layers triggers
+    #     variable-shape array masks and was the source of the cold-start
+    #     slowdown we observed earlier.
+    # Distributed runs (``group is not None``) do not pass the drafter
+    # through to mlx_lm, so this branch only applies to single-device.
     spec_active = draft_model is not None and group is None
 
-    # Use prefix cache if available, otherwise create fresh cache.
-    # On the spec path we skip the prefix-cache lookup entirely (see above).
     prefix_hit_length = 0
     matched_index: int | None = None
     is_exact_hit = False
     if spec_active or kv_prefix_cache is None:
-        caches = make_kv_cache(model=model, force_plain_kv_cache=spec_active)
+        caches = make_kv_cache(model=model)
         prompt_tokens = all_prompt_tokens
     else:
         caches, prompt_tokens, matched_index, is_exact_hit = (
@@ -844,21 +845,14 @@ def mlx_generate(
 
     # mlx_lm's speculative_generate_step splits its ``prompt_cache`` argument
     # as ``[: len(target.layers)]`` for the target and ``[len(target.layers) :]``
-    # for the drafter. We build both as plain KVCache (see ``spec_active``
-    # comment above) and concatenate; mlx_lm prefills both internally on the
-    # full prompt we hand it.
+    # for the drafter. We build both with each model's native ``make_cache``
+    # factory and concatenate; mlx_lm prefills both internally on the full
+    # prompt we hand it.
     decode_cache: KVCacheType | list[object] = caches
     if effective_draft_model is not None and group is None:
-        drafter_caches = make_kv_cache(
-            model=effective_draft_model, force_plain_kv_cache=True
-        )
+        drafter_caches = make_kv_cache(model=effective_draft_model)
         decode_cache = list(caches) + list(drafter_caches)
-        logger.info(
-            f"spec decode_cache: target={len(caches)}, drafter={len(drafter_caches)}, "
-            f"prompt_size={len(decode_prompt)}, K={spec_kwargs.get('num_draft_tokens')}"
-        )
 
-    logger.info(f"about to call stream_generate (spec={spec_active})")
     for completion_tokens, out in enumerate(
         stream_generate(
             model=model,
@@ -876,10 +870,6 @@ def mlx_generate(
         ),
         start=1,
     ):
-        if completion_tokens <= 3:
-            logger.info(
-                f"spec out [{completion_tokens}]: from_draft={getattr(out, 'from_draft', None)}, text={out.text!r}"
-            )
         generated_text_parts.append(out.text)
         accumulated_text += out.text
         if getattr(out, "from_draft", False):

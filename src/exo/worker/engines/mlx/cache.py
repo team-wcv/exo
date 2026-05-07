@@ -316,8 +316,6 @@ class KVPrefixCache:
         model: Model,
         prompt_tokens: mx.array,
         media_regions: list["MediaRegion"] | None = None,
-        *,
-        force_plain_kv_cache: bool = False,
     ) -> tuple[KVCacheType, mx.array, int | None, bool]:
         """Get KV cache for prompt, returning remaining tokens to prefill.
 
@@ -361,7 +359,7 @@ class KVPrefixCache:
 
         if best_index is None:
             return (
-                make_kv_cache(model, force_plain_kv_cache=force_plain_kv_cache),
+                make_kv_cache(model),
                 prompt_tokens,
                 None,
                 False,
@@ -382,7 +380,7 @@ class KVPrefixCache:
         # No usable snapshot — need fresh cache
         if restore_snap is None and has_ssm:
             return (
-                make_kv_cache(model, force_plain_kv_cache=force_plain_kv_cache),
+                make_kv_cache(model),
                 prompt_tokens,
                 None,
                 False,
@@ -573,36 +571,21 @@ def make_kv_cache(
     model: Model,
     max_kv_size: int | None = None,
     keep: int = 0,
-    *,
-    force_plain_kv_cache: bool = False,
 ) -> KVCacheType:
     """Build a KV cache for ``model``.
 
-    By default we honor the model's own ``make_cache()`` factory when
-    available so each architecture gets the cache layout it was designed
-    for (e.g. Gemma 4 returns a mix of ``RotatingKVCache`` for sliding-window
-    layers and ``KVCache`` for global-attention layers).
-
-    When ``force_plain_kv_cache=True``, every entry is replaced with a plain
-    ``KVCache``, preserving the model's per-layer cache *count* (which is
-    what the layer-level forward pass indexes into) but dropping the
-    sliding-window behaviour. This is required for drafters used in
-    ``mlx_lm.speculative_generate_step``: that path repeatedly trims and
-    re-extends each cache, which ``RotatingKVCache`` handles by physically
-    rotating its underlying KV buffer on every spec round, slowing
-    generation by ~750x. Using a plain ``KVCache`` skips that rotation cost
-    at the price of unbounded growth, which is fine for the small drafters
-    we use (~1-2GB) and short-lived per-request caches.
+    Honors the model's own ``make_cache()`` factory when available so each
+    architecture gets the cache layout it was designed for (e.g. Gemma 4
+    returns a mix of ``RotatingKVCache`` for sliding-window layers and
+    ``KVCache`` for global-attention layers). This is exactly what
+    ``mlx_lm.speculative_generate_step`` expects when ``draft_model`` is
+    supplied -- it slices the supplied ``prompt_cache`` into target/drafter
+    halves of native shape and uses each model's own attention masks.
     """
     assert hasattr(model, "layers")
 
     if hasattr(model, "make_cache"):
         native = cast(list[object], model.make_cache())  # type: ignore[reportAttributeAccessIssue]
-        if force_plain_kv_cache:
-            logger.info(
-                f"Using plain KVCache (n={len(native)}) for spec-decoding compatibility"
-            )
-            return cast(KVCacheType, [KVCache() for _ in native])
         logger.info("Using MLX LM's make cache")
         return cast(KVCacheType, native)
 
