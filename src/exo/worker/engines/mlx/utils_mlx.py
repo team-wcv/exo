@@ -193,19 +193,61 @@ def initialize_mlx(
 
 
 EXO_DISABLE_DRAFTER_ENV = "EXO_DISABLE_DRAFTER"
+EXO_DRAFTER_PREFERENCE_ENV = "EXO_DRAFTER_PREFERENCE"
+
+# Allowed values for ``EXO_DRAFTER_PREFERENCE``. ``fastest`` picks the first
+# drafter declared on the card (smallest by convention); ``highest_acceptance``
+# picks the last (largest by convention); ``auto`` defaults to ``fastest`` but
+# may be tuned by future heuristics (e.g. observed acceptance rate).
+_DRAFTER_PREFERENCE_VALUES: frozenset[str] = frozenset(
+    {"fastest", "highest_acceptance", "auto"}
+)
 
 
 def _drafter_disabled_by_env() -> bool:
     return os.environ.get(EXO_DISABLE_DRAFTER_ENV, "").lower() in {"1", "true", "yes"}
 
 
-def _maybe_load_drafter(model_card: ModelCard) -> Model | None:
-    """Load the drafter model declared on ``model_card``, if any.
+def _drafter_preference() -> str:
+    raw = os.environ.get(EXO_DRAFTER_PREFERENCE_ENV, "auto").lower()
+    if raw not in _DRAFTER_PREFERENCE_VALUES:
+        logger.warning(
+            f"Unknown {EXO_DRAFTER_PREFERENCE_ENV}={raw!r}, falling back to 'auto'"
+        )
+        return "auto"
+    return raw
 
-    Returns ``None`` when the card has no drafter, the drafter weights are not
-    on disk, or the user has disabled drafter loading via
-    ``EXO_DISABLE_DRAFTER``. Drafter loading failures are logged and swallowed:
-    the target model continues to load and inference falls back to standard
+
+def _select_drafter_id(
+    candidates: list[ModelId], preference: str
+) -> ModelId | None:
+    """Pick a drafter id from a card's preference-ordered list.
+
+    The card lists drafters in `[fastest, ..., highest_acceptance]` order. We
+    prefer drafters that are already on disk (so the chooser doesn't force a
+    surprise download); within the on-disk subset we honor the user's
+    preference. If nothing is on disk we fall back to the head of the list,
+    leaving the loader to log a "weights missing" warning.
+    """
+    if not candidates:
+        return None
+
+    on_disk = [cid for cid in candidates if resolve_existing_model(cid) is not None]
+    pool = on_disk if on_disk else candidates
+
+    if preference == "highest_acceptance":
+        return pool[-1]
+    return pool[0]
+
+
+def _maybe_load_drafter(model_card: ModelCard) -> tuple[ModelId, Model] | None:
+    """Load a drafter model declared on ``model_card``, if any.
+
+    Returns the chosen ``(drafter_id, drafter_model)`` pair on success, or
+    ``None`` when the card declares no drafter, the chosen drafter's weights
+    are not on disk, ``EXO_DISABLE_DRAFTER`` is set, or the load itself
+    fails. Drafter loading failures are logged and swallowed: the target
+    model continues to load and inference falls back to standard
     (non-speculative) decoding.
 
     This helper is intentionally single-device only. Multi-device distributed
@@ -213,22 +255,28 @@ def _maybe_load_drafter(model_card: ModelCard) -> Model | None:
     today (see ``mlx_generate``), so loading a drafter on those ranks would
     just waste memory.
     """
-    drafter_id = model_card.drafter_model_id
-    if drafter_id is None:
+    candidates = list(model_card.drafter_model_ids)
+    if not candidates:
         return None
     if _drafter_disabled_by_env():
         logger.info(
-            f"Drafter {drafter_id} declared by {model_card.model_id} but "
+            f"Drafter declared by {model_card.model_id} but "
             f"{EXO_DISABLE_DRAFTER_ENV} is set; skipping drafter load."
         )
+        return None
+
+    preference = _drafter_preference()
+    drafter_id = _select_drafter_id(candidates, preference)
+    if drafter_id is None:
         return None
 
     drafter_path = resolve_existing_model(drafter_id)
     if drafter_path is None:
         logger.warning(
-            f"Drafter {drafter_id} declared by {model_card.model_id} is not "
-            "downloaded; falling back to standard decoding. Pre-download the "
-            "drafter to enable speculative decoding."
+            f"Drafter {drafter_id} (preferred '{preference}') declared by "
+            f"{model_card.model_id} is not downloaded; falling back to "
+            "standard decoding. Pre-download the drafter to enable "
+            "speculative decoding."
         )
         return None
 
@@ -243,10 +291,26 @@ def _maybe_load_drafter(model_card: ModelCard) -> Model | None:
         )
         return None
     logger.info(
-        f"Loaded drafter {drafter_id} for {model_card.model_id} in "
-        f"{(time.perf_counter() - drafter_start):.2f}s"
+        f"Loaded drafter {drafter_id} (preferred '{preference}') for "
+        f"{model_card.model_id} in {(time.perf_counter() - drafter_start):.2f}s"
     )
-    return cast(Model, drafter_model)
+    return drafter_id, cast(Model, drafter_model)
+
+
+def _drafter_weight_size_bytes(drafter_id: ModelId) -> int:
+    """Best-effort drafter-on-disk size for the wired-memory bump.
+
+    Walks the drafter directory and sums file sizes. Returns 0 on any error
+    (the drafter weights aren't critical-path so we'd rather under-wire than
+    crash).
+    """
+    drafter_path = resolve_existing_model(drafter_id)
+    if drafter_path is None:
+        return 0
+    try:
+        return sum(p.stat().st_size for p in drafter_path.rglob("*") if p.is_file())
+    except OSError:
+        return 0
 
 
 def load_mlx_items(
@@ -257,13 +321,34 @@ def load_mlx_items(
     None,
     tuple[Model, TokenizerWrapper, "VisionProcessor | None", Model | None],
 ]:
-    set_wired_limit_for_model(get_weights_size(bound_instance.bound_shard))
+    target_card = bound_instance.bound_shard.model_card
+    target_size = get_weights_size(bound_instance.bound_shard)
+
+    # Pre-include drafter size in the wired-memory limit so the OS doesn't
+    # page out drafter weights between requests. We have to make this decision
+    # *before* loading the target because `set_wired_limit_for_model` configures
+    # the limit once.
+    combined_size = target_size
+    if (
+        group is None
+        and not _drafter_disabled_by_env()
+        and target_card.drafter_model_ids
+    ):
+        chosen = _select_drafter_id(
+            list(target_card.drafter_model_ids), _drafter_preference()
+        )
+        if chosen is not None:
+            drafter_bytes = _drafter_weight_size_bytes(chosen)
+            if drafter_bytes > 0:
+                combined_size = target_size + Memory.from_bytes(drafter_bytes)
+
+    set_wired_limit_for_model(combined_size)
 
     drafter_model: Model | None = None
 
     if group is None:
         logger.info(f"Single device used for {bound_instance.instance}")
-        model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
+        model_path = build_model_path(target_card.model_id)
         start_time = time.perf_counter()
         model, _ = load_model(model_path, lazy=True, strict=False)
         # Eval layers one by one for progress reporting
@@ -283,7 +368,9 @@ def load_mlx_items(
         logger.info(f"Time taken to load model: {(end_time - start_time):.2f}s")
         tokenizer = get_tokenizer(model_path, bound_instance.bound_shard)
 
-        drafter_model = _maybe_load_drafter(bound_instance.bound_shard.model_card)
+        drafter_pair = _maybe_load_drafter(target_card)
+        if drafter_pair is not None:
+            _, drafter_model = drafter_pair
 
     else:
         logger.info("Starting distributed init")

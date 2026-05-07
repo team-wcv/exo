@@ -38,7 +38,7 @@ TARGET_ID = ModelId("test-org/test-target")
 DRAFTER_ID = ModelId("test-org/test-drafter")
 
 
-def _make_target_card(drafter: ModelId | None) -> ModelCard:
+def _make_target_card(drafters: list[ModelId]) -> ModelCard:
     return ModelCard(
         model_id=TARGET_ID,
         storage_size=Memory.from_mb(500),
@@ -46,7 +46,7 @@ def _make_target_card(drafter: ModelId | None) -> ModelCard:
         hidden_size=2048,
         supports_tensor=False,
         tasks=[ModelTask.TextGeneration],
-        drafter_model_id=drafter,
+        drafter_model_ids=drafters,
     )
 
 
@@ -200,7 +200,7 @@ async def _running_coordinator(
 
 
 async def test_target_with_drafter_chains_drafter_download() -> None:
-    target_shard = _make_shard(_make_target_card(DRAFTER_ID))
+    target_shard = _make_shard(_make_target_card([DRAFTER_ID]))
     drafter_card = _make_drafter_card()
 
     async def fake_load(model_id: ModelId) -> ModelCard:
@@ -227,7 +227,7 @@ async def test_target_with_drafter_chains_drafter_download() -> None:
 
 
 async def test_target_without_drafter_does_not_chain() -> None:
-    target_shard = _make_shard(_make_target_card(None))
+    target_shard = _make_shard(_make_target_card([]))
 
     async def fail_load(_: ModelId) -> ModelCard:
         raise AssertionError("ModelCard.load should not be called when no drafter")
@@ -253,7 +253,7 @@ async def test_drafter_chain_skipped_when_disabled_by_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("EXO_DISABLE_DRAFTER", "1")
-    target_shard = _make_shard(_make_target_card(DRAFTER_ID))
+    target_shard = _make_shard(_make_target_card([DRAFTER_ID]))
 
     async def fail_load(_: ModelId) -> ModelCard:
         raise AssertionError(
@@ -281,7 +281,7 @@ async def test_drafter_chain_swallows_card_load_error() -> None:
     """If the drafter's ModelCard cannot be loaded (e.g. HF unreachable, card
     not in repo), the target download must still complete and the coordinator
     must not crash."""
-    target_shard = _make_shard(_make_target_card(DRAFTER_ID))
+    target_shard = _make_shard(_make_target_card([DRAFTER_ID]))
 
     async def boom(_: ModelId) -> ModelCard:
         raise RuntimeError("simulated card load failure")
