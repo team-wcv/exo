@@ -27,6 +27,7 @@ from exo.worker.runner.llm_inference.batch_generator import (
 from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 
 from .cache import KVPrefixCache
+from .generator.drafter import EXO_DRAFT_MODE_ENV, parse_draft_mode
 from .types import Model
 from .utils_mlx import (
     initialize_mlx,
@@ -103,19 +104,27 @@ class MlxBuilder(Builder):
 
         device_rank = 0 if self.group is None else self.group.rank()
 
-        # Speculative decoding currently only flows through `mlx_generate` ->
-        # `stream_generate(draft_model=...)`, which is the SequentialGenerator
-        # path. Upstream `mlx_lm.generate.BatchGenerator` does not accept a
-        # draft model. Force the sequential path when a drafter is loaded so
-        # the user actually gets speculative decoding instead of silently
-        # falling through to non-speculative batching.
-        force_sequential_for_drafter = self.draft_model is not None
+        # Speculative decoding (model or n-gram) currently flows only through
+        # SequentialGenerator -> mlx_generate. Upstream BatchGenerator does
+        # not accept a draft model and has no hook for n-gram drafting, so
+        # force the sequential path whenever speculative decoding could
+        # plausibly run for any request: a drafter model is loaded *or*
+        # ``EXO_DRAFT_MODE=ngram`` is set process-wide. Per-request
+        # overrides (``TaskParams.draft_mode``) only apply within the
+        # surface that the chosen generator exposes.
+        configured_draft_mode = parse_draft_mode(
+            os.environ.get(EXO_DRAFT_MODE_ENV),
+            default="model" if self.draft_model is not None else "none",
+        )
+        force_sequential_for_drafter = (
+            self.draft_model is not None or configured_draft_mode == "ngram"
+        )
 
         if os.environ.get("EXO_NO_BATCH") or force_sequential_for_drafter:
             if force_sequential_for_drafter:
                 logger.info(
-                    "using SequentialGenerator (drafter loaded; "
-                    "BatchGenerator does not support speculative decoding)"
+                    f"using SequentialGenerator (draft_mode={configured_draft_mode!r}; "
+                    f"BatchGenerator has no spec-decoding hook)"
                 )
             else:
                 logger.info("using SequentialGenerator (batching disabled)")
@@ -133,8 +142,8 @@ class MlxBuilder(Builder):
             ).lower() in {"1", "true", "yes"}
             if force_sequential_for_drafter:
                 logger.info(
-                    f"speculative decoding: K={num_draft_tokens} "
-                    f"(adaptive={adaptive_draft_tokens}), "
+                    f"speculative decoding: mode={configured_draft_mode}, "
+                    f"K={num_draft_tokens} (adaptive={adaptive_draft_tokens}), "
                     f"skip_drafter_when_max_tokens<={drafter_min_output_tokens}"
                 )
 

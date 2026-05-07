@@ -198,6 +198,13 @@ class GenerationStats(BaseModel):
     accepted_draft_tokens: int = 0
     # K used for speculative_generate_step (None when drafter didn't run).
     num_draft_tokens: int | None = None
+    # Drafting strategy that actually ran for this request: "model" for
+    # external-drafter spec decoding, "ngram" for in-context suffix
+    # lookup, "none" for non-speculative. None when the engine doesn't
+    # surface drafting (e.g. image gen). Useful for telemetry dashboards
+    # to attribute throughput wins to a specific strategy when running
+    # mixed-mode A/B tests.
+    draft_mode: Literal["model", "ngram", "none"] | None = None
 
     @property
     def drafter_acceptance_fraction(self) -> float | None:

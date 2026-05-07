@@ -83,9 +83,7 @@ DEFAULT_DRAFTER_MIN_OUTPUT_TOKENS = 16
 ADAPTIVE_K_WINDOW = 8
 
 
-def adaptive_num_draft_tokens(
-    rolling_fractions: list[float], fallback: int
-) -> int:
+def adaptive_num_draft_tokens(rolling_fractions: list[float], fallback: int) -> int:
     """Pick K (num_draft_tokens) from a rolling window of acceptance fractions.
 
     The bands are based on the geometric expectation
@@ -112,14 +110,10 @@ def parse_env_int(name: str, default: int, minimum: int = 1) -> int:
     try:
         value = int(raw)
     except ValueError:
-        logger.warning(
-            f"{name}={raw!r} is not a valid int; falling back to {default}"
-        )
+        logger.warning(f"{name}={raw!r} is not a valid int; falling back to {default}")
         return default
     if value < minimum:
-        logger.warning(
-            f"{name}={value} below minimum {minimum}; clamping to {minimum}"
-        )
+        logger.warning(f"{name}={value} below minimum {minimum}; clamping to {minimum}")
         return minimum
     return value
 
