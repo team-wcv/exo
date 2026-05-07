@@ -229,12 +229,12 @@ class DownloadCoordinator:
                     case StartDownload(shard_metadata=shard, available_peers=peers):
                         # Pass peer endpoints to the shard downloader if it supports it
                         if isinstance(self.shard_downloader, PeerAwareShardDownloader):
-                            self.shard_downloader.set_available_peers(peers)
+                            self.shard_downloader.set_available_peers(shard, peers)
                         elif hasattr(self.shard_downloader, "shard_downloader") and isinstance(
                             self.shard_downloader.shard_downloader, PeerAwareShardDownloader  # type: ignore[union-attr]
                         ):
                             # Unwrap SingletonShardDownloader
-                            self.shard_downloader.shard_downloader.set_available_peers(peers)  # type: ignore[union-attr]
+                            self.shard_downloader.shard_downloader.set_available_peers(shard, peers)  # type: ignore[union-attr]
                         await self._start_download(shard)
                     case DeleteDownload(model_id=model_id):
                         await self._delete_download(model_id)

@@ -53,17 +53,22 @@ class PeerFileServer:
     async def _handle_status(self, request: web.Request) -> web.Response:
         """Return status of all files for a model (complete + in-progress)."""
         model_id = request.match_info["model_id"]
-        model_dir = self.models_dir / model_id
+        model_dir = _resolve_child(self.models_dir, model_id)
+        if model_dir is None:
+            return web.Response(status=404, text="Model not found")
 
         if not await aios.path.exists(model_dir):
             return web.json_response({"files": []})
 
         files: list[dict[str, object]] = []
-        for item in model_dir.iterdir():
-            if item.is_dir() or item.name.endswith(".partial.meta"):
+        for item in model_dir.rglob("*"):
+            relative_path = item.relative_to(model_dir).as_posix()
+            if item.is_dir() or relative_path.endswith(".partial.meta"):
+                continue
+            if _resolve_child(model_dir, relative_path) is None:
                 continue
 
-            if item.name.endswith(".partial"):
+            if relative_path.endswith(".partial"):
                 # In-progress file - read meta for safe bytes
                 meta = await _read_partial_meta(item)
                 if meta:
@@ -71,7 +76,7 @@ class PeerFileServer:
                     safe_bytes = _meta_int(meta, "safe_bytes")
                     files.append(
                         {
-                            "path": item.name.removesuffix(".partial"),
+                            "path": relative_path.removesuffix(".partial"),
                             "size": total,
                             "complete": False,
                             "safe_bytes": safe_bytes,
@@ -82,7 +87,7 @@ class PeerFileServer:
                 stat = await aios.stat(item)
                 files.append(
                     {
-                        "path": item.name,
+                        "path": relative_path,
                         "size": stat.st_size,
                         "complete": True,
                         "safe_bytes": stat.st_size,
@@ -100,9 +105,14 @@ class PeerFileServer:
         model_id = request.match_info["model_id"]
         file_path = request.match_info["file_path"]
 
-        model_dir = self.models_dir / model_id
-        complete_path = model_dir / file_path
-        partial_path = model_dir / f"{file_path}.partial"
+        model_dir = _resolve_child(self.models_dir, model_id)
+        if model_dir is None:
+            return web.Response(status=404, text="Model not found")
+
+        complete_path = _resolve_child(model_dir, file_path)
+        partial_path = _resolve_child(model_dir, f"{file_path}.partial")
+        if complete_path is None or partial_path is None:
+            return web.Response(status=404, text="File not found")
 
         # Determine which file to serve and its safe size
         if await aios.path.exists(complete_path):
@@ -165,6 +175,15 @@ class PeerFileServer:
 
         await response.write_eof()
         return response
+
+
+def _resolve_child(root: Path, relative_path: str) -> Path | None:
+    """Resolve relative_path under root, rejecting path traversal."""
+    resolved_root = root.resolve(strict=False)
+    resolved_path = (resolved_root / relative_path).resolve(strict=False)
+    if resolved_root in resolved_path.parents:
+        return resolved_path
+    return None
 
 
 def _meta_int(meta: PartialMeta, key: str) -> int:

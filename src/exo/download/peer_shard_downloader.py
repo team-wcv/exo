@@ -11,6 +11,7 @@ decoupled from Worker state.
 
 import asyncio
 import time
+from collections import defaultdict, deque
 from collections.abc import Awaitable, Coroutine
 from datetime import timedelta
 from pathlib import Path
@@ -37,6 +38,8 @@ from exo.shared.types.memory import Memory
 from exo.shared.types.worker.downloads import FileListEntry, RepoFileDownloadProgress
 from exo.shared.types.worker.shards import ShardMetadata
 
+ShardPeerKey = str
+
 
 async def _run_progress_callback(
     callback: Callable[[ShardMetadata, RepoDownloadProgress], Awaitable[None]],
@@ -60,16 +63,20 @@ class PeerAwareShardDownloader(ShardDownloader):
         self._progress_callbacks: list[
             Callable[[ShardMetadata, RepoDownloadProgress], Awaitable[None]]
         ] = []
-        # Peers are set per-download by the coordinator before calling ensure_shard
-        self._current_peers: list[PeerEndpoint] = []
+        # Peers are set per-download by the coordinator before calling ensure_shard.
+        self._peers_by_shard: defaultdict[
+            ShardPeerKey, deque[list[PeerEndpoint]]
+        ] = defaultdict(deque)
 
-    def set_available_peers(self, peers: list[PeerEndpoint]) -> None:
-        """Set the peers to try for the next ensure_shard call.
+    def set_available_peers(
+        self, shard: ShardMetadata, peers: list[PeerEndpoint]
+    ) -> None:
+        """Set the peers to try for a specific ensure_shard call.
 
         Called by DownloadCoordinator before triggering a download, based
         on the peers embedded in the StartDownload command.
         """
-        self._current_peers = peers
+        self._peers_by_shard[_peer_key(shard)].append(list(peers))
 
     def on_progress(
         self,
@@ -86,8 +93,7 @@ class PeerAwareShardDownloader(ShardDownloader):
 
         model_id = shard.model_card.model_id
         normalized = model_id.normalize()
-        peers = self._current_peers
-        self._current_peers = []  # Reset after consumption
+        peers = self._pop_available_peers(shard)
 
         if not peers:
             logger.debug(f"No peers available for {model_id}, downloading from HuggingFace")
@@ -279,3 +285,17 @@ class PeerAwareShardDownloader(ShardDownloader):
         self, shard: ShardMetadata
     ) -> RepoDownloadProgress:
         return await self._inner.get_shard_download_status_for_shard(shard)
+
+    def _pop_available_peers(self, shard: ShardMetadata) -> list[PeerEndpoint]:
+        key = _peer_key(shard)
+        queue = self._peers_by_shard.get(key)
+        if not queue:
+            return []
+        peers = queue.popleft()
+        if not queue:
+            del self._peers_by_shard[key]
+        return peers
+
+
+def _peer_key(shard: ShardMetadata) -> ShardPeerKey:
+    return shard.model_dump_json()

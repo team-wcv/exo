@@ -12,6 +12,13 @@ import pytest
 
 from exo.download.peer_download import download_file_from_peer, get_peer_file_status
 from exo.download.peer_file_server import PeerFileServer
+from exo.download.peer_shard_downloader import PeerAwareShardDownloader
+from exo.download.shard_downloader import NoopShardDownloader
+from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
+from exo.shared.types.commands import PeerEndpoint
+from exo.shared.types.common import NodeId
+from exo.shared.types.memory import Memory
+from exo.shared.types.worker.shards import PipelineShardMetadata, ShardMetadata
 
 
 @pytest.fixture
@@ -37,6 +44,24 @@ async def peer_server(temp_models_dir: Path) -> AsyncIterator[PeerFileServer]:
     server.port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
     yield server
     await server.shutdown()
+
+
+def _make_shard(model_id: ModelId) -> ShardMetadata:
+    return PipelineShardMetadata(
+        model_card=ModelCard(
+            model_id=model_id,
+            storage_size=Memory.from_mb(100),
+            n_layers=28,
+            hidden_size=1024,
+            supports_tensor=False,
+            tasks=[ModelTask.TextGeneration],
+        ),
+        device_rank=0,
+        world_size=1,
+        start_layer=0,
+        end_layer=28,
+        n_layers=28,
+    )
 
 
 class TestPeerFileServer:
@@ -109,6 +134,32 @@ class TestPeerFileServer:
         assert files[0].safe_bytes == 1024
         assert files[0].size == 4096
 
+    async def test_status_includes_nested_files(
+        self, peer_server: PeerFileServer, temp_models_dir: Path
+    ) -> None:
+        """Status should report nested complete and partial files."""
+        model_dir = temp_models_dir / "test--model"
+        nested_dir = model_dir / "snapshots" / "abc123"
+        await aios.makedirs(nested_dir, exist_ok=True)
+
+        async with aiofiles.open(nested_dir / "config.json", "wb") as f:
+            await f.write(b"{}")
+        async with aiofiles.open(nested_dir / "model.safetensors.partial", "wb") as f:
+            await f.write(b"x" * 512)
+        async with aiofiles.open(
+            nested_dir / "model.safetensors.partial.meta", "w"
+        ) as f:
+            await f.write(json.dumps({"safe_bytes": 512, "total": 2048}))
+
+        files = await get_peer_file_status(
+            "127.0.0.1", peer_server.port, "test--model"
+        )
+        assert files is not None
+        by_path = {file.path: file for file in files}
+        assert by_path["snapshots/abc123/config.json"].complete is True
+        assert by_path["snapshots/abc123/model.safetensors"].complete is False
+        assert by_path["snapshots/abc123/model.safetensors"].safe_bytes == 512
+
     async def test_serve_complete_file(
         self, peer_server: PeerFileServer, temp_models_dir: Path
     ) -> None:
@@ -129,6 +180,48 @@ class TestPeerFileServer:
             assert r.headers["X-Exo-Complete"] == "true"
             body = await r.read()
             assert body == content
+
+    async def test_serve_nested_file(
+        self, peer_server: PeerFileServer, temp_models_dir: Path
+    ) -> None:
+        """Should serve a complete nested file with correct headers."""
+        model_dir = temp_models_dir / "test--model"
+        nested_dir = model_dir / "snapshots" / "abc123"
+        await aios.makedirs(nested_dir, exist_ok=True)
+
+        content = b"nested content"
+        async with aiofiles.open(nested_dir / "config.json", "wb") as f:
+            await f.write(content)
+
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session, session.get(
+            f"http://127.0.0.1:{peer_server.port}/files/test--model/"
+            "snapshots/abc123/config.json"
+        ) as r:
+            assert r.status == 200
+            body = await r.read()
+            assert body == content
+
+    async def test_rejects_path_traversal(
+        self, peer_server: PeerFileServer, temp_models_dir: Path
+    ) -> None:
+        """Should not serve files outside the requested model directory."""
+        model_dir = temp_models_dir / "test--model"
+        await aios.makedirs(model_dir, exist_ok=True)
+
+        outside_file = temp_models_dir / "outside.txt"
+        async with aiofiles.open(outside_file, "wb") as f:
+            await f.write(b"outside")
+
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session, session.get(
+            f"http://127.0.0.1:{peer_server.port}/files/test--model/"
+            "%2E%2E/outside.txt"
+        ) as r:
+            assert r.status == 404
+            assert await r.text() != "outside"
 
     async def test_serve_with_range_request(
         self, peer_server: PeerFileServer, temp_models_dir: Path
@@ -260,3 +353,52 @@ class TestPeerDownloadClient:
 
         assert result is not None
         assert result == download_dir / "config.json"
+
+
+class TestPeerAwareShardDownloader:
+    """Tests for peer selection handoff into peer-aware downloads."""
+
+    def test_peers_are_queued_per_shard(self) -> None:
+        """Concurrent downloads should not overwrite each other's peer list."""
+        downloader = PeerAwareShardDownloader(NoopShardDownloader())
+        shard_a = _make_shard(ModelId("test-org/model-a"))
+        shard_b = _make_shard(ModelId("test-org/model-b"))
+        peer_a = PeerEndpoint(
+            node_id=NodeId("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            ip="10.0.0.1",
+            port=52415,
+        )
+        peer_b = PeerEndpoint(
+            node_id=NodeId("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            ip="10.0.0.2",
+            port=52415,
+        )
+
+        downloader.set_available_peers(shard_a, [peer_a])
+        downloader.set_available_peers(shard_b, [peer_b])
+
+        assert downloader._pop_available_peers(shard_b) == [peer_b]
+        assert downloader._pop_available_peers(shard_a) == [peer_a]
+        assert downloader._pop_available_peers(shard_a) == []
+
+    def test_peers_for_same_shard_are_not_overwritten(self) -> None:
+        """Repeated commands for one shard should be consumed FIFO."""
+        downloader = PeerAwareShardDownloader(NoopShardDownloader())
+        shard = _make_shard(ModelId("test-org/model-a"))
+        peer_a = PeerEndpoint(
+            node_id=NodeId("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            ip="10.0.0.1",
+            port=52415,
+        )
+        peer_b = PeerEndpoint(
+            node_id=NodeId("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            ip="10.0.0.2",
+            port=52415,
+        )
+
+        downloader.set_available_peers(shard, [peer_a])
+        downloader.set_available_peers(shard, [peer_b])
+
+        assert downloader._pop_available_peers(shard) == [peer_a]
+        assert downloader._pop_available_peers(shard) == [peer_b]
+        assert downloader._pop_available_peers(shard) == []
