@@ -87,9 +87,7 @@ def _kill_runner(
                 runner_id=runner_id,
             )
 
-        for (
-            global_runner_id
-        ) in runner.bound_instance.instance.shard_assignments.node_to_runner.values():
+        for global_runner_id in runner.bound_instance.instance.all_runner_ids:
             if runner_id == global_runner_id:
                 continue
 
@@ -108,7 +106,12 @@ def _create_runner(
     instance_backoff: KeyedBackoff[InstanceId],
 ) -> CreateRunner | None:
     for instance in instances.values():
-        runner_id = instance.shard_assignments.node_to_runner.get(node_id, None)
+        # ``all_node_to_runner`` includes the asymmetric drafter rank
+        # when ``instance.drafter_placement`` is set, so the drafter
+        # node spawns its drafter runner the same way target nodes
+        # spawn target runners.
+        per_node_runners = instance.all_node_to_runner
+        runner_id = per_node_runners.get(node_id, None)
         if runner_id is None:
             continue
 
@@ -118,7 +121,7 @@ def _create_runner(
         # don't create runners if any other nodes have runners that have failed - wait for them to fix themselves first.
         instance_has_failed_runner = any(
             isinstance(all_runners.get(remote_runner_id), RunnerFailed)
-            for remote_runner_id in instance.shard_assignments.node_to_runner.values()
+            for remote_runner_id in per_node_runners.values()
             if remote_runner_id != runner_id
         )
         we_have_failed_before = isinstance(all_runners.get(runner_id), RunnerFailed)
@@ -148,6 +151,14 @@ def _model_needs_download(
     }
 
     for runner in runners.values():
+        # The drafter rank loads its model from disk; placement assumes
+        # the operator has pre-downloaded the drafter weights on the
+        # eligible node. Auto-download for drafter ranks is a TODO --
+        # for now, the drafter runner fails loudly at load time if the
+        # weights are missing and the user fixes the cluster.
+        if runner.bound_instance.is_drafter_rank:
+            continue
+
         model_id = runner.bound_instance.bound_shard.model_card.model_id
         if (
             isinstance(runner.status, RunnerIdle)
@@ -173,10 +184,9 @@ def _init_distributed_backend(
 ):
     for runner in runners.values():
         instance = runner.bound_instance.instance
-        shard_assignments = instance.shard_assignments
 
-        is_single_node_instance = len(shard_assignments.runner_to_shard) == 1
-        if is_single_node_instance:
+        is_single_rank_instance = instance.parent_group_size == 1
+        if is_single_rank_instance:
             continue
 
         runner_is_idle = isinstance(runner.status, RunnerIdle)
@@ -185,7 +195,7 @@ def _init_distributed_backend(
                 all_runners.get(global_runner_id),
                 (RunnerConnecting, RunnerIdle),
             )
-            for global_runner_id in shard_assignments.runner_to_shard
+            for global_runner_id in instance.all_runner_ids
         )
 
         if not (runner_is_idle and all_runners_connecting):
@@ -193,19 +203,21 @@ def _init_distributed_backend(
 
         runner_id = runner.bound_instance.bound_runner_id
 
-        shard = runner.bound_instance.bound_shard
-        device_rank = shard.device_rank
-        world_size = shard.world_size
+        # Use parent group size + parent rank so the same predicate
+        # works for symmetric placement (drafter rank doesn't exist)
+        # and asymmetric placement (drafter is the last rank, hence
+        # the "connecting" rank that triggers the ConnectToGroup
+        # collective when all earlier ranks are already RunnerConnecting).
+        parent_size = instance.parent_group_size
+        parent_rank = runner.bound_instance.parent_rank
+        assert parent_rank < parent_size
+        assert parent_rank >= 0
 
-        assert device_rank < world_size
-        assert device_rank >= 0
+        accepting_ranks = parent_rank < parent_size - 1
 
-        accepting_ranks = device_rank < world_size - 1
-
-        # Rank = n-1
-        connecting_rank_ready = device_rank == world_size - 1 and all(
+        connecting_rank_ready = parent_rank == parent_size - 1 and all(
             isinstance(all_runners.get(global_runner_id, None), RunnerConnecting)
-            for global_runner_id in shard_assignments.runner_to_shard
+            for global_runner_id in instance.all_runner_ids
             if global_runner_id != runner_id
         )
 
@@ -226,6 +238,10 @@ def _load_model(
         instance = runner.bound_instance.instance
         shard_assignments = instance.shard_assignments
 
+        # Target shards must all be downloaded before any rank loads;
+        # the drafter's pre-downloaded weights are the operator's
+        # responsibility (see _model_needs_download), so we don't gate
+        # on its DownloadCompleted entry here.
         all_local_downloads_complete = all(
             nid in global_download_status
             and any(
@@ -238,8 +254,8 @@ def _load_model(
         if not all_local_downloads_complete:
             continue
 
-        is_single_node_instance = len(instance.shard_assignments.runner_to_shard) == 1
-        if is_single_node_instance and isinstance(runner.status, RunnerIdle):
+        is_single_rank_instance = instance.parent_group_size == 1
+        if is_single_rank_instance and isinstance(runner.status, RunnerIdle):
             return LoadModel(instance_id=instance.instance_id)
 
         is_runner_waiting = isinstance(runner.status, RunnerConnected)
@@ -249,7 +265,7 @@ def _load_model(
                 all_runners.get(global_runner_id, None),
                 (RunnerConnected, RunnerLoading, RunnerLoaded),
             )
-            for global_runner_id in shard_assignments.runner_to_shard
+            for global_runner_id in instance.all_runner_ids
         )
 
         if is_runner_waiting and all_ready_for_model:
@@ -264,30 +280,30 @@ def _ready_to_warmup(
 ) -> StartWarmup | None:
     for runner in runners.values():
         instance = runner.bound_instance.instance
-        shard_assignments = instance.shard_assignments
-        shard = runner.bound_instance.bound_shard
-        device_rank = shard.device_rank
         runner_id = runner.bound_instance.bound_runner_id
-        world_size = shard.world_size
+
+        # Use parent rank/size so warmup ordering applies to drafter
+        # ranks too: rank 0 is the warmup "connector"; higher ranks
+        # (including the drafter at rank parent_size-1) are accepting.
+        parent_rank = runner.bound_instance.parent_rank
+        parent_size = instance.parent_group_size
 
         is_runner_loaded = isinstance(runner.status, RunnerLoaded)
 
-        assert device_rank < world_size
-        assert device_rank >= 0
+        assert parent_rank < parent_size
+        assert parent_rank >= 0
 
-        # Rank != 0
-        accepting_ranks_ready = device_rank > 0 and all(
+        accepting_ranks_ready = parent_rank > 0 and all(
             isinstance(
                 all_runners.get(global_runner_id, None),
                 (RunnerLoaded, RunnerWarmingUp),
             )
-            for global_runner_id in shard_assignments.runner_to_shard
+            for global_runner_id in instance.all_runner_ids
         )
 
-        # Rank = 0
-        connecting_rank_ready = device_rank == 0 and all(
+        connecting_rank_ready = parent_rank == 0 and all(
             isinstance(all_runners.get(global_runner_id, None), RunnerWarmingUp)
-            for global_runner_id in shard_assignments.runner_to_shard
+            for global_runner_id in instance.all_runner_ids
             if global_runner_id != runner_id
         )
 
@@ -338,7 +354,7 @@ def _pending_tasks(
 
             if isinstance(runner.status, (RunnerReady, RunnerRunning)) and all(
                 isinstance(all_runners[global_runner_id], (RunnerReady, RunnerRunning))
-                for global_runner_id in runner.bound_instance.instance.shard_assignments.runner_to_shard
+                for global_runner_id in runner.bound_instance.instance.all_runner_ids
             ):
                 return task
 

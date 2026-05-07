@@ -89,6 +89,36 @@ class BaseInstance(TaggedModel):
             and self.drafter_placement.drafter_runner_id == runner_id
         )
 
+    @property
+    def all_runner_ids(self) -> list[RunnerId]:
+        """Every runner id participating in this instance, target + drafter.
+
+        Lifecycle barriers (ConnectToGroup, LoadModel, StartWarmup,
+        Ready) wait on the *whole* parent group, so plan-time readiness
+        checks iterate this list. Generation tasks themselves are
+        target-only and iterate ``shard_assignments.runner_to_shard``
+        directly.
+        """
+        runners = list(self.shard_assignments.runner_to_shard.keys())
+        if self.drafter_placement is not None:
+            runners.append(self.drafter_placement.drafter_runner_id)
+        return runners
+
+    @property
+    def all_node_to_runner(self) -> dict[NodeId, RunnerId]:
+        """Per-node runner id including the drafter rank when asymmetric.
+
+        Worker plan iterates this when deciding which node should spawn
+        which runner. Symmetric placement returns the legacy
+        ``shard_assignments.node_to_runner`` mapping unchanged.
+        """
+        result = dict(self.shard_assignments.node_to_runner)
+        if self.drafter_placement is not None:
+            result[self.drafter_placement.drafter_node_id] = (
+                self.drafter_placement.drafter_runner_id
+            )
+        return result
+
 
 class MlxRingInstance(BaseInstance):
     hosts_by_node: dict[NodeId, list[Host]]
@@ -119,6 +149,23 @@ class BoundInstance(FrozenModel):
         drafter has no target shard.
         """
         return self.instance.is_drafter_runner(self.bound_runner_id)
+
+    @property
+    def parent_rank(self) -> int:
+        """This runner's rank inside the parent ``mx.distributed`` group.
+
+        Target ranks read it from their bound shard's ``device_rank``;
+        the drafter rank reads it from
+        ``DrafterPlacement.drafter_rank``. Plan-time connect/warmup
+        ordering checks use this so the same predicate works for both
+        symmetric (drafter rank doesn't exist) and asymmetric (drafter
+        is rank ``parent_group_size - 1``) placement.
+        """
+        if self.is_drafter_rank:
+            placement = self.instance.drafter_placement
+            assert placement is not None  # type narrowed by is_drafter_rank
+            return placement.drafter_rank
+        return self.bound_shard.device_rank
 
     @property
     def bound_shard(self) -> ShardMetadata:
