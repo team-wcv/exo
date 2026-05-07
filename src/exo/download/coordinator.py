@@ -279,53 +279,60 @@ class DownloadCoordinator:
         await self._maybe_chain_drafter_download(shard)
 
     async def _maybe_chain_drafter_download(self, target_shard: ShardMetadata) -> None:
-        """Enqueue a download for the drafter declared on ``target_shard``'s
-        model card, if any.
+        """Enqueue downloads for every drafter declared on ``target_shard``'s
+        model card.
 
-        Drafter downloads are silent: anything that fails (no card, env
-        opt-out, HF unreachable, drafter already tracked) is logged and
-        swallowed. The target download is the source of truth for the user's
-        intent; speculative decoding is best-effort.
+        We download *all* candidate drafters so the runner can switch between
+        them at startup time via ``EXO_DRAFTER_PREFERENCE`` without an
+        on-demand fetch. Drafters are small (typically <2GB) so the storage
+        overhead is fine.
 
-        The drafter is downloaded as a single ``PipelineShardMetadata`` for
+        Drafter downloads are silent best-effort: anything that fails (no
+        cards, env opt-out, HF unreachable, drafter already tracked) is
+        logged and swallowed. The target download is the source of truth for
+        the user's intent; speculative decoding is best-effort.
+
+        Each drafter is downloaded as a single ``PipelineShardMetadata`` for
         the entire model. Speculative decoding is single-device today (see
         ``mlx_generate``), so we never need a sharded drafter.
         """
-        drafter_id = target_shard.model_card.drafter_model_id
-        if drafter_id is None:
+        drafter_ids = list(target_shard.model_card.drafter_model_ids)
+        if not drafter_ids:
             return
         if _drafter_disabled_by_env():
             logger.debug(
-                f"EXO_DISABLE_DRAFTER set; skipping drafter download "
-                f"{drafter_id} for {target_shard.model_card.model_id}"
-            )
-            return
-        if drafter_id in self.download_status:
-            return  # already tracked
-
-        try:
-            drafter_card = await ModelCard.load(drafter_id)
-        except Exception as exc:
-            logger.warning(
-                f"Could not load drafter card {drafter_id} for "
-                f"{target_shard.model_card.model_id}; skipping drafter "
-                f"download: {exc}"
+                f"EXO_DISABLE_DRAFTER set; skipping drafter downloads "
+                f"{drafter_ids} for {target_shard.model_card.model_id}"
             )
             return
 
-        drafter_shard = PipelineShardMetadata(
-            model_card=drafter_card,
-            device_rank=0,
-            world_size=1,
-            start_layer=0,
-            end_layer=drafter_card.n_layers,
-            n_layers=drafter_card.n_layers,
-        )
-        logger.info(
-            f"Chaining drafter download {drafter_id} for "
-            f"{target_shard.model_card.model_id}"
-        )
-        await self._start_download(drafter_shard)
+        for drafter_id in drafter_ids:
+            if drafter_id in self.download_status:
+                continue  # already tracked
+
+            try:
+                drafter_card = await ModelCard.load(drafter_id)
+            except Exception as exc:
+                logger.warning(
+                    f"Could not load drafter card {drafter_id} for "
+                    f"{target_shard.model_card.model_id}; skipping drafter "
+                    f"download: {exc}"
+                )
+                continue
+
+            drafter_shard = PipelineShardMetadata(
+                model_card=drafter_card,
+                device_rank=0,
+                world_size=1,
+                start_layer=0,
+                end_layer=drafter_card.n_layers,
+                n_layers=drafter_card.n_layers,
+            )
+            logger.info(
+                f"Chaining drafter download {drafter_id} for "
+                f"{target_shard.model_card.model_id}"
+            )
+            await self._start_download(drafter_shard)
 
     def _start_download_task(
         self, shard: ShardMetadata, initial_progress: RepoDownloadProgress
