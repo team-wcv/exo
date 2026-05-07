@@ -157,6 +157,10 @@ class SequentialGenerator(Engine):
     # `mlx_generate` itself enforces ``draft_model=None`` whenever ``group is
     # not None``; this field is only ever populated for single-device runners.
     draft_model: Model | None = None
+    # Parallel KVPrefixCache for the drafter so multi-turn conversations
+    # don't pay drafter prefill on every request. None disables drafter
+    # prefix caching (single-shot drafter prefill on every call).
+    drafter_kv_prefix_cache: KVPrefixCache | None = None
     # The chosen drafter's ModelId. Used for telemetry (GenerationStats) so
     # dashboards can attribute speedup to a specific drafter.
     draft_model_id: ModelId | None = None
@@ -401,6 +405,7 @@ class SequentialGenerator(Engine):
             group=self.group,
             vision_processor=self.vision_processor,
             draft_model=self.draft_model,
+            drafter_kv_prefix_cache=self.drafter_kv_prefix_cache,
             drafter_model_id=self.draft_model_id,
             num_draft_tokens=effective_num_draft_tokens,
             drafter_min_output_tokens=self.drafter_min_output_tokens,

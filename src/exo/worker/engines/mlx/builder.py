@@ -93,6 +93,13 @@ class MlxBuilder(Builder):
             )
 
         kv_prefix_cache = KVPrefixCache(self.group)
+        # Item 6: dedicated KVPrefixCache for the drafter so multi-turn
+        # workloads don't repeatedly prefill the drafter on the same prefix.
+        # Allocated only when a drafter is actually loaded; None means
+        # mlx_generate falls back to the per-request drafter prefill.
+        drafter_kv_prefix_cache: KVPrefixCache | None = (
+            KVPrefixCache(self.group) if self.draft_model is not None else None
+        )
 
         device_rank = 0 if self.group is None else self.group.rank()
 
@@ -144,6 +151,7 @@ class MlxBuilder(Builder):
                 vision_processor=vision_processor,
                 draft_model=self.draft_model,
                 draft_model_id=self.draft_model_id,
+                drafter_kv_prefix_cache=drafter_kv_prefix_cache,
                 num_draft_tokens=num_draft_tokens,
                 drafter_min_output_tokens=drafter_min_output_tokens,
                 adaptive_draft_tokens=adaptive_draft_tokens,

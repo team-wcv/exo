@@ -437,6 +437,33 @@ def resolve_speculative_decoding(
     return draft_model, spec_kwargs
 
 
+def drafter_prefill(
+    draft_model: Model,
+    cache: KVCacheType,
+    prompt_tokens: mx.array,
+    prefill_step_size: int = 512,
+) -> None:
+    """Prefill the drafter's KV cache with ``prompt_tokens``.
+
+    The drafter is single-device and small, so we don't need the full
+    ``prefill`` machinery (no group sync, no pipeline parallelism, no SSM
+    snapshots, no progress callbacks). A simple loop of forward passes
+    with periodic ``mx.eval`` keeps memory bounded.
+    """
+    num_tokens = int(prompt_tokens.size)
+    if num_tokens == 0:
+        return
+
+    pos = 0
+    while pos < num_tokens:
+        end = min(pos + prefill_step_size, num_tokens)
+        chunk = prompt_tokens[pos:end]
+        draft_model(chunk[None], cache=cache)
+        mx.eval([c.state for c in cache])  # type: ignore[reportAttributeAccessIssue]
+        pos = end
+    mx.clear_cache()
+
+
 def warmup_inference(
     model: Model,
     tokenizer: TokenizerWrapper,
@@ -594,6 +621,7 @@ def mlx_generate(
     on_generation_token: Callable[[], None] | None = None,
     vision_processor: VisionProcessor | None = None,
     draft_model: Model | None = None,
+    drafter_kv_prefix_cache: KVPrefixCache | None = None,
     drafter_model_id: ModelId | None = None,
     num_draft_tokens: int | None = None,
     drafter_min_output_tokens: int | None = None,
@@ -791,6 +819,67 @@ def mlx_generate(
         drafter_min_output_tokens=drafter_min_output_tokens,
     )
 
+    # Item 6: drafter KV prefix caching. mlx_lm's speculative_generate_step
+    # splits its `prompt_cache` argument as ``[: len(target.layers)]`` for the
+    # target and ``[len(target.layers) :]`` for the drafter, so we can hand it
+    # a concatenated cache list and have mlx_lm wire each side to the right
+    # model. We look up the drafter prefix cache on the same prompt the
+    # target's cache hit on, prefill any uncovered tail, and store the
+    # post-prefill state back to the drafter's prefix cache before calling
+    # stream_generate.
+    decode_cache: KVCacheType | list[object] = caches
+    if (
+        effective_draft_model is not None
+        and drafter_kv_prefix_cache is not None
+        and group is None  # single-device contract
+    ):
+        (
+            drafter_caches,
+            drafter_remaining,
+            drafter_matched_index,
+            _drafter_exact_hit,
+        ) = drafter_kv_prefix_cache.get_kv_cache(
+            effective_draft_model, all_prompt_tokens, media_regions=media_regions
+        )
+        drafter_prefix_hit_length = len(all_prompt_tokens) - len(drafter_remaining)
+
+        # Prefill the drafter on the un-cached prompt tail. We skip the last
+        # token because stream_generate consumes it as its starting input.
+        if len(drafter_remaining) > 1:
+            drafter_prefill_start = time.perf_counter()
+            drafter_prefill(
+                effective_draft_model, drafter_caches, drafter_remaining[:-1]
+            )
+            logger.debug(
+                f"Drafter prefill: {len(drafter_remaining) - 1} tokens in "
+                f"{(time.perf_counter() - drafter_prefill_start):.2f}s"
+            )
+
+        # Snapshot the drafter's post-prefill state back to its prefix cache.
+        # We do this *before* stream_generate runs so subsequent requests can
+        # reuse this drafter cache (KVPrefixCache deepcopies internally so
+        # the in-place mutation by stream_generate doesn't corrupt the entry).
+        if drafter_matched_index is not None:
+            drafter_kv_prefix_cache.update_kv_cache(
+                drafter_matched_index,
+                all_prompt_tokens,
+                drafter_caches,
+                None,
+                restore_pos=drafter_prefix_hit_length,
+                media_regions=media_regions,
+                prefill_tps=0.0,
+            )
+        else:
+            drafter_kv_prefix_cache.add_kv_cache(
+                all_prompt_tokens,
+                drafter_caches,
+                None,
+                media_regions=media_regions,
+                prefill_tps=0.0,
+            )
+
+        decode_cache = list(caches) + list(drafter_caches)
+
     for completion_tokens, out in enumerate(
         stream_generate(
             model=model,
@@ -799,7 +888,7 @@ def mlx_generate(
             max_tokens=max_tokens,
             sampler=sampler,
             logits_processors=logits_processors,
-            prompt_cache=caches,
+            prompt_cache=decode_cache,
             prefill_step_size=1,
             kv_group_size=KV_GROUP_SIZE,
             kv_bits=KV_BITS,
