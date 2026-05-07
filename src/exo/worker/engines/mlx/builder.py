@@ -15,8 +15,13 @@ from exo.utils.channels import MpReceiver, MpSender
 from exo.worker.engines.base import Builder, Engine
 from exo.worker.runner.bootstrap import logger
 from exo.worker.runner.llm_inference.batch_generator import (
+    DEFAULT_DRAFTER_MIN_OUTPUT_TOKENS,
+    DEFAULT_NUM_DRAFT_TOKENS,
+    EXO_DRAFTER_MIN_OUTPUT_TOKENS,
+    EXO_NUM_DRAFT_TOKENS,
     BatchGenerator,
     SequentialGenerator,
+    parse_env_int,
 )
 from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 
@@ -104,6 +109,21 @@ class MlxBuilder(Builder):
                 )
             else:
                 logger.info("using SequentialGenerator (batching disabled)")
+
+            num_draft_tokens = parse_env_int(
+                EXO_NUM_DRAFT_TOKENS, DEFAULT_NUM_DRAFT_TOKENS
+            )
+            drafter_min_output_tokens = parse_env_int(
+                EXO_DRAFTER_MIN_OUTPUT_TOKENS,
+                DEFAULT_DRAFTER_MIN_OUTPUT_TOKENS,
+                minimum=0,
+            )
+            if force_sequential_for_drafter:
+                logger.info(
+                    f"speculative decoding: K={num_draft_tokens}, "
+                    f"skip_drafter_when_max_tokens<={drafter_min_output_tokens}"
+                )
+
             return SequentialGenerator(
                 model=self.inference_model,
                 tokenizer=self.tokenizer,
@@ -116,6 +136,8 @@ class MlxBuilder(Builder):
                 event_sender=self.event_sender,
                 vision_processor=vision_processor,
                 draft_model=self.draft_model,
+                num_draft_tokens=num_draft_tokens,
+                drafter_min_output_tokens=drafter_min_output_tokens,
             )
         else:
             logger.info("using BatchGenerator")

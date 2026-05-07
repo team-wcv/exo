@@ -1,4 +1,5 @@
 import itertools
+import os
 import time
 from collections import deque
 from collections.abc import Generator, Iterator
@@ -68,6 +69,33 @@ EXO_RUNNER_MUST_FAIL = "EXO RUNNER MUST FAIL"
 EXO_RUNNER_MUST_OOM = "EXO RUNNER MUST OOM"
 EXO_RUNNER_MUST_TIMEOUT = "EXO RUNNER MUST TIMEOUT"
 
+# Drafter-tuning env vars. Read once per process at SequentialGenerator
+# construction time so every request in this runner sees the same K and
+# short-skip threshold (avoids surprises mid-stream).
+EXO_NUM_DRAFT_TOKENS = "EXO_NUM_DRAFT_TOKENS"
+EXO_DRAFTER_MIN_OUTPUT_TOKENS = "EXO_DRAFTER_MIN_OUTPUT_TOKENS"
+DEFAULT_NUM_DRAFT_TOKENS = 5  # purpose-built family pairs hit ~80% acceptance
+DEFAULT_DRAFTER_MIN_OUTPUT_TOKENS = 16
+
+
+def parse_env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            f"{name}={raw!r} is not a valid int; falling back to {default}"
+        )
+        return default
+    if value < minimum:
+        logger.warning(
+            f"{name}={value} below minimum {minimum}; clamping to {minimum}"
+        )
+        return minimum
+    return value
+
 
 def _check_for_debug_prompts(task_params: TextGenerationTaskParams) -> None:
     """Check for debug prompt triggers in the input."""
@@ -102,6 +130,12 @@ class SequentialGenerator(Engine):
     # `mlx_generate` itself enforces ``draft_model=None`` whenever ``group is
     # not None``; this field is only ever populated for single-device runners.
     draft_model: Model | None = None
+    # K (num_draft_tokens) for speculative_generate_step. None falls back to
+    # the env var EXO_NUM_DRAFT_TOKENS, then DEFAULT_NUM_DRAFTER_TOKENS.
+    num_draft_tokens: int | None = None
+    # max_output_tokens threshold below which the drafter is skipped per
+    # request. None falls back to the env var EXO_DRAFTER_MIN_OUTPUT_TOKENS.
+    drafter_min_output_tokens: int | None = None
     check_for_cancel_every: int = 50
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
@@ -128,6 +162,7 @@ class SequentialGenerator(Engine):
             tokenizer=self.tokenizer,
             group=self.group,
             model_id=self.model_id,
+            draft_model=self.draft_model,
         )
 
     def submit(
@@ -300,6 +335,8 @@ class SequentialGenerator(Engine):
             group=self.group,
             vision_processor=self.vision_processor,
             draft_model=self.draft_model,
+            num_draft_tokens=self.num_draft_tokens,
+            drafter_min_output_tokens=self.drafter_min_output_tokens,
         )
 
     def close(self) -> None:

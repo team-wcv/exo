@@ -396,12 +396,61 @@ def prefill(
     return tokens_per_sec, num_tokens, snapshots[:-1] if snapshots else []
 
 
+def resolve_speculative_decoding(
+    draft_model: Model | None,
+    group: mx.distributed.Group | None,
+    max_tokens: int,
+    num_draft_tokens: int | None,
+    drafter_min_output_tokens: int | None,
+) -> tuple[Model | None, dict[str, object]]:
+    """Decide whether to actually use speculative decoding for this request.
+
+    Pure helper so we can unit-test the policy without spinning up MLX. Returns
+    ``(effective_draft_model, spec_kwargs)`` for forwarding to
+    ``stream_generate``.
+
+    Policy:
+    - Distributed runs: drafter is dropped (mlx_lm does not pipe the drafter
+      through the multi-device path yet).
+    - Single-device + drafter + ``max_tokens <= drafter_min_output_tokens``:
+      drafter is dropped (item 8 -- short outputs don't amortise the prefill
+      cost).
+    - Single-device + drafter active: forward ``num_draft_tokens`` (item 1)
+      via kwargs so ``speculative_generate_step`` honors it.
+    """
+    if group is not None or draft_model is None:
+        return None, {}
+
+    if (
+        drafter_min_output_tokens is not None
+        and max_tokens <= drafter_min_output_tokens
+    ):
+        logger.debug(
+            f"Short generation (max_tokens={max_tokens} <= "
+            f"{drafter_min_output_tokens}); skipping drafter for this request."
+        )
+        return None, {}
+
+    spec_kwargs: dict[str, object] = {}
+    if num_draft_tokens is not None:
+        spec_kwargs["num_draft_tokens"] = num_draft_tokens
+    return draft_model, spec_kwargs
+
+
 def warmup_inference(
     model: Model,
     tokenizer: TokenizerWrapper,
     group: mx.distributed.Group | None,
     model_id: ModelId,
+    draft_model: Model | None = None,
 ) -> int:
+    """Run a throwaway generation to JIT-compile kernels and prime caches.
+
+    When ``draft_model`` is supplied (single-device only), the drafter
+    participates in the warmup so the *first real request* doesn't pay a
+    cold-cache penalty on the drafter's first speculative step. This is
+    item 3 from the drafter tuning plan.
+    """
     logger.info(f"warming up inference for instance: {model_id}")
 
     content = InputMessageContent(
@@ -424,7 +473,10 @@ def warmup_inference(
 
     mx_barrier(group)
 
-    logger.info("Generating warmup tokens")
+    logger.info(
+        "Generating warmup tokens"
+        + (" (with drafter)" if draft_model is not None else "")
+    )
 
     t = time.monotonic()
 
@@ -435,6 +487,7 @@ def warmup_inference(
         prompt=warmup_prompt,
         kv_prefix_cache=None,
         group=group,
+        draft_model=draft_model,
     ):
         tokens_generated += 1
 
@@ -541,6 +594,8 @@ def mlx_generate(
     on_generation_token: Callable[[], None] | None = None,
     vision_processor: VisionProcessor | None = None,
     draft_model: Model | None = None,
+    num_draft_tokens: int | None = None,
+    drafter_min_output_tokens: int | None = None,
 ) -> Generator[GenerationResponse]:
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
@@ -722,7 +777,13 @@ def mlx_generate(
     # (group is None). Distributed speculative is not yet plumbed; passing a
     # draft_model alongside a non-trivial group would be a no-op, so we drop
     # it explicitly to make the caller contract clear.
-    effective_draft_model = draft_model if group is None else None
+    effective_draft_model, spec_kwargs = resolve_speculative_decoding(
+        draft_model=draft_model,
+        group=group,
+        max_tokens=max_tokens,
+        num_draft_tokens=num_draft_tokens,
+        drafter_min_output_tokens=drafter_min_output_tokens,
+    )
 
     for completion_tokens, out in enumerate(
         stream_generate(
@@ -737,6 +798,7 @@ def mlx_generate(
             kv_group_size=KV_GROUP_SIZE,
             kv_bits=KV_BITS,
             draft_model=effective_draft_model,
+            **spec_kwargs,
         ),
         start=1,
     ):
