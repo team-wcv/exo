@@ -14,6 +14,8 @@ from exo.worker.engines.mlx.generator.drafter import (
     ALL_DRAFT_MODES,
     EXO_DRAFT_MODE_ENV,
     DraftMode,
+    EagleDrafter,
+    LookaheadDrafter,
     NgramDrafter,
     NoSpecDrafter,
     make_drafter,
@@ -24,7 +26,76 @@ from exo.worker.engines.mlx.generator.drafter import (
 
 def test_all_draft_modes_match_literal() -> None:
     """``ALL_DRAFT_MODES`` must be the runtime mirror of the ``DraftMode`` Literal."""
-    assert ALL_DRAFT_MODES == ("model", "pipelined", "ngram", "none")
+    assert ALL_DRAFT_MODES == (
+        "model",
+        "pipelined",
+        "ngram",
+        "eagle",
+        "lookahead",
+        "none",
+    )
+
+
+def test_eagle_drafter_scaffold_raises_on_stream() -> None:
+    """``EagleDrafter`` is a scaffolding stub; ``stream`` must fail loudly.
+
+    The factory dispatch + ``Drafter`` protocol shape are the durable
+    contract here; the actual auxiliary-head loop is intentionally not
+    implemented yet. A future PR fills this in.
+    """
+    drafter = make_drafter(
+        mode="eagle",
+        num_draft_tokens=3,
+        draft_model=None,
+        draft_cache=None,
+    )
+    assert isinstance(drafter, EagleDrafter)
+    assert drafter.mode == "eagle"
+    assert drafter.num_draft_tokens == 3
+    with pytest.raises(NotImplementedError, match="EagleDrafter is a scaffolding"):
+        # ``stream`` is a generator function; ``next()`` triggers the body.
+        next(
+            drafter.stream(
+                model=object(),  # type: ignore[arg-type]
+                tokenizer=object(),  # type: ignore[arg-type]
+                prompt=object(),  # type: ignore[arg-type]
+                context_tokens=[],
+                prompt_cache=[],  # type: ignore[arg-type]
+                max_tokens=1,
+                sampler=lambda x: x,  # type: ignore[arg-type, return-value]
+                logits_processors=[],
+            )
+        )
+
+
+def test_lookahead_drafter_scaffold_raises_on_stream() -> None:
+    """``LookaheadDrafter`` is a scaffolding stub; ``stream`` must fail loudly."""
+    drafter = make_drafter(
+        mode="lookahead",
+        num_draft_tokens=3,
+        draft_model=None,
+        draft_cache=None,
+    )
+    assert isinstance(drafter, LookaheadDrafter)
+    assert drafter.mode == "lookahead"
+    assert drafter.num_draft_tokens == 3
+    assert drafter.window_size == 5
+    assert drafter.ngram_size == 3
+    with pytest.raises(
+        NotImplementedError, match="LookaheadDrafter is a scaffolding"
+    ):
+        next(
+            drafter.stream(
+                model=object(),  # type: ignore[arg-type]
+                tokenizer=object(),  # type: ignore[arg-type]
+                prompt=object(),  # type: ignore[arg-type]
+                context_tokens=[],
+                prompt_cache=[],  # type: ignore[arg-type]
+                max_tokens=1,
+                sampler=lambda x: x,  # type: ignore[arg-type, return-value]
+                logits_processors=[],
+            )
+        )
 
 
 @pytest.mark.parametrize(

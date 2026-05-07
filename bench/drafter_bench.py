@@ -25,6 +25,7 @@ JSON written to ``--out``.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import http.client
 import json
@@ -33,7 +34,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 PROMPTS: dict[str, dict[str, str | int]] = {
     "short_repetitive": {
@@ -79,7 +80,84 @@ PROMPTS: dict[str, dict[str, str | int]] = {
         ),
         "max_tokens": 384,
     },
+    "long_context_summary": {
+        "system": "You are a careful research assistant.",
+        "user": (
+            "Below is a long technical document about distributed LLM "
+            "inference systems. Read it carefully and produce a 600-800 word "
+            "structured summary that covers: (1) the systems mentioned and "
+            "what each is for, (2) the network fabrics they use, (3) the "
+            "trade-offs between tensor and pipeline parallelism, (4) where "
+            "speculative decoding helps and where it doesn't, (5) what is "
+            "missing from the document. End with a numbered list of three "
+            "follow-up research questions.\n\n"
+            "DOCUMENT:\n\n"
+            + (
+                "Distributed inference of large language models has become a "
+                "central topic in 2024-2026 because frontier model sizes have "
+                "outpaced the memory of any single accelerator. The landscape "
+                "now includes pipeline-parallel systems such as Petals and "
+                "exo, tensor-parallel systems like NVIDIA's Megatron-LM and "
+                "MLX-distributed, hybrid approaches such as DeepSpeed-Inference "
+                "and vLLM's tensor+pipeline split, and speculative-decoding "
+                "frameworks including Medusa, EAGLE, EAGLE-2, lookahead "
+                "decoding, and Google's MTP drafter family. Each system makes "
+                "a different trade-off between bandwidth, latency, and the "
+                "operational complexity of coordinating multiple devices.\n\n"
+                "Networking fabrics in this space split into three broad "
+                "categories: NVLink/NVSwitch on a single host, RDMA-style "
+                "fabrics such as InfiniBand, RoCE, and Apple's Thunderbolt + "
+                "JACCL, and ordinary TCP/IP over Ethernet. Bandwidth ranges "
+                "span four orders of magnitude (NVLink at 900 GB/s, "
+                "Thunderbolt 4 RDMA around 40 Gbps effective, 100 Gbps RoCE "
+                "in datacenters, and 1-10 Gbps Ethernet for hobbyist clusters). "
+                "Latency follows a similar spread: NVLink under 1 microsecond, "
+                "RDMA fabrics in the 1-10 microsecond range, TCP/IP at 50-500 "
+                "microseconds depending on switching topology.\n\n"
+                "Tensor parallelism splits each weight matrix across devices "
+                "and aggregates partial outputs with all-reduce. It is "
+                "bandwidth-heavy because every layer round-trips activations. "
+                "Pipeline parallelism instead splits the model by layer "
+                "depth and pipelines micro-batches; it has smaller per-step "
+                "communication but introduces pipeline bubbles when "
+                "micro-batch counts are low. Hybrid 2D parallelism combines "
+                "both, which is standard at datacenter scale but rarely seen "
+                "on edge clusters because the latency budget for tensor "
+                "parallel reductions over commodity network links is too "
+                "tight.\n\n"
+                "Speculative decoding uses a small draft model to propose "
+                "tokens and the large target model to verify them in "
+                "parallel. The expected speed-up depends on draft acceptance "
+                "rate, the relative cost of draft and target forwards, and "
+                "the round-trip latency between draft and verify steps. On "
+                "fast hardware with a small target model the overhead of "
+                "drafting can exceed the savings, while on slow targets and "
+                "long contexts the savings dominate. Variants such as Medusa "
+                "add multiple speculative heads to the target itself, EAGLE "
+                "uses a tiny auxiliary network conditioned on the target's "
+                "hidden states, lookahead decoding generates n-grams from the "
+                "target's own forward pass with no auxiliary network, and "
+                "MTP teaches the target model to predict multiple future "
+                "tokens directly.\n\n"
+                "Cluster-style speculative decoding, where the draft and "
+                "target live on different hosts connected by RDMA or TCP, is "
+                "less explored. The relevant questions are how the wire "
+                "protocol carries draft tokens, draft logits, and acceptance "
+                "decisions; how the KV caches on draft and target are kept "
+                "consistent under partial acceptance; and how to pipeline "
+                "the next draft round behind the current verify step. Apple "
+                "Silicon clusters such as exo are particularly interesting "
+                "because unified memory and Thunderbolt RDMA give them a "
+                "latency profile closer to a single-host NVLink setup than "
+                "to a typical Ethernet GPU cluster.\n\n"
+            ) * 3
+        ),
+        "max_tokens": 1024,
+    },
 }
+
+
+DraftModeArg = Literal["none", "model", "ngram", "pipelined", "auto"]
 
 
 @dataclass
@@ -89,13 +167,15 @@ class RequestStats:
     label: str
     use_drafter: bool | None
     num_draft_tokens: int | None
+    draft_mode: str | None
+    concurrency_slot: int = 0
     prompt_tokens: int = 0
     generation_tokens: int = 0
     prompt_tps: float = 0.0
     generation_tps: float = 0.0
     accepted_draft_tokens: int = 0
     drafter_model_id: str | None = None
-    draft_mode: str | None = None
+    response_draft_mode: str | None = None
     accept_fraction: float | None = None
     ttft_ms: float = 0.0
     wall_seconds: float = 0.0
@@ -110,6 +190,8 @@ class BenchmarkResult:
     model: str
     use_drafter: bool | None
     num_draft_tokens: int | None
+    draft_mode: str | None
+    concurrency: int
     runs: int
     requests: list[RequestStats] = field(default_factory=list)
 
@@ -215,7 +297,9 @@ def _run_one(
     label: str,
     use_drafter: bool | None,
     num_draft_tokens: int | None,
+    draft_mode: str | None,
     run_index: int,
+    concurrency_slot: int,
     timeout: float,
     max_tokens_override: int | None,
 ) -> RequestStats:
@@ -232,16 +316,20 @@ def _run_one(
         body["use_drafter"] = use_drafter
     if num_draft_tokens is not None:
         body["num_draft_tokens"] = num_draft_tokens
+    if draft_mode is not None:
+        body["draft_mode"] = draft_mode
     stats = RequestStats(
         prompt_id=prompt_id,
         run_index=run_index,
         label=label,
         use_drafter=use_drafter,
         num_draft_tokens=num_draft_tokens,
+        draft_mode=draft_mode,
+        concurrency_slot=concurrency_slot,
     )
     try:
         chunk, ttft_ms, wall = _post_chat(host, port, body, timeout=timeout)
-    except Exception as exc:  # surface but don't crash the suite
+    except Exception as exc:
         stats.error = f"{type(exc).__name__}: {exc}"
         return stats
     stats.ttft_ms = ttft_ms
@@ -253,7 +341,7 @@ def _run_one(
     stats.generation_tps = float(gen.get("generation_tps") or 0.0)
     stats.accepted_draft_tokens = int(gen.get("accepted_draft_tokens") or 0)
     stats.drafter_model_id = gen.get("drafter_model_id")
-    stats.draft_mode = gen.get("draft_mode")
+    stats.response_draft_mode = gen.get("draft_mode")
     if stats.drafter_model_id and stats.generation_tokens:
         stats.accept_fraction = (
             stats.accepted_draft_tokens / stats.generation_tokens
@@ -286,6 +374,27 @@ def main() -> int:
         help="per-request K override (default: runner config)",
     )
     p.add_argument(
+        "--draft-mode",
+        choices=["none", "model", "ngram", "pipelined", "auto"],
+        default="auto",
+        help=(
+            "per-request draft_mode override; 'auto' omits the field "
+            "(model-card / runner default applies). 'none' disables, 'model' "
+            "uses the model drafter, 'ngram' uses the n-gram drafter, "
+            "'pipelined' uses pipelined+remote model drafter."
+        ),
+    )
+    p.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help=(
+            "issue this many requests in parallel against the same instance. "
+            "Each parallel slot runs the full prompt set sequentially; "
+            "throughput is reported as the sum across slots over wall time."
+        ),
+    )
+    p.add_argument(
         "--prompts",
         nargs="*",
         default=list(PROMPTS.keys()),
@@ -303,6 +412,8 @@ def main() -> int:
     else:
         use_drafter = None
 
+    draft_mode: str | None = None if args.draft_mode == "auto" else args.draft_mode
+
     result = BenchmarkResult(
         label=args.label,
         host=args.host,
@@ -310,6 +421,8 @@ def main() -> int:
         model=args.model,
         use_drafter=use_drafter,
         num_draft_tokens=args.num_draft_tokens,
+        draft_mode=draft_mode,
+        concurrency=args.concurrency,
         runs=args.runs,
     )
 
@@ -326,14 +439,22 @@ def main() -> int:
             label=args.label,
             use_drafter=use_drafter,
             num_draft_tokens=args.num_draft_tokens,
+            draft_mode=draft_mode,
             run_index=-1,
+            concurrency_slot=0,
             timeout=args.timeout,
             max_tokens_override=args.max_tokens,
         )
 
+    work: list[tuple[str, int, int]] = []
     for prompt_id in args.prompts:
-        prompt = PROMPTS[prompt_id]
         for run_index in range(args.runs):
+            for slot in range(args.concurrency):
+                work.append((prompt_id, run_index, slot))
+
+    if args.concurrency <= 1:
+        for prompt_id, run_index, slot in work:
+            prompt = PROMPTS[prompt_id]
             print(
                 f"[{args.label}] {prompt_id} run={run_index + 1}/{args.runs}",
                 file=sys.stderr,
@@ -347,21 +468,46 @@ def main() -> int:
                 label=args.label,
                 use_drafter=use_drafter,
                 num_draft_tokens=args.num_draft_tokens,
+                draft_mode=draft_mode,
                 run_index=run_index,
+                concurrency_slot=slot,
                 timeout=args.timeout,
                 max_tokens_override=args.max_tokens,
             )
             result.requests.append(stats)
-            if stats.error:
-                print(f"  ERROR: {stats.error}", file=sys.stderr)
-            else:
-                print(
-                    f"  gen={stats.generation_tokens}t @ "
-                    f"{stats.generation_tps:.2f}t/s ttft={stats.ttft_ms:.1f}ms "
-                    f"draft_mode={stats.draft_mode} "
-                    f"accept={stats.accept_fraction}",
-                    file=sys.stderr,
+            _print_stats(stats)
+    else:
+        # Concurrency mode: dispatch each (prompt, run, slot) tuple into its
+        # own thread so the server sees ``concurrency`` overlapping requests.
+        # Threads are fine here because each request is just an HTTP call.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=args.concurrency * len(args.prompts)
+        ) as ex:
+            futures: list[concurrent.futures.Future[RequestStats]] = []
+            for prompt_id, run_index, slot in work:
+                prompt = PROMPTS[prompt_id]
+                futures.append(
+                    ex.submit(
+                        _run_one,
+                        host=args.host,
+                        port=args.port,
+                        model=args.model,
+                        prompt_id=prompt_id,
+                        prompt=prompt,
+                        label=args.label,
+                        use_drafter=use_drafter,
+                        num_draft_tokens=args.num_draft_tokens,
+                        draft_mode=draft_mode,
+                        run_index=run_index,
+                        concurrency_slot=slot,
+                        timeout=args.timeout,
+                        max_tokens_override=args.max_tokens,
+                    )
                 )
+            for fut in concurrent.futures.as_completed(futures):
+                stats = fut.result()
+                result.requests.append(stats)
+                _print_stats(stats)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -372,15 +518,47 @@ def main() -> int:
     if successful:
         gen_tps_values = [r.generation_tps for r in successful]
         ttft_values = [r.ttft_ms for r in successful]
-        print(
-            f"[{args.label}] median gen_tps="
-            f"{statistics.median(gen_tps_values):.2f} "
-            f"median ttft={statistics.median(ttft_values):.1f}ms "
-            f"runs={len(successful)}",
-            file=sys.stderr,
-        )
+        wall_values = [r.wall_seconds for r in successful]
+        # Aggregate throughput sums per-request tps across overlapping slots,
+        # which is what serving operators actually care about under
+        # concurrency. Single-slot runs collapse to the per-request tps.
+        if args.concurrency > 1:
+            aggregate = sum(
+                r.generation_tokens for r in successful
+            ) / max(wall_values)
+            print(
+                f"[{args.label}] aggregate gen_tps="
+                f"{aggregate:.2f} (concurrency={args.concurrency}) "
+                f"median per-request gen_tps="
+                f"{statistics.median(gen_tps_values):.2f} "
+                f"median ttft={statistics.median(ttft_values):.1f}ms "
+                f"runs={len(successful)}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[{args.label}] median gen_tps="
+                f"{statistics.median(gen_tps_values):.2f} "
+                f"median ttft={statistics.median(ttft_values):.1f}ms "
+                f"runs={len(successful)}",
+                file=sys.stderr,
+            )
 
     return 0 if all(r.error is None for r in result.requests) else 1
+
+
+def _print_stats(stats: RequestStats) -> None:
+    if stats.error:
+        print(f"  [{stats.prompt_id}/run{stats.run_index}/slot{stats.concurrency_slot}] ERROR: {stats.error}", file=sys.stderr)
+    else:
+        print(
+            f"  [{stats.prompt_id}/run{stats.run_index}/slot{stats.concurrency_slot}] "
+            f"gen={stats.generation_tokens}t @ {stats.generation_tps:.2f}t/s "
+            f"ttft={stats.ttft_ms:.1f}ms "
+            f"draft_mode={stats.response_draft_mode} "
+            f"accept={stats.accept_fraction}",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

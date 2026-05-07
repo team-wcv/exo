@@ -75,7 +75,7 @@ def _get_eos_ids(tokenizer: TokenizerWrapper) -> list[int]:
     return eos
 
 
-DraftMode = Literal["model", "pipelined", "ngram", "none"]
+DraftMode = Literal["model", "pipelined", "ngram", "eagle", "lookahead", "none"]
 """How to source draft tokens for speculative decoding.
 
 * ``"model"``: small distilled drafter (e.g. Gemma-4 e2b/e4b) via
@@ -96,6 +96,20 @@ DraftMode = Literal["model", "pipelined", "ngram", "none"]
   Zero drafter compute, no extra KV cache, no warmup. Wins on prompts
   the model echoes (RAG, summarisation, structured/code output);
   gracefully degrades to baseline when no match is found.
+* ``"eagle"``: tiny auxiliary network conditioned on the target's
+  hidden states (EAGLE / EAGLE-2). Reuses the target's KV cache,
+  no second model load. Reported 2-3x wins in the literature versus
+  bare model-drafter on dense targets. **NOT YET IMPLEMENTED** -- the
+  scaffolding (factory dispatch, ``EagleDrafter`` shell) ships in this
+  PR so a follow-up only has to fill in the auxiliary head + tree
+  decoding loop. See :class:`EagleDrafter` for the integration seam.
+* ``"lookahead"``: lookahead decoding (Fu et al. 2024). Uses the
+  target's own forward pass at multiple time-steps to produce n-gram
+  candidates via Jacobi iteration, no auxiliary model and no extra
+  weights. Composable with ``"ngram"`` -- the lookahead lookup table
+  acts as a richer source for the n-gram drafter. **NOT YET
+  IMPLEMENTED** -- the scaffolding ships in this PR; see
+  :class:`LookaheadDrafter`.
 * ``"none"``: standard non-speculative generation.
 """
 
@@ -103,6 +117,8 @@ ALL_DRAFT_MODES: Final[tuple[DraftMode, ...]] = (
     "model",
     "pipelined",
     "ngram",
+    "eagle",
+    "lookahead",
     "none",
 )
 
@@ -121,6 +137,10 @@ def parse_draft_mode(raw: str | None, default: DraftMode) -> DraftMode:
         return "pipelined"
     if candidate == "ngram":
         return "ngram"
+    if candidate == "eagle":
+        return "eagle"
+    if candidate == "lookahead":
+        return "lookahead"
     if candidate == "none":
         return "none"
     logger.warning(
@@ -436,6 +456,224 @@ class NgramDrafter:
         )
 
 
+@final
+class EagleDrafter:
+    """EAGLE / EAGLE-2 speculative decoder using a tiny auxiliary head.
+
+    **Status: scaffolding only.** This class ships an explicit integration
+    seam so EAGLE can plug into the existing :class:`Drafter` factory
+    without churning call-sites in :mod:`generate` / :mod:`builder`. The
+    actual auxiliary-head load + tree decoding loop is intentionally
+    deferred -- a follow-up PR fills this in once we pick which EAGLE
+    variant to support (vanilla EAGLE, EAGLE-2 with dynamic tree, or
+    Hydra heads).
+
+    Why this is an *additional* drafter and not a flag on
+    :class:`ModelDrafter`:
+
+    * EAGLE's drafter needs the target's *last hidden state*, not just
+      the sampled token. The :class:`Drafter.stream` signature already
+      lets us read ``model``'s forward output, but EAGLE additionally
+      requires plumbing the hidden state out of the target's forward
+      pass. That's a target-engine change, not a drafter change.
+    * EAGLE-2 uses a tree of draft tokens rather than a single chain;
+      verifying a tree requires ``mlx_lm.tree_verify_step`` (does not
+      yet exist) or an in-house verifier. Plug-in point: a new method
+      on this class that returns ``(token_tree, parent_indices)``,
+      consumed by a tree-aware verify loop in :func:`stream`.
+    * Tree verification is also what Medusa needs, so factoring the
+      verifier into a separate ``TreeVerifier`` class lets EAGLE +
+      Medusa share it.
+
+    Recommended config surface (when filling this in):
+
+    * ``eagle_head_repo``: HuggingFace repo for the auxiliary head
+      weights, surfaced in :class:`exo.shared.models.types.ModelCard`
+      alongside ``drafter_model_ids`` (probably a new
+      ``eagle_head_ids: list[str]``).
+    * ``num_draft_tokens``: tree depth for EAGLE-2 (vanilla EAGLE is
+      depth-only and can reuse the existing ``K`` knob).
+    * ``tree_branching``: per-level branching for EAGLE-2 (e.g.
+      ``[4, 2, 2, 2]``); ignored by vanilla EAGLE.
+
+    Until the implementation lands, ``stream`` raises
+    :class:`NotImplementedError` so misconfiguration fails loudly. The
+    factory in :func:`make_drafter` checks for the head being loaded;
+    if not, it logs and falls back to ``"none"`` (mirrors the
+    ``"model"`` -> ``"none"`` degradation when no drafter is loaded).
+    """
+
+    def __init__(
+        self,
+        *,
+        eagle_head: object | None,
+        num_draft_tokens: int,
+        tree_branching: tuple[int, ...] | None = None,
+    ) -> None:
+        if num_draft_tokens < 1:
+            raise ValueError(f"num_draft_tokens must be >= 1, got {num_draft_tokens}")
+        self._eagle_head = eagle_head
+        self._num_draft_tokens = num_draft_tokens
+        self._tree_branching = tree_branching
+
+    @property
+    def mode(self) -> DraftMode:
+        return "eagle"
+
+    @property
+    def num_draft_tokens(self) -> int:
+        return self._num_draft_tokens
+
+    @property
+    def tree_branching(self) -> tuple[int, ...] | None:
+        return self._tree_branching
+
+    def stream(
+        self,
+        *,
+        model: Model,
+        tokenizer: TokenizerWrapper,
+        prompt: mx.array,
+        context_tokens: Sequence[int],
+        prompt_cache: KVCacheType,
+        max_tokens: int,
+        sampler: Callable[[mx.array], mx.array],
+        logits_processors: Sequence[Callable[[mx.array, mx.array], mx.array]],
+        prefill_step_size: int = 1,
+    ) -> Generator[GenerationResponse, None, None]:
+        del (
+            model,
+            tokenizer,
+            prompt,
+            context_tokens,
+            prompt_cache,
+            max_tokens,
+            sampler,
+            logits_processors,
+            prefill_step_size,
+        )
+        raise NotImplementedError(
+            "EagleDrafter is a scaffolding stub. Implement the auxiliary-"
+            "head forward + tree verify loop here. The Drafter protocol "
+            "and factory dispatch are in place; the missing pieces are "
+            "(1) loading EAGLE head weights (probably a new "
+            "ModelCard.eagle_head_ids field), (2) plumbing the target's "
+            "last hidden state out of the verify forward, and (3) a tree-"
+            "aware verifier (shareable with future Medusa support). See "
+            "the class docstring for the recommended factoring."
+        )
+        yield  # pragma: no cover  -- keeps the function a generator.
+
+
+@final
+class LookaheadDrafter:
+    """Lookahead decoding (Fu et al. 2024) using the target's own forward.
+
+    **Status: scaffolding only.** Plug-in point shipped so a follow-up
+    can fill in the Jacobi iteration loop without changing call sites.
+
+    Lookahead decoding builds an n-gram candidate pool from intermediate
+    Jacobi-iteration outputs of the target itself: each generation step
+    runs the target on a window of ``window_size`` positions and seeds
+    an n-gram lookup table from the result. The next step queries the
+    table for candidates, verifies them in parallel via a single target
+    forward, and updates the table. No auxiliary model, no extra
+    weights.
+
+    Composability with :class:`NgramDrafter`: the lookahead lookup
+    table is the same shape as the n-gram drafter's suffix lookup,
+    just populated by Jacobi rather than context history. A natural
+    factoring is to share the ``propose(context, k)`` interface with
+    :class:`NgramDrafter` and have :class:`LookaheadDrafter` swap the
+    proposal source at runtime; that lets ``"ngram"`` and
+    ``"lookahead"`` share the verify loop. Recommended seam:
+
+    * Extract :meth:`NgramDrafter.propose` to a shared
+      ``NgramProposer`` Protocol with two impls (``SuffixProposer``,
+      ``LookaheadProposer``).
+    * :func:`_ngram_speculative_step` takes the proposer rather than
+      the concrete :class:`NgramDrafter`, picks one based on
+      :data:`DraftMode`.
+
+    Config surface:
+
+    * ``num_draft_tokens``: K (max chain length per round).
+    * ``window_size``: Jacobi window width per step. Larger windows
+      seed more n-grams but cost a wider verify forward.
+    * ``ngram_size``: size of the n-grams stored in the lookup table
+      (typically 2-4).
+
+    Until implemented, ``stream`` raises :class:`NotImplementedError`.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_draft_tokens: int,
+        window_size: int = 5,
+        ngram_size: int = 3,
+    ) -> None:
+        if num_draft_tokens < 1:
+            raise ValueError(f"num_draft_tokens must be >= 1, got {num_draft_tokens}")
+        if window_size < 1:
+            raise ValueError(f"window_size must be >= 1, got {window_size}")
+        if ngram_size < 2:
+            raise ValueError(f"ngram_size must be >= 2, got {ngram_size}")
+        self._num_draft_tokens = num_draft_tokens
+        self._window_size = window_size
+        self._ngram_size = ngram_size
+
+    @property
+    def mode(self) -> DraftMode:
+        return "lookahead"
+
+    @property
+    def num_draft_tokens(self) -> int:
+        return self._num_draft_tokens
+
+    @property
+    def window_size(self) -> int:
+        return self._window_size
+
+    @property
+    def ngram_size(self) -> int:
+        return self._ngram_size
+
+    def stream(
+        self,
+        *,
+        model: Model,
+        tokenizer: TokenizerWrapper,
+        prompt: mx.array,
+        context_tokens: Sequence[int],
+        prompt_cache: KVCacheType,
+        max_tokens: int,
+        sampler: Callable[[mx.array], mx.array],
+        logits_processors: Sequence[Callable[[mx.array, mx.array], mx.array]],
+        prefill_step_size: int = 1,
+    ) -> Generator[GenerationResponse, None, None]:
+        del (
+            model,
+            tokenizer,
+            prompt,
+            context_tokens,
+            prompt_cache,
+            max_tokens,
+            sampler,
+            logits_processors,
+            prefill_step_size,
+        )
+        raise NotImplementedError(
+            "LookaheadDrafter is a scaffolding stub. Implement the Jacobi "
+            "iteration + n-gram lookup table here. Recommended factoring: "
+            "extract NgramDrafter.propose into a shared NgramProposer "
+            "Protocol with SuffixProposer and LookaheadProposer impls so "
+            "this drafter and NgramDrafter share the verify loop. See "
+            "the class docstring."
+        )
+        yield  # pragma: no cover  -- keeps the function a generator.
+
+
 def make_drafter(
     *,
     mode: DraftMode,
@@ -479,6 +717,17 @@ def make_drafter(
         return NoSpecDrafter()
     if mode == "ngram":
         return NgramDrafter(num_draft_tokens=num_draft_tokens)
+    if mode == "eagle":
+        # Scaffold path; the runner-side bootstrap doesn't load EAGLE heads
+        # yet, so the head is always None today and the constructor builds
+        # a stub that raises on ``stream``. ``resolve_draft_mode`` should
+        # downgrade to ``"none"`` once an analogous ``has_eagle_head`` flag
+        # is wired through; until then the stub error makes misuse obvious.
+        return EagleDrafter(eagle_head=None, num_draft_tokens=num_draft_tokens)
+    if mode == "lookahead":
+        # Scaffold path; uses target weights only, no extra load needed.
+        # Stub raises on ``stream`` until the Jacobi loop lands.
+        return LookaheadDrafter(num_draft_tokens=num_draft_tokens)
     if mode == "model":
         if draft_model is None or draft_cache is None:
             raise ValueError(

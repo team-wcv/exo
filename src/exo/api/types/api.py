@@ -288,6 +288,11 @@ class ChatCompletionRequest(BaseModel):
     # ignore unknown fields and get the runner's defaults.
     use_drafter: bool | None = None
     num_draft_tokens: int | None = None
+    # Per-request draft-strategy override. ``"model"`` uses the external
+    # drafter, ``"pipelined"`` uses the pipelined+remote drafter, ``"ngram"``
+    # uses CPU n-gram tables, ``"none"`` disables speculation. ``None`` defers
+    # to the model card / runner default. Mirrors ``draft_mode`` on the task.
+    draft_mode: Literal["model", "pipelined", "ngram", "none"] | None = None
 
 
 class BenchChatCompletionRequest(ChatCompletionRequest):

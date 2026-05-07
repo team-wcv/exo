@@ -177,6 +177,7 @@ async def chat_request_to_text_generation(
         images=images,
         use_drafter=request.use_drafter,
         num_draft_tokens=request.num_draft_tokens,
+        draft_mode=request.draft_mode,
     )
 
 
