@@ -1,0 +1,325 @@
+"""Transport-agnostic interface to a speculative-decoding drafter.
+
+The pipelined spec loop in :mod:`pipelined_drafter` orchestrates rounds
+against a drafter through this Protocol, so the same loop drives an
+in-process drafter (this module's :class:`InProcessTransport`) or a
+drafter on a different MLX rank (:mod:`remote_drafter`'s
+``RemoteTransport``, communicating via ``mx.distributed.send/recv`` over
+the existing JACCL/ring backend -- RDMA over Thunderbolt-bridge between
+twin Macs is just a backend choice the same call site honours).
+
+API surface (kept as small as possible -- the spec loop owns
+high-level accept/reject logic; the transport just implements the
+mechanical primitives):
+
+  * ``forward(inputs, num_forwards)`` -> ``Future[list[int]]`` -- run
+    ``num_forwards`` drafter forwards. Forward 0 consumes ``inputs``
+    (length 1 for partial-accept seeds, length 2 for full-accept
+    seeds matching mlx_lm's ``draft_y = [drafts[-1], bonus]``
+    convention); forwards 1..N-1 consume the previous forward's
+    sampled output. Returns immediately so the caller can dispatch
+    target verify in parallel.
+
+    The spec loop uses this in two patterns:
+      * Standard round: ``forward([seed], K)`` -> K drafts.
+      * Speculative round (bonus prediction + round-ahead): ``forward([drafts[-1]], K+1)``
+        -> ``[d_K, d^spec_0, ..., d^spec_{K-1}]`` where ``d_K`` is the
+        drafter's prediction for the bonus position (compared against
+        the actual ``bonus_t`` to detect speculation hit).
+  * ``trim_cache(n)`` -- trim ``n`` positions from the drafter's KV
+    cache. Used after partial accept (trim rejected drafts) and after
+    speculation miss (rollback the speculative forward).
+  * ``shutdown()`` -- release transport resources. No-op for the
+    in-process transport.
+
+The Future returned by ``propose`` is a synchronous
+:class:`concurrent.futures.Future`, not :mod:`asyncio`. The spec loop
+is a synchronous generator; blocking on a sync Future from a generator
+is natural, whereas threading asyncio through the generator would be
+invasive. The remote transport's IPC thread sets the Future from
+outside the calling thread, which ``concurrent.futures.Future``
+supports.
+"""
+
+from __future__ import annotations
+
+from concurrent.futures import Future
+from typing import Callable, Final, Protocol, final, runtime_checkable
+
+import mlx.core as mx
+from mlx_lm.models.cache import trim_prompt_cache as mlx_trim_prompt_cache
+
+from exo.worker.engines.mlx.types import KVCacheType, Model
+
+# Returned by ``propose``; the spec loop blocks on ``.result()`` once it
+# has dispatched target verify.
+DraftFuture = Future[list[int]]
+
+
+@runtime_checkable
+class DrafterTransport(Protocol):
+    """Async access to a speculative-decoding drafter.
+
+    Implementations MUST be safe under the call sequence
+    :func:`pipelined_speculative_step` issues:
+
+      1. ``forward([seed], K)`` -> ``future``
+      2. (caller dispatches target verify in parallel)
+      3. ``future.result()``
+      4. either:
+         a. partial accept: ``trim_cache(K - num_accepted - 1)`` then
+            ``forward([target_correction], K)`` for next round, or
+         b. full accept: no trim, then ``forward([drafts[-1], bonus], K)``
+            for next round.
+
+    For cross-round speculation an additional ``forward([drafts[-1]], K+1)``
+    is issued in step 2 (parallel with verify); the first of the K+1
+    returned tokens is the drafter's predicted bonus, which is checked
+    against the actual ``bonus_t``. On hit, the remaining K outputs are
+    used as round t+1's drafts. On miss, ``trim_cache(K + 1)`` rolls
+    back the speculative work.
+
+    Behaviour is undefined if more than one un-resolved Future is in
+    flight without an intervening ``trim_cache`` or ``.result()`` call.
+    """
+
+    @property
+    def num_draft_tokens(self) -> int:
+        """``K`` -- the typical number of drafts per round.
+
+        Remote transports use this to pre-allocate fixed-size receive
+        buffers (sized for ``K + 1`` to cover the speculative forward).
+        ``forward()`` accepts ``num_forwards`` up to ``K + 1``.
+        """
+        ...
+
+    def forward(self, inputs: list[int], num_forwards: int) -> DraftFuture:
+        """Run ``num_forwards`` drafter forwards starting from ``inputs``.
+
+        Args:
+            inputs: First-forward input. Length 1 for partial-accept
+                seeds (``[seed]``); length 2 for full-accept seeds
+                (``[drafts[-1], bonus]`` matching mlx_lm's
+                ``_draft_generate`` ``draft_y`` convention).
+                Subsequent forwards consume the previous forward's
+                output, so they are always length-1.
+            num_forwards: Number of forwards (and number of returned
+                sampled tokens). Must satisfy
+                ``1 <= num_forwards <= self.num_draft_tokens + 1``;
+                the ``+ 1`` covers the speculative bonus-prediction
+                forward.
+
+        Cache effect: extends the drafter's KV cache by
+        ``len(inputs) + num_forwards - 1`` positions.
+
+        Returns:
+            A Future resolving to ``num_forwards`` sampled token ids.
+        """
+        ...
+
+    def trim_cache(self, n_positions: int) -> None:
+        """Trim ``n_positions`` from the drafter's KV cache.
+
+        Used after partial accept (``n_positions = K - num_accepted - 1``)
+        and after speculation miss (``n_positions = positions added by
+        the speculative forward``).
+
+        ``n_positions == 0`` is a valid no-op so callers don't have to
+        guard against the trivial case. Negative values raise
+        ``ValueError``.
+        """
+        ...
+
+    def shutdown(self) -> None:
+        """Release transport resources. Idempotent.
+
+        In-process transport: no-op (the drafter model and cache are
+        owned by the caller). Remote transport: terminates the drafter
+        rank's serve loop, drains pending IPC.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# In-process transport
+# ---------------------------------------------------------------------------
+
+
+@final
+class InProcessTransport:
+    """Drafter model + cache live in the calling process on the same MLX device.
+
+    All MLX work happens on the calling thread; ``propose`` runs the K
+    drafter forwards inline and returns an immediately-resolved Future
+    so the call site is uniform with the remote transport. Any
+    pipelining win at this transport comes from MLX's intra-forward
+    async dispatch (``mx.async_eval`` between drafter forwards) and
+    the cross-round speculation in :func:`pipelined_speculative_step`.
+
+    Apple Silicon's unified-memory single GPU bounds the gain because
+    drafter and target target compete for the same memory bandwidth on
+    the same Metal command queue; on multi-machine deployments the
+    same call site runs against :class:`RemoteTransport` instead and
+    the gain unlocks.
+    """
+
+    def __init__(
+        self,
+        *,
+        draft_model: Model,
+        draft_cache: KVCacheType,
+        num_draft_tokens: int,
+    ) -> None:
+        if num_draft_tokens < 1:
+            raise ValueError(f"num_draft_tokens must be >= 1, got {num_draft_tokens}")
+        self._draft_model = draft_model
+        self._draft_cache = draft_cache
+        self._num_draft_tokens = num_draft_tokens
+
+    @property
+    def num_draft_tokens(self) -> int:
+        return self._num_draft_tokens
+
+    def forward(self, inputs: list[int], num_forwards: int) -> DraftFuture:
+        # ``+ 1`` upper bound covers the speculative bonus-prediction
+        # forward; see DrafterTransport docstring.
+        upper = self._num_draft_tokens + 1
+        if not 1 <= num_forwards <= upper:
+            raise ValueError(
+                f"num_forwards must be in [1, {upper}], got {num_forwards}"
+            )
+        if not 1 <= len(inputs) <= 2:
+            # Length 1 = partial-accept seed; length 2 = full-accept
+            # ``[drafts[-1], bonus]`` shape. No other shape is meaningful
+            # for spec decoding and accepting it would mask bookkeeping
+            # bugs in the spec loop.
+            raise ValueError(f"inputs must have length 1 or 2, got {len(inputs)}")
+
+        future: DraftFuture = Future()
+        try:
+            outputs = self._run_drafter_forwards(inputs, num_forwards)
+            future.set_result(outputs)
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    def trim_cache(self, n_positions: int) -> None:
+        if n_positions < 0:
+            raise ValueError(f"n_positions must be >= 0, got {n_positions}")
+        if n_positions == 0:
+            return
+        # mlx_lm types ``trim_prompt_cache`` against ``List[Cache]``;
+        # exo's ``KVCacheType`` is a structural superset, hence the
+        # cast + ignore (same pattern used in ``mlx_generate`` and the
+        # n-gram spec loop).
+        from typing import cast as _cast
+
+        mlx_trim_prompt_cache(_cast(list[object], self._draft_cache), n_positions)  # type: ignore[reportArgumentType]
+
+    def shutdown(self) -> None:
+        return
+
+    # -- internals --------------------------------------------------------
+
+    def _run_drafter_forwards(self, inputs: list[int], num_forwards: int) -> list[int]:
+        """Mirror of mlx_lm's ``_draft_generate`` semantics.
+
+        Forward 0 consumes ``inputs`` (length 1 or 2); forwards 1..N-1
+        consume the previous forward's sampled output. ``mx.async_eval``
+        between forwards lets the GPU pipeline the dispatches.
+        """
+        ys: list[mx.array] = []
+        y = mx.array(inputs, dtype=mx.uint32)
+        for _ in range(num_forwards):
+            logits = self._draft_model(y[None], cache=self._draft_cache)
+            sampled = mx.argmax(logits[:, -1, :], axis=-1).astype(mx.uint32)
+            mx.async_eval(sampled)
+            ys.append(sampled)
+            y = sampled
+        # Force a sync at the end so the cache state is realised before
+        # the spec loop dispatches target verify on top of these outputs.
+        mx.eval(ys + [c.state for c in self._draft_cache])  # type: ignore[reportArgumentType]
+        return [int(t.item()) for t in ys]
+
+
+# ---------------------------------------------------------------------------
+# Transport kind selection
+# ---------------------------------------------------------------------------
+
+
+ALL_TRANSPORT_KINDS: Final[tuple[str, ...]] = ("inprocess", "remote")
+"""Recognised values of ``EXO_DRAFTER_TRANSPORT``."""
+
+EXO_DRAFTER_TRANSPORT_ENV: Final[str] = "EXO_DRAFTER_TRANSPORT"
+
+
+def parse_transport_kind(raw: str | None, default: str) -> str:
+    """Parse the ``EXO_DRAFTER_TRANSPORT`` env var, warning on unknown values."""
+    if raw is None:
+        return default
+    candidate = raw.strip().lower()
+    if candidate in ALL_TRANSPORT_KINDS:
+        return candidate
+    # Imported lazily so this module is importable without the runner
+    # bootstrap (used by tests that exercise the parser in isolation).
+    from exo.worker.runner.bootstrap import logger
+
+    logger.warning(
+        f"{EXO_DRAFTER_TRANSPORT_ENV}={raw!r} not in {ALL_TRANSPORT_KINDS}; "
+        f"falling back to {default!r}"
+    )
+    return default
+
+
+def make_inprocess_transport(
+    *,
+    draft_model: Model,
+    draft_cache: KVCacheType,
+    num_draft_tokens: int,
+) -> DrafterTransport:
+    """Build an :class:`InProcessTransport`.
+
+    Wrapped in a factory so callers don't import the concrete class;
+    keeps the spec loop coupled only to the Protocol.
+    """
+    return InProcessTransport(
+        draft_model=draft_model,
+        draft_cache=draft_cache,
+        num_draft_tokens=num_draft_tokens,
+    )
+
+
+_TransportFactory = Callable[..., DrafterTransport]
+
+
+def transport_factory_for(kind: str) -> _TransportFactory:
+    """Return the factory for the requested transport kind.
+
+    Raises:
+        ValueError: ``kind`` is not in :data:`ALL_TRANSPORT_KINDS`.
+        ImportError: ``kind == "remote"`` and the distributed transport's
+            runtime dependencies are unavailable.
+    """
+    if kind == "inprocess":
+        return make_inprocess_transport
+    if kind == "remote":
+        # Imported lazily so the in-process path doesn't pull in any
+        # distributed-only modules.
+        from exo.worker.engines.mlx.generator.remote_drafter import (
+            make_remote_transport,
+        )
+
+        return make_remote_transport
+    raise ValueError(f"Unknown drafter transport kind: {kind!r}")
+
+
+__all__ = [
+    "ALL_TRANSPORT_KINDS",
+    "DraftFuture",
+    "DrafterTransport",
+    "EXO_DRAFTER_TRANSPORT_ENV",
+    "InProcessTransport",
+    "make_inprocess_transport",
+    "parse_transport_kind",
+    "transport_factory_for",
+]

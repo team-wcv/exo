@@ -117,7 +117,8 @@ class MlxBuilder(Builder):
             default="model" if self.draft_model is not None else "none",
         )
         force_sequential_for_drafter = (
-            self.draft_model is not None or configured_draft_mode == "ngram"
+            self.draft_model is not None
+            or configured_draft_mode in ("ngram", "pipelined")
         )
 
         if os.environ.get("EXO_NO_BATCH") or force_sequential_for_drafter:

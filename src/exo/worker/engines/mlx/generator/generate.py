@@ -59,9 +59,7 @@ from exo.worker.engines.mlx.constants import (
 from exo.worker.engines.mlx.generator.drafter import (
     Drafter,
     DraftMode,
-    ModelDrafter,
-    NgramDrafter,
-    NoSpecDrafter,
+    make_drafter,
     resolve_draft_mode,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
@@ -693,12 +691,13 @@ def mlx_generate(
             request_use_drafter=request_use_drafter,
             request_draft_mode=request_draft_mode,
         )
-    # Item 8: short-output skip applies only to the model-drafter path
-    # where the drafter prefill cost dominates. N-gram drafting has no
-    # prefill (microsecond suffix-match per round) so the threshold is
-    # irrelevant; baseline non-spec wouldn't be cheaper anyway.
+    # Item 8: short-output skip applies to drafter-model paths
+    # (``"model"`` and ``"pipelined"``) where the drafter prefill cost
+    # dominates. N-gram drafting has no prefill (microsecond suffix-
+    # match per round) so the threshold is irrelevant; baseline non-
+    # spec wouldn't be cheaper anyway.
     if (
-        draft_mode == "model"
+        draft_mode in ("model", "pipelined")
         and drafter_min_output_tokens is not None
         and max_tokens <= drafter_min_output_tokens
     ):
@@ -707,11 +706,15 @@ def mlx_generate(
             f"(max_tokens={max_tokens} <= {drafter_min_output_tokens})"
         )
         draft_mode = "none"
-    effective_draft_model = draft_model if draft_mode == "model" else None
-    # Reused below: only the model-drafter path needs paired drafter caches.
-    # The variable name is preserved for readability with the existing cache
-    # bookkeeping code immediately below.
-    spec_active = draft_mode == "model" and effective_draft_model is not None
+    effective_draft_model = (
+        draft_model if draft_mode in ("model", "pipelined") else None
+    )
+    # Reused below: drafter-model paths need paired drafter caches; the
+    # ngram and none paths don't. The variable name is preserved for
+    # readability with the existing cache bookkeeping code below.
+    spec_active = (
+        draft_mode in ("model", "pipelined") and effective_draft_model is not None
+    )
     if effective_num_draft_tokens < 1:
         # Defaulted to 0 above when the runner didn't pre-resolve K and the
         # request didn't override either. Clamp to 1 so n-gram and model
@@ -774,7 +777,9 @@ def mlx_generate(
                 matched_index = None
                 is_exact_hit = False
         if drafter_hit > aligned_hit:
-            mlx_trim_prompt_cache(cast(list[object], drafter_caches), drafter_hit - aligned_hit)  # type: ignore[reportArgumentType]
+            mlx_trim_prompt_cache(
+                cast(list[object], drafter_caches), drafter_hit - aligned_hit
+            )  # type: ignore[reportArgumentType]
             if drafter_matched_index is not None and aligned_hit < drafter_hit:
                 drafter_matched_index = None
 
@@ -954,22 +959,19 @@ def mlx_generate(
     logger.info("Starting decode")
     mx_barrier(group)
 
-    # Dispatch to the selected drafting strategy. ``ModelDrafter``
-    # delegates to ``mlx_lm.stream_generate(draft_model=...)`` (the
-    # well-tested upstream spec loop); ``NgramDrafter`` runs an in-house
-    # spec loop that proposes drafts via in-context suffix lookup;
-    # ``NoSpecDrafter`` is a thin pass-through to ``mlx_lm.stream_generate``.
-    drafter: Drafter
-    if spec_active and effective_draft_model is not None:
-        drafter = ModelDrafter(
-            draft_model=effective_draft_model,
-            draft_cache=drafter_caches,
-            num_draft_tokens=effective_num_draft_tokens,
-        )
-    elif draft_mode == "ngram":
-        drafter = NgramDrafter(num_draft_tokens=effective_num_draft_tokens)
-    else:
-        drafter = NoSpecDrafter()
+    # Dispatch to the selected drafting strategy via ``make_drafter``.
+    # The factory routes:
+    #   * ``"model"``    -> mlx_lm.speculative_generate_step (well-tested upstream)
+    #   * ``"pipelined"`` -> custom spec loop with cross-round speculation
+    #                       behind a ``DrafterTransport`` (in-process or remote)
+    #   * ``"ngram"``    -> in-house n-gram suffix-match spec loop
+    #   * ``"none"``     -> plain ``mlx_lm.stream_generate``
+    drafter: Drafter = make_drafter(
+        mode=draft_mode,
+        num_draft_tokens=effective_num_draft_tokens,
+        draft_model=effective_draft_model if spec_active else None,
+        draft_cache=drafter_caches if spec_active else None,
+    )
 
     # ``decode_prompt`` is the prefill-tail (last two tokens of the
     # prompt). The cache is already aligned to ``all_prompt_tokens[:-2]``

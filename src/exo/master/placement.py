@@ -304,10 +304,7 @@ def place_instance(
     # enough memory. Speculative decoding is single-device only in mlx_lm,
     # so the drafter declared on this card will be ignored. Log it
     # actionably so operators know to grab a smaller quant.
-    if (
-        len(selected_cycle) > 1
-        and command.model_card.drafter_model_ids
-    ):
+    if len(selected_cycle) > 1 and command.model_card.drafter_model_ids:
         logger.warning(
             f"Model {command.model_card.model_id} declares drafters "
             f"{list(command.model_card.drafter_model_ids)} but is being "

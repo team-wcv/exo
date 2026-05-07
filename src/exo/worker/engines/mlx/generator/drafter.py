@@ -75,7 +75,7 @@ def _get_eos_ids(tokenizer: TokenizerWrapper) -> list[int]:
     return eos
 
 
-DraftMode = Literal["model", "ngram", "none"]
+DraftMode = Literal["model", "pipelined", "ngram", "none"]
 """How to source draft tokens for speculative decoding.
 
 * ``"model"``: small distilled drafter (e.g. Gemma-4 e2b/e4b) via
@@ -83,6 +83,14 @@ DraftMode = Literal["model", "ngram", "none"]
   distributed pipeline-parallel where token latency is dominated by
   cross-device communication. On fast single-device inference this is
   frequently a net loss; benchmark before defaulting to it.
+* ``"pipelined"``: same drafter model as ``"model"``, but routed
+  through :class:`exo.worker.engines.mlx.generator.pipelined_drafter
+  .PipelinedModelDrafter` -- a custom spec loop with cross-round
+  speculation (drafter forward for round ``t + 1`` overlaps target
+  verify of round ``t``). The transport layer (in-process or remote)
+  is selected by ``EXO_DRAFTER_TRANSPORT``; remote (RDMA/TCP via
+  ``mx.distributed.send/recv``) is the regime where the pipelining
+  win is unambiguous.
 * ``"ngram"``: propose drafts by matching the longest suffix of the
   running token context against earlier positions in the same context.
   Zero drafter compute, no extra KV cache, no warmup. Wins on prompts
@@ -91,7 +99,12 @@ DraftMode = Literal["model", "ngram", "none"]
 * ``"none"``: standard non-speculative generation.
 """
 
-ALL_DRAFT_MODES: Final[tuple[DraftMode, ...]] = ("model", "ngram", "none")
+ALL_DRAFT_MODES: Final[tuple[DraftMode, ...]] = (
+    "model",
+    "pipelined",
+    "ngram",
+    "none",
+)
 
 EXO_DRAFT_MODE_ENV: Final[str] = "EXO_DRAFT_MODE"
 """Process-wide default mode. Per-request ``TaskParams`` overrides take precedence."""
@@ -104,6 +117,8 @@ def parse_draft_mode(raw: str | None, default: DraftMode) -> DraftMode:
     candidate = raw.strip().lower()
     if candidate == "model":
         return "model"
+    if candidate == "pipelined":
+        return "pipelined"
     if candidate == "ngram":
         return "ngram"
     if candidate == "none":
@@ -127,12 +142,13 @@ def resolve_draft_mode(
       2. ``request_use_drafter is False`` — opt-out shortcut maps to ``"none"``.
       3. ``EXO_DRAFT_MODE`` env var if recognised.
       4. Implicit default: ``"model"`` if a drafter model was loaded,
-         else ``"none"``. ``"ngram"`` is opt-in; we don't auto-promote
-         because its win is workload-dependent.
+         else ``"none"``. ``"ngram"`` and ``"pipelined"`` are opt-in;
+         we don't auto-promote because their wins are topology-dependent
+         (``"pipelined"``'s gain unlocks at remote-transport scale).
 
-    A ``"model"`` mode without a loaded drafter degrades to ``"none"``
-    with a warning, so misconfiguration fails loudly instead of silently
-    producing the wrong throughput.
+    A ``"model"`` or ``"pipelined"`` mode without a loaded drafter
+    degrades to ``"none"`` with a warning, so misconfiguration fails
+    loudly instead of silently producing the wrong throughput.
     """
     if request_draft_mode is not None:
         chosen: DraftMode = request_draft_mode
@@ -142,10 +158,10 @@ def resolve_draft_mode(
         env_default: DraftMode = "model" if has_drafter_model else "none"
         chosen = parse_draft_mode(os.environ.get(EXO_DRAFT_MODE_ENV), env_default)
 
-    if chosen == "model" and not has_drafter_model:
+    if chosen in ("model", "pipelined") and not has_drafter_model:
         logger.warning(
-            "draft_mode='model' requested but no drafter model is loaded; "
-            "falling back to 'none'."
+            f"draft_mode={chosen!r} requested but no drafter model is "
+            "loaded; falling back to 'none'."
         )
         return "none"
     return chosen
@@ -429,9 +445,14 @@ def make_drafter(
 ) -> Drafter:
     """Build a :class:`Drafter` for the resolved mode.
 
-    Raises ``ValueError`` if ``mode == "model"`` is requested without a
-    loaded drafter; callers should resolve that via
+    Raises ``ValueError`` if ``mode in ("model", "pipelined")`` is
+    requested without a loaded drafter; callers should resolve that via
     :func:`resolve_draft_mode` (which downgrades silently).
+
+    For ``mode == "pipelined"`` the transport kind defaults to
+    ``EXO_DRAFTER_TRANSPORT`` (``"inprocess"`` if unset). The remote
+    transport requires asymmetric instance topology (drafter on a
+    different MLX rank); see :mod:`pipelined_drafter` for details.
     """
     if mode == "none":
         return NoSpecDrafter()
@@ -445,6 +466,41 @@ def make_drafter(
         return ModelDrafter(
             draft_model=draft_model,
             draft_cache=draft_cache,
+            num_draft_tokens=num_draft_tokens,
+        )
+    if mode == "pipelined":
+        # Imported here to keep the module's import surface minimal in
+        # the common (model/ngram/none) paths.
+        from exo.worker.engines.mlx.generator.drafter_transport import (
+            EXO_DRAFTER_TRANSPORT_ENV,
+            parse_transport_kind,
+            transport_factory_for,
+        )
+        from exo.worker.engines.mlx.generator.pipelined_drafter import (
+            PipelinedModelDrafter,
+        )
+
+        transport_kind = parse_transport_kind(
+            os.environ.get(EXO_DRAFTER_TRANSPORT_ENV), default="inprocess"
+        )
+        factory = transport_factory_for(transport_kind)
+        # The factory accepts ``draft_model`` / ``draft_cache`` for the
+        # in-process transport; the remote transport ignores those (they
+        # live on the drafter rank).
+        if transport_kind == "inprocess" and (
+            draft_model is None or draft_cache is None
+        ):
+            raise ValueError(
+                "draft_mode='pipelined' with EXO_DRAFTER_TRANSPORT='inprocess' "
+                "requires both draft_model and draft_cache"
+            )
+        transport = factory(
+            draft_model=draft_model,
+            draft_cache=draft_cache,
+            num_draft_tokens=num_draft_tokens,
+        )
+        return PipelinedModelDrafter(
+            transport=transport,
             num_draft_tokens=num_draft_tokens,
         )
     # Exhaustiveness: DraftMode is a closed Literal. Any other value is a

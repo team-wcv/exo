@@ -147,9 +147,16 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
     # K for long completions, lower for short structured outputs).
     #
     # ``draft_mode`` selects between speculative-decoding strategies:
-    #   - ``"model"``: external drafter model (Gemma-4 e2b/e4b style).
-    #     Best for slow/distributed targets; usually a net loss for fast
+    #   - ``"model"``: external drafter model (Gemma-4 e2b/e4b style)
+    #     via ``mlx_lm.speculative_generate_step``. Best for slow /
+    #     distributed targets; usually a net loss for fast
     #     single-device targets.
+    #   - ``"pipelined"``: same drafter, but routed through exo's
+    #     custom :class:`PipelinedModelDrafter` with cross-round
+    #     speculation. Transport (in-process or remote drafter rank
+    #     via ``mx.distributed.send/recv`` over JACCL/RDMA or
+    #     ring/TCP) is selected by ``EXO_DRAFTER_TRANSPORT``. The
+    #     remote-transport case is the regime where the gain unlocks.
     #   - ``"ngram"``: in-context suffix lookup (no drafter model).
     #     Wins on RAG, summarisation, structured/code output where the
     #     model echoes prompt content. Cost ~0 when no match is found,
@@ -159,7 +166,7 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
     # explicit ``draft_mode`` wins.
     use_drafter: bool | None = None
     num_draft_tokens: int | None = None
-    draft_mode: Literal["model", "ngram", "none"] | None = None
+    draft_mode: Literal["model", "pipelined", "ngram", "none"] | None = None
 
     def with_card_sampling_defaults(self) -> "TextGenerationTaskParams":
         from exo.shared.models.model_cards import get_card

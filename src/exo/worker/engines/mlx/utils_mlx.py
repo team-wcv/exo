@@ -218,9 +218,7 @@ def _drafter_preference() -> str:
     return raw
 
 
-def _select_drafter_id(
-    candidates: list[ModelId], preference: str
-) -> ModelId | None:
+def _select_drafter_id(candidates: list[ModelId], preference: str) -> ModelId | None:
     """Pick a drafter id from a card's preference-ordered list.
 
     The card lists drafters in `[fastest, ..., highest_acceptance]` order. We

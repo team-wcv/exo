@@ -24,7 +24,7 @@ from exo.worker.engines.mlx.generator.drafter import (
 
 def test_all_draft_modes_match_literal() -> None:
     """``ALL_DRAFT_MODES`` must be the runtime mirror of the ``DraftMode`` Literal."""
-    assert ALL_DRAFT_MODES == ("model", "ngram", "none")
+    assert ALL_DRAFT_MODES == ("model", "pipelined", "ngram", "none")
 
 
 @pytest.mark.parametrize(
@@ -35,6 +35,8 @@ def test_all_draft_modes_match_literal() -> None:
         ("model", "none", "model"),
         ("MODEL", "none", "model"),
         ("  ngram  ", "none", "ngram"),
+        ("pipelined", "none", "pipelined"),
+        ("PIPELINED", "model", "pipelined"),
         ("none", "model", "none"),
         ("garbage", "model", "model"),
         ("garbage", "none", "none"),
@@ -126,6 +128,36 @@ class TestResolveDraftMode:
                 request_draft_mode="model",
             )
             == "none"
+        )
+
+    def test_pipelined_mode_without_drafter_demotes_to_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Same misconfiguration safety net as ``"model"``: requesting
+        # ``"pipelined"`` without a loaded drafter must fall back to
+        # ``"none"`` rather than hard-failing or producing a no-op
+        # drafter that silently degrades throughput.
+        monkeypatch.delenv(EXO_DRAFT_MODE_ENV, raising=False)
+        assert (
+            resolve_draft_mode(
+                has_drafter_model=False,
+                request_use_drafter=None,
+                request_draft_mode="pipelined",
+            )
+            == "none"
+        )
+
+    def test_pipelined_mode_with_drafter_loaded_passes_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(EXO_DRAFT_MODE_ENV, raising=False)
+        assert (
+            resolve_draft_mode(
+                has_drafter_model=True,
+                request_use_drafter=None,
+                request_draft_mode="pipelined",
+            )
+            == "pipelined"
         )
 
     def test_explicit_none_with_drafter_loaded(

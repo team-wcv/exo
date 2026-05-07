@@ -204,7 +204,7 @@ class GenerationStats(BaseModel):
     # surface drafting (e.g. image gen). Useful for telemetry dashboards
     # to attribute throughput wins to a specific strategy when running
     # mixed-mode A/B tests.
-    draft_mode: Literal["model", "ngram", "none"] | None = None
+    draft_mode: Literal["model", "pipelined", "ngram", "none"] | None = None
 
     @property
     def drafter_acceptance_fraction(self) -> float | None:
