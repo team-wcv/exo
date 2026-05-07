@@ -6,6 +6,7 @@ import uuid
 from typing import Callable, Generator, cast, get_args
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx_lm.generate import (
     maybe_quantize_kv_cache,
     stream_generate,
@@ -439,28 +440,48 @@ def resolve_speculative_decoding(
 
 def drafter_prefill(
     draft_model: Model,
+    tokenizer: TokenizerWrapper,
+    sampler: Callable[[mx.array], mx.array],
     cache: KVCacheType,
     prompt_tokens: mx.array,
-    prefill_step_size: int = 512,
 ) -> None:
-    """Prefill the drafter's KV cache with ``prompt_tokens``.
+    """Prefill the drafter's KV cache to match the target cache's offset.
 
-    The drafter is single-device and small, so we don't need the full
-    ``prefill`` machinery (no group sync, no pipeline parallelism, no SSM
-    snapshots, no progress callbacks). A simple loop of forward passes
-    with periodic ``mx.eval`` keeps memory bounded.
+    Critical contract: this MUST leave the drafter cache in the same logical
+    state that ``prefill()`` leaves the target cache in -- i.e. the cache
+    holds ``prompt_tokens[:-2]`` worth of context and the caller passes
+    ``prompt_tokens[-2:]`` to ``stream_generate``. Otherwise the drafter's
+    RoPE state desyncs from the target's and ``speculative_generate_step``
+    feeds garbage tokens through the verifier, eventually tripping Metal's
+    GPU watchdog.
+
+    We achieve this by driving the drafter through the same
+    ``stream_generate(max_tokens=1) + c.trim(2)`` ritual that ``prefill()``
+    uses for the target. The drafter is single-device and small, so we don't
+    need the pipeline-parallel branch or the progress callbacks.
     """
-    num_tokens = int(prompt_tokens.size)
-    if num_tokens == 0:
+    if prompt_tokens.size <= 1:
+        # stream_generate handles this case directly via its own _prefill.
         return
 
-    pos = 0
-    while pos < num_tokens:
-        end = min(pos + prefill_step_size, num_tokens)
-        chunk = prompt_tokens[pos:end]
-        draft_model(chunk[None], cache=cache)
-        mx.eval([c.state for c in cache])  # type: ignore[reportAttributeAccessIssue]
-        pos = end
+    for _ in stream_generate(
+        model=cast(nn.Module, draft_model),
+        tokenizer=tokenizer,
+        prompt=prompt_tokens[:-1],
+        max_tokens=1,
+        sampler=sampler,
+        prompt_cache=cache,
+        prefill_step_size=512,
+        kv_group_size=KV_GROUP_SIZE,
+        kv_bits=KV_BITS,
+    ):
+        break
+
+    # Match `prefill()`'s trim(2): stream_generate processed prompt[:-1] (N-1
+    # tokens) and added 1 more generated token to the cache, so cache.offset
+    # is at N. We trim 2 to land at N-2, which matches the target cache state.
+    for c in cache:
+        c.trim(2)
     mx.clear_cache()
 
 
@@ -869,15 +890,20 @@ def mlx_generate(
             drafter_matched_index = None
             drafter_prefix_hit_length = 0
 
-        # Prefill the drafter on the un-cached prompt tail. We skip the last
-        # token because stream_generate consumes it as its starting input.
+        # Drive the drafter through the same prefill+trim ritual as the
+        # target so both caches end up at matched offsets before mlx_lm's
+        # speculative_generate_step takes over (see drafter_prefill docstring).
         if len(drafter_remaining) > 1:
             drafter_prefill_start = time.perf_counter()
             drafter_prefill(
-                effective_draft_model, drafter_caches, drafter_remaining[:-1]
+                effective_draft_model,
+                tokenizer,
+                sampler,
+                drafter_caches,
+                drafter_remaining,
             )
             logger.debug(
-                f"Drafter prefill: {len(drafter_remaining) - 1} tokens in "
+                f"Drafter prefill: {len(drafter_remaining)} tokens in "
                 f"{(time.perf_counter() - drafter_prefill_start):.2f}s"
             )
 
