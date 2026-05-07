@@ -6,7 +6,6 @@ Falls back gracefully if the peer is unreachable or the transfer fails.
 """
 
 import asyncio
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -41,12 +40,11 @@ async def get_peer_file_status(
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=timeout)
-        ) as session:
-            async with session.get(url) as r:
-                if r.status != 200:
-                    return None
-                data = await r.json()
-                return [PeerFileInfo(**f) for f in data.get("files", [])]
+        ) as session, session.get(url) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+            return [PeerFileInfo(**f) for f in data.get("files", [])]
     except Exception as e:
         logger.debug(f"Could not reach peer {peer_host}:{peer_port}: {e}")
         return None
@@ -103,36 +101,32 @@ async def download_file_from_peer(
             got_bytes = False
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=300, sock_read=60)
-            ) as session:
-                async with session.get(url, headers=headers) as r:
-                    if r.status == 416:
-                        # Range not satisfiable - peer doesn't have more yet
-                        pass
-                    elif r.status in (200, 206):
-                        peer_complete = r.headers.get("X-Exo-Complete") == "true"
-                        safe_bytes = int(r.headers.get("X-Exo-Safe-Bytes", "0"))
-
-                        async with aiofiles.open(
-                            partial_path, "ab" if n_read > 0 else "wb"
-                        ) as f:
-                            while True:
-                                chunk = await r.content.read(chunk_size)
-                                if not chunk:
-                                    break
-                                written = await f.write(chunk)
-                                n_read += written
-                                got_bytes = True
-                                on_progress(n_read, expected_size, False)
-                    elif r.status == 404:
-                        logger.debug(
-                            f"File {file_path} not found on peer {peer_host}"
-                        )
-                        return None
-                    else:
-                        logger.warning(
-                            f"Unexpected status {r.status} from peer {peer_host}"
-                        )
-                        return None
+            ) as session, session.get(url, headers=headers) as r:
+                if r.status == 416:
+                    # Range not satisfiable - peer doesn't have more yet
+                    pass
+                elif r.status in (200, 206):
+                    async with aiofiles.open(
+                        partial_path, "ab" if n_read > 0 else "wb"
+                    ) as f:
+                        while True:
+                            chunk = await r.content.read(chunk_size)
+                            if not chunk:
+                                break
+                            written = await f.write(chunk)
+                            n_read += written
+                            got_bytes = True
+                            on_progress(n_read, expected_size, False)
+                elif r.status == 404:
+                    logger.debug(
+                        f"File {file_path} not found on peer {peer_host}"
+                    )
+                    return None
+                else:
+                    logger.warning(
+                        f"Unexpected status {r.status} from peer {peer_host}"
+                    )
+                    return None
 
             # Check if we're done
             if n_read >= expected_size:

@@ -68,7 +68,7 @@ class RequestEventLog(BaseCommand):
     since_idx: int
 
 
-class PeerEndpoint(CamelCaseModel):
+class PeerEndpoint(FrozenModel):
     """A peer node that has (or is downloading) a model, with its network address."""
 
     node_id: NodeId

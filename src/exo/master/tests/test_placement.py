@@ -664,6 +664,10 @@ def test_qwen3_5_tensor_auto_upgrade_requires_opt_in(
         model_card=model_card,
         min_nodes=2,
     )
+    node_rdma_ctl = {
+        large_node: NodeRdmaCtlStatus(enabled=True),
+        small_node: NodeRdmaCtlStatus(enabled=True),
+    }
 
     placements_without_opt_in = place_instance(
         command,
@@ -677,6 +681,7 @@ def test_qwen3_5_tensor_auto_upgrade_requires_opt_in(
             large_node: create_jaccl_node_network("192.168.0.1"),
             small_node: create_jaccl_node_network("192.168.0.2"),
         },
+        node_rdma_ctl=node_rdma_ctl,
     )
     instance_without_opt_in = next(iter(placements_without_opt_in.values()))
     large_runner_without_opt_in = (
@@ -703,6 +708,7 @@ def test_qwen3_5_tensor_auto_upgrade_requires_opt_in(
             large_node: create_jaccl_node_network("192.168.0.1"),
             small_node: create_jaccl_node_network("192.168.0.2"),
         },
+        node_rdma_ctl=node_rdma_ctl,
     )
 
     instance = next(iter(placements.values()))
@@ -1017,8 +1023,19 @@ def test_jaccl_placement_uses_advertised_lan_ip_for_rdma_coordinator(
         model_card=model_card,
         min_nodes=2,
     )
+    node_rdma_ctl = {
+        node_a: NodeRdmaCtlStatus(enabled=True),
+        node_b: NodeRdmaCtlStatus(enabled=True),
+    }
 
-    placements = place_instance(command, topology, {}, node_memory, node_network)
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        node_rdma_ctl=node_rdma_ctl,
+    )
 
     instance = list(placements.values())[0]
     assert isinstance(instance, MlxJacclInstance)

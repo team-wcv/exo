@@ -1,6 +1,5 @@
 """Tests for peer-to-peer model downloading."""
 
-import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -45,13 +44,12 @@ class TestPeerFileServer:
         """Health endpoint should return ok."""
         import aiohttp
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"http://127.0.0.1:{peer_server.port}/health"
-            ) as r:
-                assert r.status == 200
-                data = await r.json()
-                assert data["status"] == "ok"
+        async with aiohttp.ClientSession() as session, session.get(
+            f"http://127.0.0.1:{peer_server.port}/health"
+        ) as r:
+            assert r.status == 200
+            data = await r.json()
+            assert data["status"] == "ok"
 
     async def test_status_empty_model(self, peer_server: PeerFileServer) -> None:
         """Status for non-existent model should return empty file list."""
@@ -122,14 +120,13 @@ class TestPeerFileServer:
 
         import aiohttp
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"http://127.0.0.1:{peer_server.port}/files/test--model/config.json"
-            ) as r:
-                assert r.status == 200
-                assert r.headers["X-Exo-Complete"] == "true"
-                body = await r.read()
-                assert body == content
+        async with aiohttp.ClientSession() as session, session.get(
+            f"http://127.0.0.1:{peer_server.port}/files/test--model/config.json"
+        ) as r:
+            assert r.status == 200
+            assert r.headers["X-Exo-Complete"] == "true"
+            body = await r.read()
+            assert body == content
 
     async def test_serve_with_range_request(
         self, peer_server: PeerFileServer, temp_models_dir: Path
@@ -144,24 +141,22 @@ class TestPeerFileServer:
 
         import aiohttp
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"http://127.0.0.1:{peer_server.port}/files/test--model/weights.bin",
-                headers={"Range": "bytes=8-"},
-            ) as r:
-                assert r.status == 206
-                body = await r.read()
-                assert body == b"89abcdef"
+        async with aiohttp.ClientSession() as session, session.get(
+            f"http://127.0.0.1:{peer_server.port}/files/test--model/weights.bin",
+            headers={"Range": "bytes=8-"},
+        ) as r:
+            assert r.status == 206
+            body = await r.read()
+            assert body == b"89abcdef"
 
     async def test_file_not_found(self, peer_server: PeerFileServer) -> None:
         """Should return 404 for missing files."""
         import aiohttp
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"http://127.0.0.1:{peer_server.port}/files/test--model/missing.bin"
-            ) as r:
-                assert r.status == 404
+        async with aiohttp.ClientSession() as session, session.get(
+            f"http://127.0.0.1:{peer_server.port}/files/test--model/missing.bin"
+        ) as r:
+            assert r.status == 404
 
 
 class TestPeerDownloadClient:
