@@ -683,17 +683,30 @@ def mlx_generate(
     if is_bench and not task.use_prefix_cache:
         kv_prefix_cache = None
 
+    # When the drafter is going to participate, force plain KVCache for the
+    # *target* too. mlx_lm's `speculative_generate_step` performs trim+extend
+    # cycles on every spec round, which RotatingKVCache (used by gemma-4 for
+    # sliding-window layers) handles by physically rotating its underlying KV
+    # buffer -- making each round ~750x slower than a non-spec decode. The
+    # plain KVCache trades unbounded growth (fine for the typical request
+    # length) for spec-friendly trim semantics. Distributed runs don't use
+    # the drafter today, so this only applies to single-device.
+    target_force_plain = draft_model is not None and group is None
+
     # Use prefix cache if available, otherwise create fresh cache
     prefix_hit_length = 0
     matched_index: int | None = None
     is_exact_hit = False
     if kv_prefix_cache is None:
-        caches = make_kv_cache(model=model)
+        caches = make_kv_cache(model=model, force_plain_kv_cache=target_force_plain)
         prompt_tokens = all_prompt_tokens
     else:
         caches, prompt_tokens, matched_index, is_exact_hit = (
             kv_prefix_cache.get_kv_cache(
-                model, all_prompt_tokens, media_regions=media_regions
+                model,
+                all_prompt_tokens,
+                media_regions=media_regions,
+                force_plain_kv_cache=target_force_plain,
             )
         )
         prefix_hit_length = len(all_prompt_tokens) - len(prompt_tokens)
