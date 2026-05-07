@@ -7,7 +7,7 @@ import time
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, cast, final
+from typing import TYPE_CHECKING, Any, cast, final
 
 if TYPE_CHECKING:
     from exo.worker.engines.mlx.vision import VisionProcessor
@@ -209,9 +209,20 @@ class MlxGroupSplit:
     Asymmetric placement: ``parent`` spans N+1 ranks (N target + 1
     drafter at rank ``parent.size() - 1``). Target ranks see a
     ``target_subgroup`` of size N for tensor / pipeline collectives;
-    the drafter rank sees a size-1 subgroup that it never uses.
-    ``parent`` is reserved for ``RemoteTransport.send/recv`` between
-    target rank 0 and the drafter rank.
+    the drafter rank sees ``target_subgroup is None`` because the
+    drafter never runs target-side collectives. ``parent`` is reserved
+    for ``RemoteTransport.send/recv`` between target rank 0 and the
+    drafter rank.
+
+    For V1 N=1 (single target rank, parent_size == 2) the target rank
+    also sets ``target_subgroup = None``. ``None`` is the well-known
+    "single rank, no collectives needed" signal that
+    :func:`load_mlx_items`, :func:`mx_barrier`, :func:`mx_any`, etc.
+    already understand and short-circuit on. We don't synthesize a
+    size-1 ``mx.distributed.Group`` because MLX's ring and jaccl
+    backends do not implement ``Group.split`` on Apple Silicon, and a
+    pure-Python stub fails the C++ ``mx.distributed.all_sum`` nanobind
+    type check.
 
     The drafter rank is always last in the parent group, by placement
     convention. This avoids needing to broadcast the drafter rank index
@@ -221,21 +232,12 @@ class MlxGroupSplit:
     """
 
     parent: mx.distributed.Group
-    target_subgroup: mx.distributed.Group
+    target_subgroup: mx.distributed.Group | None
     drafter_rank_in_parent: int | None
 
     @property
     def is_asymmetric(self) -> bool:
         return self.drafter_rank_in_parent is not None
-
-
-# Color values for ``mx.distributed.Group.split``. Target ranks use
-# ``COLOR_TARGET`` so they end up in one subgroup; the drafter rank
-# uses ``COLOR_DRAFTER`` so it ends up alone in a size-1 subgroup that
-# it doesn't use (``split`` is a collective so every rank must call
-# it).
-COLOR_TARGET: Final = 0
-COLOR_DRAFTER: Final = 1
 
 
 def initialize_mlx(bound_instance: BoundInstance) -> MlxGroupSplit:
@@ -244,8 +246,9 @@ def initialize_mlx(bound_instance: BoundInstance) -> MlxGroupSplit:
     For symmetric placement (no drafter) returns a split where parent
     and target subgroup are the same object. For asymmetric placement
     returns three things in one struct: the parent (used for drafter
-    IPC), the target subgroup (used for tensor / pipeline collectives),
-    and the drafter rank index in the parent group.
+    IPC), the target subgroup (used for tensor / pipeline collectives,
+    or ``None`` for V1 N=1), and the drafter rank index in the parent
+    group.
     """
     # should we unseed it?
     # TODO: pass in seed from params
@@ -272,12 +275,11 @@ def initialize_mlx(bound_instance: BoundInstance) -> MlxGroupSplit:
     # V1 boundary: single target rank + drafter rank (parent_size == 2).
     # MLX's ring and jaccl backends do not implement ``Group.split`` on
     # Apple Silicon (only the MPI backend does), so we cannot construct
-    # a real target-only subgroup. Fortunately V1 only supports a single
-    # target rank, where TP=1 / PP=1 means the target never invokes
-    # collectives over the subgroup -- ``self.group`` is read only for
-    # ``rank()`` / ``size()`` introspection. We expose a non-distributed
-    # singleton group for the target rank so its sharding code sees
-    # world_size=1 and never tries to call collectives at all.
+    # a real target-only subgroup. Fortunately V1 only supports a
+    # single target rank, where TP=1 / PP=1 means the target never
+    # invokes target-subgroup collectives at all -- the existing
+    # ``group is None`` short-circuits in ``load_mlx_items``,
+    # ``mx_barrier``, and ``mx_any`` cover us.
     #
     # When V2 lands (multi-target asymmetric, parent_size > 2), the
     # target subgroup MUST exclude the drafter rank because TP/PP
@@ -292,45 +294,11 @@ def initialize_mlx(bound_instance: BoundInstance) -> MlxGroupSplit:
             "do not support split on Apple Silicon today; V1 supports a "
             "single target rank (parent_size == 2)."
         )
-    # ``mx.distributed.Group`` is a C++-backed type; ``_SingletonStubGroup``
-    # implements the only methods the V1 N=1 target flow reads. Routing
-    # through ``object`` documents the deliberate type narrowing.
-    target_subgroup = cast(
-        "mx.distributed.Group", cast(object, _SingletonStubGroup())
-    )
     return MlxGroupSplit(
         parent=parent,
-        target_subgroup=target_subgroup,
+        target_subgroup=None,
         drafter_rank_in_parent=drafter_rank,
     )
-
-
-class _SingletonStubGroup:
-    """Stand-in for a size-1 ``mx.distributed.Group`` on Apple Silicon.
-
-    MLX's ring and jaccl backends do not implement ``Group.split``; we
-    cannot ask the parent group to give us a real target-only subgroup.
-    For V1 N=1 target placements the target's TP/PP code only reads
-    ``rank()`` / ``size()`` for sharding decisions and -- with
-    ``world_size==1`` -- never invokes ``mx.distributed`` collectives.
-    A pure-Python stub satisfies the interface without needing a C++
-    ``Group`` handle.
-
-    Casting to ``mx.distributed.Group`` at the use site is safe because
-    no path in the V1 single-target flow ever passes this object to a
-    real collective; if a future change does, it will fail loudly with
-    a TypeError pointing operators at the V1 boundary.
-    """
-
-    def rank(self) -> int:
-        return 0
-
-    def size(self) -> int:
-        return 1
-
-    def split(self, color: int, key: int = -1) -> "_SingletonStubGroup":
-        del color, key
-        return self
 
 
 EXO_DISABLE_DRAFTER_ENV = "EXO_DISABLE_DRAFTER"
@@ -472,10 +440,13 @@ def load_mlx_items(
     # Pre-include drafter size in the wired-memory limit so the OS doesn't
     # page out drafter weights between requests. We have to make this decision
     # *before* loading the target because `set_wired_limit_for_model` configures
-    # the limit once.
+    # the limit once. Skip the bump for asymmetric placements: the drafter
+    # weights live on a different node so they don't draw from this rank's
+    # wired pool.
     combined_size = target_size
     if (
         group is None
+        and bound_instance.instance.drafter_placement is None
         and not _drafter_disabled_by_env()
         and target_card.drafter_model_ids
     ):
@@ -514,9 +485,16 @@ def load_mlx_items(
         logger.info(f"Time taken to load model: {(end_time - start_time):.2f}s")
         tokenizer = get_tokenizer(model_path, bound_instance.bound_shard)
 
-        drafter_pair = _maybe_load_drafter(target_card)
-        if drafter_pair is not None:
-            drafter_id, drafter_model = drafter_pair
+        # Skip the local in-process drafter when an asymmetric drafter
+        # rank exists for this instance: ``DrafterPlacement`` means the
+        # drafter is a separate ``DrafterRunner`` reachable via
+        # ``RemoteTransport`` over the parent group, and loading a
+        # second copy locally would just duplicate the weights and
+        # confuse the spec-decode loop.
+        if bound_instance.instance.drafter_placement is None:
+            drafter_pair = _maybe_load_drafter(target_card)
+            if drafter_pair is not None:
+                drafter_id, drafter_model = drafter_pair
 
     else:
         logger.info("Starting distributed init")
