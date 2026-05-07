@@ -316,19 +316,16 @@ class RemoteTransport:
             num_forwards=num_forwards,
             trim_amount=0,
         )
-        try:
-            from exo.worker.runner.bootstrap import logger as _bootstrap_logger
-
-            _bootstrap_logger.info(
-                f"RemoteTransport._forward_blocking send: op=OP_FORWARD "
-                f"num_inputs={len(inputs)} num_forwards={num_forwards} "
-                f"inputs={inputs} drafter_rank={self._drafter_rank} "
-                f"target_rank={self._target_rank} "
-                f"frame_array={[int(x) for x in frame.tolist()]}"  # type: ignore[reportUnknownArgumentType]
-            )
-        except Exception:
-            pass
-        mx.distributed.send(frame, self._drafter_rank, group=self._group)
+        sent_frame = mx.distributed.send(frame, self._drafter_rank, group=self._group)
+        # Force the send to actually leave the local stream. ``mx.distributed.send``
+        # returns an ``mx.array`` whose evaluation is what flushes the
+        # underlying RDMA / ring transmit; without this kick MLX leaves
+        # the send queued indefinitely while the target sits inside
+        # ``mx.eval(drafts_buffer)`` polling for a response that the
+        # peer can't produce -- a wire-level deadlock that masquerades
+        # as "drafter never replies". Mirrors the pattern in
+        # ``auto_parallel.flush_prefill_sends``.
+        mx.async_eval(sent_frame)
         # Drafts buffer is fixed-size at K + 1 (the upper bound of any
         # forward request); we slice to ``num_forwards`` here.
         drafts_buffer = mx.distributed.recv(
@@ -349,7 +346,8 @@ class RemoteTransport:
             num_forwards=0,
             trim_amount=n_positions,
         )
-        mx.distributed.send(frame, self._drafter_rank, group=self._group)
+        sent_frame = mx.distributed.send(frame, self._drafter_rank, group=self._group)
+        mx.async_eval(sent_frame)
         ack = mx.distributed.recv(
             shape=(ACK_FRAME_SIZE,),
             dtype=mx.uint32,
@@ -370,7 +368,8 @@ class RemoteTransport:
             num_forwards=0,
             trim_amount=0,
         )
-        mx.distributed.send(frame, self._drafter_rank, group=self._group)
+        sent_frame = mx.distributed.send(frame, self._drafter_rank, group=self._group)
+        mx.async_eval(sent_frame)
         ack = mx.distributed.recv(
             shape=(ACK_FRAME_SIZE,),
             dtype=mx.uint32,
@@ -394,21 +393,14 @@ class RemoteTransport:
             num_forwards=num_prompt_tokens,
             trim_amount=0,
         )
-        try:
-            from exo.worker.runner.bootstrap import logger as _bootstrap_logger
-
-            _bootstrap_logger.info(
-                f"RemoteTransport._reset_and_prefill_blocking send: "
-                f"op=OP_PREFILL num_prompt_tokens={num_prompt_tokens} "
-                f"drafter_rank={self._drafter_rank} "
-                f"frame_array={[int(x) for x in frame.tolist()]}"  # type: ignore[reportUnknownArgumentType]
-            )
-        except Exception:
-            pass
-        mx.distributed.send(frame, self._drafter_rank, group=self._group)
+        sent_frame = mx.distributed.send(frame, self._drafter_rank, group=self._group)
+        mx.async_eval(sent_frame)
         if num_prompt_tokens > 0:
             tokens_array = mx.array(prompt_tokens, dtype=mx.uint32)
-            mx.distributed.send(tokens_array, self._drafter_rank, group=self._group)
+            sent_tokens = mx.distributed.send(
+                tokens_array, self._drafter_rank, group=self._group
+            )
+            mx.async_eval(sent_tokens)
         ack = mx.distributed.recv(
             shape=(ACK_FRAME_SIZE,),
             dtype=mx.uint32,
@@ -505,24 +497,14 @@ def drafter_serve_loop(
         )
         mx.eval(frame)
         op, inputs, num_forwards, trim_amount = _decode_command_frame(frame)
-        # Diagnostic: surface the raw decoded frame so wire-protocol
-        # mismatches between target and drafter are debuggable without
-        # needing a coupled tracer. Logged at INFO so it's visible
-        # without enabling debug-level on the drafter rank.
-        try:
-            from exo.worker.runner.bootstrap import logger as _bootstrap_logger
-
-            _bootstrap_logger.info(
-                f"drafter_serve_loop recv frame: op={op} "
-                f"num_inputs={len(inputs)} num_forwards={num_forwards} "
-                f"trim_amount={trim_amount} inputs={inputs}"
-            )
-        except Exception:
-            pass
 
         if op == OP_SHUTDOWN:
             ack = mx.array([ACK_OK], dtype=mx.uint32)
-            mx.distributed.send(ack, target_rank, group=group)
+            sent_ack = mx.distributed.send(ack, target_rank, group=group)
+            # Force the reply to flush before we return -- the target
+            # is waiting on this ack inside ``_shutdown_blocking`` and
+            # we will tear the serve loop down right after.
+            mx.eval(sent_ack)
             return
 
         if op == OP_TRIM_CACHE:
@@ -531,7 +513,8 @@ def drafter_serve_loop(
 
                 mlx_trim_prompt_cache(_cast(list[object], draft_cache), trim_amount)  # type: ignore[reportArgumentType]
             ack = mx.array([ACK_OK], dtype=mx.uint32)
-            mx.distributed.send(ack, target_rank, group=group)
+            sent_ack = mx.distributed.send(ack, target_rank, group=group)
+            mx.async_eval(sent_ack)
             continue
 
         if op == OP_FORWARD:
@@ -544,7 +527,8 @@ def drafter_serve_loop(
             # Pad to fixed-shape buffer so the target's recv pre-allocation matches.
             padded = list(outputs) + [0] * (drafts_buffer_size - len(outputs))
             response = mx.array(padded, dtype=mx.uint32)
-            mx.distributed.send(response, target_rank, group=group)
+            sent_response = mx.distributed.send(response, target_rank, group=group)
+            mx.async_eval(sent_response)
             continue
 
         if op == OP_PREFILL:
@@ -560,7 +544,8 @@ def drafter_serve_loop(
                 group=group,
             )
             ack = mx.array([ACK_OK], dtype=mx.uint32)
-            mx.distributed.send(ack, target_rank, group=group)
+            sent_ack = mx.distributed.send(ack, target_rank, group=group)
+            mx.async_eval(sent_ack)
             continue
 
         # Unknown op code: this is a wire-protocol violation, not a
