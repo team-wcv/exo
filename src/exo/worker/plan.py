@@ -293,16 +293,30 @@ def _ready_to_warmup(
         assert parent_rank < parent_size
         assert parent_rank >= 0
 
+        # ``RunnerWarmingUp`` is the canonical "ready to run warmup" state
+        # for an accepting rank, but a peer that has already advanced past
+        # warmup (``RunnerReady``/``RunnerRunning``) is *strictly past*
+        # the barrier we care about. Asymmetric drafter rank warmup is
+        # near-instant (one forward pass) so it can race past
+        # ``RunnerWarmingUp`` before the connecting rank's plan loop
+        # observes it; without including the post-warmup states the
+        # connecting rank stalls in ``RunnerLoaded`` forever.
+        post_loaded_states = (
+            RunnerWarmingUp,
+            RunnerReady,
+            RunnerRunning,
+        )
+
         accepting_ranks_ready = parent_rank > 0 and all(
             isinstance(
                 all_runners.get(global_runner_id, None),
-                (RunnerLoaded, RunnerWarmingUp),
+                (RunnerLoaded, *post_loaded_states),
             )
             for global_runner_id in instance.all_runner_ids
         )
 
         connecting_rank_ready = parent_rank == 0 and all(
-            isinstance(all_runners.get(global_runner_id, None), RunnerWarmingUp)
+            isinstance(all_runners.get(global_runner_id, None), post_loaded_states)
             for global_runner_id in instance.all_runner_ids
             if global_runner_id != runner_id
         )
