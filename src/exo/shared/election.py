@@ -187,8 +187,7 @@ class Election:
                     continue
 
                 if any(
-                    not self._connection_state[node_id]
-                    for node_id in changed_node_ids
+                    not self._connection_state[node_id] for node_id in changed_node_ids
                 ):
                     await anyio.sleep(DEFAULT_DROPOUT_GRACE_SECONDS)
                     follow_up_messages = connection_messages.collect()

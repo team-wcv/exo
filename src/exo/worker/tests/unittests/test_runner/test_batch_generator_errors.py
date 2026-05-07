@@ -16,7 +16,10 @@ from exo.shared.types.worker.instances import InstanceId
 from exo.utils.channels import MpSender
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.runner.llm_inference import batch_generator as batch_generator_module
-from exo.worker.runner.llm_inference.batch_generator import BatchGenerator, Finished
+from exo.worker.runner.llm_inference.batch_generator import (
+    BatchGenerator,
+    FinishedResponse,
+)
 
 
 class _FakeBatchEngine:
@@ -62,7 +65,7 @@ def test_batch_generator_finishes_task_when_prompt_template_fails(
     generator._queue = deque([task])  # pyright: ignore[reportPrivateUsage]
     generator._active_tasks = {}  # pyright: ignore[reportPrivateUsage]
     generator._cancelled_tasks = set()  # pyright: ignore[reportPrivateUsage]
-    generator._mlx_gen = cast(ExoBatchGenerator, cast(object, _FakeBatchEngine()))  # pyright: ignore[reportPrivateUsage]
+    generator._gen = cast(ExoBatchGenerator, cast(object, _FakeBatchEngine()))  # pyright: ignore[reportPrivateUsage]
 
     def fail_template(*_args: object, **_kwargs: object) -> None:
         raise ValueError("bad tool history")
@@ -77,7 +80,7 @@ def test_batch_generator_finishes_task_when_prompt_template_fails(
 
     assert len(results) == 1
     assert results[0][0] == task.task_id
-    assert isinstance(results[0][1], Finished)
+    assert isinstance(results[0][1], FinishedResponse)
     assert generator._active_tasks == {}  # pyright: ignore[reportPrivateUsage]
     assert len(sender.events) == 1
     assert isinstance(sender.events[0], ChunkGenerated)

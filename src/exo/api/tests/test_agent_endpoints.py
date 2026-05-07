@@ -150,8 +150,7 @@ def test_provider_list_includes_default_model_and_instance_endpoints() -> None:
         provider.kind == "instance"
         and provider.model_id == model_id
         and provider.target_instance_id == instance_id
-        and provider.openai_base_url
-        == "http://testserver/agents/inst-instance-one/v1"
+        and provider.openai_base_url == "http://testserver/agents/inst-instance-one/v1"
         and provider.claude_base_url is None
         for provider in providers
     )
@@ -234,7 +233,9 @@ async def test_agent_chat_dispatches_with_target_instance_id() -> None:
 
     api._send_text_generation_with_images = MethodType(_capture_send, api)
     route = api._resolve_text_generation_route(
-        ModelId("ignored-request-model"), f"inst-{instance_id}", _RequestStub()  # type: ignore[arg-type]
+        ModelId("ignored-request-model"),
+        f"inst-{instance_id}",
+        _RequestStub(),  # type: ignore[arg-type]
     )
 
     command = await api._send_routed_text_generation(
@@ -267,7 +268,9 @@ async def test_model_endpoint_dispatches_without_target_instance_id() -> None:
 
     api._send_text_generation_with_images = MethodType(_capture_send, api)
     route = api._resolve_text_generation_route(
-        ModelId("ignored-request-model"), endpoint, _RequestStub()  # type: ignore[arg-type]
+        ModelId("ignored-request-model"),
+        endpoint,
+        _RequestStub(),  # type: ignore[arg-type]
     )
 
     command = await api._send_routed_text_generation(
@@ -284,7 +287,9 @@ def test_unknown_agent_endpoint_returns_404_before_dispatch() -> None:
 
     with pytest.raises(HTTPException) as exception_info:
         api._resolve_text_generation_route(
-            ModelId("model"), "inst-deleted", _RequestStub()  # type: ignore[arg-type]
+            ModelId("model"),
+            "inst-deleted",
+            _RequestStub(),  # type: ignore[arg-type]
         )
 
     assert exception_info.value.status_code == 404
@@ -342,6 +347,7 @@ def test_http_agent_models_returns_backing_model(
             "supports_tensor": True,
             "tasks": ["TextGeneration"],
             "is_custom": False,
+            "reasoning_dialect": "none",
             "family": "",
             "quantization": "",
             "base_model": "",
@@ -377,7 +383,10 @@ def test_http_unknown_agent_chat_returns_404_before_dispatch() -> None:
 
     response = client.post(
         "/agents/missing/v1/chat/completions",
-        json={"model": "missing-model", "messages": [{"role": "user", "content": "hi"}]},
+        json={
+            "model": "missing-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
     )
 
     assert response.status_code == 404

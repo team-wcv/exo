@@ -35,8 +35,7 @@ def filter_cycles_by_memory(
             (
                 _placement_memory_for_node(
                     node_memory[node_id],
-                    use_total_memory=allow_single_node_total_memory
-                    and len(cycle) == 1,
+                    use_total_memory=allow_single_node_total_memory and len(cycle) == 1,
                 )
                 for node_id in cycle.node_ids
             ),
@@ -428,7 +427,7 @@ def _find_connection_ip(
             yield connection.sink_multiaddr.ip_address
 
 
-def _find_ip_prioritised(
+def find_ip_prioritised(
     node_id: NodeId,
     other_node_id: NodeId,
     cycle_digraph: Topology,
@@ -547,7 +546,7 @@ def get_mlx_ring_hosts_by_node(
                 hosts_for_node.append(Host(ip="198.51.100.1", port=0))
                 continue
 
-            connection_ip = _find_ip_prioritised(
+            connection_ip = find_ip_prioritised(
                 node_id, other_node_id, cycle_digraph, node_network, ring=True
             )
             if connection_ip is None:
@@ -579,7 +578,7 @@ def get_mlx_jaccl_coordinators(
         if n == coordinator:
             return "0.0.0.0"
 
-        ip = _find_ip_prioritised(
+        ip = find_ip_prioritised(
             n, coordinator, cycle_digraph, node_network, ring=False
         )
         if ip is not None:

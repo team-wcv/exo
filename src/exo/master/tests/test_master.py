@@ -423,9 +423,7 @@ def test_text_generation_with_target_instance_uses_that_instance() -> None:
 
     assert (
         master._select_text_generation_instance(
-            _test_text_generation(
-                model_id, target_instance_id=target_instance_id
-            )
+            _test_text_generation(model_id, target_instance_id=target_instance_id)
         )
         == target_instance_id
     )
