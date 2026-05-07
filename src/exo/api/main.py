@@ -486,6 +486,7 @@ class API:
             base_model=card.base_model,
             capabilities=card.capabilities,
             reasoning_dialect=card.reasoning_dialect,
+            drafter_model_id=card.drafter_model_id,
             context_length=card.context_length,
         )
 

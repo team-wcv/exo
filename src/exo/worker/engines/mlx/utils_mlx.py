@@ -27,7 +27,7 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.models.deepseek_v3 import DeepseekV3Model
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
-from exo.shared.models.model_cards import ModelId
+from exo.shared.models.model_cards import ModelCard, ModelId
 from exo.worker.engines.mlx.constants import TRUST_REMOTE_CODE
 
 try:
@@ -41,7 +41,7 @@ import mlx.nn as nn
 from mlx_lm.utils import load_model
 from pydantic import RootModel
 
-from exo.download.download_utils import build_model_path
+from exo.download.download_utils import build_model_path, resolve_existing_model
 from exo.shared.types.common import Host
 from exo.shared.types.memory import Memory
 from exo.shared.types.tasks import TaskId, TextGeneration
@@ -192,13 +192,74 @@ def initialize_mlx(
     return mlx_distributed_init(bound_instance)
 
 
+EXO_DISABLE_DRAFTER_ENV = "EXO_DISABLE_DRAFTER"
+
+
+def _drafter_disabled_by_env() -> bool:
+    return os.environ.get(EXO_DISABLE_DRAFTER_ENV, "").lower() in {"1", "true", "yes"}
+
+
+def _maybe_load_drafter(model_card: ModelCard) -> Model | None:
+    """Load the drafter model declared on ``model_card``, if any.
+
+    Returns ``None`` when the card has no drafter, the drafter weights are not
+    on disk, or the user has disabled drafter loading via
+    ``EXO_DISABLE_DRAFTER``. Drafter loading failures are logged and swallowed:
+    the target model continues to load and inference falls back to standard
+    (non-speculative) decoding.
+
+    This helper is intentionally single-device only. Multi-device distributed
+    inference does not pass ``draft_model`` through to ``stream_generate``
+    today (see ``mlx_generate``), so loading a drafter on those ranks would
+    just waste memory.
+    """
+    drafter_id = model_card.drafter_model_id
+    if drafter_id is None:
+        return None
+    if _drafter_disabled_by_env():
+        logger.info(
+            f"Drafter {drafter_id} declared by {model_card.model_id} but "
+            f"{EXO_DISABLE_DRAFTER_ENV} is set; skipping drafter load."
+        )
+        return None
+
+    drafter_path = resolve_existing_model(drafter_id)
+    if drafter_path is None:
+        logger.warning(
+            f"Drafter {drafter_id} declared by {model_card.model_id} is not "
+            "downloaded; falling back to standard decoding. Pre-download the "
+            "drafter to enable speculative decoding."
+        )
+        return None
+
+    drafter_start = time.perf_counter()
+    try:
+        drafter_model, _ = load_model(drafter_path, lazy=True, strict=False)
+        mx.eval(drafter_model)
+    except Exception as exc:
+        logger.opt(exception=exc).warning(
+            f"Failed to load drafter {drafter_id}; continuing without "
+            "speculative decoding."
+        )
+        return None
+    logger.info(
+        f"Loaded drafter {drafter_id} for {model_card.model_id} in "
+        f"{(time.perf_counter() - drafter_start):.2f}s"
+    )
+    return cast(Model, drafter_model)
+
+
 def load_mlx_items(
     bound_instance: BoundInstance,
     group: mx.distributed.Group | None,
 ) -> Generator[
-    ModelLoadingResponse, None, tuple[Model, TokenizerWrapper, "VisionProcessor | None"]
+    ModelLoadingResponse,
+    None,
+    tuple[Model, TokenizerWrapper, "VisionProcessor | None", Model | None],
 ]:
     set_wired_limit_for_model(get_weights_size(bound_instance.bound_shard))
+
+    drafter_model: Model | None = None
 
     if group is None:
         logger.info(f"Single device used for {bound_instance.instance}")
@@ -221,6 +282,8 @@ def load_mlx_items(
         end_time = time.perf_counter()
         logger.info(f"Time taken to load model: {(end_time - start_time):.2f}s")
         tokenizer = get_tokenizer(model_path, bound_instance.bound_shard)
+
+        drafter_model = _maybe_load_drafter(bound_instance.bound_shard.model_card)
 
     else:
         logger.info("Starting distributed init")
@@ -258,7 +321,7 @@ def load_mlx_items(
     else:
         vision_processor = None
 
-    return cast(Model, model), tokenizer, vision_processor
+    return cast(Model, model), tokenizer, vision_processor, drafter_model
 
 
 def shard_and_load(

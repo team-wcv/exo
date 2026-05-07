@@ -98,6 +98,10 @@ class SequentialGenerator(Engine):
     cancel_receiver: MpReceiver[TaskId]
     event_sender: MpSender[Event]
     vision_processor: VisionProcessor | None = None
+    # Optional draft model for speculative decoding (single-device only).
+    # `mlx_generate` itself enforces ``draft_model=None`` whenever ``group is
+    # not None``; this field is only ever populated for single-device runners.
+    draft_model: Model | None = None
     check_for_cancel_every: int = 50
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
@@ -295,6 +299,7 @@ class SequentialGenerator(Engine):
             on_generation_token=on_generation_token,
             group=self.group,
             vision_processor=self.vision_processor,
+            draft_model=self.draft_model,
         )
 
     def close(self) -> None:
