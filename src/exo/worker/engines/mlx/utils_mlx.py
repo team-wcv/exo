@@ -1210,6 +1210,18 @@ def mx_all_gather_tasks(
     tasks: list[TextGeneration],
     group: mx.distributed.Group | None,
 ) -> tuple[list[TextGeneration], list[TextGeneration]]:
+    # Single-rank short-circuit. ``mx.distributed.all_gather(group=None)``
+    # delegates to the MLX *default* group, which on an asymmetric runner
+    # is the parent (target+drafter) group. The drafter rank is busy in
+    # ``drafter_serve_loop`` doing its own ``recv`` on that same default
+    # group, so an unguarded all-gather here cross-talks with the
+    # drafter's wire protocol and corrupts the next command frame the
+    # drafter decodes (manifesting as ``num_forwards must be >= 1, got
+    # 0``). When ``group is None`` we are by construction the only
+    # participating rank, so every task is trivially "agreed".
+    if group is None:
+        return list(tasks), []
+
     def encode_task_id(task_id: TaskId) -> list[int]:
         utf8_task_id = task_id.encode()
         return [
@@ -1229,7 +1241,7 @@ def mx_all_gather_tasks(
         mx.distributed.all_gather(mx.array([n_tasks]), group=group).tolist(),
     )
     max_tasks = max(all_counts)
-    world_size: int = 1 if group is None else group.size()
+    world_size: int = group.size()
 
     if max_tasks == 0:
         return [], []
