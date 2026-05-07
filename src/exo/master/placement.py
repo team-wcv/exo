@@ -298,6 +298,25 @@ def place_instance(
         instance_meta = InstanceMeta.MlxRing
         sharding = Sharding.Pipeline
 
+    # Item 10: warn when a drafter-aware model gets multi-node placement.
+    # `get_smallest_cycles` already biases toward single-node when memory
+    # allows; getting here with len > 1 means no single-node cycle had
+    # enough memory. Speculative decoding is single-device only in mlx_lm,
+    # so the drafter declared on this card will be ignored. Log it
+    # actionably so operators know to grab a smaller quant.
+    if (
+        len(selected_cycle) > 1
+        and command.model_card.drafter_model_ids
+    ):
+        logger.warning(
+            f"Model {command.model_card.model_id} declares drafters "
+            f"{list(command.model_card.drafter_model_ids)} but is being "
+            f"placed across {len(selected_cycle)} nodes. Speculative "
+            "decoding is single-device only and will be disabled for this "
+            "instance. To get the drafter speedup, place a smaller quant "
+            "(e.g. 4-bit) on the largest single node instead."
+        )
+
     placement_node_memory = (
         _node_memory_with_total_capacity(selected_cycle, node_memory)
         if allow_single_node_total_memory and len(selected_cycle) == 1
