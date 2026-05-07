@@ -100,7 +100,7 @@ def _resolve_peer_endpoint(
                         status=status,
                         connection_type="rdma",
                     )
-            elif isinstance(conn.edge, SocketConnection):
+            else:
                 return PeerEndpoint(
                     node_id=peer_node_id,
                     ip=conn.edge.sink_multiaddr.ip_address,

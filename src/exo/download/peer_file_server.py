@@ -11,11 +11,14 @@ how many bytes have been safely flushed to disk.
 
 import json
 from pathlib import Path
+from typing import TypeAlias, cast
 
 import aiofiles
 import aiofiles.os as aios
 from aiohttp import web
 from loguru import logger
+
+PartialMeta: TypeAlias = dict[str, int | str]
 
 
 class PeerFileServer:
@@ -55,7 +58,7 @@ class PeerFileServer:
         if not await aios.path.exists(model_dir):
             return web.json_response({"files": []})
 
-        files = []
+        files: list[dict[str, object]] = []
         for item in model_dir.iterdir():
             if item.is_dir() or item.name.endswith(".partial.meta"):
                 continue
@@ -64,12 +67,14 @@ class PeerFileServer:
                 # In-progress file - read meta for safe bytes
                 meta = await _read_partial_meta(item)
                 if meta:
+                    total = _meta_int(meta, "total")
+                    safe_bytes = _meta_int(meta, "safe_bytes")
                     files.append(
                         {
                             "path": item.name.removesuffix(".partial"),
-                            "size": meta.get("total", 0),
+                            "size": total,
                             "complete": False,
-                            "safe_bytes": meta.get("safe_bytes", 0),
+                            "safe_bytes": safe_bytes,
                         }
                     )
             else:
@@ -107,11 +112,11 @@ class PeerFileServer:
             is_complete = True
         elif await aios.path.exists(partial_path):
             meta = await _read_partial_meta(partial_path)
-            if not meta or meta.get("safe_bytes", 0) == 0:
+            if not meta or _meta_int(meta, "safe_bytes") == 0:
                 return web.Response(status=404, text="File not available yet")
             serve_path = partial_path
-            file_size = meta.get("total", 0)
-            safe_bytes = meta["safe_bytes"]
+            file_size = _meta_int(meta, "total")
+            safe_bytes = _meta_int(meta, "safe_bytes")
             is_complete = False
         else:
             return web.Response(status=404, text="File not found")
@@ -162,13 +167,26 @@ class PeerFileServer:
         return response
 
 
-async def _read_partial_meta(partial_path: Path) -> dict | None:
+def _meta_int(meta: PartialMeta, key: str) -> int:
+    value = meta.get(key, 0)
+    return value if isinstance(value, int) else 0
+
+
+async def _read_partial_meta(partial_path: Path) -> PartialMeta | None:
     """Read the .partial.meta companion file for a .partial download."""
     meta_path = Path(f"{partial_path}.meta")
     if not await aios.path.exists(meta_path):
         return None
     try:
         async with aiofiles.open(meta_path, "r") as f:
-            return json.loads(await f.read())
+            data = cast(object, json.loads(await f.read()))
+            if not isinstance(data, dict):
+                return None
+            raw_meta = cast(dict[object, object], data)
+            return {
+                str(key): value
+                for key, value in raw_meta.items()
+                if isinstance(value, (int, str))
+            }
     except (json.JSONDecodeError, OSError):
         return None

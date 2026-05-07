@@ -8,7 +8,7 @@ Falls back gracefully if the peer is unreachable or the transfer fails.
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, cast
 
 import aiofiles
 import aiofiles.os as aios
@@ -24,6 +24,10 @@ class PeerFileInfo:
     size: int
     complete: bool
     safe_bytes: int
+
+
+def _as_int(value: object) -> int:
+    return value if isinstance(value, int) else 0
 
 
 async def get_peer_file_status(
@@ -43,8 +47,28 @@ async def get_peer_file_status(
         ) as session, session.get(url) as r:
             if r.status != 200:
                 return None
-            data = await r.json()
-            return [PeerFileInfo(**f) for f in data.get("files", [])]
+            data = cast(dict[str, object], await r.json())
+            files = data.get("files", [])
+            if not isinstance(files, list):
+                return []
+            raw_files = cast(list[object], files)
+            out: list[PeerFileInfo] = []
+            required = {"path", "size", "complete", "safe_bytes"}
+            for raw_file in raw_files:
+                if not isinstance(raw_file, dict):
+                    continue
+                file_info = cast(dict[str, object], raw_file)
+                if not required.issubset(file_info):
+                    continue
+                out.append(
+                    PeerFileInfo(
+                        path=str(file_info["path"]),
+                        size=_as_int(file_info["size"]),
+                        complete=bool(file_info["complete"]),
+                        safe_bytes=_as_int(file_info["safe_bytes"]),
+                    )
+                )
+            return out
     except Exception as e:
         logger.debug(f"Could not reach peer {peer_host}:{peer_port}: {e}")
         return None

@@ -11,20 +11,20 @@ decoupled from Worker state.
 
 import asyncio
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Coroutine
 from datetime import timedelta
 from pathlib import Path
-from typing import AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable
 
 from loguru import logger
 
 from exo.download.download_utils import (
     RepoDownloadProgress,
     calculate_repo_progress,
-    ensure_models_dir,
     fetch_file_list_with_cache,
     is_image_model,
     resolve_allow_patterns,
+    resolve_model_dir,
 )
 from exo.download.huggingface_utils import filter_repo_objects
 from exo.download.peer_download import (
@@ -34,8 +34,16 @@ from exo.download.peer_download import (
 from exo.download.shard_downloader import ShardDownloader
 from exo.shared.types.commands import PeerEndpoint
 from exo.shared.types.memory import Memory
-from exo.shared.types.worker.downloads import RepoFileDownloadProgress
+from exo.shared.types.worker.downloads import FileListEntry, RepoFileDownloadProgress
 from exo.shared.types.worker.shards import ShardMetadata
+
+
+async def _run_progress_callback(
+    callback: Callable[[ShardMetadata, RepoDownloadProgress], Awaitable[None]],
+    shard: ShardMetadata,
+    progress: RepoDownloadProgress,
+) -> None:
+    await callback(shard, progress)
 
 
 class PeerAwareShardDownloader(ShardDownloader):
@@ -129,7 +137,7 @@ class PeerAwareShardDownloader(ShardDownloader):
 
         # Get the file list we need (same logic as download_shard)
         revision = "main"
-        target_dir = await ensure_models_dir() / model_id_normalized
+        target_dir = await resolve_model_dir(shard.model_card.model_id)
 
         try:
             file_list = await fetch_file_list_with_cache(
@@ -142,7 +150,7 @@ class PeerAwareShardDownloader(ShardDownloader):
             return None
 
         allow_patterns = await resolve_allow_patterns(shard)
-        filtered_file_list = list(
+        filtered_file_list: list[FileListEntry] = list(
             filter_repo_objects(
                 file_list, allow_patterns=allow_patterns, key=lambda x: x.path
             )
@@ -197,7 +205,7 @@ class PeerAwareShardDownloader(ShardDownloader):
                     all_start_time,
                 )
                 for cb in self._progress_callbacks:
-                    asyncio.create_task(cb(shard, progress))
+                    asyncio.create_task(_run_progress_callback(cb, shard, progress))
 
             async with semaphore:
                 result = await download_file_from_peer(
@@ -227,7 +235,7 @@ class PeerAwareShardDownloader(ShardDownloader):
             )
 
         # Download all files in parallel
-        tasks = []
+        tasks: list[Coroutine[Any, Any, bool]] = []
         for f in filtered_file_list:
             if f.size is None or f.size == 0:
                 continue

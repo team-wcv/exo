@@ -1,8 +1,10 @@
 """Tests for peer-to-peer model downloading."""
+# pyright: reportPrivateUsage=false
 
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import cast
 
 import aiofiles
 import aiofiles.os as aios
@@ -48,7 +50,7 @@ class TestPeerFileServer:
             f"http://127.0.0.1:{peer_server.port}/health"
         ) as r:
             assert r.status == 200
-            data = await r.json()
+            data = cast(dict[str, object], await r.json())
             assert data["status"] == "ok"
 
     async def test_status_empty_model(self, peer_server: PeerFileServer) -> None:
