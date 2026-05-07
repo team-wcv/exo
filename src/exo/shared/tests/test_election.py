@@ -565,9 +565,7 @@ async def test_rejects_low_seniority_winner_when_forced_master_seen() -> None:
             tg.start_soon(election.run)
 
             # Round 1: forced master (seniority=1_000_000) participates and wins
-            await em_in_tx.send(
-                em(clock=1, seniority=1_000_000, node_id="MASTER")
-            )
+            await em_in_tx.send(em(clock=1, seniority=1_000_000, node_id="MASTER"))
             while True:
                 got = await em_out_rx.receive()
                 if got.clock == 1:
@@ -578,9 +576,7 @@ async def test_rejects_low_seniority_winner_when_forced_master_seen() -> None:
             # Round 2: triggered by a higher clock, but the forced master's
             # message doesn't arrive (simulated by only sending a
             # low-seniority peer message).
-            await em_in_tx.send(
-                em(clock=2, seniority=0, node_id="OTHER_WORKER")
-            )
+            await em_in_tx.send(em(clock=2, seniority=0, node_id="OTHER_WORKER"))
             while True:
                 got = await em_out_rx.receive()
                 if got.clock == 2:

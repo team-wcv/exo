@@ -276,10 +276,14 @@ def test_filtered_single_node_placement_can_use_total_memory_capacity() -> None:
     topology.add_node(selected_node)
     topology.add_node(other_node)
     topology.add_connection(
-        Connection(source=selected_node, sink=other_node, edge=create_socket_connection(1))
+        Connection(
+            source=selected_node, sink=other_node, edge=create_socket_connection(1)
+        )
     )
     topology.add_connection(
-        Connection(source=other_node, sink=selected_node, edge=create_socket_connection(2))
+        Connection(
+            source=other_node, sink=selected_node, edge=create_socket_connection(2)
+        )
     )
     node_memory = {
         selected_node: create_node_memory_with_total(available=1000, total=2000),
@@ -321,10 +325,14 @@ def test_filtered_single_node_placement_still_rejects_over_capacity_node() -> No
     topology.add_node(selected_node)
     topology.add_node(other_node)
     topology.add_connection(
-        Connection(source=selected_node, sink=other_node, edge=create_socket_connection(1))
+        Connection(
+            source=selected_node, sink=other_node, edge=create_socket_connection(1)
+        )
     )
     topology.add_connection(
-        Connection(source=other_node, sink=selected_node, edge=create_socket_connection(2))
+        Connection(
+            source=other_node, sink=selected_node, edge=create_socket_connection(2)
+        )
     )
     node_memory = {
         selected_node: create_node_memory_with_total(available=1000, total=1200),
@@ -641,9 +649,9 @@ def test_qwen3_5_tensor_auto_upgrade_requires_opt_in(
         },
     )
     instance_without_opt_in = next(iter(placements_without_opt_in.values()))
-    large_runner_without_opt_in = instance_without_opt_in.shard_assignments.node_to_runner[
-        large_node
-    ]
+    large_runner_without_opt_in = (
+        instance_without_opt_in.shard_assignments.node_to_runner[large_node]
+    )
     large_shard_without_opt_in = (
         instance_without_opt_in.shard_assignments.runner_to_shard[
             large_runner_without_opt_in
