@@ -6,7 +6,6 @@ import uuid
 from typing import Callable, Generator, cast, get_args
 
 import mlx.core as mx
-import mlx.nn as nn
 from mlx_lm.generate import (
     maybe_quantize_kv_cache,
     stream_generate,
@@ -438,53 +437,6 @@ def resolve_speculative_decoding(
     return draft_model, spec_kwargs
 
 
-def drafter_prefill(
-    draft_model: Model,
-    tokenizer: TokenizerWrapper,
-    sampler: Callable[[mx.array], mx.array],
-    cache: KVCacheType,
-    prompt_tokens: mx.array,
-) -> None:
-    """Prefill the drafter's KV cache to match the target cache's offset.
-
-    Critical contract: this MUST leave the drafter cache in the same logical
-    state that ``prefill()`` leaves the target cache in -- i.e. the cache
-    holds ``prompt_tokens[:-2]`` worth of context and the caller passes
-    ``prompt_tokens[-2:]`` to ``stream_generate``. Otherwise the drafter's
-    RoPE state desyncs from the target's and ``speculative_generate_step``
-    feeds garbage tokens through the verifier, eventually tripping Metal's
-    GPU watchdog.
-
-    We achieve this by driving the drafter through the same
-    ``stream_generate(max_tokens=1) + c.trim(2)`` ritual that ``prefill()``
-    uses for the target. The drafter is single-device and small, so we don't
-    need the pipeline-parallel branch or the progress callbacks.
-    """
-    if prompt_tokens.size <= 1:
-        # stream_generate handles this case directly via its own _prefill.
-        return
-
-    for _ in stream_generate(
-        model=cast(nn.Module, draft_model),
-        tokenizer=tokenizer,
-        prompt=prompt_tokens[:-1],
-        max_tokens=1,
-        sampler=sampler,
-        prompt_cache=cache,
-        prefill_step_size=512,
-        kv_group_size=KV_GROUP_SIZE,
-        kv_bits=KV_BITS,
-    ):
-        break
-
-    # Match `prefill()`'s trim(2): stream_generate processed prompt[:-1] (N-1
-    # tokens) and added 1 more generated token to the cache, so cache.offset
-    # is at N. We trim 2 to land at N-2, which matches the target cache state.
-    for c in cache:
-        c.trim(2)
-    mx.clear_cache()
-
-
 def warmup_inference(
     model: Model,
     tokenizer: TokenizerWrapper,
@@ -683,22 +635,30 @@ def mlx_generate(
     if is_bench and not task.use_prefix_cache:
         kv_prefix_cache = None
 
-    # When the drafter is going to participate, force plain KVCache for the
-    # *target* too. mlx_lm's `speculative_generate_step` performs trim+extend
-    # cycles on every spec round, which RotatingKVCache (used by gemma-4 for
-    # sliding-window layers) handles by physically rotating its underlying KV
-    # buffer -- making each round ~750x slower than a non-spec decode. The
-    # plain KVCache trades unbounded growth (fine for the typical request
-    # length) for spec-friendly trim semantics. Distributed runs don't use
-    # the drafter today, so this only applies to single-device.
-    target_force_plain = draft_model is not None and group is None
+    # When the drafter participates we run a self-contained spec-decoding
+    # path below: we hand mlx_lm fresh plain KVCache lists for both target
+    # and drafter and let its `speculative_generate_step._prefill` do prompt
+    # ingestion. Reasons:
+    #   - mlx_lm's spec_step trims and re-extends each cache every round.
+    #     ``RotatingKVCache`` (gemma-4's default for sliding-window layers)
+    #     rotates its underlying KV buffer on every trim, slowing generation
+    #     by ~750x. Plain KVCache trades unbounded growth (fine for typical
+    #     request lengths) for cheap trim semantics.
+    #   - exo's pre-existing prefill / prefix-cache machinery operates on the
+    #     model's native cache types (rotating + plain mix). Threading those
+    #     through spec_step's trim-heavy path inherits the same rotating-cache
+    #     slowdown, so we bypass it on the spec path.
+    # Distributed runs do not pass the drafter through to mlx_lm, so this
+    # branch only applies to single-device.
+    spec_active = draft_model is not None and group is None
 
-    # Use prefix cache if available, otherwise create fresh cache
+    # Use prefix cache if available, otherwise create fresh cache.
+    # On the spec path we skip the prefix-cache lookup entirely (see above).
     prefix_hit_length = 0
     matched_index: int | None = None
     is_exact_hit = False
-    if kv_prefix_cache is None:
-        caches = make_kv_cache(model=model, force_plain_kv_cache=target_force_plain)
+    if spec_active or kv_prefix_cache is None:
+        caches = make_kv_cache(model=model, force_plain_kv_cache=spec_active)
         prompt_tokens = all_prompt_tokens
     else:
         caches, prompt_tokens, matched_index, is_exact_hit = (
@@ -706,7 +666,6 @@ def mlx_generate(
                 model,
                 all_prompt_tokens,
                 media_regions=media_regions,
-                force_plain_kv_cache=target_force_plain,
             )
         )
         prefix_hit_length = len(all_prompt_tokens) - len(prompt_tokens)
@@ -759,6 +718,7 @@ def mlx_generate(
     use_remote = (
         len(prompt_tokens) > REMOTE_PREFILL_MIN_TOKENS
         and task.prefill_endpoint is not None
+        and not spec_active
     )
     remote_prefilled = False
     prefill_tps = 0.0
@@ -781,7 +741,12 @@ def mlx_generate(
                 logger.opt(exception=True).warning(
                     "Remote prefill failed, falling back to local prefill"
                 )
-        if not remote_prefilled:
+        if not remote_prefilled and not spec_active:
+            # On the spec path we hand the full prompt to mlx_lm and let
+            # speculative_generate_step's own _prefill drive both target and
+            # drafter caches. Running exo's prefill+trim ritual here too
+            # would either double-process the prompt or leave the caches at
+            # offsets spec_step doesn't expect.
             prefill_tps, prefill_tokens, ssm_snapshots_list = prefill(
                 model,
                 tokenizer,
@@ -794,10 +759,15 @@ def mlx_generate(
             )
     cache_snapshots: list[CacheSnapshot] | None = ssm_snapshots_list or None
 
-    if kv_prefix_cache is not None and matched_index is not None and is_exact_hit:
+    if (
+        not spec_active
+        and kv_prefix_cache is not None
+        and matched_index is not None
+        and is_exact_hit
+    ):
         prefill_tps = kv_prefix_cache.prefill_tps[matched_index]
 
-    if kv_prefix_cache is not None:
+    if not spec_active and kv_prefix_cache is not None:
         hit_ratio = (
             prefix_hit_length / len(all_prompt_tokens)
             if len(all_prompt_tokens) > 0
@@ -825,8 +795,11 @@ def mlx_generate(
                 prefill_tps=prefill_tps,
             )
 
-    # stream_generate starts from the last token
-    last_token = prompt_tokens[-2:]
+    # On the non-spec path, stream_generate starts from the last token (caches
+    # already cover prompt[:-2] via exo's prefill + c.trim(2)). On the spec
+    # path, we hand mlx_lm the full prompt and fresh caches; its internal
+    # _prefill will ingest it before the spec loop begins.
+    decode_prompt = all_prompt_tokens if spec_active else prompt_tokens[-2:]
 
     max_tokens = task.max_output_tokens or MAX_TOKENS
     accumulated_text = ""
@@ -869,100 +842,28 @@ def mlx_generate(
         drafter_min_output_tokens=drafter_min_output_tokens,
     )
 
-    # Item 6: drafter KV prefix caching. mlx_lm's speculative_generate_step
-    # splits its `prompt_cache` argument as ``[: len(target.layers)]`` for the
-    # target and ``[len(target.layers) :]`` for the drafter, so when the
-    # drafter is active we must always hand it a concatenated cache list --
-    # otherwise mlx_lm sees an empty drafter cache slice and stalls.
-    #
-    # We always build a drafter cache when the drafter is active. When a
-    # ``KVPrefixCache`` is wired in, we additionally look it up to reuse a
-    # prior turn's drafter state, prefill only the uncached tail, and store
-    # the post-prefill state back to the prefix cache. With no prefix cache
-    # (e.g. warmup), we just build a fresh drafter cache and prefill the full
-    # prompt directly.
+    # mlx_lm's speculative_generate_step splits its ``prompt_cache`` argument
+    # as ``[: len(target.layers)]`` for the target and ``[len(target.layers) :]``
+    # for the drafter. We build both as plain KVCache (see ``spec_active``
+    # comment above) and concatenate; mlx_lm prefills both internally on the
+    # full prompt we hand it.
     decode_cache: KVCacheType | list[object] = caches
     if effective_draft_model is not None and group is None:
-        if drafter_kv_prefix_cache is not None:
-            (
-                drafter_caches,
-                drafter_remaining,
-                drafter_matched_index,
-                _drafter_exact_hit,
-            ) = drafter_kv_prefix_cache.get_kv_cache(
-                effective_draft_model,
-                all_prompt_tokens,
-                media_regions=media_regions,
-                force_plain_kv_cache=True,
-            )
-            drafter_prefix_hit_length = len(all_prompt_tokens) - len(
-                drafter_remaining
-            )
-        else:
-            # force_plain_kv_cache: see make_kv_cache docstring -- mlx_lm's
-            # speculative_generate_step is catastrophically slow against
-            # RotatingKVCache (gemma-4 e2b/e4b drafters use sliding window
-            # for most layers), so we force plain KVCache here.
-            drafter_caches = make_kv_cache(
-                model=effective_draft_model, force_plain_kv_cache=True
-            )
-            drafter_remaining = all_prompt_tokens
-            drafter_matched_index = None
-            drafter_prefix_hit_length = 0
-
-        # Drive the drafter through the same prefill+trim ritual as the
-        # target so both caches end up at matched offsets before mlx_lm's
-        # speculative_generate_step takes over (see drafter_prefill docstring).
-        if len(drafter_remaining) > 1:
-            drafter_prefill_start = time.perf_counter()
-            drafter_prefill(
-                effective_draft_model,
-                tokenizer,
-                sampler,
-                drafter_caches,
-                drafter_remaining,
-            )
-            logger.debug(
-                f"Drafter prefill: {len(drafter_remaining)} tokens in "
-                f"{(time.perf_counter() - drafter_prefill_start):.2f}s"
-            )
-
-        # Snapshot the drafter's post-prefill state back to its prefix cache
-        # (when one is available) so subsequent requests can reuse it.
-        # KVPrefixCache deepcopies internally so the in-place mutation by
-        # stream_generate doesn't corrupt the stored entry.
-        if drafter_kv_prefix_cache is not None:
-            if drafter_matched_index is not None:
-                drafter_kv_prefix_cache.update_kv_cache(
-                    drafter_matched_index,
-                    all_prompt_tokens,
-                    drafter_caches,
-                    None,
-                    restore_pos=drafter_prefix_hit_length,
-                    media_regions=media_regions,
-                    prefill_tps=0.0,
-                )
-            else:
-                drafter_kv_prefix_cache.add_kv_cache(
-                    all_prompt_tokens,
-                    drafter_caches,
-                    None,
-                    media_regions=media_regions,
-                    prefill_tps=0.0,
-                )
-
+        drafter_caches = make_kv_cache(
+            model=effective_draft_model, force_plain_kv_cache=True
+        )
         decode_cache = list(caches) + list(drafter_caches)
 
     for completion_tokens, out in enumerate(
         stream_generate(
             model=model,
             tokenizer=tokenizer,
-            prompt=last_token,
+            prompt=decode_prompt,
             max_tokens=max_tokens,
             sampler=sampler,
             logits_processors=logits_processors,
             prompt_cache=decode_cache,
-            prefill_step_size=1,
+            prefill_step_size=4096 if spec_active else 1,
             kv_group_size=KV_GROUP_SIZE,
             kv_bits=KV_BITS,
             draft_model=effective_draft_model,
