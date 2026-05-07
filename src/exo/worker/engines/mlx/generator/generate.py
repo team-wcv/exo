@@ -853,7 +853,12 @@ def mlx_generate(
             model=effective_draft_model, force_plain_kv_cache=True
         )
         decode_cache = list(caches) + list(drafter_caches)
+        logger.info(
+            f"spec decode_cache: target={len(caches)}, drafter={len(drafter_caches)}, "
+            f"prompt_size={len(decode_prompt)}, K={spec_kwargs.get('num_draft_tokens')}"
+        )
 
+    logger.info(f"about to call stream_generate (spec={spec_active})")
     for completion_tokens, out in enumerate(
         stream_generate(
             model=model,
@@ -871,6 +876,10 @@ def mlx_generate(
         ),
         start=1,
     ):
+        if completion_tokens <= 3:
+            logger.info(
+                f"spec out [{completion_tokens}]: from_draft={getattr(out, 'from_draft', None)}, text={out.text!r}"
+            )
         generated_text_parts.append(out.text)
         accumulated_text += out.text
         if getattr(out, "from_draft", False):
