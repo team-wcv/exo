@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
+from exo.shared.constants import EXO_MAX_CONCURRENT_REQUESTS
 from exo.shared.types.common import ModelId
 from exo.shared.types.events import Event
 from exo.shared.types.tasks import TaskId
@@ -212,6 +213,27 @@ class MlxBuilder(Builder):
                     f"skip_drafter_when_max_tokens<={drafter_min_output_tokens}"
                 )
 
+            # Concurrent in-flight tasks. Asymmetric pipelined+remote keeps
+            # the singular slot because ``RemoteTransport``'s wire protocol
+            # is per-session: two concurrent target requests would interleave
+            # ``OP_PREFILL`` / ``OP_FORWARD`` frames on the same socket and
+            # corrupt the drafter rank's per-request KV cache. Lifting that
+            # cap requires extending the wire protocol with a request-id
+            # field plus per-request cache state on the drafter rank --
+            # tracked separately from this PR. All other configurations
+            # (no drafter, n-gram, in-process model drafter) are safe to
+            # round-robin: each ``mlx_generate`` call allocates its own KV
+            # cache and the per-tick ``next(gen)`` is a single forward, so
+            # generators are independent in everything but model weights
+            # (which are read-only during forward).
+            max_concurrent_tasks = 1 if is_asymmetric else EXO_MAX_CONCURRENT_REQUESTS
+            if max_concurrent_tasks > 1:
+                logger.info(
+                    f"SequentialGenerator round-robin concurrency: "
+                    f"max_concurrent_tasks={max_concurrent_tasks} "
+                    f"(EXO_MAX_CONCURRENT_REQUESTS)"
+                )
+
             return SequentialGenerator(
                 model=self.inference_model,
                 tokenizer=self.tokenizer,
@@ -232,6 +254,7 @@ class MlxBuilder(Builder):
                 parent_group=self.parent_group,
                 drafter_rank_in_parent=self.drafter_rank_in_parent,
                 remote_drafter_transport=remote_drafter_transport,
+                max_concurrent_tasks=max_concurrent_tasks,
             )
         else:
             logger.info("using BatchGenerator")

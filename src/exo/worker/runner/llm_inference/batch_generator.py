@@ -1,7 +1,7 @@
 import itertools
 import os
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
 from typing import BinaryIO
@@ -195,7 +195,31 @@ class SequentialGenerator(Engine):
         default_factory=lambda: deque(maxlen=ADAPTIVE_K_WINDOW),
         init=False,
     )
-    _active: (
+    # Maximum number of in-flight tasks the runner will round-robin through
+    # in :meth:`step`. Set to 1 by ``builder.build`` whenever the runner
+    # owns a long-lived ``RemoteTransport`` (asymmetric pipelined drafter):
+    # the wire protocol assumes one in-flight prefill/forward session, so
+    # interleaving two target requests on the same socket would corrupt
+    # the drafter's per-request state. For all other configurations
+    # (no drafter, n-gram drafter, in-process model drafter where every
+    # ``mlx_generate`` call allocates its own draft KVCache) this defaults
+    # to ``EXO_MAX_CONCURRENT_REQUESTS`` and gives concurrent requests the
+    # cooperative-scheduling semantics the dispatcher always claimed but
+    # never delivered: prior to this field every spec-config runner pinned
+    # ``_active`` to a singular slot and slot 1's TTFT equalled slot 0's
+    # full completion time (measured 14s on a K=3 single-host n-gram bench
+    # in the PR #15 concurrency leg).
+    max_concurrent_tasks: int = 1
+    # Currently in-flight tasks, keyed by ``TaskId`` for O(1) cancel/finish.
+    # Insertion order is the round-robin order; ``OrderedDict`` makes that
+    # preservation explicit (CPython dicts already preserve it but we want
+    # the contract to be load-bearing). Capped by ``max_concurrent_tasks``;
+    # ``step`` round-robins one ``next(gen)`` call per active task per
+    # tick. Each tuple is (task, mlx generator, response queue, parsed-
+    # output generator) -- the same shape the previous singular ``_active``
+    # slot held, just multiplexed.
+    _active_tasks: OrderedDict[
+        TaskId,
         tuple[
             TextGeneration,
             # mlx generator that does work
@@ -204,9 +228,8 @@ class SequentialGenerator(Engine):
             GeneratorQueue[GenerationResponse],
             # generator to get parsed outputs
             Iterator[GenerationChunk | None],
-        ]
-        | None
-    ) = field(default=None, init=False)
+        ],
+    ] = field(default_factory=OrderedDict, init=False)
     # Tasks that failed during ``_build_generator`` or mid-stream. Drained
     # by ``step`` so per-task failures surface as ``FinishedResponse`` to
     # the caller without taking down the runner subprocess. We accept the
@@ -267,10 +290,15 @@ class SequentialGenerator(Engine):
             tuple[TaskId, GenerationChunk | CancelledResponse | FinishedResponse]
         ] = []
 
-        if self._active is None:
+        # Top up the active set from the queue. ``agree_on_tasks`` is a
+        # collective op across the MLX group; we only call it when there
+        # might be new work to admit (active set has slack and queue is
+        # potentially non-empty after ``agree_on_tasks`` runs). Calling
+        # it on every tick is safe but wastes a collective when the
+        # active set is already full.
+        if len(self._active_tasks) < self.max_concurrent_tasks:
             self.agree_on_tasks()
-
-            if self._queue:
+            while self._queue and len(self._active_tasks) < self.max_concurrent_tasks:
                 self._start_next()
 
         # Drain failures recorded by ``_start_next`` (this tick or any
@@ -281,7 +309,7 @@ class SequentialGenerator(Engine):
         while self._pending_failed:
             output.append((self._pending_failed.pop(0), FinishedResponse()))
 
-        if self._active is None:
+        if not self._active_tasks:
             return itertools.chain(
                 iter(output),
                 map(
@@ -290,49 +318,63 @@ class SequentialGenerator(Engine):
                 ),
             )
 
-        assert self._active is not None
+        # Round-robin one ``next(gen)`` per active task. Each generator
+        # owns its own KV cache (``mlx_generate`` allocates fresh caches
+        # per request), so interleaving generators per-tick is safe -- the
+        # only shared state is the model weights themselves, which are
+        # read-only during forward. Snapshot the items so per-task
+        # exceptions can ``del self._active_tasks[task_id]`` mid-iteration
+        # without invalidating the loop.
+        for task_id, (task, gen, queue, output_generator) in list(
+            self._active_tasks.items()
+        ):
+            try:
+                response = next(gen)
+                queue.push(response)
+                # Observe drafter acceptance once the final stats arrive. We
+                # do this here (and not in mlx_generate) because the rolling
+                # buffer is owned by the generator and must persist across
+                # requests for adaptive K to converge.
+                if (
+                    self.adaptive_draft_tokens
+                    and response.stats is not None
+                    and response.stats.drafter_model_id is not None
+                    and response.stats.generation_tokens > 0
+                ):
+                    fraction = (
+                        response.stats.accepted_draft_tokens
+                        / response.stats.generation_tokens
+                    )
+                    self._recent_acceptance.append(fraction)
+                # drain potentially many responses every time
+                while (parsed := next(output_generator, None)) is not None:
+                    output.append((task_id, parsed))
 
-        task, gen, queue, output_generator = self._active
-        try:
-            response = next(gen)
-            queue.push(response)
-            # Observe drafter acceptance once the final stats arrive. We do
-            # this here (and not in mlx_generate) because the rolling buffer
-            # is owned by the generator and must persist across requests for
-            # adaptive K to converge.
-            if (
-                self.adaptive_draft_tokens
-                and response.stats is not None
-                and response.stats.drafter_model_id is not None
-                and response.stats.generation_tokens > 0
-            ):
-                fraction = (
-                    response.stats.accepted_draft_tokens
-                    / response.stats.generation_tokens
-                )
-                self._recent_acceptance.append(fraction)
-            # drain potentially many responses every time
-            while (parsed := next(output_generator, None)) is not None:
-                output.append((task.task_id, parsed))
+            except (StopIteration, PrefillCancelled):
+                output.append((task_id, FinishedResponse()))
+                del self._active_tasks[task_id]
 
-        except (StopIteration, PrefillCancelled):
-            output.append((task.task_id, FinishedResponse()))
-            self._active = None
-            if self._queue:
+            except Exception as e:
+                # Send error chunk to the client and mark the task finished,
+                # but DO NOT re-raise. Re-raising here propagates through
+                # ``handle_generation_tasks`` and triggers ``RunnerFailed``
+                # on the supervisor, which currently leaves a respawned
+                # target rank stuck in ``RunnerIdle`` because its drafter
+                # peer is still ``RunnerRunning`` (see
+                # ``_init_distributed_backend``). A single malformed
+                # request must never permanently brick a multi-rank
+                # instance, and with ``max_concurrent_tasks > 1`` it must
+                # not affect the *other* in-flight tasks either.
+                self._send_error(task, e)
+                del self._active_tasks[task_id]
+                output.append((task_id, FinishedResponse()))
+
+        # Top up again if we just retired any task -- keeps slot 1's
+        # TTFT independent of slot 0's completion length, which is the
+        # whole point of ``max_concurrent_tasks > 1``.
+        if self._queue and len(self._active_tasks) < self.max_concurrent_tasks:
+            while self._queue and len(self._active_tasks) < self.max_concurrent_tasks:
                 self._start_next()
-
-        except Exception as e:
-            # Send error chunk to the client and mark the task finished,
-            # but DO NOT re-raise. Re-raising here propagates through
-            # ``handle_generation_tasks`` and triggers ``RunnerFailed`` on
-            # the supervisor, which currently leaves a respawned target
-            # rank stuck in ``RunnerIdle`` because its drafter peer is
-            # still ``RunnerRunning`` (see ``_init_distributed_backend``).
-            # A single malformed request must never permanently brick a
-            # multi-rank instance.
-            self._send_error(task, e)
-            self._active = None
-            output.append((task.task_id, FinishedResponse()))
 
         return filter(
             lambda chunk: (
@@ -351,8 +393,8 @@ class SequentialGenerator(Engine):
         except Exception as e:
             # Preserve runner liveness: surface the error to the client
             # via ``_send_error`` and queue a ``FinishedResponse`` for
-            # ``step`` to drain on the next tick. ``self._active`` stays
-            # ``None`` so the next ``step`` either picks up the next
+            # ``step`` to drain on the next tick. The active set is
+            # unchanged so the next ``step`` either picks up the next
             # queued task or returns idle (instead of asserting and
             # crashing the subprocess).
             self._send_error(task, e)
@@ -374,7 +416,7 @@ class SequentialGenerator(Engine):
                 self.model_id,
                 task.task_params.tools,
             )
-        self._active = (task, gen, queue, output_generator)
+        self._active_tasks[task.task_id] = (task, gen, queue, output_generator)
 
     def _send_error(self, task: TextGeneration, e: Exception) -> None:
         if self.device_rank == 0:
