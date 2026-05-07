@@ -38,6 +38,7 @@ class MlxBuilder(Builder):
     tokenizer: TokenizerWrapper | None = None
     group: mx.distributed.Group | None = None
     vision_processor: VisionProcessor | None = None
+    draft_model: Model | None = None
 
     def connect(self, bound_instance: BoundInstance) -> None:
         self.group = initialize_mlx(bound_instance)
@@ -47,6 +48,7 @@ class MlxBuilder(Builder):
             self.inference_model,
             self.tokenizer,
             self.vision_processor,
+            self.draft_model,
         ) = yield from load_mlx_items(bound_instance, self.group)
 
     def close(self) -> None:
@@ -56,6 +58,8 @@ class MlxBuilder(Builder):
             del self.tokenizer
         with contextlib.suppress(NameError, AttributeError):
             del self.group
+        with contextlib.suppress(NameError, AttributeError):
+            del self.draft_model
 
     def build(
         self,
@@ -83,8 +87,23 @@ class MlxBuilder(Builder):
         kv_prefix_cache = KVPrefixCache(self.group)
 
         device_rank = 0 if self.group is None else self.group.rank()
-        if os.environ.get("EXO_NO_BATCH"):
-            logger.info("using SequentialGenerator (batching disabled)")
+
+        # Speculative decoding currently only flows through `mlx_generate` ->
+        # `stream_generate(draft_model=...)`, which is the SequentialGenerator
+        # path. Upstream `mlx_lm.generate.BatchGenerator` does not accept a
+        # draft model. Force the sequential path when a drafter is loaded so
+        # the user actually gets speculative decoding instead of silently
+        # falling through to non-speculative batching.
+        force_sequential_for_drafter = self.draft_model is not None
+
+        if os.environ.get("EXO_NO_BATCH") or force_sequential_for_drafter:
+            if force_sequential_for_drafter:
+                logger.info(
+                    "using SequentialGenerator (drafter loaded; "
+                    "BatchGenerator does not support speculative decoding)"
+                )
+            else:
+                logger.info("using SequentialGenerator (batching disabled)")
             return SequentialGenerator(
                 model=self.inference_model,
                 tokenizer=self.tokenizer,
@@ -96,6 +115,7 @@ class MlxBuilder(Builder):
                 cancel_receiver=self.cancel_receiver,
                 event_sender=self.event_sender,
                 vision_processor=vision_processor,
+                draft_model=self.draft_model,
             )
         else:
             logger.info("using BatchGenerator")

@@ -49,6 +49,10 @@ class ModelListModel(BaseModel):
     base_model: str = Field(default="")
     capabilities: list[str] = Field(default_factory=list)
     reasoning_dialect: ReasoningDialect = "none"
+    # When set, identifies a smaller draft model that runners can load
+    # alongside this target for speculative decoding. Surfaced so dashboards
+    # and clients can pre-download the drafter.
+    drafter_model_id: str | None = None
 
 
 class ModelList(BaseModel):
