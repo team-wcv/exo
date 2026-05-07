@@ -481,6 +481,9 @@ class Master:
 
     # These plan loops are the cracks showing in our event sourcing architecture - more things could be commands
     async def _plan(self) -> None:
+        node_inactivity_timeout = timedelta(seconds=5)
+        tick_interval_seconds = 1.0
+
         while True:
             # kill broken instances
             connected_node_ids = set(self.state.topology.list_nodes())
@@ -503,7 +506,7 @@ class Master:
             # time out dead nodes
             for node_id, time in self.state.last_seen.items():
                 now = datetime.now(tz=timezone.utc)
-                if now - time > timedelta(seconds=30):
+                if now - time > node_inactivity_timeout:
                     impacted_instances = [
                         str(instance_id)
                         for instance_id, instance in self.state.instances.items()
@@ -520,7 +523,7 @@ class Master:
                     )
                     await self.event_sender.send(NodeTimedOut(node_id=node_id))
 
-            await anyio.sleep(10)
+            await anyio.sleep(tick_interval_seconds)
 
     async def _event_processor(self) -> None:
         with self.local_event_receiver as local_events:
