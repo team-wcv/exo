@@ -28,6 +28,7 @@ from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 
 from .cache import KVPrefixCache
 from .generator.drafter import EXO_DRAFT_MODE_ENV, parse_draft_mode
+from .generator.drafter_transport import DrafterTransport
 from .types import Model
 from .utils_mlx import (
     initialize_mlx,
@@ -139,8 +140,53 @@ class MlxBuilder(Builder):
             or configured_draft_mode in ("ngram", "pipelined")
         )
 
-        if os.environ.get("EXO_NO_BATCH") or force_sequential_for_drafter:
-            if force_sequential_for_drafter:
+        # Asymmetric placement: parent group spans all target ranks +
+        # the drafter rank, drafter lives on a separate MLX rank.
+        # Force the SequentialGenerator path (BatchGenerator has no
+        # spec-decoding hook) and build a long-lived RemoteTransport
+        # that the spec loop reuses across requests.
+        is_asymmetric = (
+            self.parent_group is not None and self.drafter_rank_in_parent is not None
+        )
+        remote_drafter_transport: DrafterTransport | None = None
+        if is_asymmetric:
+            assert self.parent_group is not None
+            assert self.drafter_rank_in_parent is not None
+            from exo.worker.engines.mlx.generator.remote_drafter import (
+                make_remote_transport,
+            )
+
+            num_draft_tokens_remote = parse_env_int(
+                EXO_NUM_DRAFT_TOKENS, DEFAULT_NUM_DRAFT_TOKENS
+            )
+            target_rank_in_parent = self.parent_group.rank()
+            logger.info(
+                "Allocating long-lived RemoteTransport: "
+                f"parent_group_size={self.parent_group.size()} "
+                f"target_rank_in_parent={target_rank_in_parent} "
+                f"drafter_rank_in_parent={self.drafter_rank_in_parent} "
+                f"K={num_draft_tokens_remote}"
+            )
+            remote_drafter_transport = make_remote_transport(
+                draft_model=None,
+                draft_cache=None,
+                num_draft_tokens=num_draft_tokens_remote,
+                group=self.parent_group,
+                drafter_rank=self.drafter_rank_in_parent,
+                target_rank=target_rank_in_parent,
+            )
+
+        if (
+            os.environ.get("EXO_NO_BATCH")
+            or force_sequential_for_drafter
+            or is_asymmetric
+        ):
+            if is_asymmetric:
+                logger.info(
+                    "using SequentialGenerator (asymmetric placement: "
+                    "drafter lives on a separate MLX rank, pipelined+remote spec)"
+                )
+            elif force_sequential_for_drafter:
                 logger.info(
                     f"using SequentialGenerator (draft_mode={configured_draft_mode!r}; "
                     f"BatchGenerator has no spec-decoding hook)"
@@ -159,9 +205,9 @@ class MlxBuilder(Builder):
             adaptive_draft_tokens = os.environ.get(
                 EXO_ADAPTIVE_DRAFT_TOKENS, ""
             ).lower() in {"1", "true", "yes"}
-            if force_sequential_for_drafter:
+            if force_sequential_for_drafter or is_asymmetric:
                 logger.info(
-                    f"speculative decoding: mode={configured_draft_mode}, "
+                    f"speculative decoding: mode={'pipelined+remote' if is_asymmetric else configured_draft_mode}, "
                     f"K={num_draft_tokens} (adaptive={adaptive_draft_tokens}), "
                     f"skip_drafter_when_max_tokens<={drafter_min_output_tokens}"
                 )
@@ -183,6 +229,9 @@ class MlxBuilder(Builder):
                 num_draft_tokens=num_draft_tokens,
                 drafter_min_output_tokens=drafter_min_output_tokens,
                 adaptive_draft_tokens=adaptive_draft_tokens,
+                parent_group=self.parent_group,
+                drafter_rank_in_parent=self.drafter_rank_in_parent,
+                remote_drafter_transport=remote_drafter_transport,
             )
         else:
             logger.info("using BatchGenerator")

@@ -32,6 +32,7 @@ from exo.worker.engines.mlx.cache import KVPrefixCache
 from exo.worker.engines.mlx.disaggregated.adapter import write_cache_to_wire
 from exo.worker.engines.mlx.disaggregated.serve import run_prefill_for_request
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
+from exo.worker.engines.mlx.generator.drafter_transport import DrafterTransport
 from exo.worker.engines.mlx.generator.generate import (
     PrefillCancelled,
     mlx_generate,
@@ -168,6 +169,19 @@ class SequentialGenerator(Engine):
     # of observed acceptance fractions. Disabled by default so K stays
     # predictable for benchmarking.
     adaptive_draft_tokens: bool = False
+    # Asymmetric placement: parent group spans all target ranks + the
+    # drafter rank. ``parent_group`` is None for symmetric/single-device
+    # builds (in which case ``self.group`` is the only group). When set
+    # together with ``remote_drafter_transport``, every request runs
+    # the pipelined+remote drafter path: the spec loop talks to the
+    # drafter via ``mx.distributed.send/recv`` on the parent group.
+    parent_group: mx.distributed.Group | None = None
+    drafter_rank_in_parent: int | None = None
+    # Long-lived transport bound to the drafter rank. Allocated once at
+    # builder.build() time; reused across requests so the executor
+    # thread + drafter cache lifecycle isn't paid per-request. Closed
+    # in :meth:`close` (sends ``OP_SHUTDOWN`` to the drafter rank).
+    remote_drafter_transport: DrafterTransport | None = None
     check_for_cancel_every: int = 50
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
@@ -403,9 +417,25 @@ class SequentialGenerator(Engine):
             drafter_model_id=self.draft_model_id,
             num_draft_tokens=effective_num_draft_tokens,
             drafter_min_output_tokens=self.drafter_min_output_tokens,
+            asymmetric_parent_group=self.parent_group,
+            asymmetric_drafter_rank=self.drafter_rank_in_parent,
+            asymmetric_drafter_transport=self.remote_drafter_transport,
         )
 
     def close(self) -> None:
+        if self.remote_drafter_transport is not None:
+            try:
+                self.remote_drafter_transport.shutdown()
+            except Exception:
+                # Drafter rank may already be gone (e.g. due to a
+                # parallel shutdown of the cluster); log and continue
+                # so target-side cleanup isn't blocked on a peer that
+                # can't ack. The shutdown call is idempotent so a
+                # later retry is harmless.
+                logger.opt(exception=True).warning(
+                    "Drafter rank shutdown failed; continuing close"
+                )
+            self.remote_drafter_transport = None
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:

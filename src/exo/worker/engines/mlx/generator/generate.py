@@ -630,6 +630,9 @@ def mlx_generate(
     drafter_model_id: ModelId | None = None,
     num_draft_tokens: int | None = None,
     drafter_min_output_tokens: int | None = None,
+    asymmetric_parent_group: mx.distributed.Group | None = None,
+    asymmetric_drafter_rank: int | None = None,
+    asymmetric_drafter_transport: object | None = None,
 ) -> Generator[GenerationResponse]:
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
@@ -683,8 +686,22 @@ def mlx_generate(
         else num_draft_tokens
     ) or 0
     max_tokens = task.max_output_tokens or MAX_TOKENS
-    if group is not None:
-        draft_mode: DraftMode = "none"
+    asymmetric_drafter_active = (
+        asymmetric_parent_group is not None
+        and asymmetric_drafter_rank is not None
+        and request_use_drafter is not False
+    )
+    if asymmetric_drafter_active:
+        # Asymmetric placement: the drafter lives on a separate MLX
+        # rank, communicating via mx.distributed.send/recv on the
+        # parent group. This bypasses the legacy "group is not None ->
+        # draft_mode = none" demotion (which exists because mlx_lm's
+        # own speculative_generate_step doesn't handle pipeline
+        # collectives). The pipelined+remote path is the whole point
+        # of the asymmetric topology, so honor it unconditionally.
+        draft_mode: DraftMode = "pipelined"
+    elif group is not None:
+        draft_mode = "none"
     else:
         draft_mode = resolve_draft_mode(
             has_drafter_model=draft_model is not None,
@@ -777,9 +794,8 @@ def mlx_generate(
                 matched_index = None
                 is_exact_hit = False
         if drafter_hit > aligned_hit:
-            mlx_trim_prompt_cache(
-                cast(list[object], drafter_caches), drafter_hit - aligned_hit
-            )  # type: ignore[reportArgumentType]
+            drafter_overshoot = drafter_hit - aligned_hit
+            mlx_trim_prompt_cache(cast(list[object], drafter_caches), drafter_overshoot)  # type: ignore[reportArgumentType]
             if drafter_matched_index is not None and aligned_hit < drafter_hit:
                 drafter_matched_index = None
 
@@ -966,12 +982,51 @@ def mlx_generate(
     #                       behind a ``DrafterTransport`` (in-process or remote)
     #   * ``"ngram"``    -> in-house n-gram suffix-match spec loop
     #   * ``"none"``     -> plain ``mlx_lm.stream_generate``
-    drafter: Drafter = make_drafter(
-        mode=draft_mode,
-        num_draft_tokens=effective_num_draft_tokens,
-        draft_model=effective_draft_model if spec_active else None,
-        draft_cache=drafter_caches if spec_active else None,
-    )
+    if asymmetric_drafter_active:
+        assert asymmetric_parent_group is not None
+        assert asymmetric_drafter_rank is not None
+        target_rank_in_parent = asymmetric_parent_group.rank()
+        target_subgroup_size = group.size() if group is not None else 1
+        # Sync the drafter rank's cache against this request's prompt
+        # before constructing the drafter wrapper. The transport sends
+        # OP_PREFILL with prompt[:-2] (matching ``_spec_drafter_prefill``'s
+        # invariant: align the drafter's offset to ``len(prompt) - 2``
+        # so the spec loop's first OP_FORWARD seeds from prompt[-2]).
+        # Cast: ``asymmetric_drafter_transport`` is typed ``object`` at
+        # the public surface to avoid pulling DrafterTransport into
+        # mlx_generate's import set.
+        from exo.worker.engines.mlx.generator.drafter_transport import (
+            DrafterTransport as _DrafterTransport,
+        )
+
+        if not isinstance(asymmetric_drafter_transport, _DrafterTransport):
+            raise TypeError(
+                "asymmetric_drafter_transport must implement DrafterTransport "
+                "when asymmetric placement is active; "
+                f"got {type(asymmetric_drafter_transport).__name__}"
+            )
+        prefill_prompt: list[int] = [
+            int(t) for t in cast(list[int], all_prompt_tokens[:-2].tolist())
+        ]
+        asymmetric_drafter_transport.reset_and_prefill(prefill_prompt)
+        drafter: Drafter = make_drafter(
+            mode=draft_mode,
+            num_draft_tokens=effective_num_draft_tokens,
+            draft_model=None,
+            draft_cache=None,
+            remote_parent_group=asymmetric_parent_group,
+            remote_drafter_rank=asymmetric_drafter_rank,
+            remote_target_rank=target_rank_in_parent,
+            target_subgroup_size=target_subgroup_size,
+            pipelined_transport=asymmetric_drafter_transport,
+        )
+    else:
+        drafter = make_drafter(
+            mode=draft_mode,
+            num_draft_tokens=effective_num_draft_tokens,
+            draft_model=effective_draft_model if spec_active else None,
+            draft_cache=drafter_caches if spec_active else None,
+        )
 
     # ``decode_prompt`` is the prefill-tail (last two tokens of the
     # prompt). The cache is already aligned to ``all_prompt_tokens[:-2]``

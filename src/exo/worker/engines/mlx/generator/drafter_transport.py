@@ -130,6 +130,25 @@ class DrafterTransport(Protocol):
         """
         ...
 
+    def reset_and_prefill(self, prompt_tokens: list[int]) -> None:
+        """Reset the drafter cache and prefill it with ``prompt_tokens``.
+
+        Issued once at the start of every request so the drafter cache
+        is aligned with the target's cache before the spec loop starts.
+        ``prompt_tokens`` is the prompt minus the last 2 tokens (matching
+        the in-process path's ``_spec_drafter_prefill`` invariant);
+        the spec loop seeds from the last prompt token internally.
+
+        Empty ``prompt_tokens`` is valid (very short prompts) and only
+        resets the cache.
+
+        For the in-process transport this is a no-op when the caller
+        owns drafter cache prefill externally (the legacy mlx_generate
+        path). Implementations that own the drafter cache fully (e.g.
+        the remote transport) handle reset + prefill internally here.
+        """
+        ...
+
     def shutdown(self) -> None:
         """Release transport resources. Idempotent.
 
@@ -216,6 +235,19 @@ class InProcessTransport:
 
         mlx_trim_prompt_cache(_cast(list[object], self._draft_cache), n_positions)  # type: ignore[reportArgumentType]
 
+    def reset_and_prefill(self, prompt_tokens: list[int]) -> None:
+        """No-op: the legacy in-process path manages drafter cache externally.
+
+        ``mlx_generate`` allocates the drafter cache, runs
+        :func:`exo.worker.engines.mlx.generator.generate._spec_drafter_prefill`,
+        and only then constructs this transport. Re-running prefill
+        here would double-fill the cache. The Protocol method exists
+        for symmetry with :class:`RemoteTransport`, where the drafter
+        cache lives on the drafter rank and the transport owns its
+        per-request reset/prefill.
+        """
+        del prompt_tokens
+
     def shutdown(self) -> None:
         return
 
@@ -273,15 +305,27 @@ def parse_transport_kind(raw: str | None, default: str) -> str:
 
 def make_inprocess_transport(
     *,
-    draft_model: Model,
-    draft_cache: KVCacheType,
+    draft_model: Model | None,
+    draft_cache: KVCacheType | None,
     num_draft_tokens: int,
+    group: mx.distributed.Group | None = None,
+    drafter_rank: int | None = None,
+    target_rank: int | None = None,
 ) -> DrafterTransport:
     """Build an :class:`InProcessTransport`.
 
     Wrapped in a factory so callers don't import the concrete class;
-    keeps the spec loop coupled only to the Protocol.
+    keeps the spec loop coupled only to the Protocol. The ``group`` /
+    ``drafter_rank`` / ``target_rank`` kwargs are accepted (ignored) for
+    parity with :func:`make_remote_transport`, so :func:`make_drafter`
+    can dispatch to either factory with one call shape.
     """
+    del group, drafter_rank, target_rank  # remote-only knobs
+    if draft_model is None or draft_cache is None:
+        raise ValueError(
+            "InProcessTransport requires draft_model and draft_cache; "
+            "remote transport is the only path that runs without them"
+        )
     return InProcessTransport(
         draft_model=draft_model,
         draft_cache=draft_cache,

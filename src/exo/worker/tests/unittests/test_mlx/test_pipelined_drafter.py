@@ -111,6 +111,16 @@ class FakeTransport:
         self.calls.append(_Call(kind="trim", n_positions=n_positions))
         self.cache_offset -= n_positions
 
+    def reset_and_prefill(self, prompt_tokens: list[int]) -> None:
+        # Mirror RemoteTransport semantics: reset cache to 0, then
+        # extend by len(prompt_tokens). The FakeTransport doesn't
+        # actually run a model, so the offset bookkeeping is the only
+        # observable side-effect tests care about.
+        self.cache_offset = len(prompt_tokens)
+        self.calls.append(
+            _Call(kind="reset_and_prefill", n_positions=len(prompt_tokens))
+        )
+
     def shutdown(self) -> None:
         return
 
@@ -428,4 +438,71 @@ def test_make_drafter_pipelined_resolves_transport_from_env(
             num_draft_tokens=4,
             draft_model=None,
             draft_cache=None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Asymmetric placement entry points
+# ---------------------------------------------------------------------------
+
+
+def test_make_drafter_uses_supplied_pipelined_transport() -> None:
+    """When ``pipelined_transport`` is supplied, ``make_drafter`` must reuse it.
+
+    Asymmetric placement allocates a long-lived RemoteTransport at
+    SequentialGenerator build time so executor + drafter cache lifecycle
+    aren't paid per-request. The factory entry point must accept that
+    pre-built transport instead of constructing a new one.
+    """
+    from exo.worker.engines.mlx.generator.drafter import make_drafter
+    from exo.worker.engines.mlx.generator.pipelined_drafter import (
+        PipelinedModelDrafter,
+    )
+
+    transport = FakeTransport(num_draft_tokens_value=4)
+    drafter = make_drafter(
+        mode="pipelined",
+        num_draft_tokens=4,
+        draft_model=None,
+        draft_cache=None,
+        pipelined_transport=transport,
+    )
+    assert isinstance(drafter, PipelinedModelDrafter)
+    # The drafter must wrap the supplied transport, not a freshly-
+    # constructed one (would be a behavioural regression because the
+    # remote drafter cache + executor would be leaked on every request).
+    drafter.shutdown()
+    assert transport.calls == []  # FakeTransport.shutdown is a no-op
+
+
+def test_make_drafter_rejects_non_protocol_pipelined_transport() -> None:
+    """``pipelined_transport`` must implement ``DrafterTransport``."""
+    from exo.worker.engines.mlx.generator.drafter import make_drafter
+
+    class NotATransport:
+        pass
+
+    with pytest.raises(TypeError, match="DrafterTransport"):
+        make_drafter(
+            mode="pipelined",
+            num_draft_tokens=4,
+            draft_model=None,
+            draft_cache=None,
+            pipelined_transport=NotATransport(),
+        )
+
+
+def test_make_drafter_pipelined_rejects_multi_target_subgroup() -> None:
+    """V1 boundary: multi-target asymmetric needs broadcast support not yet implemented."""
+    from exo.worker.engines.mlx.generator.drafter import make_drafter
+
+    transport = FakeTransport(num_draft_tokens_value=4)
+    with pytest.raises(NotImplementedError, match="target_subgroup_size=2"):
+        make_drafter(
+            mode="pipelined",
+            num_draft_tokens=4,
+            draft_model=None,
+            draft_cache=None,
+            pipelined_transport=transport,
+            target_subgroup_size=2,
         )

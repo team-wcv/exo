@@ -442,6 +442,11 @@ def make_drafter(
     num_draft_tokens: int,
     draft_model: Model | None,
     draft_cache: KVCacheType | None,
+    remote_parent_group: "mx.distributed.Group | None" = None,
+    remote_drafter_rank: int | None = None,
+    remote_target_rank: int | None = None,
+    target_subgroup_size: int = 1,
+    pipelined_transport: object | None = None,
 ) -> Drafter:
     """Build a :class:`Drafter` for the resolved mode.
 
@@ -449,10 +454,26 @@ def make_drafter(
     requested without a loaded drafter; callers should resolve that via
     :func:`resolve_draft_mode` (which downgrades silently).
 
-    For ``mode == "pipelined"`` the transport kind defaults to
-    ``EXO_DRAFTER_TRANSPORT`` (``"inprocess"`` if unset). The remote
-    transport requires asymmetric instance topology (drafter on a
-    different MLX rank); see :mod:`pipelined_drafter` for details.
+    For ``mode == "pipelined"`` the transport kind is selected as:
+
+      * ``"remote"`` when ``remote_parent_group`` is non-None (asymmetric
+        placement: drafter lives on a separate MLX rank). ``draft_model``
+        / ``draft_cache`` are ignored on the target rank.
+      * ``"inprocess"`` otherwise (single-process pipelining win, no
+        remote IPC). Requires both ``draft_model`` and ``draft_cache``.
+
+    ``EXO_DRAFTER_TRANSPORT`` is honored only when ``remote_parent_group``
+    is None (debug/dev override for forcing remote transport in tests
+    is intentionally not exposed as an env var; the real remote path
+    requires the runner-bootstrap-supplied parent group).
+
+    V1 asymmetric constraint: the remote transport assumes
+    ``target_subgroup_size == 1`` (a single target rank issuing drafter
+    IPC). Multi-target asymmetric (``target_subgroup_size > 1``) requires
+    broadcasting drafts on the target subgroup to keep ranks in lockstep
+    and is rejected loudly here until that lands; placement still emits
+    a successful asymmetric :class:`DrafterPlacement` so telemetry is
+    accurate, but the runner side fails to construct a transport.
     """
     if mode == "none":
         return NoSpecDrafter()
@@ -473,6 +494,7 @@ def make_drafter(
         # the common (model/ngram/none) paths.
         from exo.worker.engines.mlx.generator.drafter_transport import (
             EXO_DRAFTER_TRANSPORT_ENV,
+            DrafterTransport,
             parse_transport_kind,
             transport_factory_for,
         )
@@ -480,13 +502,59 @@ def make_drafter(
             PipelinedModelDrafter,
         )
 
-        transport_kind = parse_transport_kind(
-            os.environ.get(EXO_DRAFTER_TRANSPORT_ENV), default="inprocess"
-        )
+        if pipelined_transport is not None:
+            # Caller supplied a long-lived transport (asymmetric path:
+            # SequentialGenerator allocates the RemoteTransport once at
+            # build time and reuses it across requests). Validate it
+            # implements the protocol and skip the factory dance below.
+            if not isinstance(pipelined_transport, DrafterTransport):
+                raise TypeError(
+                    "pipelined_transport must implement DrafterTransport; "
+                    f"got {type(pipelined_transport).__name__}"
+                )
+            if target_subgroup_size > 1:
+                raise NotImplementedError(
+                    f"Asymmetric drafter with target_subgroup_size="
+                    f"{target_subgroup_size} (> 1) requires broadcasting "
+                    "drafts on the target subgroup. V1 supports a single "
+                    "target rank (twins topology); multi-target "
+                    "asymmetric is a planned follow-up."
+                )
+            return PipelinedModelDrafter(
+                transport=pipelined_transport,
+                num_draft_tokens=num_draft_tokens,
+            )
+
+        if remote_parent_group is not None:
+            transport_kind = "remote"
+        else:
+            transport_kind = parse_transport_kind(
+                os.environ.get(EXO_DRAFTER_TRANSPORT_ENV), default="inprocess"
+            )
+
+        if transport_kind == "remote":
+            if remote_parent_group is None:
+                raise ValueError(
+                    "draft_mode='pipelined' with remote transport requires "
+                    "remote_parent_group; the runner bootstrap supplies it "
+                    "from the asymmetric MlxGroupSplit"
+                )
+            if remote_drafter_rank is None or remote_target_rank is None:
+                raise ValueError(
+                    "draft_mode='pipelined' with remote transport requires "
+                    "remote_drafter_rank and remote_target_rank"
+                )
+            if target_subgroup_size > 1:
+                # V1 boundary; see docstring.
+                raise NotImplementedError(
+                    f"Asymmetric drafter with target_subgroup_size="
+                    f"{target_subgroup_size} (> 1) requires broadcasting "
+                    "drafts on the target subgroup. V1 supports a single "
+                    "target rank (twins topology); multi-target "
+                    "asymmetric is a planned follow-up."
+                )
+
         factory = transport_factory_for(transport_kind)
-        # The factory accepts ``draft_model`` / ``draft_cache`` for the
-        # in-process transport; the remote transport ignores those (they
-        # live on the drafter rank).
         if transport_kind == "inprocess" and (
             draft_model is None or draft_cache is None
         ):
@@ -498,6 +566,9 @@ def make_drafter(
             draft_model=draft_model,
             draft_cache=draft_cache,
             num_draft_tokens=num_draft_tokens,
+            group=remote_parent_group,
+            drafter_rank=remote_drafter_rank,
+            target_rank=remote_target_rank,
         )
         return PipelinedModelDrafter(
             transport=transport,

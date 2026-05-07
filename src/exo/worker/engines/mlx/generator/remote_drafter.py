@@ -50,6 +50,39 @@ constructed via ``group.split`` so they don't drag the drafter rank
 in. The drafter rank's serve loop uses ``send/recv`` against the
 parent ``group`` for cross-subgroup point-to-point, which is exactly
 what those primitives are designed for.
+
+Twin-machine testing recipe (V1 N=1 asymmetric):
+================================================
+
+Two Macs reachable over Tailscale (e.g. ``wc-smbp`` + ``wc-smbpt``):
+
+    # On both machines, ensure the model card lists drafter_eligible_nodes:
+    # ModelCard(..., drafter_eligible_nodes=[wc_smbpt_node_id], drafters=[<drafter_id>])
+
+    # Worker on wc-smbp (target rank): defaults
+    EXO_DRAFT_MODE=pipelined uv run exo
+
+    # Worker on wc-smbpt (drafter rank): same env, the asymmetric
+    # placement layer assigns the drafter role automatically based
+    # on drafter_eligible_nodes. Pre-download the drafter weights
+    # there so DrafterRunner.LoadModel doesn't fault.
+    EXO_DRAFT_MODE=pipelined uv run exo
+
+For TCP/IP testing, use ``MlxRing`` (single-shard target) + the drafter
+node listed in eligibility. For RDMA testing, use ``MlxJaccl``
+(typically multi-node target) + Thunderbolt-bridge between the twins;
+the same code path runs over both backends -- the only difference is
+which ``mx.distributed`` backend negotiates the wire format.
+
+Single target rank (N=1) is the only supported V1 topology because
+the spec loop currently runs in lockstep on a single rank. Multi-target
+asymmetric (N>1, e.g. four target shards + one drafter on a fifth
+node) is gated behind a ``NotImplementedError`` in
+:func:`exo.worker.engines.mlx.generator.drafter.make_drafter` until the
+pipelined spec loop gains target-subgroup draft broadcast support.
+Placement still allows N>1 to keep telemetry honest; the runner side
+fails loudly so misconfiguration doesn't silently fall back to an
+arbitrary mode.
 """
 
 from __future__ import annotations
@@ -59,14 +92,13 @@ from typing import TYPE_CHECKING, Final, final
 
 if TYPE_CHECKING:
     from exo.worker.engines.mlx.generator.drafter_transport import (
-        DraftFuture,
         DrafterTransport,
+        DraftFuture,
     )
     from exo.worker.engines.mlx.types import KVCacheType, Model
 
 import mlx.core as mx
 from mlx_lm.models.cache import trim_prompt_cache as mlx_trim_prompt_cache
-
 
 # ---------------------------------------------------------------------------
 # Wire protocol
@@ -91,6 +123,14 @@ with an Ack frame so the target has a sync point."""
 OP_SHUTDOWN: Final[int] = 3
 """Drafter exits its serve loop. Replies with an Ack frame, then the
 serve loop returns."""
+
+OP_PREFILL: Final[int] = 4
+"""Per-request setup: target announces a prompt of ``num_inputs`` (used
+as ``num_prompt_tokens``) tokens. The drafter trims its cache to 0,
+recvs the prompt token array (shape ``(num_prompt_tokens,)``), runs
+prefill forwards through the drafter model, then replies with an Ack
+frame. Issued once at the start of every request so the spec loop's
+first ``OP_FORWARD`` seeds against an aligned drafter cache."""
 
 ACK_OK: Final[int] = 0
 
@@ -234,6 +274,27 @@ class RemoteTransport:
         # accept count). We still ack so the target has a sync point.
         self._executor.submit(self._trim_blocking, n_positions).result()
 
+    def reset_and_prefill(self, prompt_tokens: list[int]) -> None:
+        """Reset drafter cache and prefill it with ``prompt_tokens``.
+
+        Per-request setup: the drafter rank's KV cache persists across
+        requests (it was allocated once during runner load). Each new
+        request must reset the cache to offset 0 and re-prefill against
+        the new prompt so the spec loop's first ``OP_FORWARD`` seeds
+        against an aligned cache. ``prompt_tokens`` is the prompt minus
+        the last 2 tokens (the same prefill range the in-process path
+        feeds to ``_spec_drafter_prefill``); the spec loop's seed is
+        ``prompt_tokens[-2]`` (advanced internally by ``_pipelined_speculative_step``).
+
+        Empty ``prompt_tokens`` is valid (very short prompts) and only
+        resets the cache.
+        """
+        if self._is_shutdown:
+            raise RuntimeError(
+                "RemoteTransport.reset_and_prefill called after shutdown"
+            )
+        self._executor.submit(self._reset_and_prefill_blocking, prompt_tokens).result()
+
     def shutdown(self) -> None:
         if self._is_shutdown:
             return
@@ -305,6 +366,38 @@ class RemoteTransport:
             group=self._group,
         )
         mx.eval(ack)
+
+    def _reset_and_prefill_blocking(self, prompt_tokens: list[int]) -> None:
+        """Send the prefill command + token array and wait for the ack.
+
+        The command frame announces ``num_prompt_tokens`` (encoded in
+        the ``num_forwards`` slot). For an empty prefill we only send
+        the command frame; the drafter's cache reset is implicit in
+        every ``OP_PREFILL`` whether or not tokens follow.
+        """
+        num_prompt_tokens = len(prompt_tokens)
+        frame = _build_command_frame(
+            op=OP_PREFILL,
+            inputs=[],
+            num_forwards=num_prompt_tokens,
+            trim_amount=0,
+        )
+        mx.distributed.send(frame, self._drafter_rank, group=self._group)
+        if num_prompt_tokens > 0:
+            tokens_array = mx.array(prompt_tokens, dtype=mx.uint32)
+            mx.distributed.send(tokens_array, self._drafter_rank, group=self._group)
+        ack = mx.distributed.recv(
+            shape=(ACK_FRAME_SIZE,),
+            dtype=mx.uint32,
+            src=self._drafter_rank,
+            group=self._group,
+        )
+        mx.eval(ack)
+        if int(ack[0].item()) != ACK_OK:
+            raise RuntimeError(
+                f"Drafter rank reported error code {int(ack[0].item())} "
+                f"for reset_and_prefill({num_prompt_tokens} tokens)"
+            )
 
 
 def make_remote_transport(
@@ -417,6 +510,22 @@ def drafter_serve_loop(
             mx.distributed.send(response, target_rank, group=group)
             continue
 
+        if op == OP_PREFILL:
+            # ``num_forwards`` is overloaded here as the prompt token
+            # count (see _build_command_frame call site in
+            # _reset_and_prefill_blocking).
+            num_prompt_tokens = num_forwards
+            _reset_and_prefill_remote(
+                draft_model=draft_model,
+                draft_cache=draft_cache,
+                num_prompt_tokens=num_prompt_tokens,
+                target_rank=target_rank,
+                group=group,
+            )
+            ack = mx.array([ACK_OK], dtype=mx.uint32)
+            mx.distributed.send(ack, target_rank, group=group)
+            continue
+
         # Unknown op code: this is a wire-protocol violation, not a
         # recoverable error. Send an ack with a non-zero status so the
         # caller's trim_cache/shutdown blocks observe it; for
@@ -456,11 +565,80 @@ def _run_drafter_forwards_remote(
     return [int(t.item()) for t in ys]
 
 
+_DRAFTER_PREFILL_STEP_SIZE: Final[int] = 4096
+"""Chunk size for drafter-side prefill forwards.
+
+Mirrors :func:`exo.worker.engines.mlx.generator.generate._spec_drafter_prefill`'s
+``step`` default. Drafter weights are small (typically <2 GB) so the
+4096-token chunks comfortably fit in the drafter rank's command queue
+without OOM, even at long prompts."""
+
+
+def _reset_and_prefill_remote(
+    *,
+    draft_model: "Model",
+    draft_cache: "KVCacheType",
+    num_prompt_tokens: int,
+    target_rank: int,
+    group: mx.distributed.Group,
+) -> None:
+    """Reset drafter cache and prefill against an incoming prompt.
+
+    Pulled out as a free function (matches
+    :func:`_run_drafter_forwards_remote`) so the drafter rank doesn't
+    depend on any target-side code. The target rank already sent the
+    ``OP_PREFILL`` command frame; this function handles the cache
+    reset, recvs the prompt array (if any), and runs the prefill
+    forwards. The serve loop sends the ack after this returns.
+    """
+    # Trim cache to offset 0 so the new prompt starts cleanly. KVCache's
+    # offset is the only state we need to reset; SSM caches and other
+    # exotic types are not in scope for the drafter (drafter models are
+    # standard transformers by convention). If the offset is 0 the trim
+    # is a no-op.
+    current_offset = 0
+    if draft_cache:
+        # Every cache entry shares the same offset for transformer
+        # drafters; use entry 0 as the source of truth.
+        cache_zero = draft_cache[0]
+        offset_attr = getattr(cache_zero, "offset", None)
+        if isinstance(offset_attr, int):
+            current_offset = offset_attr
+    if current_offset > 0:
+        from typing import cast as _cast
+
+        mlx_trim_prompt_cache(_cast(list[object], draft_cache), current_offset)  # type: ignore[reportArgumentType]
+
+    if num_prompt_tokens == 0:
+        return
+
+    # Pull the prompt array from the target rank.
+    tokens = mx.distributed.recv(
+        shape=(num_prompt_tokens,),
+        dtype=mx.uint32,
+        src=target_rank,
+        group=group,
+    )
+    mx.eval(tokens)
+
+    # Mirror :func:`_spec_drafter_prefill`: feed tokens through the
+    # drafter model in chunks, advancing its KV cache.
+    step = _DRAFTER_PREFILL_STEP_SIZE
+    cursor = 0
+    while cursor < num_prompt_tokens:
+        chunk_end = min(cursor + step, num_prompt_tokens)
+        chunk = tokens[cursor:chunk_end]
+        draft_model(chunk[None], cache=draft_cache)
+        mx.eval([c.state for c in draft_cache])  # type: ignore[reportArgumentType]
+        cursor = chunk_end
+
+
 __all__ = [
     "ACK_FRAME_SIZE",
     "ACK_OK",
     "COMMAND_FRAME_SIZE",
     "OP_FORWARD",
+    "OP_PREFILL",
     "OP_SHUTDOWN",
     "OP_TRIM_CACHE",
     "RemoteTransport",
