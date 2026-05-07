@@ -20,7 +20,7 @@ from exo.download.peer_file_server import PeerFileServer
 from exo.master.main import Master
 from exo.routing.event_router import EventRouter
 from exo.routing.router import Router, get_node_id_keypair
-from exo.shared.constants import EXO_LOG, EXO_MODELS_DIR, EXO_PEER_DOWNLOAD_PORT
+from exo.shared.constants import EXO_DEFAULT_MODELS_DIR, EXO_LOG, EXO_PEER_DOWNLOAD_PORT
 from exo.shared.election import Election, ElectionResult
 from exo.shared.logging import logger_cleanup, logger_set_context, logger_setup
 from exo.shared.types.common import NodeId, SessionId
@@ -105,7 +105,7 @@ class Node:
             peer_file_server = PeerFileServer(
                 host="0.0.0.0",
                 port=EXO_PEER_DOWNLOAD_PORT,
-                models_dir=EXO_MODELS_DIR,
+                models_dir=EXO_DEFAULT_MODELS_DIR,
             )
 
         if not args.no_downloads:
