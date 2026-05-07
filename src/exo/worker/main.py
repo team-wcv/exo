@@ -381,8 +381,12 @@ class Worker:
 
     async def _start_runner_task(self, task: Task):
         if (instance := self.state.instances.get(task.instance_id)) is not None:
+            # ``all_node_to_runner`` resolves both target and drafter ranks
+            # for asymmetric placement; ``node_to_runner`` alone misses the
+            # drafter rank because it lives on ``instance.drafter_placement``,
+            # not on ``shard_assignments``.
             await self.runners[
-                instance.shard_assignments.node_to_runner[self.node_id]
+                instance.all_node_to_runner[self.node_id]
             ].start_task(task)
 
     def _create_supervisor(self, task: CreateRunner) -> RunnerSupervisor:

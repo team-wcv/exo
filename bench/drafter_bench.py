@@ -25,6 +25,7 @@ JSON written to ``--out``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.client
 import json
 import statistics
@@ -164,7 +165,7 @@ def _post_chat(
         # ``\n\n`` so the body stream contains both header lines (data:
         # / : comment) and blank separator lines we ignore.
         while True:
-            raw = resp.fp.readline()  # type: ignore[union-attr]
+            raw = resp.fp.readline()
             if not raw:
                 break
             line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
@@ -176,10 +177,8 @@ def _post_chat(
             # back to the non-streaming endpoint (which would lose TTFT).
             if line.startswith(": generation_stats"):
                 payload_str = line[len(": generation_stats"):].strip()
-                try:
+                with contextlib.suppress(json.JSONDecodeError):
                     generation_stats = json.loads(payload_str)
-                except json.JSONDecodeError:
-                    pass
                 continue
             if not line.startswith("data:"):
                 continue
