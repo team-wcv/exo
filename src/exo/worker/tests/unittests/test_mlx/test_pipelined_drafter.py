@@ -30,6 +30,7 @@ from exo.worker.engines.mlx.generator.drafter_transport import (
     EXO_DRAFTER_TRANSPORT_ENV,
     DrafterTransport,
     DraftFuture,
+    clamp_num_draft_tokens_to_transport,
     parse_transport_kind,
     transport_factory_for,
 )
@@ -490,6 +491,66 @@ def test_make_drafter_rejects_non_protocol_pipelined_transport() -> None:
             draft_cache=None,
             pipelined_transport=NotATransport(),
         )
+
+
+class TestClampNumDraftTokensToTransport:
+    """Per-request K must be clamped to the transport's wire-protocol max.
+
+    Regression coverage: aborted K=8 sweep at 14:35:05 raised
+    ``ValueError`` deep inside :class:`PipelinedModelDrafter` and killed
+    the target runner subprocess (PR #15). The clamp helper exists so
+    ``generate.py`` can defend the runner from malformed per-request
+    overrides without ever reaching the drafter constructor.
+    """
+
+    def test_clamp_no_op_when_request_within_budget(self) -> None:
+        transport = FakeTransport(num_draft_tokens_value=5)
+        clamped, was_clamped = clamp_num_draft_tokens_to_transport(3, transport)
+        assert clamped == 3
+        assert was_clamped is False
+
+    def test_clamp_no_op_when_request_equals_budget(self) -> None:
+        transport = FakeTransport(num_draft_tokens_value=5)
+        clamped, was_clamped = clamp_num_draft_tokens_to_transport(5, transport)
+        assert clamped == 5
+        assert was_clamped is False
+
+    def test_clamp_applies_when_request_exceeds_budget(self) -> None:
+        transport = FakeTransport(num_draft_tokens_value=5)
+        clamped, was_clamped = clamp_num_draft_tokens_to_transport(8, transport)
+        assert clamped == 5
+        assert was_clamped is True
+
+    def test_clamp_pathological_request(self) -> None:
+        transport = FakeTransport(num_draft_tokens_value=5)
+        clamped, was_clamped = clamp_num_draft_tokens_to_transport(1024, transport)
+        assert clamped == 5
+        assert was_clamped is True
+
+    def test_clamp_rejects_zero_or_negative(self) -> None:
+        transport = FakeTransport(num_draft_tokens_value=5)
+        with pytest.raises(ValueError, match="requested_num_draft_tokens"):
+            clamp_num_draft_tokens_to_transport(0, transport)
+        with pytest.raises(ValueError, match="requested_num_draft_tokens"):
+            clamp_num_draft_tokens_to_transport(-1, transport)
+
+    def test_clamped_k_constructs_pipelined_drafter_safely(self) -> None:
+        """Smoke: clamped K must satisfy ``PipelinedModelDrafter`` validation.
+
+        The whole point of the clamp is that the value flowing into
+        :class:`PipelinedModelDrafter` never exceeds ``transport.num_draft_tokens``.
+        Construct the drafter with the clamped K to prove the pre-fix
+        regression path is gone.
+        """
+        from exo.worker.engines.mlx.generator.pipelined_drafter import (
+            PipelinedModelDrafter,
+        )
+
+        transport = FakeTransport(num_draft_tokens_value=5)
+        # Pre-fix: K=8 raised ValueError here and killed the subprocess.
+        clamped, _ = clamp_num_draft_tokens_to_transport(8, transport)
+        drafter = PipelinedModelDrafter(transport=transport, num_draft_tokens=clamped)
+        assert drafter.num_draft_tokens == 5
 
 
 def test_make_drafter_pipelined_rejects_multi_target_subgroup() -> None:

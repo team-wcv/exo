@@ -207,6 +207,13 @@ class SequentialGenerator(Engine):
         ]
         | None
     ) = field(default=None, init=False)
+    # Tasks that failed during ``_build_generator`` or mid-stream. Drained
+    # by ``step`` so per-task failures surface as ``FinishedResponse`` to
+    # the caller without taking down the runner subprocess. We accept the
+    # rank-desync risk: ``_build_generator`` failures are deterministic
+    # in practice (config / per-request K mismatch) so all ranks fail
+    # together; any non-deterministic failure was already a desync hazard.
+    _pending_failed: list[TaskId] = field(default_factory=list, init=False)
 
     def warmup(self):
         self.check_for_cancel_every = warmup_inference(
@@ -256,22 +263,36 @@ class SequentialGenerator(Engine):
     ) -> Iterator[
         tuple[TaskId, GenerationChunk | FinishedResponse | CancelledResponse]
     ]:
+        output: list[
+            tuple[TaskId, GenerationChunk | CancelledResponse | FinishedResponse]
+        ] = []
+
         if self._active is None:
             self.agree_on_tasks()
 
             if self._queue:
                 self._start_next()
-            else:
-                return map(
-                    lambda task: (task, CancelledResponse()), self._cancelled_tasks
-                )
+
+        # Drain failures recorded by ``_start_next`` (this tick or any
+        # prior tick that left them queued) so the runner loop marks
+        # them complete and proceeds with the next task instead of
+        # tearing down the subprocess (regression: K=8 ValueError took
+        # the target rank with it on 14:35:05).
+        while self._pending_failed:
+            output.append((self._pending_failed.pop(0), FinishedResponse()))
+
+        if self._active is None:
+            return itertools.chain(
+                iter(output),
+                map(
+                    lambda task: (task, CancelledResponse()),
+                    self._cancelled_tasks,
+                ),
+            )
 
         assert self._active is not None
 
         task, gen, queue, output_generator = self._active
-        output: list[
-            tuple[TaskId, GenerationChunk | CancelledResponse | FinishedResponse]
-        ] = []
         try:
             response = next(gen)
             queue.push(response)
@@ -301,9 +322,17 @@ class SequentialGenerator(Engine):
                 self._start_next()
 
         except Exception as e:
+            # Send error chunk to the client and mark the task finished,
+            # but DO NOT re-raise. Re-raising here propagates through
+            # ``handle_generation_tasks`` and triggers ``RunnerFailed`` on
+            # the supervisor, which currently leaves a respawned target
+            # rank stuck in ``RunnerIdle`` because its drafter peer is
+            # still ``RunnerRunning`` (see ``_init_distributed_backend``).
+            # A single malformed request must never permanently brick a
+            # multi-rank instance.
             self._send_error(task, e)
             self._active = None
-            raise
+            output.append((task.task_id, FinishedResponse()))
 
         return filter(
             lambda chunk: (
@@ -320,8 +349,15 @@ class SequentialGenerator(Engine):
         try:
             gen = self._build_generator(task)
         except Exception as e:
+            # Preserve runner liveness: surface the error to the client
+            # via ``_send_error`` and queue a ``FinishedResponse`` for
+            # ``step`` to drain on the next tick. ``self._active`` stays
+            # ``None`` so the next ``step`` either picks up the next
+            # queued task or returns idle (instead of asserting and
+            # crashing the subprocess).
             self._send_error(task, e)
-            raise
+            self._pending_failed.append(task.task_id)
+            return
         queue = GeneratorQueue[GenerationResponse]()
 
         if task.task_params.bench:

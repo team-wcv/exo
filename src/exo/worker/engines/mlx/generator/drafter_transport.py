@@ -285,6 +285,40 @@ ALL_TRANSPORT_KINDS: Final[tuple[str, ...]] = ("inprocess", "remote")
 EXO_DRAFTER_TRANSPORT_ENV: Final[str] = "EXO_DRAFTER_TRANSPORT"
 
 
+def clamp_num_draft_tokens_to_transport(
+    requested_num_draft_tokens: int,
+    transport: DrafterTransport,
+) -> tuple[int, bool]:
+    """Clamp a per-request K against the transport's wire-protocol budget.
+
+    Asymmetric placement allocates a long-lived ``RemoteTransport`` at
+    builder time with a fixed ``num_draft_tokens`` budget (see
+    ``builder.py``). A per-request ``num_draft_tokens`` override above
+    the budget would otherwise raise ``ValueError`` deep inside
+    :class:`PipelinedModelDrafter`, killing the runner subprocess and
+    leaving the peer rank wedged (regression: aborted K=8 sweep at
+    14:35:05 took the target rank with it). Clamping silently to the
+    transport max is the only safe behaviour: the wire-protocol budget
+    is a startup-time setting (``EXO_NUM_DRAFT_TOKENS``) and cannot be
+    widened mid-flight without re-warmup.
+
+    Returns the (possibly clamped) K and a flag indicating whether
+    clamping was applied so callers can emit a structured warning.
+
+    :raises ValueError: if ``requested_num_draft_tokens`` is < 1. The
+        spec loop never proposes zero or negative drafts, so this would
+        be a programmer error rather than a malformed request.
+    """
+    if requested_num_draft_tokens < 1:
+        raise ValueError(
+            f"requested_num_draft_tokens must be >= 1, got {requested_num_draft_tokens}"
+        )
+    transport_max = transport.num_draft_tokens
+    if requested_num_draft_tokens > transport_max:
+        return transport_max, True
+    return requested_num_draft_tokens, False
+
+
 def parse_transport_kind(raw: str | None, default: str) -> str:
     """Parse the ``EXO_DRAFTER_TRANSPORT`` env var, warning on unknown values."""
     if raw is None:

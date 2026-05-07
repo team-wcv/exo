@@ -1,6 +1,6 @@
 import time
 from collections.abc import Generator
-from typing import Annotated, Any, Literal, get_args
+from typing import Annotated, Any, Final, Literal, get_args
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
@@ -16,6 +16,15 @@ from exo.utils.pydantic_ext import FrozenModel
 FinishReason = Literal[
     "stop", "length", "tool_calls", "content_filter", "function_call", "error"
 ]
+
+# Upper bound for the per-request ``num_draft_tokens`` override. The runner
+# allocates a fixed wire-protocol budget at warmup (``EXO_NUM_DRAFT_TOKENS``,
+# default in ``defaults.py``), and per-request K is clamped to that budget
+# inside ``generate.py``. The API-level cap exists to reject pathological
+# values up-front (which previously crashed the runner subprocess via an
+# unhandled ``ValueError``); 32 is well above any realistic drafter K and
+# any sane wire-protocol budget on Apple Silicon.
+MAX_NUM_DRAFT_TOKENS_PER_REQUEST: Final[int] = 32
 
 
 class ErrorInfo(BaseModel):
@@ -199,12 +208,16 @@ class GenerationStats(BaseModel):
     # K used for speculative_generate_step (None when drafter didn't run).
     num_draft_tokens: int | None = None
     # Drafting strategy that actually ran for this request: "model" for
-    # external-drafter spec decoding, "ngram" for in-context suffix
-    # lookup, "none" for non-speculative. None when the engine doesn't
+    # external-drafter spec decoding, "pipelined" for the pipelined+
+    # remote drafter, "ngram" for in-context suffix lookup, "eagle" /
+    # "lookahead" reserved for the upcoming auxiliary-head + Jacobi
+    # drafters, "none" for non-speculative. None when the engine doesn't
     # surface drafting (e.g. image gen). Useful for telemetry dashboards
     # to attribute throughput wins to a specific strategy when running
     # mixed-mode A/B tests.
-    draft_mode: Literal["model", "pipelined", "ngram", "none"] | None = None
+    draft_mode: (
+        Literal["model", "pipelined", "ngram", "eagle", "lookahead", "none"] | None
+    ) = None
 
     @property
     def drafter_acceptance_fraction(self) -> float | None:
@@ -287,7 +300,17 @@ class ChatCompletionRequest(BaseModel):
     # extensions to the OpenAI Chat Completions schema -- standard clients
     # ignore unknown fields and get the runner's defaults.
     use_drafter: bool | None = None
-    num_draft_tokens: int | None = None
+    num_draft_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_NUM_DRAFT_TOKENS_PER_REQUEST,
+        description=(
+            "Per-request override for the number of speculative draft tokens "
+            "per round (K). Bounded to "
+            f"[1, {MAX_NUM_DRAFT_TOKENS_PER_REQUEST}] to prevent malformed "
+            "requests from triggering wire-protocol failures in the runner."
+        ),
+    )
     # Per-request draft-strategy override. ``"model"`` uses the external
     # drafter, ``"pipelined"`` uses the pipelined+remote drafter, ``"ngram"``
     # uses CPU n-gram tables, ``"none"`` disables speculation. ``None`` defers

@@ -738,6 +738,28 @@ def mlx_generate(
         # drafters don't crash on zero-K proposals.
         effective_num_draft_tokens = 1
 
+    if asymmetric_drafter_active and asymmetric_drafter_transport is not None:
+        from exo.worker.engines.mlx.generator.drafter_transport import (
+            DrafterTransport as _DrafterTransport,
+        )
+        from exo.worker.engines.mlx.generator.drafter_transport import (
+            clamp_num_draft_tokens_to_transport,
+        )
+
+        if isinstance(asymmetric_drafter_transport, _DrafterTransport):
+            clamped_k, was_clamped = clamp_num_draft_tokens_to_transport(
+                effective_num_draft_tokens, asymmetric_drafter_transport
+            )
+            if was_clamped:
+                logger.warning(
+                    f"clamping num_draft_tokens={effective_num_draft_tokens} "
+                    f"to transport max={clamped_k} "
+                    f"(request_num_draft_tokens={request_num_draft_tokens}); "
+                    f"raise EXO_NUM_DRAFT_TOKENS at runner startup to widen "
+                    f"the wire-protocol budget"
+                )
+            effective_num_draft_tokens = clamped_k
+
     prefix_hit_length = 0
     matched_index: int | None = None
     is_exact_hit = False

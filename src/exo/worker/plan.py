@@ -87,11 +87,48 @@ def _kill_runner(
                 runner_id=runner_id,
             )
 
-        for global_runner_id in runner.bound_instance.instance.all_runner_ids:
+        # Restart-cascade rule: only fires when our local rank is
+        # ``RunnerRunning`` (mid-task), which guarantees we previously
+        # cleared the bootstrap collective with every peer rank in lock-
+        # step (warmup-complete on all ranks is a precondition for
+        # ``RunnerRunning`` -- see ``handle_generation_tasks``). If a
+        # peer is now ``RunnerIdle``, that is a backward jump only
+        # reachable by a process restart; the transient ``RunnerFailed``
+        # was gossiped too briefly for the rule above to fire (the
+        # supervisor respawned the runner immediately and the new
+        # process emitted ``RunnerIdle`` right away). Without this rule
+        # the bootstrap predicate (``all_runners_connecting`` in
+        # ``_init_distributed_backend``) never fires and the respawned
+        # peer is stuck in ``RunnerIdle`` forever -- the failure mode
+        # observed in the K=8 sweep regression at 14:35:05.
+        #
+        # We restrict the trigger to ``RunnerRunning`` (not
+        # ``RunnerLoaded``/``RunnerReady``) because during initial
+        # bootstrap a peer can legitimately sit at ``RunnerIdle`` while
+        # we have completed our own loading -- ``LoadModel`` happens
+        # per-rank without a collective barrier (see ``runner.py``
+        # case ``LoadModel``), so warmup-gate predicates need to keep
+        # waiting rather than tearing the cluster down.
+        instance = runner.bound_instance.instance
+        is_multi_rank_instance = instance.parent_group_size > 1
+        local_is_running = isinstance(runner.status, RunnerRunning)
+
+        for global_runner_id in instance.all_runner_ids:
             if runner_id == global_runner_id:
                 continue
 
-            if isinstance(all_runners.get(global_runner_id, None), RunnerFailed):
+            peer_status = all_runners.get(global_runner_id, None)
+            if isinstance(peer_status, RunnerFailed):
+                return Shutdown(
+                    instance_id=instance_id,
+                    runner_id=runner_id,
+                )
+
+            if (
+                is_multi_rank_instance
+                and local_is_running
+                and isinstance(peer_status, RunnerIdle)
+            ):
                 return Shutdown(
                     instance_id=instance_id,
                     runner_id=runner_id,

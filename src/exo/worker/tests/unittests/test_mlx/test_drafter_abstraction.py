@@ -60,9 +60,9 @@ def test_eagle_drafter_scaffold_raises_on_stream() -> None:
                 tokenizer=object(),  # type: ignore[arg-type]
                 prompt=object(),  # type: ignore[arg-type]
                 context_tokens=[],
-                prompt_cache=[],  # type: ignore[arg-type]
+                prompt_cache=[],
                 max_tokens=1,
-                sampler=lambda x: x,  # type: ignore[arg-type, return-value]
+                sampler=lambda x: x,
                 logits_processors=[],
             )
         )
@@ -81,18 +81,16 @@ def test_lookahead_drafter_scaffold_raises_on_stream() -> None:
     assert drafter.num_draft_tokens == 3
     assert drafter.window_size == 5
     assert drafter.ngram_size == 3
-    with pytest.raises(
-        NotImplementedError, match="LookaheadDrafter is a scaffolding"
-    ):
+    with pytest.raises(NotImplementedError, match="LookaheadDrafter is a scaffolding"):
         next(
             drafter.stream(
                 model=object(),  # type: ignore[arg-type]
                 tokenizer=object(),  # type: ignore[arg-type]
                 prompt=object(),  # type: ignore[arg-type]
                 context_tokens=[],
-                prompt_cache=[],  # type: ignore[arg-type]
+                prompt_cache=[],
                 max_tokens=1,
-                sampler=lambda x: x,  # type: ignore[arg-type, return-value]
+                sampler=lambda x: x,
                 logits_processors=[],
             )
         )
