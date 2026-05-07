@@ -17,6 +17,7 @@ from exo.worker.runner.bootstrap import logger
 from exo.worker.runner.llm_inference.batch_generator import (
     DEFAULT_DRAFTER_MIN_OUTPUT_TOKENS,
     DEFAULT_NUM_DRAFT_TOKENS,
+    EXO_ADAPTIVE_DRAFT_TOKENS,
     EXO_DRAFTER_MIN_OUTPUT_TOKENS,
     EXO_NUM_DRAFT_TOKENS,
     BatchGenerator,
@@ -120,9 +121,13 @@ class MlxBuilder(Builder):
                 DEFAULT_DRAFTER_MIN_OUTPUT_TOKENS,
                 minimum=0,
             )
+            adaptive_draft_tokens = os.environ.get(
+                EXO_ADAPTIVE_DRAFT_TOKENS, ""
+            ).lower() in {"1", "true", "yes"}
             if force_sequential_for_drafter:
                 logger.info(
-                    f"speculative decoding: K={num_draft_tokens}, "
+                    f"speculative decoding: K={num_draft_tokens} "
+                    f"(adaptive={adaptive_draft_tokens}), "
                     f"skip_drafter_when_max_tokens<={drafter_min_output_tokens}"
                 )
 
@@ -141,6 +146,7 @@ class MlxBuilder(Builder):
                 draft_model_id=self.draft_model_id,
                 num_draft_tokens=num_draft_tokens,
                 drafter_min_output_tokens=drafter_min_output_tokens,
+                adaptive_draft_tokens=adaptive_draft_tokens,
             )
         else:
             logger.info("using BatchGenerator")

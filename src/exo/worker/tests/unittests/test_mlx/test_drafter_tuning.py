@@ -16,6 +16,7 @@ from exo.worker.runner.llm_inference.batch_generator import (
     DEFAULT_NUM_DRAFT_TOKENS,
     EXO_DRAFTER_MIN_OUTPUT_TOKENS,
     EXO_NUM_DRAFT_TOKENS,
+    adaptive_num_draft_tokens,
     parse_env_int,
 )
 
@@ -127,6 +128,35 @@ def test_resolve_speculative_decoding_passes_k_through() -> None:
     )
     assert eff is drafter
     assert kwargs == {"num_draft_tokens": 5}
+
+
+def test_adaptive_num_draft_tokens_uses_fallback_until_warmup() -> None:
+    """With <2 observations the controller hasn't warmed up yet."""
+    assert adaptive_num_draft_tokens([], fallback=5) == 5
+    assert adaptive_num_draft_tokens([0.9], fallback=7) == 7
+
+
+def test_adaptive_num_draft_tokens_low_acceptance_uses_k2() -> None:
+    """Drafter is missing badly -- don't waste cycles speculating."""
+    assert adaptive_num_draft_tokens([0.1, 0.2, 0.3], fallback=5) == 2
+
+
+def test_adaptive_num_draft_tokens_mid_acceptance_uses_k4() -> None:
+    assert adaptive_num_draft_tokens([0.6, 0.65, 0.6], fallback=5) == 4
+
+
+def test_adaptive_num_draft_tokens_high_acceptance_uses_k6() -> None:
+    assert adaptive_num_draft_tokens([0.85, 0.9, 0.8], fallback=5) == 6
+
+
+def test_adaptive_num_draft_tokens_band_boundaries() -> None:
+    """0.5 is the K=2 -> K=4 boundary; 0.75 is K=4 -> K=6."""
+    # average exactly 0.5 -> K=4 (>= 0.5)
+    assert adaptive_num_draft_tokens([0.5, 0.5], fallback=5) == 4
+    # average exactly 0.75 -> K=6 (>= 0.75)
+    assert adaptive_num_draft_tokens([0.75, 0.75], fallback=5) == 6
+    # average just under 0.5 -> K=2
+    assert adaptive_num_draft_tokens([0.499, 0.499], fallback=5) == 2
 
 
 def test_resolve_speculative_decoding_no_k_means_no_kwarg() -> None:

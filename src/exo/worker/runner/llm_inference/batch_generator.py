@@ -74,8 +74,35 @@ EXO_RUNNER_MUST_TIMEOUT = "EXO RUNNER MUST TIMEOUT"
 # short-skip threshold (avoids surprises mid-stream).
 EXO_NUM_DRAFT_TOKENS = "EXO_NUM_DRAFT_TOKENS"
 EXO_DRAFTER_MIN_OUTPUT_TOKENS = "EXO_DRAFTER_MIN_OUTPUT_TOKENS"
+EXO_ADAPTIVE_DRAFT_TOKENS = "EXO_ADAPTIVE_DRAFT_TOKENS"  # "1" to enable
 DEFAULT_NUM_DRAFT_TOKENS = 5  # purpose-built family pairs hit ~80% acceptance
 DEFAULT_DRAFTER_MIN_OUTPUT_TOKENS = 16
+# Rolling-window size used by adaptive K. Keep small so the controller is
+# responsive to traffic shifts (code completion vs reasoning) without
+# oscillating on per-request noise.
+ADAPTIVE_K_WINDOW = 8
+
+
+def adaptive_num_draft_tokens(
+    rolling_fractions: list[float], fallback: int
+) -> int:
+    """Pick K (num_draft_tokens) from a rolling window of acceptance fractions.
+
+    The bands are based on the geometric expectation
+    ``(1 - p^(K+1)) / (1 - p)`` from the speculative-decoding literature:
+    K=2 is the right call when the drafter is missing, K=4 around 50-75%
+    acceptance, K=6 above 75%. Below the warmup threshold (need at least 2
+    observations) we fall back to the configured default rather than
+    twitching at K=2 on first request.
+    """
+    if len(rolling_fractions) < 2:
+        return fallback
+    average = sum(rolling_fractions) / len(rolling_fractions)
+    if average < 0.5:
+        return 2
+    if average < 0.75:
+        return 4
+    return 6
 
 
 def parse_env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -139,6 +166,10 @@ class SequentialGenerator(Engine):
     # max_output_tokens threshold below which the drafter is skipped per
     # request. None falls back to the env var EXO_DRAFTER_MIN_OUTPUT_TOKENS.
     drafter_min_output_tokens: int | None = None
+    # Item 7: when True, K is recomputed each request from a rolling window
+    # of observed acceptance fractions. Disabled by default so K stays
+    # predictable for benchmarking.
+    adaptive_draft_tokens: bool = False
     check_for_cancel_every: int = 50
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
@@ -146,6 +177,12 @@ class SequentialGenerator(Engine):
     _maybe_cancel: list[TextGeneration] = field(default_factory=list, init=False)
     _all_tasks: dict[TaskId, TextGeneration] = field(default_factory=dict, init=False)
     _queue: deque[TextGeneration] = field(default_factory=deque, init=False)
+    # Rolling window of recently-observed drafter-acceptance fractions for
+    # adaptive K. Only populated when adaptive_draft_tokens is True.
+    _recent_acceptance: deque[float] = field(
+        default_factory=lambda: deque(maxlen=ADAPTIVE_K_WINDOW),
+        init=False,
+    )
     _active: (
         tuple[
             TextGeneration,
@@ -226,6 +263,21 @@ class SequentialGenerator(Engine):
         try:
             response = next(gen)
             queue.push(response)
+            # Observe drafter acceptance once the final stats arrive. We do
+            # this here (and not in mlx_generate) because the rolling buffer
+            # is owned by the generator and must persist across requests for
+            # adaptive K to converge.
+            if (
+                self.adaptive_draft_tokens
+                and response.stats is not None
+                and response.stats.drafter_model_id is not None
+                and response.stats.generation_tokens > 0
+            ):
+                fraction = (
+                    response.stats.accepted_draft_tokens
+                    / response.stats.generation_tokens
+                )
+                self._recent_acceptance.append(fraction)
             # drain potentially many responses every time
             while (parsed := next(output_generator, None)) is not None:
                 output.append((task.task_id, parsed))
@@ -326,6 +378,17 @@ class SequentialGenerator(Engine):
 
                 self.agree_on_tasks()
 
+        # Adaptive K (item 7): when enabled, recompute K from the rolling
+        # window of observed acceptance fractions. The configured value
+        # (`self.num_draft_tokens`) is the warmup fallback used until the
+        # window has enough data.
+        if self.adaptive_draft_tokens and self.num_draft_tokens is not None:
+            effective_num_draft_tokens: int | None = adaptive_num_draft_tokens(
+                list(self._recent_acceptance), fallback=self.num_draft_tokens
+            )
+        else:
+            effective_num_draft_tokens = self.num_draft_tokens
+
         return mlx_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -339,7 +402,7 @@ class SequentialGenerator(Engine):
             vision_processor=self.vision_processor,
             draft_model=self.draft_model,
             drafter_model_id=self.draft_model_id,
-            num_draft_tokens=self.num_draft_tokens,
+            num_draft_tokens=effective_num_draft_tokens,
             drafter_min_output_tokens=self.drafter_min_output_tokens,
         )
 
