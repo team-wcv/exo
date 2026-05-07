@@ -267,14 +267,70 @@ def initialize_mlx(bound_instance: BoundInstance) -> MlxGroupSplit:
         )
 
     drafter_rank = placement.drafter_rank
-    my_rank = parent.rank()
-    color = COLOR_DRAFTER if my_rank == drafter_rank else COLOR_TARGET
-    target_subgroup = parent.split(color, key=my_rank)
+    parent_size = parent.size()
+
+    # V1 boundary: single target rank + drafter rank (parent_size == 2).
+    # MLX's ring and jaccl backends do not implement ``Group.split`` on
+    # Apple Silicon (only the MPI backend does), so we cannot construct
+    # a real target-only subgroup. Fortunately V1 only supports a single
+    # target rank, where TP=1 / PP=1 means the target never invokes
+    # collectives over the subgroup -- ``self.group`` is read only for
+    # ``rank()`` / ``size()`` introspection. We expose a non-distributed
+    # singleton group for the target rank so its sharding code sees
+    # world_size=1 and never tries to call collectives at all.
+    #
+    # When V2 lands (multi-target asymmetric, parent_size > 2), the
+    # target subgroup MUST exclude the drafter rank because TP/PP
+    # collectives would otherwise hang waiting on the drafter. At that
+    # point either MPI is required or we add a backend-level split
+    # implementation; the assertion below pins the V1 contract.
+    if parent_size > 2:
+        raise NotImplementedError(
+            f"Asymmetric placement with multi-target subgroup "
+            f"(parent_size={parent_size}) requires a backend that "
+            "implements ``Group.split``. MLX's ring and jaccl backends "
+            "do not support split on Apple Silicon today; V1 supports a "
+            "single target rank (parent_size == 2)."
+        )
+    # ``mx.distributed.Group`` is a C++-backed type; ``_SingletonStubGroup``
+    # implements the only methods the V1 N=1 target flow reads. Routing
+    # through ``object`` documents the deliberate type narrowing.
+    target_subgroup = cast(
+        "mx.distributed.Group", cast(object, _SingletonStubGroup())
+    )
     return MlxGroupSplit(
         parent=parent,
         target_subgroup=target_subgroup,
         drafter_rank_in_parent=drafter_rank,
     )
+
+
+class _SingletonStubGroup:
+    """Stand-in for a size-1 ``mx.distributed.Group`` on Apple Silicon.
+
+    MLX's ring and jaccl backends do not implement ``Group.split``; we
+    cannot ask the parent group to give us a real target-only subgroup.
+    For V1 N=1 target placements the target's TP/PP code only reads
+    ``rank()`` / ``size()`` for sharding decisions and -- with
+    ``world_size==1`` -- never invokes ``mx.distributed`` collectives.
+    A pure-Python stub satisfies the interface without needing a C++
+    ``Group`` handle.
+
+    Casting to ``mx.distributed.Group`` at the use site is safe because
+    no path in the V1 single-target flow ever passes this object to a
+    real collective; if a future change does, it will fail loudly with
+    a TypeError pointing operators at the V1 boundary.
+    """
+
+    def rank(self) -> int:
+        return 0
+
+    def size(self) -> int:
+        return 1
+
+    def split(self, color: int, key: int = -1) -> "_SingletonStubGroup":
+        del color, key
+        return self
 
 
 EXO_DISABLE_DRAFTER_ENV = "EXO_DISABLE_DRAFTER"
