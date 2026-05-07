@@ -316,6 +316,18 @@ class RemoteTransport:
             num_forwards=num_forwards,
             trim_amount=0,
         )
+        try:
+            from exo.worker.runner.bootstrap import logger as _bootstrap_logger
+
+            _bootstrap_logger.info(
+                f"RemoteTransport._forward_blocking send: op=OP_FORWARD "
+                f"num_inputs={len(inputs)} num_forwards={num_forwards} "
+                f"inputs={inputs} drafter_rank={self._drafter_rank} "
+                f"target_rank={self._target_rank} "
+                f"frame_array={[int(x) for x in frame.tolist()]}"  # type: ignore[reportUnknownArgumentType]
+            )
+        except Exception:
+            pass
         mx.distributed.send(frame, self._drafter_rank, group=self._group)
         # Drafts buffer is fixed-size at K + 1 (the upper bound of any
         # forward request); we slice to ``num_forwards`` here.
@@ -382,6 +394,17 @@ class RemoteTransport:
             num_forwards=num_prompt_tokens,
             trim_amount=0,
         )
+        try:
+            from exo.worker.runner.bootstrap import logger as _bootstrap_logger
+
+            _bootstrap_logger.info(
+                f"RemoteTransport._reset_and_prefill_blocking send: "
+                f"op=OP_PREFILL num_prompt_tokens={num_prompt_tokens} "
+                f"drafter_rank={self._drafter_rank} "
+                f"frame_array={[int(x) for x in frame.tolist()]}"  # type: ignore[reportUnknownArgumentType]
+            )
+        except Exception:
+            pass
         mx.distributed.send(frame, self._drafter_rank, group=self._group)
         if num_prompt_tokens > 0:
             tokens_array = mx.array(prompt_tokens, dtype=mx.uint32)
@@ -482,6 +505,20 @@ def drafter_serve_loop(
         )
         mx.eval(frame)
         op, inputs, num_forwards, trim_amount = _decode_command_frame(frame)
+        # Diagnostic: surface the raw decoded frame so wire-protocol
+        # mismatches between target and drafter are debuggable without
+        # needing a coupled tracer. Logged at INFO so it's visible
+        # without enabling debug-level on the drafter rank.
+        try:
+            from exo.worker.runner.bootstrap import logger as _bootstrap_logger
+
+            _bootstrap_logger.info(
+                f"drafter_serve_loop recv frame: op={op} "
+                f"num_inputs={len(inputs)} num_forwards={num_forwards} "
+                f"trim_amount={trim_amount} inputs={inputs}"
+            )
+        except Exception:
+            pass
 
         if op == OP_SHUTDOWN:
             ack = mx.array([ACK_OK], dtype=mx.uint32)
