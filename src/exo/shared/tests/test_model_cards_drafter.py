@@ -6,11 +6,17 @@ models that runners may load alongside the target. Coverage:
 - Cards with no drafters declared default to an empty list.
 - Gemma 4 large-instruct cards declare both e2b and e4b drafters at matching
   quantisation, in fastest-first order.
+
+Also covers the asymmetric placement opt-in field
+``drafter_eligible_nodes``: empty by default (legacy in-process drafter),
+populated to designate per-deployment hosts for drafter-only ranks. The
+field round-trips through Pydantic serialisation.
 """
 
 import pytest
 
 from exo.shared.models.model_cards import ModelCard, ModelId, get_model_cards
+from exo.shared.types.common import NodeId
 from exo.shared.types.memory import Memory
 
 
@@ -110,3 +116,36 @@ def test_model_card_explicit_drafters_round_trip() -> None:
         "mlx-community/test-drafter-fast",
         "mlx-community/test-drafter-accurate",
     ]
+
+
+def test_drafter_eligible_nodes_defaults_to_empty() -> None:
+    card = ModelCard(
+        model_id=ModelId("mlx-community/test-target-2"),
+        storage_size=Memory.from_gb(1.0),
+        n_layers=12,
+        hidden_size=768,
+        supports_tensor=True,
+        tasks=["TextGeneration"],  # pyright: ignore[reportArgumentType]
+    )
+    assert card.drafter_eligible_nodes == []
+    dump = card.model_dump(exclude_none=True)
+    assert dump["drafter_eligible_nodes"] == []
+
+
+def test_drafter_eligible_nodes_round_trip() -> None:
+    eligible = [NodeId(), NodeId()]
+    card = ModelCard(
+        model_id=ModelId("mlx-community/test-target-3"),
+        storage_size=Memory.from_gb(1.0),
+        n_layers=12,
+        hidden_size=768,
+        supports_tensor=True,
+        tasks=["TextGeneration"],  # pyright: ignore[reportArgumentType]
+        drafter_model_ids=[ModelId("mlx-community/test-drafter")],
+        drafter_eligible_nodes=eligible,
+    )
+    assert card.drafter_eligible_nodes == eligible
+    dump = card.model_dump(exclude_none=True)
+    assert dump["drafter_eligible_nodes"] == eligible
+    rehydrated = ModelCard.model_validate(dump)
+    assert rehydrated.drafter_eligible_nodes == eligible

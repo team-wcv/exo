@@ -26,7 +26,7 @@ from exo.shared.constants import (
     EXO_MODELS_DIRS,
     RESOURCES_DIR,
 )
-from exo.shared.types.common import ModelId
+from exo.shared.types.common import ModelId, NodeId
 from exo.shared.types.memory import Memory
 from exo.shared.types.text_generation import ReasoningDialect
 from exo.utils.pydantic_ext import FrozenModel
@@ -168,6 +168,20 @@ class ModelCard(FrozenModel):
     # declares `[gemma-4-e2b-it-4bit, gemma-4-e4b-it-4bit]`), but cross-quant
     # drafters are allowed for advanced tuning.
     drafter_model_ids: list[ModelId] = Field(default_factory=list)
+    # Nodes the operator has designated as eligible drafter hosts. When this
+    # list is non-empty AND the model has at least one declared drafter, the
+    # placement layer attempts asymmetric placement: target ranks land on the
+    # selected target cycle, the drafter is loaded on the first eligible node
+    # reachable from target rank 0 (RDMA for `MlxJaccl`, socket for `MlxRing`),
+    # and the parent `mx.distributed` group spans both. Eligibility is
+    # *operator-controlled*, not auto-discovered: the operator opts a node in
+    # by listing its `NodeId` here (typically in a custom card under
+    # `~/.exo/custom_model_cards/`). If no listed node is reachable, placement
+    # emits a `DrafterPlacementDegraded` event and falls back -- the user's
+    # request still completes, the operator just doesn't get the asymmetric
+    # speedup until they fix the eligibility list. Empty (the default) preserves
+    # legacy single-device drafter behaviour.
+    drafter_eligible_nodes: list[NodeId] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _autodetect_vision(self) -> "ModelCard":

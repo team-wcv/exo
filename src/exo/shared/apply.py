@@ -9,6 +9,7 @@ from exo.shared.types.events import (
     ChunkGenerated,
     CustomModelCardAdded,
     CustomModelCardDeleted,
+    DrafterPlacementDegraded,
     Event,
     IndexedEvent,
     InputChunkReceived,
@@ -77,6 +78,7 @@ def event_apply(event: Event, state: State) -> State:
             | TracesMerged()
             | CustomModelCardAdded()
             | CustomModelCardDeleted()
+            | DrafterPlacementDegraded()
         ):  # Pass-through events that don't modify state
             return state
         case InstanceCreated():

@@ -38,6 +38,7 @@ from exo.shared.types.common import CommandId, NodeId, SessionId, SystemId
 from exo.shared.types.events import (
     CustomModelCardAdded,
     CustomModelCardDeleted,
+    DrafterPlacementDegraded,
     Event,
     GlobalForwarderEvent,
     IndexedEvent,
@@ -385,6 +386,9 @@ class Master:
                                 )
                             generated_events.extend(transition_events)
                         case PlaceInstance():
+                            drafter_degradation_events: list[
+                                DrafterPlacementDegraded
+                            ] = []
                             placement = place_instance(
                                 command,
                                 self.state.topology,
@@ -392,11 +396,13 @@ class Master:
                                 self.state.node_memory,
                                 self.state.node_network,
                                 download_status=self.state.downloads,
+                                on_drafter_placement_degraded=drafter_degradation_events.append,
                             )
                             transition_events = get_transition_events(
                                 self.state.instances, placement, self.state.tasks
                             )
                             generated_events.extend(transition_events)
+                            generated_events.extend(drafter_degradation_events)
                         case CreateInstance():
                             placement = add_instance_to_placements(
                                 command,

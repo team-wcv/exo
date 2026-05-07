@@ -1,4 +1,4 @@
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from os import environ
 from typing import Sequence
@@ -25,6 +25,8 @@ from exo.shared.types.commands import (
 )
 from exo.shared.types.common import NodeId
 from exo.shared.types.events import (
+    DrafterPlacementDegradationReason,
+    DrafterPlacementDegraded,
     Event,
     InstanceCreated,
     InstanceDeleted,
@@ -33,7 +35,7 @@ from exo.shared.types.events import (
 from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import MemoryUsage, NodeNetworkInfo
 from exo.shared.types.tasks import Task, TaskId, TaskStatus
-from exo.shared.types.topology import SocketConnection
+from exo.shared.types.topology import RDMAConnection, SocketConnection
 from exo.shared.types.worker.downloads import (
     DownloadCompleted,
     DownloadFailed,
@@ -42,12 +44,14 @@ from exo.shared.types.worker.downloads import (
     DownloadProgress,
 )
 from exo.shared.types.worker.instances import (
+    DrafterPlacement,
     Instance,
     InstanceId,
     InstanceMeta,
     MlxJacclInstance,
     MlxRingInstance,
 )
+from exo.shared.types.worker.runners import RunnerId
 from exo.shared.types.worker.shards import Sharding
 from exo.utils.ports import random_ephemeral_port
 
@@ -131,6 +135,9 @@ def place_instance(
     allowed_nodes: set[NodeId] | None = None,
     allow_single_node_total_memory: bool = False,
     download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
+    on_drafter_placement_degraded: (
+        Callable[[DrafterPlacementDegraded], None] | None
+    ) = None,
 ) -> dict[InstanceId, Instance]:
     sharding = command.sharding
     instance_meta = command.instance_meta
@@ -150,6 +157,23 @@ def place_instance(
             for cycle in candidate_cycles
             if set(cycle.node_ids).issubset(allowed_nodes)
         ]
+
+    # Reserve drafter-eligible nodes for the drafter rank when possible, so
+    # the placement layer doesn't accidentally pull a drafter-eligible node
+    # into the target cycle and then degrade because no eligible host
+    # remains. If filtering them out leaves zero cycles, fall back to the
+    # unfiltered set -- the user gets target placement at the cost of the
+    # asymmetric drafter, and `_select_drafter_placement` emits a
+    # ``AllEligibleNodesInTargetCycle`` degradation downstream.
+    eligible_drafter_set = set(command.model_card.drafter_eligible_nodes)
+    if eligible_drafter_set and command.model_card.drafter_model_ids:
+        cycles_excluding_drafters = [
+            cycle
+            for cycle in candidate_cycles
+            if not (set(cycle.node_ids) & eligible_drafter_set)
+        ]
+        if cycles_excluding_drafters:
+            candidate_cycles = cycles_excluding_drafters
     cycles_with_sufficient_memory = filter_cycles_by_memory(
         candidate_cycles,
         node_memory,
@@ -298,22 +322,6 @@ def place_instance(
         instance_meta = InstanceMeta.MlxRing
         sharding = Sharding.Pipeline
 
-    # Item 10: warn when a drafter-aware model gets multi-node placement.
-    # `get_smallest_cycles` already biases toward single-node when memory
-    # allows; getting here with len > 1 means no single-node cycle had
-    # enough memory. Speculative decoding is single-device only in mlx_lm,
-    # so the drafter declared on this card will be ignored. Log it
-    # actionably so operators know to grab a smaller quant.
-    if len(selected_cycle) > 1 and command.model_card.drafter_model_ids:
-        logger.warning(
-            f"Model {command.model_card.model_id} declares drafters "
-            f"{list(command.model_card.drafter_model_ids)} but is being "
-            f"placed across {len(selected_cycle)} nodes. Speculative "
-            "decoding is single-device only and will be disabled for this "
-            "instance. To get the drafter speedup, place a smaller quant "
-            "(e.g. 4-bit) on the largest single node instead."
-        )
-
     placement_node_memory = (
         _node_memory_with_total_capacity(selected_cycle, node_memory)
         if allow_single_node_total_memory and len(selected_cycle) == 1
@@ -323,9 +331,30 @@ def place_instance(
         command.model_card, selected_cycle, sharding, placement_node_memory
     )
 
-    cycle_digraph: Topology = topology.get_subgraph_from_nodes(selected_cycle.node_ids)
-
     instance_id = InstanceId()
+    drafter_placement = _select_drafter_placement(
+        command=command,
+        selected_cycle=selected_cycle,
+        instance_meta=instance_meta,
+        topology=topology,
+        node_memory=node_memory,
+        instance_id=instance_id,
+        on_drafter_placement_degraded=on_drafter_placement_degraded,
+    )
+
+    # Asymmetric placement extends the parent ``mx.distributed`` group to
+    # include the drafter rank as the last rank. Subgraph + connectivity
+    # tables (hosts_by_node / jaccl_devices) must cover both target nodes
+    # and the drafter node; ``shard_assignments`` stays target-only because
+    # the drafter has no target shard.
+    if drafter_placement is not None:
+        nodes_for_group = list(selected_cycle.node_ids) + [
+            drafter_placement.drafter_node_id
+        ]
+    else:
+        nodes_for_group = list(selected_cycle.node_ids)
+    cycle_digraph: Topology = topology.get_subgraph_from_nodes(nodes_for_group)
+
     target_instances = dict(deepcopy(current_instances))
 
     match instance_meta:
@@ -346,7 +375,7 @@ def place_instance(
             coordinator_node_id = zero_node_ids[0]
 
             mlx_jaccl_devices = get_mlx_jaccl_devices_matrix(
-                [node_id for node_id in selected_cycle],
+                nodes_for_group,
                 cycle_digraph,
             )
             mlx_jaccl_coordinators = get_mlx_jaccl_coordinators(
@@ -360,11 +389,12 @@ def place_instance(
                 shard_assignments=shard_assignments,
                 jaccl_devices=mlx_jaccl_devices,
                 jaccl_coordinators=mlx_jaccl_coordinators,
+                drafter_placement=drafter_placement,
             )
         case InstanceMeta.MlxRing:
             ephemeral_port = random_ephemeral_port()
             hosts_by_node = get_mlx_ring_hosts_by_node(
-                selected_cycle=selected_cycle,
+                selected_cycle=Cycle(node_ids=nodes_for_group),
                 cycle_digraph=cycle_digraph,
                 ephemeral_port=ephemeral_port,
                 node_network=node_network,
@@ -374,9 +404,270 @@ def place_instance(
                 shard_assignments=shard_assignments,
                 hosts_by_node=hosts_by_node,
                 ephemeral_port=ephemeral_port,
+                drafter_placement=drafter_placement,
             )
 
+    # Multi-node placement WITHOUT an asymmetric drafter rank still loses
+    # speculative decoding (mlx_lm doesn't run draft_model on TP/PP target
+    # ranks today). Degrade-loud so operators see it without crawling logs;
+    # the user's request still completes.
+    if (
+        len(selected_cycle) > 1
+        and command.model_card.drafter_model_ids
+        and drafter_placement is None
+    ):
+        logger.warning(
+            f"Model {command.model_card.model_id} declares drafters "
+            f"{list(command.model_card.drafter_model_ids)} but is being "
+            f"placed across {len(selected_cycle)} nodes WITHOUT an asymmetric "
+            "drafter rank. Speculative decoding is single-device only and "
+            "will be disabled for this instance. To get the drafter speedup, "
+            "either place a smaller quant on a single node OR list a separate "
+            "drafter-eligible node in the model card's `drafter_eligible_nodes`."
+        )
+
     return target_instances
+
+
+def _select_drafter_placement(
+    *,
+    command: PlaceInstance,
+    selected_cycle: Cycle,
+    instance_meta: InstanceMeta,
+    topology: Topology,
+    node_memory: Mapping[NodeId, MemoryUsage],
+    instance_id: InstanceId,
+    on_drafter_placement_degraded: (Callable[[DrafterPlacementDegraded], None] | None),
+) -> DrafterPlacement | None:
+    """Pick a drafter-eligible node for asymmetric drafter placement.
+
+    A drafter rank is appended to the parent ``mx.distributed`` group when
+    *all* of the following hold:
+
+      * The model card lists ``drafter_eligible_nodes``.
+      * The card lists ``drafter_model_ids`` (otherwise there's nothing to
+        run on the drafter rank).
+      * At least one eligible node is alive in topology, NOT already a
+        target rank, AND reachable from target rank 0 over the right
+        transport (RDMA for ``MlxJaccl``; socket for ``MlxRing``).
+
+    The fallback is loud-but-graceful: when none of the eligible nodes
+    satisfies the constraints, the function emits a
+    :class:`DrafterPlacementDegraded` event via
+    ``on_drafter_placement_degraded`` and returns ``None``. The caller
+    proceeds with the legacy symmetric topology, the user's request still
+    completes, and the operator sees the degradation event surfaced in
+    the dashboard / API stats so they know to fix the cluster (bring an
+    eligible node online, free RAM, repair the network edge).
+
+    The drafter is always assigned the **last rank** in the parent group
+    (``len(selected_cycle)``). Target ranks split off into a subgroup at
+    runtime via ``mx.distributed.Group.split``.
+    """
+    eligible_nodes = list(command.model_card.drafter_eligible_nodes)
+    drafter_candidates = list(command.model_card.drafter_model_ids)
+    if not eligible_nodes or not drafter_candidates:
+        return None
+
+    target_node_ids = list(selected_cycle.node_ids)
+    fallback = _drafter_fallback(target_node_ids)
+
+    alive_in_topology = set(topology.list_nodes())
+    alive_eligible = [n for n in eligible_nodes if n in alive_in_topology]
+    if not alive_eligible:
+        _emit_drafter_degraded(
+            on_drafter_placement_degraded,
+            command=command,
+            instance_id=instance_id,
+            target_node_ids=target_node_ids,
+            eligible_nodes=eligible_nodes,
+            reason=DrafterPlacementDegradationReason.NoEligibleNodeAvailable,
+            fallback=fallback,
+            detail=(
+                f"None of {eligible_nodes} are present in topology "
+                f"(known nodes: {sorted(alive_in_topology)})"
+            ),
+        )
+        return None
+
+    not_in_target = [n for n in alive_eligible if n not in target_node_ids]
+    if not not_in_target:
+        _emit_drafter_degraded(
+            on_drafter_placement_degraded,
+            command=command,
+            instance_id=instance_id,
+            target_node_ids=target_node_ids,
+            eligible_nodes=eligible_nodes,
+            reason=DrafterPlacementDegradationReason.AllEligibleNodesInTargetCycle,
+            fallback=fallback,
+            detail=(
+                f"All eligible nodes {alive_eligible} are already target "
+                f"ranks ({target_node_ids}); no spare host available"
+            ),
+        )
+        return None
+
+    requires_rdma = instance_meta == InstanceMeta.MlxJaccl
+    reachable: list[NodeId] = []
+    for candidate in not_in_target:
+        if _drafter_node_is_reachable(
+            target_node_ids=target_node_ids,
+            drafter_node=candidate,
+            topology=topology,
+            requires_rdma=requires_rdma,
+        ):
+            reachable.append(candidate)
+
+    if not reachable:
+        _emit_drafter_degraded(
+            on_drafter_placement_degraded,
+            command=command,
+            instance_id=instance_id,
+            target_node_ids=target_node_ids,
+            eligible_nodes=eligible_nodes,
+            reason=DrafterPlacementDegradationReason.NoReachablePathFromTargetRankZero,
+            fallback=fallback,
+            detail=(
+                f"No {'RDMA' if requires_rdma else 'socket'} path from target "
+                f"ranks {target_node_ids} to any of {not_in_target}"
+            ),
+        )
+        return None
+
+    drafter_node_id = reachable[0]
+    if not _node_has_drafter_memory(
+        drafter_node=drafter_node_id,
+        node_memory=node_memory,
+        target_card=command.model_card,
+    ):
+        _emit_drafter_degraded(
+            on_drafter_placement_degraded,
+            command=command,
+            instance_id=instance_id,
+            target_node_ids=target_node_ids,
+            eligible_nodes=eligible_nodes,
+            reason=DrafterPlacementDegradationReason.InsufficientDrafterMemory,
+            fallback=fallback,
+            detail=(
+                f"Drafter node {drafter_node_id} has "
+                f"{node_memory[drafter_node_id].ram_available.in_gb:.1f}GB "
+                f"available; conservative drafter estimate is "
+                f"{_DRAFTER_MEMORY_FLOOR.in_gb:.1f}GB"
+            ),
+        )
+        return None
+
+    drafter_model_id = drafter_candidates[0]
+    drafter_runner_id = RunnerId()
+    drafter_rank = len(selected_cycle)
+    return DrafterPlacement(
+        drafter_node_id=drafter_node_id,
+        drafter_runner_id=drafter_runner_id,
+        drafter_model_id=drafter_model_id,
+        drafter_rank=drafter_rank,
+    )
+
+
+def _drafter_fallback(target_node_ids: list[NodeId]) -> str:
+    """``single_device_drafter`` when target is single-node, else ``no_drafter``.
+
+    Multi-node target with no asymmetric drafter rank can't host the
+    drafter at all (mlx_lm spec decode is single-device); single-node
+    target falls back to in-process drafter as before.
+    """
+    return "single_device_drafter" if len(target_node_ids) == 1 else "no_drafter"
+
+
+def _emit_drafter_degraded(
+    callback: Callable[[DrafterPlacementDegraded], None] | None,
+    *,
+    command: PlaceInstance,
+    instance_id: InstanceId,
+    target_node_ids: list[NodeId],
+    eligible_nodes: list[NodeId],
+    reason: DrafterPlacementDegradationReason,
+    fallback: str,
+    detail: str,
+) -> None:
+    logger.error(
+        f"Drafter placement degraded for {command.model_card.model_id} "
+        f"({reason.value}): {detail}; falling back to {fallback}"
+    )
+    if callback is None:
+        return
+    assert fallback in ("single_device_drafter", "no_drafter")
+    callback(
+        DrafterPlacementDegraded(
+            model_id=command.model_card.model_id,
+            instance_id=instance_id,
+            target_node_ids=target_node_ids,
+            eligible_nodes=eligible_nodes,
+            reason=reason,
+            fallback=fallback,
+            detail=detail,
+        )
+    )
+
+
+def _drafter_node_is_reachable(
+    *,
+    target_node_ids: list[NodeId],
+    drafter_node: NodeId,
+    topology: Topology,
+    requires_rdma: bool,
+) -> bool:
+    """Drafter must reach every target rank (and be reached from each).
+
+    For ``MlxJaccl``: ``get_mlx_jaccl_devices_matrix`` enforces all-to-all
+    RDMA across the parent group. The drafter is part of that group, so
+    it needs bidirectional RDMA edges to *every* target node, not just
+    rank 0.
+
+    For ``MlxRing``: target rank 0 (the rank that does send/recv with the
+    drafter via ``RemoteTransport``) must reach the drafter directly. The
+    ring backend additionally wires drafter <-> rank N-1 (drafter's left
+    neighbor in the parent ring). Both edges have to exist as sockets.
+    Requiring all target ranks to be socket-reachable from drafter is
+    over-conservative for ring, but in practice every multi-node exo
+    deployment already has all-pairs socket discovery, and the cost of
+    requiring it is zero. Keeps the predicate simple and matches jaccl's
+    behaviour.
+    """
+    edge_check: Callable[[object], bool]
+    if requires_rdma:
+        edge_check = lambda c: isinstance(c, RDMAConnection)  # noqa: E731
+    else:
+        edge_check = lambda c: isinstance(c, SocketConnection)  # noqa: E731
+    for target in target_node_ids:
+        forward = list(topology.get_all_connections_between(target, drafter_node))
+        backward = list(topology.get_all_connections_between(drafter_node, target))
+        if not any(edge_check(c) for c in forward):
+            return False
+        if not any(edge_check(c) for c in backward):
+            return False
+    return True
+
+
+# Conservative floor for the drafter's wired-memory bump. The drafter
+# weights are usually 1-5GB (e.g. gemma-4-e2b @ 8-bit ~ 2GB), but during
+# load the runner may briefly hold the safetensors mmap + decompression
+# buffers; bake in headroom so placement doesn't pick a node that will
+# OOM at warmup. If the drafter on disk is larger than this floor the
+# runner's own ``set_wired_limit_for_model`` will catch it; this is just
+# a placement-time sanity check.
+_DRAFTER_MEMORY_FLOOR = Memory.from_gb(6.0)
+
+
+def _node_has_drafter_memory(
+    *,
+    drafter_node: NodeId,
+    node_memory: Mapping[NodeId, MemoryUsage],
+    target_card: ModelCard,
+) -> bool:
+    del target_card  # reserved for future per-drafter sizing
+    if drafter_node not in node_memory:
+        return False
+    return node_memory[drafter_node].ram_available >= _DRAFTER_MEMORY_FLOOR
 
 
 def _prefer_socket_reachable_rank_zero(cycle: Cycle, topology: Topology) -> Cycle:
