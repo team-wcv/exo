@@ -18,6 +18,20 @@ Empirical measurements on that hardware show:
   * n-gram spec is roughly parity on echo-shaped prompts (-0.5%) and
     a 20-30% loss on novel content where suffix matches are weak.
 
+Asymmetric (drafter on a separate node via RDMA/TCP) and EAGLE / lookahead
+hit the same wall on Apple Silicon for a structural reason: ``mlx_lm``
+derives every position's RoPE id from ``KVCache.offset`` (a single
+``int``), so the multi-position-per-step verify that gives speculative
+decoding its CUDA wins (3.3-6.5x for EAGLE-3, 1.5-2.5x for lookahead)
+collapses to a *linear* verify on Metal. Track upstream
+`ml-explore/mlx-lm#846 <https://github.com/ml-explore/mlx-lm/issues/846>`_
+and `ml-explore/mlx-lm#250
+<https://github.com/ml-explore/mlx-lm/issues/250>`_ before investing
+in EAGLE / lookahead runtime work; the scaffolding lives here so the
+seam is ready when the upstream blocker lifts. A community MLX EAGLE-3
+prototype on M3 Ultra confirms the ceiling at 1.05x today (mlx-lm
+discussion #890).
+
 The right call there is ``DraftMode = "none"`` (the default).
 ``"ngram"`` and ``"model"`` are exposed for slower-target regimes
 (distributed inference, larger FP16 models, ASIC-bound targets) where
@@ -501,6 +515,45 @@ class EagleDrafter:
     factory in :func:`make_drafter` checks for the head being loaded;
     if not, it logs and falls back to ``"none"`` (mirrors the
     ``"model"`` -> ``"none"`` degradation when no drafter is loaded).
+
+    **Apple Silicon ceiling (read before implementing).** The CUDA
+    literature (3.3-6.5x on the EAGLE-3 paper; 1.72x on the RedHat
+    Gemma-4-31B EAGLE3 head on 8x H200) gets its win from *tree*
+    verification: dozens of candidate continuations verified in a
+    single batched forward where memory bandwidth, not arithmetic,
+    sets the cost. On Apple Silicon a single sibling-position verify
+    is *not* free because Metal's command queue serialises GPU work
+    per device and ``mlx_lm`` derives every position's RoPE id from
+    ``KVCache.offset`` (a single ``int``), so two siblings at the
+    same depth cannot get different RoPE positions in the same
+    forward. Until ``mlx_lm`` accepts ``position_ids`` (open issues
+    `ml-explore/mlx-lm#846 <https://github.com/ml-explore/mlx-lm/issues/846>`_,
+    `ml-explore/mlx-lm#250 <https://github.com/ml-explore/mlx-lm/issues/250>`_),
+    a faithful EAGLE port collapses to a *linear* verify, which a
+    community prototype (`mlx-lm discussion #890
+    <https://github.com/ml-explore/mlx-lm/discussions/890>`_) measured
+    at **1.05x** on LLaMA-3.1-8B-4bit on an M3 Ultra -- inside the
+    noise of our own n-gram K-sweep on this hardware. Don't ship the
+    EAGLE runtime until the position-id seam lands upstream; the
+    converter (offline tool) is fine to ship now since the artifact
+    is durable.
+
+    Concrete artifacts to consume when picking this up:
+
+    * Pre-trained head for our exact target:
+      ``RedHatAI/gemma-4-26B-A4B-it-speculator.eagle3``
+      (released 2026-04-13, ~277 MB).
+    * Reference MLX port (Llama-3.1 only, no Gemma-4 architecture
+      adapter, no tree verify): the gist linked from mlx-lm
+      discussion #890 above. ``eagle_convert.py`` is reusable;
+      ``eagle_generate.py`` is the loop to fork.
+    * For Gemma-4 specifically the EAGLE head shape is
+      ``num_hidden_layers=1`` with ``input_size = 2 * hidden_size``
+      (Q/K/V take ``[token_embedding, fused_features]`` concatenated)
+      and a reduced 32k draft vocabulary -- same as the Llama variant,
+      so the Gemma adaptation is mostly the layer-tap indices
+      (Gemma-4-26b is N=30 layers, so taps go at ``{2, 15, 27}``
+      following EAGLE's ``{2, N//2, N-3}`` heuristic).
     """
 
     def __init__(
@@ -604,6 +657,21 @@ class LookaheadDrafter:
       (typically 2-4).
 
     Until implemented, ``stream`` raises :class:`NotImplementedError`.
+
+    **Same Apple Silicon ceiling as :class:`EagleDrafter`.** Lookahead
+    decoding's win comes from verifying *multiple* Jacobi-seeded
+    candidate continuations in parallel, which collapses to linear
+    verify under the same ``KVCache.offset`` / ``position_ids``
+    constraint described on :class:`EagleDrafter`. On the
+    ``gemma-4-26b-a4b-it-4bit`` target measured here (119 t/s
+    baseline), the n-gram drafter -- which shares the linear-verify
+    cost model lookahead would inherit -- lands at 92-102 t/s
+    across K=2..8 (a 14-23% net loss). Implementing lookahead before
+    ``position_ids`` lands upstream is unlikely to flip that sign.
+    Track the same upstream issues
+    (`ml-explore/mlx-lm#846 <https://github.com/ml-explore/mlx-lm/issues/846>`_,
+    `ml-explore/mlx-lm#250 <https://github.com/ml-explore/mlx-lm/issues/250>`_)
+    before investing in the implementation.
     """
 
     def __init__(
