@@ -25,11 +25,11 @@ JSON written to ``--out``.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import statistics
 import sys
 import time
-import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -134,19 +134,53 @@ def _post_chat(
     body = dict(body)
     body["stream"] = True
     body["stream_options"] = {"include_usage": True}
-    url = f"http://{host}:{port}/v1/chat/completions"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    # ``/bench/chat/completions`` returns ``BenchChatCompletionResponse``,
+    # which carries the ``generation_stats`` block we read for tps / accept
+    # numbers. The standard ``/v1/chat/completions`` does not include them.
+    payload = json.dumps(body).encode("utf-8")
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    conn.request(
+        "POST",
+        "/bench/chat/completions",
+        body=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        },
     )
     start = _now()
     ttft: float | None = None
-    last_chunk: dict[str, Any] = {}
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-        for raw in resp:
-            line = raw.decode("utf-8", errors="replace").strip()
+    generation_stats: dict[str, Any] = {}
+    last_chat_chunk: dict[str, Any] = {}
+    try:
+        resp = conn.getresponse()
+        if resp.status >= 400:
+            raise RuntimeError(
+                f"HTTP {resp.status} {resp.reason}: {resp.read(200)!r}"
+            )
+        # ``HTTPResponse.fp.readline`` reads one chunk-encoded line at a
+        # time and flushes immediately, so we get true streaming SSE
+        # without urllib's read-ahead buffering. Each event ends in
+        # ``\n\n`` so the body stream contains both header lines (data:
+        # / : comment) and blank separator lines we ignore.
+        while True:
+            raw = resp.fp.readline()  # type: ignore[union-attr]
+            if not raw:
+                break
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                continue
+            # ``generate_chat_stream`` emits ``: generation_stats {json}``
+            # as an SSE comment immediately before the terminal ``[DONE]``.
+            # Parse the comment so we can capture stats without falling
+            # back to the non-streaming endpoint (which would lose TTFT).
+            if line.startswith(": generation_stats"):
+                payload_str = line[len(": generation_stats"):].strip()
+                try:
+                    generation_stats = json.loads(payload_str)
+                except json.JSONDecodeError:
+                    pass
+                continue
             if not line.startswith("data:"):
                 continue
             payload_str = line[len("data:"):].strip()
@@ -161,10 +195,15 @@ def _post_chat(
                 (c.get("delta") or {}).get("content") for c in choices
             ):
                 ttft = _now()
-            last_chunk = chunk
+            last_chat_chunk = chunk
+    finally:
+        conn.close()
     wall = _now() - start
     ttft_ms = ((ttft - start) * 1000.0) if ttft is not None else 0.0
-    return last_chunk, ttft_ms, wall
+    out: dict[str, Any] = dict(last_chat_chunk)
+    if generation_stats:
+        out["generation_stats"] = generation_stats
+    return out, ttft_ms, wall
 
 
 def _run_one(
