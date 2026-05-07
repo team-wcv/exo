@@ -1,7 +1,7 @@
 import gc
 import os
 from copy import deepcopy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import mlx.core as mx
 import numpy as np
@@ -316,6 +316,8 @@ class KVPrefixCache:
         model: Model,
         prompt_tokens: mx.array,
         media_regions: list["MediaRegion"] | None = None,
+        *,
+        force_plain_kv_cache: bool = False,
     ) -> tuple[KVCacheType, mx.array, int | None, bool]:
         """Get KV cache for prompt, returning remaining tokens to prefill.
 
@@ -358,7 +360,12 @@ class KVPrefixCache:
                 best_index, best_length = i, length
 
         if best_index is None:
-            return make_kv_cache(model), prompt_tokens, None, False
+            return (
+                make_kv_cache(model, force_plain_kv_cache=force_plain_kv_cache),
+                prompt_tokens,
+                None,
+                False,
+            )
 
         # For exact match: trim to max_length-1 so remaining has the last token
         # For partial match: trim to best_length, remaining has suffix to prefill
@@ -374,7 +381,12 @@ class KVPrefixCache:
 
         # No usable snapshot — need fresh cache
         if restore_snap is None and has_ssm:
-            return make_kv_cache(model), prompt_tokens, None, False
+            return (
+                make_kv_cache(model, force_plain_kv_cache=force_plain_kv_cache),
+                prompt_tokens,
+                None,
+                False,
+            )
 
         prompt_cache = deepcopy(self.caches[best_index])
         tokens_to_trim = cached_length - restore_pos
@@ -558,13 +570,41 @@ def get_memory_used_percentage() -> float:
 
 
 def make_kv_cache(
-    model: Model, max_kv_size: int | None = None, keep: int = 0
+    model: Model,
+    max_kv_size: int | None = None,
+    keep: int = 0,
+    *,
+    force_plain_kv_cache: bool = False,
 ) -> KVCacheType:
+    """Build a KV cache for ``model``.
+
+    By default we honor the model's own ``make_cache()`` factory when
+    available so each architecture gets the cache layout it was designed
+    for (e.g. Gemma 4 returns a mix of ``RotatingKVCache`` for sliding-window
+    layers and ``KVCache`` for global-attention layers).
+
+    When ``force_plain_kv_cache=True``, every entry is replaced with a plain
+    ``KVCache``, preserving the model's per-layer cache *count* (which is
+    what the layer-level forward pass indexes into) but dropping the
+    sliding-window behaviour. This is required for drafters used in
+    ``mlx_lm.speculative_generate_step``: that path repeatedly trims and
+    re-extends each cache, which ``RotatingKVCache`` handles by physically
+    rotating its underlying KV buffer on every spec round, slowing
+    generation by ~750x. Using a plain ``KVCache`` skips that rotation cost
+    at the price of unbounded growth, which is fine for the small drafters
+    we use (~1-2GB) and short-lived per-request caches.
+    """
     assert hasattr(model, "layers")
 
     if hasattr(model, "make_cache"):
+        native = cast(list[object], model.make_cache())  # type: ignore[reportAttributeAccessIssue]
+        if force_plain_kv_cache:
+            logger.info(
+                f"Using plain KVCache (n={len(native)}) for spec-decoding compatibility"
+            )
+            return cast(KVCacheType, [KVCache() for _ in native])
         logger.info("Using MLX LM's make cache")
-        return model.make_cache()  # type: ignore
+        return cast(KVCacheType, native)
 
     if max_kv_size is None:
         if KV_CACHE_BITS is None:

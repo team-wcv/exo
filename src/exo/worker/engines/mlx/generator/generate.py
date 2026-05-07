@@ -880,12 +880,19 @@ def mlx_generate(
                 effective_draft_model,
                 all_prompt_tokens,
                 media_regions=media_regions,
+                force_plain_kv_cache=True,
             )
             drafter_prefix_hit_length = len(all_prompt_tokens) - len(
                 drafter_remaining
             )
         else:
-            drafter_caches = make_kv_cache(model=effective_draft_model)
+            # force_plain_kv_cache: see make_kv_cache docstring -- mlx_lm's
+            # speculative_generate_step is catastrophically slow against
+            # RotatingKVCache (gemma-4 e2b/e4b drafters use sliding window
+            # for most layers), so we force plain KVCache here.
+            drafter_caches = make_kv_cache(
+                model=effective_draft_model, force_plain_kv_cache=True
+            )
             drafter_remaining = all_prompt_tokens
             drafter_matched_index = None
             drafter_prefix_hit_length = 0
