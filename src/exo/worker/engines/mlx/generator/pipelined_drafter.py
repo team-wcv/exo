@@ -82,6 +82,7 @@ from exo.worker.engines.mlx.generator.drafter_transport import (
     DraftFuture,
 )
 from exo.worker.engines.mlx.types import KVCacheType, Model
+from exo.worker.engines.mlx.utils_mlx import mx_broadcast_int_list
 
 
 def _get_eos_ids(tokenizer: TokenizerWrapper) -> list[int]:
@@ -112,23 +113,57 @@ class PipelinedModelDrafter:
     transport-agnostic propose/trim primitives mean swapping
     in-process for remote drafter placement is a one-line construction
     change at :func:`make_drafter`; the spec loop is unaffected.
+
+    Multi-target asymmetric placement (``target_subgroup_size > 1``):
+    the target root rank holds the drafter socket (``transport`` is
+    set, ``is_target_root=True``) and broadcasts each round's drafts on
+    ``target_group`` so non-root target ranks receive them in lockstep.
+    Non-root ranks construct with ``transport=None`` and consume the
+    broadcast each round; both ranks then run the same verify forward
+    (which is a TP collective on the model itself) and reach identical
+    accept/reject decisions deterministically because TP all-reduces
+    the final logits to be byte-identical on every rank.
     """
 
     def __init__(
         self,
         *,
-        transport: DrafterTransport,
+        transport: DrafterTransport | None,
         num_draft_tokens: int,
+        target_group: mx.distributed.Group | None = None,
+        is_target_root: bool = True,
     ) -> None:
         if num_draft_tokens < 1:
             raise ValueError(f"num_draft_tokens must be >= 1, got {num_draft_tokens}")
-        if num_draft_tokens > transport.num_draft_tokens:
-            raise ValueError(
-                f"num_draft_tokens ({num_draft_tokens}) exceeds transport's "
-                f"max ({transport.num_draft_tokens})"
-            )
+        if transport is None:
+            # Multi-target consumer rank: no socket, drafts arrive via
+            # broadcast on ``target_group``.
+            if is_target_root:
+                raise ValueError(
+                    "transport=None requires is_target_root=False (the "
+                    "consumer rank does not own the drafter socket)"
+                )
+            if target_group is None:
+                raise ValueError(
+                    "transport=None requires a target_group to receive "
+                    "draft broadcasts on"
+                )
+        else:
+            if num_draft_tokens > transport.num_draft_tokens:
+                raise ValueError(
+                    f"num_draft_tokens ({num_draft_tokens}) exceeds transport's "
+                    f"max ({transport.num_draft_tokens})"
+                )
+            if not is_target_root:
+                raise ValueError(
+                    "is_target_root=False on a transport-owning rank is a "
+                    "configuration error: the rank that holds the drafter "
+                    "socket is the broadcast root by definition"
+                )
         self._transport = transport
         self._num_draft_tokens = num_draft_tokens
+        self._target_group = target_group
+        self._is_target_root = is_target_root
 
     @property
     def mode(self) -> DraftMode:
@@ -163,11 +198,14 @@ class PipelinedModelDrafter:
             transport=self._transport,
             num_draft_tokens=self._num_draft_tokens,
             prefill_step_size=prefill_step_size,
+            target_group=self._target_group,
+            is_target_root=self._is_target_root,
         )
 
     def shutdown(self) -> None:
         """Release transport resources."""
-        self._transport.shutdown()
+        if self._transport is not None:
+            self._transport.shutdown()
 
 
 def _pipelined_stream_generate(
@@ -180,9 +218,11 @@ def _pipelined_stream_generate(
     max_tokens: int,
     sampler: Callable[[mx.array], mx.array],
     logits_processors: list[Callable[[mx.array, mx.array], mx.array]],
-    transport: DrafterTransport,
+    transport: DrafterTransport | None,
     num_draft_tokens: int,
     prefill_step_size: int,
+    target_group: mx.distributed.Group | None = None,
+    is_target_root: bool = True,
 ) -> Generator[GenerationResponse, None, None]:
     """Mirror of ``mlx_lm.stream_generate`` framing for the pipelined drafter.
 
@@ -205,6 +245,8 @@ def _pipelined_stream_generate(
         num_draft_tokens=num_draft_tokens,
         prefill_step_size=prefill_step_size,
         prompt_token_count=len(context_tokens),
+        target_group=target_group,
+        is_target_root=is_target_root,
     )
 
     prompt_size = len(context_tokens)
@@ -257,11 +299,62 @@ def _pipelined_stream_generate(
     )
 
 
+def _broadcast_drafts(
+    drafts: list[int] | None,
+    *,
+    k: int,
+    target_group: mx.distributed.Group | None,
+    is_root: bool,
+) -> list[int]:
+    """Rank-0 broadcast of a draft list, padded to ``k`` slots + length prefix.
+
+    Wire format: ``[len(drafts), drafts[0], ..., drafts[len-1], 0, 0, ...]``
+    of fixed length ``k + 1``. Encoding the length up front lets us use
+    a single fixed-size ``all_sum`` collective per round (vs. a
+    count-then-payload two-collective handshake) on the spec-decode hot
+    path -- the cost is a few unused int32 slots when the drafter
+    returns fewer than ``k`` drafts.
+
+    Single-rank short-circuit (``target_group is None``): returns
+    ``drafts`` on the root and is a programming error elsewhere (the
+    consumer rank must always have a group to receive on).
+    """
+    if target_group is None:
+        if not is_root or drafts is None:
+            raise RuntimeError(
+                "non-root broadcast consumer requires target_group"
+            )
+        return list(drafts)
+    if is_root:
+        if drafts is None:
+            raise RuntimeError("root broadcaster requires drafts")
+        if len(drafts) > k:
+            raise RuntimeError(
+                f"drafts length ({len(drafts)}) exceeds k ({k}); "
+                "transport must clamp before broadcasting"
+            )
+        payload = [len(drafts)] + list(drafts) + [0] * (k - len(drafts))
+        broadcast = mx_broadcast_int_list(
+            payload, k + 1, target_group, is_root=True
+        )
+    else:
+        broadcast = mx_broadcast_int_list(
+            None, k + 1, target_group, is_root=False
+        )
+    actual_len = broadcast[0]
+    if actual_len < 0 or actual_len > k:
+        raise RuntimeError(
+            f"draft broadcast decoded invalid length {actual_len} "
+            f"(buffer {broadcast})"
+        )
+    return broadcast[1 : 1 + actual_len]
+
+
 def _pipelined_speculative_step(
     *,
     prompt: mx.array,
     model: Model,
-    transport: DrafterTransport,
+    transport: DrafterTransport | None,
     prompt_cache: KVCacheType,
     max_tokens: int,
     sampler: Callable[[mx.array], mx.array],
@@ -269,6 +362,8 @@ def _pipelined_speculative_step(
     num_draft_tokens: int,
     prefill_step_size: int,
     prompt_token_count: int,
+    target_group: mx.distributed.Group | None = None,
+    is_target_root: bool = True,
 ) -> Generator[tuple[int, mx.array, bool], None, None]:
     """Cross-round speculative decoding loop using ``transport``.
 
@@ -288,7 +383,26 @@ def _pipelined_speculative_step(
     ``prompt_token_count`` is captured so logits processors that need
     the running token count (rare, e.g. positional repetition penalty
     that scales with absolute position) get accurate values.
+
+    Multi-target asymmetric (``target_group is not None``): only the
+    target root rank holds the drafter ``transport``; non-root target
+    ranks pass ``transport=None`` and receive each round's drafts via
+    a rank-0 broadcast on ``target_group``. Both ranks then run the
+    verify forward in TP lockstep -- the model's final all-reduce
+    makes logits byte-identical across target ranks, so accept/reject
+    decisions and emitted token sequences match deterministically
+    without any further coordination.
     """
+    if (transport is None) and is_target_root:
+        raise RuntimeError(
+            "_pipelined_speculative_step: target root requires transport"
+        )
+    if (transport is None) and target_group is None:
+        raise RuntimeError(
+            "_pipelined_speculative_step: non-root target rank requires "
+            "target_group to receive draft broadcasts"
+        )
+
     k = num_draft_tokens
     y = prompt.astype(mx.uint32)
 
@@ -311,9 +425,17 @@ def _pipelined_speculative_step(
     del prompt_token_count  # currently unused; kept for forward-compat
 
     # Round 0 propose: synchronous, no speculation possible yet because
-    # we don't have prior drafts to chain off of.
-    drafts_future = transport.forward([seed], k)
-    drafts = drafts_future.result()
+    # we don't have prior drafts to chain off of. On the root the
+    # drafter forward issues a socket round-trip; on non-root target
+    # ranks we skip that and just receive the broadcast.
+    if transport is not None:
+        drafts_future = transport.forward([seed], k)
+        drafts_local: list[int] | None = drafts_future.result()
+    else:
+        drafts_local = None
+    drafts = _broadcast_drafts(
+        drafts_local, k=k, target_group=target_group, is_root=is_target_root
+    )
 
     speculative_future: DraftFuture | None = None
     ntoks = 0
@@ -335,12 +457,18 @@ def _pipelined_speculative_step(
         # first output is the drafter's prediction of bonus_t (used to
         # detect speculation hit); the remaining k outputs are round
         # t+1's drafts if speculation hits.
+        #
+        # Speculation only fires on the rank that owns the transport.
+        # Non-root target ranks have no socket and would have nothing
+        # to dispatch; they catch up via the next-round broadcast.
         speculation_active = (
-            k_this == k
+            transport is not None
+            and k_this == k
             and ntoks + (k_this + 1) + k + 1 <= max_tokens
             and speculative_future is None
         )
         if speculation_active:
+            assert transport is not None  # narrowed by speculation_active
             speculative_future = transport.forward([drafts[-1]], k + 1)
 
         # ----- Target verify -----
@@ -431,6 +559,7 @@ def _pipelined_speculative_step(
             # any subsequent runs that might reuse the transport.
             if speculative_future is not None:
                 _drain_future(speculative_future)
+                assert transport is not None  # speculative_future is set only on root
                 transport.trim_cache(k + 1)
                 speculative_future = None
             break
@@ -444,48 +573,59 @@ def _pipelined_speculative_step(
             next_seed = target_tokens[num_accepted]
 
         # ----- Drafter cache reconciliation + next-round setup -----
-        next_drafts: list[int]
-        next_round_inputs: list[int]
-
-        if num_accepted < k_this:
-            # Partial accept (regardless of speculation state).
-            drafter_trim_partial = max(k_this - num_accepted - 1, 0)
-            if speculative_future is not None:
-                # Speculative work is bound to a different (assumed-full-
-                # accept) future; discard it and trim its k+1 positions
-                # plus the partial-accept trim.
-                _drain_future(speculative_future)
-                transport.trim_cache(k + 1 + drafter_trim_partial)
-                speculative_future = None
-            elif drafter_trim_partial > 0:
-                transport.trim_cache(drafter_trim_partial)
-            next_round_inputs = [next_seed]
-            next_drafts = transport.forward(next_round_inputs, k).result()
-        else:
-            # Full accept at this round.
-            if speculative_future is not None:
-                spec_outputs = speculative_future.result()
-                speculative_future = None
-                bonus_predicted = spec_outputs[0]
-                if bonus_predicted == next_seed:
-                    # SPECULATION HIT. Round t+1's drafts come for free.
-                    # Drafter cache state is correct (offset O+2k+1
-                    # matches what a length-2-seed propose for round
-                    # t+1 would produce).
-                    next_drafts = spec_outputs[1 : k + 1]
-                    next_round_inputs = []  # unused, drafts already in hand
-                else:
-                    # SPECULATION MISS. Rollback the k+1 speculative
-                    # positions and run a standard length-2-seed propose
-                    # for round t+1.
-                    transport.trim_cache(k + 1)
-                    next_round_inputs = [drafts[-1], next_seed]
-                    next_drafts = transport.forward(next_round_inputs, k).result()
+        # Only the root rank touches ``transport``; non-root target
+        # ranks compute ``next_drafts_local = None`` and pick up the
+        # actual drafts from the rank-0 broadcast below.
+        next_drafts_local: list[int] | None
+        if transport is not None:
+            if num_accepted < k_this:
+                # Partial accept (regardless of speculation state).
+                drafter_trim_partial = max(k_this - num_accepted - 1, 0)
+                if speculative_future is not None:
+                    # Speculative work is bound to a different (assumed-
+                    # full-accept) future; discard it and trim its k+1
+                    # positions plus the partial-accept trim.
+                    _drain_future(speculative_future)
+                    transport.trim_cache(k + 1 + drafter_trim_partial)
+                    speculative_future = None
+                elif drafter_trim_partial > 0:
+                    transport.trim_cache(drafter_trim_partial)
+                next_drafts_local = transport.forward([next_seed], k).result()
             else:
-                # Full accept, speculation was inactive. Standard length-
-                # 2-seed propose for round t+1.
-                next_round_inputs = [drafts[-1], next_seed]
-                next_drafts = transport.forward(next_round_inputs, k).result()
+                # Full accept at this round.
+                if speculative_future is not None:
+                    spec_outputs = speculative_future.result()
+                    speculative_future = None
+                    bonus_predicted = spec_outputs[0]
+                    if bonus_predicted == next_seed:
+                        # SPECULATION HIT. Round t+1's drafts come for free.
+                        # Drafter cache state is correct (offset O+2k+1
+                        # matches what a length-2-seed propose for round
+                        # t+1 would produce).
+                        next_drafts_local = spec_outputs[1 : k + 1]
+                    else:
+                        # SPECULATION MISS. Rollback the k+1 speculative
+                        # positions and run a standard length-2-seed
+                        # propose for round t+1.
+                        transport.trim_cache(k + 1)
+                        next_drafts_local = transport.forward(
+                            [drafts[-1], next_seed], k
+                        ).result()
+                else:
+                    # Full accept, speculation was inactive. Standard
+                    # length-2-seed propose for round t+1.
+                    next_drafts_local = transport.forward(
+                        [drafts[-1], next_seed], k
+                    ).result()
+        else:
+            next_drafts_local = None
+
+        next_drafts = _broadcast_drafts(
+            next_drafts_local,
+            k=k,
+            target_group=target_group,
+            is_root=is_target_root,
+        )
 
         seed = next_seed
         drafts = next_drafts

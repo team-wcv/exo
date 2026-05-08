@@ -1,5 +1,8 @@
+import faulthandler
 import os
 import resource
+import signal
+import sys
 
 import loguru
 
@@ -22,6 +25,17 @@ def entrypoint(
 ) -> None:
     global logger
     logger = _logger
+
+    # Register SIGUSR1 -> dump Python tracebacks of every thread to stderr.
+    # Critical for diagnosing TP collective deadlocks: ``sample`` only sees
+    # C frames (which all reduce to ``cvwait``), but the divergence between
+    # ranks is at the Python orchestration layer. Sending ``kill -USR1
+    # <pid>`` while the runner is stuck dumps the full Python stack of
+    # every thread without needing root for ``py-spy``.
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+    faulthandler.register(
+        signal.SIGUSR1, file=sys.stderr, all_threads=True, chain=False
+    )
 
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(max(soft, 2048), hard), hard))

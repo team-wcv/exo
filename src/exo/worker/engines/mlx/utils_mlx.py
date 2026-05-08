@@ -45,7 +45,7 @@ from pydantic import RootModel
 from exo.download.download_utils import build_model_path, resolve_existing_model
 from exo.shared.types.common import Host
 from exo.shared.types.memory import Memory
-from exo.shared.types.tasks import TaskId, TextGeneration
+from exo.shared.types.tasks import TextGeneration
 from exo.shared.types.text_generation import ChatTemplateValue, TextGenerationTaskParams
 from exo.shared.types.worker.instances import (
     BoundInstance,
@@ -566,6 +566,18 @@ def load_mlx_items(
         logger.info(
             f"Time taken to shard and load model: {(end_time - start_time):.2f}s"
         )
+
+        # Asymmetric multi-rank placement: the drafter weights live on
+        # a separate ``DrafterRunner``, so this rank doesn't load them
+        # locally (no ``drafter_model``). The model id, however, is
+        # known from the placement and is the only piece downstream
+        # telemetry needs to surface "this request used the X drafter".
+        # Without this, ``GenerationStats.drafter_model_id`` stays
+        # ``None`` for every multi-target asymmetric request even
+        # though the drafter is materially serving traffic.
+        drafter_placement = bound_instance.instance.drafter_placement
+        if drafter_placement is not None:
+            drafter_id = drafter_placement.drafter_model_id
 
     mx.clear_cache()
 
@@ -1230,6 +1242,65 @@ def mx_barrier(group: mx.distributed.Group | None):
     )
 
 
+def mx_broadcast_int_list(
+    values: list[int] | None,
+    length: int,
+    group: mx.distributed.Group | None,
+    *,
+    is_root: bool,
+) -> list[int]:
+    """Broadcast a fixed-length int list from one rank to all peers.
+
+    Implementation: all-sum of an ``int32`` buffer where non-root ranks
+    contribute zeros. Reuses MLX's well-exercised ``all_sum`` collective
+    (the same one the model's TP forward depends on every step), so the
+    primitive's reliability is bounded by JACCL's ``all_sum`` rather than
+    its problematic ``all_gather`` (see :func:`mx_all_gather_tasks`).
+
+    The fixed-length contract means the caller pads to ``length`` on
+    root and both ranks agree on ``length`` ahead of time. This avoids
+    a count-then-payload two-collective handshake that would double the
+    wire round-trips on the spec-decode hot path.
+
+    Args:
+      values: On root, a list of exactly ``length`` ints to broadcast.
+        Ignored on non-root ranks.
+      length: Buffer size, agreed by all ranks.
+      group: Distributed group; ``None`` is a single-rank short-circuit
+        that simply returns ``values`` (root-only).
+      is_root: ``True`` on the rank holding the source values; ``False``
+        elsewhere. Exactly one rank in ``group`` must pass ``True``.
+
+    Returns:
+      A list of ``length`` ints identical on every rank in ``group``,
+      equal to root's ``values``.
+    """
+    if group is None:
+        if values is None or len(values) != length:
+            raise ValueError(
+                "mx_broadcast_int_list: single-rank call requires "
+                f"values of length {length}, got "
+                f"{None if values is None else len(values)}"
+            )
+        return list(values)
+
+    if is_root:
+        if values is None or len(values) != length:
+            raise ValueError(
+                "mx_broadcast_int_list root rank requires values of "
+                f"length {length}, got {None if values is None else len(values)}"
+            )
+        buffer = mx.array(values, dtype=mx.int32)
+    else:
+        buffer = mx.zeros((length,), dtype=mx.int32)
+
+    summed = mx.distributed.all_sum(
+        buffer, group=group, stream=mx.default_stream(mx.Device(mx.cpu))
+    )
+    mx.eval(summed)
+    return [int(v) for v in cast(list[int], summed.tolist())]
+
+
 def _parse_kimi_tool_calls(text: str):
     import regex as re
 
@@ -1281,50 +1352,23 @@ def mx_all_gather_tasks(
     if group is None:
         return list(tasks), []
 
-    def encode_task_id(task_id: TaskId) -> list[int]:
-        utf8_task_id = task_id.encode()
-        return [
-            int.from_bytes(utf8_task_id[i : i + 1]) for i in range(len(utf8_task_id))
-        ]
-
-    def decode_task_id(encoded_task_id: list[int]) -> TaskId:
-        return TaskId(
-            bytes.decode(b"".join((x).to_bytes(length=1) for x in encoded_task_id))
-        )
-
-    uuid_byte_length = 36
-
-    n_tasks = len(tasks)
-    all_counts = cast(
-        list[int],
-        mx.distributed.all_gather(mx.array([n_tasks]), group=group).tolist(),
-    )
-    max_tasks = max(all_counts)
-    world_size: int = group.size()
-
-    if max_tasks == 0:
-        return [], []
-
-    padded = [encode_task_id(task.task_id) for task in tasks] + [
-        [0] * uuid_byte_length
-    ] * (max_tasks - n_tasks)
-
-    assert all(len(encoded_task_id) == uuid_byte_length for encoded_task_id in padded)
-
-    gathered = cast(
-        list[list[list[int]]],
-        mx.distributed.all_gather(mx.array(padded), group=group)
-        .reshape(world_size, max_tasks, -1)
-        .tolist(),
-    )
-    all_task_ids: list[list[TaskId]] = [
-        [decode_task_id(encoded_task_id) for encoded_task_id in rank_tasks[:count]]
-        for rank_tasks, count in zip(gathered, all_counts, strict=True)
-    ]
-
-    agreed_ids = set[TaskId].intersection(*(set(tids) for tids in all_task_ids))
-
-    local_tasks = {task.task_id: task for task in tasks}
-    agreed = [local_tasks[tid] for tid in sorted(agreed_ids)]
-    different = [task for task in tasks if task.task_id not in agreed_ids]
-    return agreed, different
+    # JACCL's ``all_gather`` is unreliable for the small task-agreement
+    # buffers we used to ship through here on Apple Silicon: the gather
+    # sporadically reads peer slots back as float32 bit patterns rather
+    # than the int32 we wrote (observed: count gather returning
+    # ``[1, 1068875521]`` -> 0x3FB80001 / a float32 representation), which
+    # forced a 144 GB padded-buffer allocation and crashed the runner with
+    # ``[metal::malloc] Attempting to allocate ...``. Padding to a fixed
+    # 32-slot UUID buffer reproduced the same corruption at larger sizes
+    # (``can't convert negative int to unsigned`` from ``decode_task_id``).
+    #
+    # The agreement protocol is *defensive*: in practice the master pushes
+    # the same task list to every target rank via the worker plan, so each
+    # rank's local view already matches its peers. Until the JACCL gather
+    # is fixed (or we replace it with a target-side TCP coordinator like
+    # the drafter wire) we trust that local view. If the master ever
+    # diverges across ranks the next step (the TP forward) will hang on
+    # the model collective rather than silently completing on stale data,
+    # which is the same failure mode as a corrupted all-gather of the
+    # task IDs.
+    return list(tasks), []

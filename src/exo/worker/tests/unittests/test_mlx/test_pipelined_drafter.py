@@ -567,12 +567,16 @@ class TestClampNumDraftTokensToTransport:
         assert drafter.num_draft_tokens == 5
 
 
-def test_make_drafter_pipelined_rejects_multi_target_subgroup() -> None:
-    """V1 boundary: multi-target asymmetric needs broadcast support not yet implemented."""
+def test_make_drafter_pipelined_multi_target_requires_target_group() -> None:
+    """V2 boundary: multi-target asymmetric requires a target_group for the
+    rank-0 -> peer broadcast of drafts each round. Building the root-side
+    drafter without ``target_group`` is a configuration error: the spec
+    loop would race on a missing collective and silently desync.
+    """
     from exo.worker.engines.mlx.generator.drafter import make_drafter
 
     transport = FakeTransport(num_draft_tokens_value=4)
-    with pytest.raises(NotImplementedError, match="target_subgroup_size=2"):
+    with pytest.raises(ValueError, match="requires target_group"):
         make_drafter(
             mode="pipelined",
             num_draft_tokens=4,
@@ -580,4 +584,54 @@ def test_make_drafter_pipelined_rejects_multi_target_subgroup() -> None:
             draft_cache=None,
             pipelined_transport=transport,
             target_subgroup_size=2,
+            target_group=None,
+        )
+
+
+def test_make_drafter_pipelined_consumer_rank_requires_target_group() -> None:
+    """V2 boundary: a non-root target rank (no transport) must receive a
+    ``target_group`` so the broadcast can land. Without it the consumer
+    drafter would have no way to obtain drafts and the round 0 verify
+    would deadlock against the root's TP collective.
+    """
+    from exo.worker.engines.mlx.generator.drafter import make_drafter
+
+    with pytest.raises(ValueError, match="requires target_group"):
+        make_drafter(
+            mode="pipelined",
+            num_draft_tokens=4,
+            draft_model=None,
+            draft_cache=None,
+            pipelined_transport=None,
+            target_subgroup_size=2,
+            target_group=None,
+            is_target_root=False,
+        )
+
+
+def test_make_drafter_pipelined_root_rank_with_no_transport_rejected() -> None:
+    """Configuration error: ``is_target_root=True`` implies this rank owns
+    the drafter socket; the caller must pass a transport. Reaching the
+    multi-target consumer branch with ``is_target_root=True`` is a
+    placement bug we want to surface loudly rather than silently drop.
+    """
+    from exo.worker.engines.mlx.generator.drafter import make_drafter
+
+    class _StubGroup:
+        def size(self) -> int:
+            return 2
+
+        def rank(self) -> int:
+            return 0
+
+    with pytest.raises(ValueError, match="is_target_root=True"):
+        make_drafter(
+            mode="pipelined",
+            num_draft_tokens=4,
+            draft_model=None,
+            draft_cache=None,
+            pipelined_transport=None,
+            target_subgroup_size=2,
+            target_group=_StubGroup(),
+            is_target_root=True,
         )

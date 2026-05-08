@@ -750,6 +750,8 @@ def make_drafter(
     draft_cache: KVCacheType | None,
     target_subgroup_size: int = 1,
     pipelined_transport: object | None = None,
+    target_group: object | None = None,
+    is_target_root: bool = True,
 ) -> Drafter:
     """Build a :class:`Drafter` for the resolved mode.
 
@@ -768,11 +770,14 @@ def make_drafter(
         ``draft_model`` / ``draft_cache`` (single-process pipelining
         win, no remote IPC).
 
-    Multi-target asymmetric (``target_subgroup_size > 1``) requires
-    broadcasting drafts on the target subgroup to keep target ranks in
-    lockstep, which is a planned follow-up. Single-target asymmetric
-    (the case where ``RemoteTransport`` ships drafts to one consumer)
-    is supported today.
+    Multi-target asymmetric (``target_subgroup_size > 1``) is V2: only
+    the target root (``is_target_root``) holds the transport; non-root
+    target ranks construct a transport-less :class:`PipelinedModelDrafter`
+    and consume each round's drafts via a rank-0 broadcast on
+    ``target_group``. Both ranks then run the verify forward in TP
+    lockstep. Requires the caller to pass ``target_group`` (the
+    target-only :class:`mx.distributed.Group`) and the rank's
+    ``is_target_root`` flag.
     """
     if mode == "none":
         return NoSpecDrafter()
@@ -810,6 +815,36 @@ def make_drafter(
             PipelinedModelDrafter,
         )
 
+        # Multi-target asymmetric: non-root target ranks have no
+        # transport (the socket is rank-0-only) but must still drive the
+        # verify forward in TP lockstep. They construct a
+        # transport-less drafter that pulls each round's drafts from a
+        # rank-0 broadcast on ``target_group``. ``target_group`` is
+        # required when ``target_subgroup_size > 1`` so the broadcast
+        # reaches every rank; raising here is a louder failure than
+        # silently falling through to an in-process drafter on rank 1
+        # (which would load the drafter weights twice and never agree
+        # on tokens with rank 0).
+        if pipelined_transport is None and target_subgroup_size > 1:
+            if target_group is None:
+                raise ValueError(
+                    "draft_mode='pipelined' on a multi-target rank "
+                    f"(target_subgroup_size={target_subgroup_size}) without "
+                    "pipelined_transport requires target_group for the "
+                    "draft broadcast (this rank is the consumer)"
+                )
+            if is_target_root:
+                raise ValueError(
+                    "is_target_root=True implies this rank owns the "
+                    "drafter socket; pipelined_transport must be supplied"
+                )
+            return PipelinedModelDrafter(
+                transport=None,
+                num_draft_tokens=num_draft_tokens,
+                target_group=cast("mx.distributed.Group | None", target_group),
+                is_target_root=False,
+            )
+
         if pipelined_transport is not None:
             # Caller supplied a long-lived transport (asymmetric path:
             # SequentialGenerator allocates the RemoteTransport once at
@@ -820,23 +855,27 @@ def make_drafter(
                     "pipelined_transport must implement DrafterTransport; "
                     f"got {type(pipelined_transport).__name__}"
                 )
-            if target_subgroup_size > 1:
-                raise NotImplementedError(
-                    f"Asymmetric drafter with target_subgroup_size="
-                    f"{target_subgroup_size} (> 1) requires broadcasting "
-                    "drafts on the target subgroup. V1 supports a single "
-                    "target rank (twins topology); multi-target "
-                    "asymmetric is a planned follow-up."
+            if target_subgroup_size > 1 and target_group is None:
+                raise ValueError(
+                    "Asymmetric drafter with target_subgroup_size="
+                    f"{target_subgroup_size} requires target_group for "
+                    "the rank-0 -> peer-target broadcast of drafts each "
+                    "round; V1 single-target paths can pass target_group=None"
                 )
             return PipelinedModelDrafter(
                 transport=pipelined_transport,
                 num_draft_tokens=num_draft_tokens,
+                target_group=cast("mx.distributed.Group | None", target_group)
+                if target_subgroup_size > 1
+                else None,
+                is_target_root=True,
             )
 
-        # No builder-supplied transport: in-process is the only sensible
-        # default. Asymmetric placements always supply
-        # ``pipelined_transport`` from the builder; reaching this branch
-        # without one means a single-process pipelined drafter.
+        # No builder-supplied transport, single target rank: in-process
+        # is the only sensible default. Asymmetric multi-target was
+        # handled above (consumer rank). Reaching here means a single-
+        # process pipelined drafter (no distributed group, drafter
+        # weights live in this same process).
         if draft_model is None or draft_cache is None:
             raise ValueError(
                 "draft_mode='pipelined' without a builder-supplied "

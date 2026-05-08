@@ -871,10 +871,19 @@ def mlx_generate(
         else num_draft_tokens
     ) or 0
     max_tokens = task.max_output_tokens or MAX_TOKENS
+    # ``asymmetric_drafter_rank`` is set on every target rank in an
+    # asymmetric placement (it's a property of the placement, not of
+    # any one rank). ``asymmetric_drafter_transport`` is set only on
+    # the target root rank (rank 0 of the target subgroup), which owns
+    # the socket to the drafter. Both ranks must enter the pipelined
+    # branch because they need to make matching TP collectives every
+    # round; the non-root rank consumes drafts via a rank-0 broadcast
+    # on the target subgroup (see :class:`PipelinedModelDrafter`).
     asymmetric_drafter_active = (
-        asymmetric_drafter_rank is not None
-        and asymmetric_drafter_transport is not None
-        and request_use_drafter is not False
+        asymmetric_drafter_rank is not None and request_use_drafter is not False
+    )
+    asymmetric_drafter_is_root = (
+        asymmetric_drafter_active and asymmetric_drafter_transport is not None
     )
     if asymmetric_drafter_active:
         # Asymmetric placement: the drafter lives on a separate node,
@@ -884,7 +893,7 @@ def mlx_generate(
         # mlx_lm's own speculative_generate_step doesn't handle
         # pipeline collectives). The pipelined+remote path is the
         # whole point of the asymmetric topology, so honor it
-        # unconditionally.
+        # unconditionally on every target rank.
         draft_mode: DraftMode = "pipelined"
     elif group is not None:
         draft_mode = "none"
@@ -924,7 +933,14 @@ def mlx_generate(
         # drafters don't crash on zero-K proposals.
         effective_num_draft_tokens = 1
 
-    if asymmetric_drafter_active and asymmetric_drafter_transport is not None:
+    if asymmetric_drafter_is_root and asymmetric_drafter_transport is not None:
+        # Only the root has access to the transport's clamp; non-root
+        # target ranks pick up the (already-clamped) K from the
+        # broadcast wire-format size. As long as both ranks agree on
+        # the configured ``num_draft_tokens`` -- which they do, since
+        # it's derived deterministically from env / placement -- the
+        # broadcast slot count is identical and no per-rank clamp is
+        # required on the consumer.
         from exo.worker.engines.mlx.generator.drafter_transport import (
             DrafterTransport as _DrafterTransport,
         )
@@ -1211,13 +1227,6 @@ def mlx_generate(
     if asymmetric_drafter_active:
         assert asymmetric_drafter_rank is not None
         target_subgroup_size = group.size() if group is not None else 1
-        # ``asymmetric_drafter_transport`` is the long-lived wire owner
-        # (``RemoteTransport``) supplied by the runner; per-request the
-        # spec loop talks to a per-session :class:`DrafterTransport`
-        # view via :meth:`RemoteTransport.open_session`. This is what
-        # lets the asymmetric runner field multiple concurrent target
-        # requests without two sessions interleaving OP_FORWARD frames
-        # on the same socket.
         from exo.worker.engines.mlx.generator.drafter_transport import (
             DrafterTransport as _DrafterTransport,
         )
@@ -1225,56 +1234,82 @@ def mlx_generate(
             RemoteTransport as _RemoteTransport,
         )
 
-        if isinstance(asymmetric_drafter_transport, _RemoteTransport):
-            asymmetric_session = asymmetric_drafter_transport.open_session()
-            session_transport: object = asymmetric_session
-        elif isinstance(asymmetric_drafter_transport, _DrafterTransport):
-            # Test fakes / in-process placeholders: no session layer,
-            # use the transport directly. Safe under the singular-task
-            # assumption of those mocks.
-            session_transport = asymmetric_drafter_transport
+        if asymmetric_drafter_is_root:
+            # Target root rank: open a per-request session on the
+            # ``RemoteTransport`` wire so concurrent target requests
+            # don't interleave OP_FORWARD frames on the same socket.
+            # Test fakes pass a bare ``DrafterTransport``; in that
+            # singular-task path we use it directly.
+            if isinstance(asymmetric_drafter_transport, _RemoteTransport):
+                asymmetric_session = asymmetric_drafter_transport.open_session()
+                session_transport: object = asymmetric_session
+            elif isinstance(asymmetric_drafter_transport, _DrafterTransport):
+                session_transport = asymmetric_drafter_transport
+            else:
+                raise TypeError(
+                    "asymmetric_drafter_transport must be a RemoteTransport "
+                    "(production asymmetric placement) or a DrafterTransport "
+                    "(test fakes); "
+                    f"got {type(asymmetric_drafter_transport).__name__}"
+                )
+            # Sync this request's drafter cache against the prompt before
+            # constructing the drafter wrapper. The session sends OP_PREFILL
+            # with prompt[:-2] (matching ``_spec_drafter_prefill``'s
+            # invariant: align the drafter's offset to ``len(prompt) - 2``
+            # so the spec loop's first OP_FORWARD seeds from prompt[-2]).
+            prefill_prompt: list[int] = [
+                int(t) for t in cast(list[int], all_prompt_tokens[:-2].tolist())
+            ]
+            try:
+                cast(_DrafterTransport, session_transport).reset_and_prefill(
+                    prefill_prompt
+                )
+                drafter: Drafter = make_drafter(
+                    mode=draft_mode,
+                    num_draft_tokens=effective_num_draft_tokens,
+                    draft_model=None,
+                    draft_cache=None,
+                    target_subgroup_size=target_subgroup_size,
+                    pipelined_transport=session_transport,
+                    target_group=group,
+                    is_target_root=True,
+                )
+            except BaseException:
+                # ``make_drafter`` or ``reset_and_prefill`` raised;
+                # release the freshly-allocated session so the drafter
+                # rank doesn't hold its KV cache forever.
+                try:
+                    if asymmetric_session is not None:
+                        cast(_DrafterTransport, asymmetric_session).shutdown()
+                except Exception:
+                    logger.opt(exception=True).warning(
+                        "asymmetric drafter session shutdown raised "
+                        "during error recovery; ignoring"
+                    )
+                asymmetric_session = None
+                raise
         else:
-            raise TypeError(
-                "asymmetric_drafter_transport must be a RemoteTransport "
-                "(production asymmetric placement) or a DrafterTransport "
-                "(test fakes); "
-                f"got {type(asymmetric_drafter_transport).__name__}"
+            # Non-root target rank in a multi-target placement: no
+            # socket, no session, no drafter prefill (the drafter rank
+            # only knows about the root's session). The consumer
+            # drafter receives drafts each round via a rank-0
+            # broadcast on ``group``; the broadcast is the only
+            # cross-rank wire this rank needs.
+            assert group is not None and target_subgroup_size > 1, (
+                "asymmetric_drafter non-root rank requires a target "
+                "subgroup of size > 1 (V1 single-target placements "
+                "only have rank 0; this branch should not be reached)"
             )
-        # Sync this request's drafter cache against the prompt before
-        # constructing the drafter wrapper. The session sends OP_PREFILL
-        # with prompt[:-2] (matching ``_spec_drafter_prefill``'s
-        # invariant: align the drafter's offset to ``len(prompt) - 2``
-        # so the spec loop's first OP_FORWARD seeds from prompt[-2]).
-        prefill_prompt: list[int] = [
-            int(t) for t in cast(list[int], all_prompt_tokens[:-2].tolist())
-        ]
-        # Cast: both session_transport branches above implement the
-        # DrafterTransport Protocol; the static type carries ``object``
-        # only because we accepted a wider runtime input.
-        try:
-            cast(_DrafterTransport, session_transport).reset_and_prefill(prefill_prompt)
-            drafter: Drafter = make_drafter(
+            drafter = make_drafter(
                 mode=draft_mode,
                 num_draft_tokens=effective_num_draft_tokens,
                 draft_model=None,
                 draft_cache=None,
                 target_subgroup_size=target_subgroup_size,
-                pipelined_transport=session_transport,
+                pipelined_transport=None,
+                target_group=group,
+                is_target_root=False,
             )
-        except BaseException:
-            # ``make_drafter`` or ``reset_and_prefill`` raised; release
-            # the freshly-allocated session so the drafter rank doesn't
-            # hold its KV cache forever.
-            try:
-                if asymmetric_session is not None:
-                    cast(_DrafterTransport, asymmetric_session).shutdown()
-            except Exception:
-                logger.opt(exception=True).warning(
-                    "asymmetric drafter session shutdown raised "
-                    "during error recovery; ignoring"
-                )
-            asymmetric_session = None
-            raise
     else:
         drafter = make_drafter(
             mode=draft_mode,
@@ -1337,14 +1372,21 @@ def mlx_generate(
 
             stats: GenerationStats | None = None
             if is_done:
-                # Drafter telemetry: only stamp the id when speculation actually
-                # ran for this request. `effective_draft_model is not None` is
-                # the source of truth -- short-skip and distributed paths zero
-                # it out, so we don't spuriously surface a drafter that didn't
-                # contribute.
+                # Drafter telemetry: stamp the id whenever speculation
+                # actually ran for this request. The asymmetric
+                # ``"pipelined"`` path has no in-process draft model
+                # (the weights live on the drafter rank), so guarding
+                # solely on ``effective_draft_model is not None`` would
+                # spuriously zero out telemetry for the very topology
+                # the drafter buys us the most. We instead trust
+                # ``drafter.mode`` together with the asymmetric flag,
+                # which is set iff the placement actually wired a
+                # drafter rank into this instance.
                 telemetry_drafter_id: str | None = None
                 telemetry_k: int | None = None
-                if drafter.mode == "model" and effective_draft_model is not None:
+                if (
+                    drafter.mode == "model" and effective_draft_model is not None
+                ) or drafter.mode == "pipelined":
                     telemetry_k = effective_num_draft_tokens
                     if drafter_model_id is not None:
                         telemetry_drafter_id = str(drafter_model_id)

@@ -84,6 +84,19 @@ def logger_setup(log_file: Path | None, verbosity: int = 0):
     logging.basicConfig(handlers=[_InterceptHandler()], level=0)
 
     console_level = "INFO" if verbosity == 0 else "DEBUG"
+    # ``diagnose=False`` disables loguru's "better exceptions" frame-locals
+    # repr. Leaving it on (the default) means any ``logger.opt(exception=e)``
+    # call walks every frame of the traceback and ``repr()``s every local
+    # variable -- catastrophic when an exception is raised from a frame
+    # that holds large structured data (e.g. ``mx_all_gather_tasks`` keeps
+    # a ``padded`` list of per-rank UUID buffers as a local; if a JACCL
+    # collective corruption blows ``max_tasks`` up to ~1B that ``padded``
+    # local becomes a ~1B-element nested int list whose ``list_repr`` is
+    # *the* hot loop the runner gets stuck in -- 100% CPU on one core,
+    # ~300 GB peak physical footprint, and every subsequent crash log
+    # restarts the storm). The compact traceback we still emit (file,
+    # line, exception message) is enough for diagnosis without ever
+    # touching frame locals.
     if verbosity == 0:
         logger.add(
             sys.__stderr__,  # type: ignore
@@ -91,6 +104,7 @@ def logger_setup(log_file: Path | None, verbosity: int = 0):
             level=console_level,
             colorize=True,
             enqueue=True,
+            diagnose=False,
         )
     else:
         logger.add(
@@ -99,6 +113,7 @@ def logger_setup(log_file: Path | None, verbosity: int = 0):
             level=console_level,
             colorize=True,
             enqueue=True,
+            diagnose=False,
         )
     if log_file:
         log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -123,6 +138,7 @@ def logger_setup(log_file: Path | None, verbosity: int = 0):
             rotation=rotation,
             retention=_MAX_LOG_ARCHIVES,
             compression=_zstd_compress,
+            diagnose=False,
         )
         for destination, serialize in ((run_text_log, False), (run_json_log, True)):
             logger.add(
@@ -135,6 +151,7 @@ def logger_setup(log_file: Path | None, verbosity: int = 0):
                 retention=retention,
                 compression=_zstd_compress,
                 serialize=serialize,
+                diagnose=False,
             )
         logger.info(
             f"Per-run logs enabled text_log={run_text_log} json_log={run_json_log} "

@@ -509,7 +509,22 @@ class Runner:
         assert isinstance(self.current_status, RunnerReady)
         assert isinstance(self.generator, Engine)
 
-        logger.info(f"received chat request: {starting_task}")
+        # Log identifiers only. The full ``starting_task`` is a deep
+        # Pydantic model whose default ``__str__`` recursively repr's
+        # every field (including ``chat_template_messages`` and any
+        # nested token / image structures). On a multi-rank target
+        # placement the worker plans the same TextGeneration repeatedly
+        # while a runner is busy, so logging the full model on every
+        # entry has been observed to peg rank 0 inside ``list_repr`` /
+        # ``long_to_decimal_string`` for minutes (peak physical
+        # footprint ~300 GB) and prevent it from ever entering the
+        # model forward -- which the peer rank then deadlocks on inside
+        # the first TP collective.
+        logger.info(
+            "received chat request task_id="
+            f"{starting_task.task_id} command_id={starting_task.command_id} "
+            f"task_type={starting_task.__class__.__name__}"
+        )
         self.update_status(RunnerRunning())
         logger.info("runner running")
         self.acknowledge_task(starting_task)
