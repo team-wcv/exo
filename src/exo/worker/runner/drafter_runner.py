@@ -109,7 +109,6 @@ class DrafterRunner:
         self.parent_group: mx.distributed.Group | None = None
         self.target_subgroup: mx.distributed.Group | None = None
         self.draft_model: Model | None = None
-        self.draft_cache: KVCacheType | None = None
 
         self._setup_start = time.perf_counter()
         self._update_status(RunnerIdle())
@@ -171,8 +170,6 @@ class DrafterRunner:
         self._update_status(RunnerConnected())
 
     def _handle_load(self, task: Task) -> None:
-        from exo.worker.engines.mlx.cache import make_kv_cache
-
         drafter_id = self._placement.drafter_model_id
         drafter_path = resolve_existing_model(drafter_id)
         if drafter_path is None:
@@ -195,7 +192,14 @@ class DrafterRunner:
         model, _ = load_model(drafter_path, lazy=True, strict=False)
         mx.eval(model)
         self.draft_model = cast("Model", model)
-        self.draft_cache = make_kv_cache(model=self.draft_model)
+        # ``draft_cache`` is no longer pre-allocated -- the serve loop
+        # multiplexes per-session caches keyed on ``session_id`` (target
+        # rank's :meth:`RemoteTransport.open_session` allocation) and
+        # builds each one lazily via ``make_kv_cache(model=...)`` on
+        # the matching ``OP_PREFILL``. Holding only the model means
+        # cluster-idle memory stays small (~drafter weights, no KV
+        # cache); active memory scales linearly with concurrent target
+        # requests, capped by the runner's ``EXO_MAX_CONCURRENT_REQUESTS``.
         loguru_logger.info(
             f"DrafterRunner loaded {drafter_id} in "
             f"{(time.perf_counter() - load_start):.2f}s"
@@ -205,27 +209,26 @@ class DrafterRunner:
         self._update_status(RunnerLoaded())
 
     def _handle_start_warmup(self, task: Task) -> None:
+        from exo.worker.engines.mlx.cache import make_kv_cache
+
         assert self.parent_group is not None
         assert self.draft_model is not None
-        assert self.draft_cache is not None
 
         self._update_status(RunnerWarmingUp())
         self._acknowledge(task)
 
-        # JIT-compile drafter Metal kernels with a single forward, so
-        # the first real spec-decode round on the target rank doesn't
-        # eat the compile latency.
+        # JIT-compile drafter Metal kernels with a single forward
+        # against a throwaway cache so the first real spec-decode round
+        # on the target rank doesn't eat the compile latency. The
+        # warmup cache is GC'd at the end of this method; per-session
+        # caches are allocated lazily inside :func:`drafter_serve_loop`
+        # on each ``OP_PREFILL``.
         warmup_start = time.perf_counter()
+        warmup_cache = make_kv_cache(model=self.draft_model)
         seed = mx.array([[0]], dtype=mx.uint32)
-        _ = self.draft_model(seed, cache=self.draft_cache)
-        mx.eval([c.state for c in self.draft_cache])  # type: ignore[reportArgumentType]
-        # Reset the cache so we don't carry the warmup token into real
-        # generation.
-        from typing import cast as _cast
-
-        from mlx_lm.models.cache import trim_prompt_cache as mlx_trim_prompt_cache
-
-        mlx_trim_prompt_cache(_cast(list[object], self.draft_cache), 1)  # type: ignore[reportArgumentType]
+        _ = self.draft_model(seed, cache=warmup_cache)
+        mx.eval([c.state for c in warmup_cache])  # type: ignore[reportArgumentType]
+        del warmup_cache
         loguru_logger.info(
             f"DrafterRunner warmup complete in "
             f"{(time.perf_counter() - warmup_start):.2f}s; "
@@ -248,16 +251,17 @@ class DrafterRunner:
         self._update_status(RunnerReady(prefill_server_port=None))
 
     def _serve_loop(self) -> None:
+        from exo.worker.engines.mlx.cache import make_kv_cache
         from exo.worker.engines.mlx.generator.remote_drafter import drafter_serve_loop
 
         assert self.parent_group is not None
         assert self.draft_model is not None
-        assert self.draft_cache is not None
 
         # Target rank that drives drafter IPC. By placement convention
         # rank 0 of the parent group owns sampling decisions and so is
-        # the rank that calls RemoteTransport.forward / trim_cache /
-        # shutdown.
+        # the rank that calls ``_SessionHandle.forward / trim_cache /
+        # reset_and_prefill`` (and the wire-level
+        # ``RemoteTransport.shutdown``).
         target_rank = 0
         # ``num_draft_tokens`` here only sizes the response buffer; the
         # spec loop on the target side may issue forwards with
@@ -267,9 +271,19 @@ class DrafterRunner:
             f"DrafterRunner entering serve_loop "
             f"(K={num_draft_tokens}, target_rank={target_rank})"
         )
+        # Capture ``draft_model`` in the closure so the serve loop can
+        # allocate per-session caches lazily without re-entering
+        # ``DrafterRunner`` state. Dummy assertion here to satisfy the
+        # type checker (``self.draft_model`` is ``Model | None`` at the
+        # field level but we asserted not None above).
+        draft_model = self.draft_model
+
+        def _make_session_cache() -> "KVCacheType":
+            return make_kv_cache(model=draft_model)
+
         drafter_serve_loop(
-            draft_model=self.draft_model,
-            draft_cache=self.draft_cache,
+            draft_model=draft_model,
+            make_draft_cache=_make_session_cache,
             num_draft_tokens=num_draft_tokens,
             group=self.parent_group,
             target_rank=target_rank,
@@ -293,10 +307,11 @@ class DrafterRunner:
         loguru_logger.info("DrafterRunner shutting down")
         self._update_status(RunnerShuttingDown())
         self._acknowledge(task)
-        # Release the model and cache so the drafter rank's process
-        # frees its drafter weights before exiting.
+        # Release the model so the drafter rank's process frees its
+        # drafter weights before exiting. Per-session caches were owned
+        # by :func:`drafter_serve_loop`; they were dropped when the
+        # loop returned via ``OP_SHUTDOWN``.
         self.draft_model = None
-        self.draft_cache = None
         self.parent_group = None
         self.target_subgroup = None
         import gc

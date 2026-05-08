@@ -879,7 +879,7 @@ def make_drafter(
                 "draft_mode='pipelined' with EXO_DRAFTER_TRANSPORT='inprocess' "
                 "requires both draft_model and draft_cache"
             )
-        transport = factory(
+        constructed = factory(
             draft_model=draft_model,
             draft_cache=draft_cache,
             num_draft_tokens=num_draft_tokens,
@@ -887,8 +887,28 @@ def make_drafter(
             drafter_rank=remote_drafter_rank,
             target_rank=remote_target_rank,
         )
+        # ``RemoteTransport`` is the wire owner -- callers must
+        # ``open_session()`` to get a per-request :class:`DrafterTransport`
+        # view. The env-var fallback is a single-session path (one
+        # ``mlx_generate`` call per ``make_drafter``) so we open a session
+        # eagerly and bind it to this drafter; the wire owner leaks for
+        # the lifetime of the process, which matches how production
+        # asymmetric placement (builder-supplied ``pipelined_transport``)
+        # already manages it.
+        from exo.worker.engines.mlx.generator.remote_drafter import RemoteTransport
+
+        if isinstance(constructed, RemoteTransport):
+            spec_transport: DrafterTransport = constructed.open_session()
+        elif isinstance(constructed, DrafterTransport):
+            spec_transport = constructed
+        else:
+            raise TypeError(
+                f"transport factory returned unsupported type "
+                f"{type(constructed).__name__}; expected RemoteTransport or "
+                "DrafterTransport"
+            )
         return PipelinedModelDrafter(
-            transport=transport,
+            transport=spec_transport,
             num_draft_tokens=num_draft_tokens,
         )
     # Exhaustiveness: DraftMode is a closed Literal. Any other value is a

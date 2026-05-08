@@ -367,7 +367,12 @@ def make_inprocess_transport(
     )
 
 
-_TransportFactory = Callable[..., DrafterTransport]
+# The dispatch table returns either a :class:`DrafterTransport` (in-process,
+# directly consumable by the spec loop) or a :class:`RemoteTransport`
+# (the wire owner; callers must call ``open_session()`` to obtain a
+# :class:`DrafterTransport` view per request). Callers route on the
+# concrete return type rather than relying on a single Protocol.
+_TransportFactory = Callable[..., object]
 
 
 def transport_factory_for(kind: str) -> _TransportFactory:

@@ -29,7 +29,6 @@ from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 
 from .cache import KVPrefixCache
 from .generator.drafter import EXO_DRAFT_MODE_ENV, parse_draft_mode
-from .generator.drafter_transport import DrafterTransport
 from .types import Model
 from .utils_mlx import (
     initialize_mlx,
@@ -149,7 +148,15 @@ class MlxBuilder(Builder):
         is_asymmetric = (
             self.parent_group is not None and self.drafter_rank_in_parent is not None
         )
-        remote_drafter_transport: DrafterTransport | None = None
+        # Long-lived ``RemoteTransport`` (NOT a per-task DrafterTransport).
+        # Each in-flight request opens its own session via
+        # :meth:`RemoteTransport.open_session`; the session handle is the
+        # actual DrafterTransport consumed by the spec loop. See
+        # ``remote_drafter.py`` module docstring for the wire-protocol
+        # session multiplexing rationale.
+        from exo.worker.engines.mlx.generator.remote_drafter import RemoteTransport
+
+        remote_drafter_transport: RemoteTransport | None = None
         if is_asymmetric:
             assert self.parent_group is not None
             assert self.drafter_rank_in_parent is not None
@@ -213,20 +220,21 @@ class MlxBuilder(Builder):
                     f"skip_drafter_when_max_tokens<={drafter_min_output_tokens}"
                 )
 
-            # Concurrent in-flight tasks. Asymmetric pipelined+remote keeps
-            # the singular slot because ``RemoteTransport``'s wire protocol
-            # is per-session: two concurrent target requests would interleave
-            # ``OP_PREFILL`` / ``OP_FORWARD`` frames on the same socket and
-            # corrupt the drafter rank's per-request KV cache. Lifting that
-            # cap requires extending the wire protocol with a request-id
-            # field plus per-request cache state on the drafter rank --
-            # tracked separately from this PR. All other configurations
-            # (no drafter, n-gram, in-process model drafter) are safe to
-            # round-robin: each ``mlx_generate`` call allocates its own KV
-            # cache and the per-tick ``next(gen)`` is a single forward, so
-            # generators are independent in everything but model weights
-            # (which are read-only during forward).
-            max_concurrent_tasks = 1 if is_asymmetric else EXO_MAX_CONCURRENT_REQUESTS
+            # Concurrent in-flight tasks. Asymmetric pipelined+remote
+            # rides the same ``EXO_MAX_CONCURRENT_REQUESTS`` cap as every
+            # other config now that the wire protocol carries a
+            # ``session_id`` slot: each in-flight target request opens
+            # its own ``_SessionHandle`` via
+            # ``RemoteTransport.open_session()`` and the drafter rank
+            # multiplexes per-session KV caches. The wire stays serial
+            # (single ``ThreadPoolExecutor`` on the target, single recv
+            # loop on the drafter) so ``mx.distributed.send/recv``
+            # ordering is preserved; concurrency comes from interleaving
+            # forward / verify rounds across sessions, which is the
+            # whole point of asymmetric placement -- keep the drafter
+            # rank busy serving session A while the target verifies
+            # session B's drafts.
+            max_concurrent_tasks = EXO_MAX_CONCURRENT_REQUESTS
             if max_concurrent_tasks > 1:
                 logger.info(
                     f"SequentialGenerator round-robin concurrency: "

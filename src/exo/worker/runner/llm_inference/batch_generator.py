@@ -32,12 +32,12 @@ from exo.worker.engines.mlx.cache import KVPrefixCache
 from exo.worker.engines.mlx.disaggregated.adapter import write_cache_to_wire
 from exo.worker.engines.mlx.disaggregated.serve import run_prefill_for_request
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
-from exo.worker.engines.mlx.generator.drafter_transport import DrafterTransport
 from exo.worker.engines.mlx.generator.generate import (
     PrefillCancelled,
     mlx_generate,
     warmup_inference,
 )
+from exo.worker.engines.mlx.generator.remote_drafter import RemoteTransport
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
@@ -179,9 +179,12 @@ class SequentialGenerator(Engine):
     drafter_rank_in_parent: int | None = None
     # Long-lived transport bound to the drafter rank. Allocated once at
     # builder.build() time; reused across requests so the executor
-    # thread + drafter cache lifecycle isn't paid per-request. Closed
+    # thread + drafter cache lifecycle isn't paid per-request. Each
+    # in-flight request opens its own session via
+    # :meth:`RemoteTransport.open_session`; the per-session handle is
+    # the actual ``DrafterTransport`` consumed by the spec loop. Closed
     # in :meth:`close` (sends ``OP_SHUTDOWN`` to the drafter rank).
-    remote_drafter_transport: DrafterTransport | None = None
+    remote_drafter_transport: RemoteTransport | None = None
     check_for_cancel_every: int = 50
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)

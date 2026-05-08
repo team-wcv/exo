@@ -1004,44 +1004,86 @@ def mlx_generate(
     #                       behind a ``DrafterTransport`` (in-process or remote)
     #   * ``"ngram"``    -> in-house n-gram suffix-match spec loop
     #   * ``"none"``     -> plain ``mlx_lm.stream_generate``
+    # Per-task session for the asymmetric remote drafter (if active).
+    # Opened in the ``if`` branch below; closed in the ``finally`` at
+    # the end of the function so a fault, cancellation, or normal
+    # completion all funnel through ``session.shutdown()`` and free
+    # the drafter rank's per-session KV cache. Without this, every
+    # completed request would leak ~50-100 MB of KV cache on the
+    # drafter rank until the runner shuts down.
+    asymmetric_session: object | None = None
     if asymmetric_drafter_active:
         assert asymmetric_parent_group is not None
         assert asymmetric_drafter_rank is not None
         target_rank_in_parent = asymmetric_parent_group.rank()
         target_subgroup_size = group.size() if group is not None else 1
-        # Sync the drafter rank's cache against this request's prompt
-        # before constructing the drafter wrapper. The transport sends
-        # OP_PREFILL with prompt[:-2] (matching ``_spec_drafter_prefill``'s
-        # invariant: align the drafter's offset to ``len(prompt) - 2``
-        # so the spec loop's first OP_FORWARD seeds from prompt[-2]).
-        # Cast: ``asymmetric_drafter_transport`` is typed ``object`` at
-        # the public surface to avoid pulling DrafterTransport into
-        # mlx_generate's import set.
+        # ``asymmetric_drafter_transport`` is the long-lived wire owner
+        # (``RemoteTransport``) supplied by the runner; per-request the
+        # spec loop talks to a per-session :class:`DrafterTransport`
+        # view via :meth:`RemoteTransport.open_session`. This is what
+        # lets the asymmetric runner field multiple concurrent target
+        # requests without two sessions interleaving OP_FORWARD frames
+        # on the same socket.
         from exo.worker.engines.mlx.generator.drafter_transport import (
             DrafterTransport as _DrafterTransport,
         )
+        from exo.worker.engines.mlx.generator.remote_drafter import (
+            RemoteTransport as _RemoteTransport,
+        )
 
-        if not isinstance(asymmetric_drafter_transport, _DrafterTransport):
+        if isinstance(asymmetric_drafter_transport, _RemoteTransport):
+            asymmetric_session = asymmetric_drafter_transport.open_session()
+            session_transport: object = asymmetric_session
+        elif isinstance(asymmetric_drafter_transport, _DrafterTransport):
+            # Test fakes / in-process placeholders: no session layer,
+            # use the transport directly. Safe under the singular-task
+            # assumption of those mocks.
+            session_transport = asymmetric_drafter_transport
+        else:
             raise TypeError(
-                "asymmetric_drafter_transport must implement DrafterTransport "
-                "when asymmetric placement is active; "
+                "asymmetric_drafter_transport must be a RemoteTransport "
+                "(production asymmetric placement) or a DrafterTransport "
+                "(test fakes); "
                 f"got {type(asymmetric_drafter_transport).__name__}"
             )
+        # Sync this request's drafter cache against the prompt before
+        # constructing the drafter wrapper. The session sends OP_PREFILL
+        # with prompt[:-2] (matching ``_spec_drafter_prefill``'s
+        # invariant: align the drafter's offset to ``len(prompt) - 2``
+        # so the spec loop's first OP_FORWARD seeds from prompt[-2]).
         prefill_prompt: list[int] = [
             int(t) for t in cast(list[int], all_prompt_tokens[:-2].tolist())
         ]
-        asymmetric_drafter_transport.reset_and_prefill(prefill_prompt)
-        drafter: Drafter = make_drafter(
-            mode=draft_mode,
-            num_draft_tokens=effective_num_draft_tokens,
-            draft_model=None,
-            draft_cache=None,
-            remote_parent_group=asymmetric_parent_group,
-            remote_drafter_rank=asymmetric_drafter_rank,
-            remote_target_rank=target_rank_in_parent,
-            target_subgroup_size=target_subgroup_size,
-            pipelined_transport=asymmetric_drafter_transport,
-        )
+        # Cast: both session_transport branches above implement the
+        # DrafterTransport Protocol; the static type carries ``object``
+        # only because we accepted a wider runtime input.
+        try:
+            cast(_DrafterTransport, session_transport).reset_and_prefill(prefill_prompt)
+            drafter: Drafter = make_drafter(
+                mode=draft_mode,
+                num_draft_tokens=effective_num_draft_tokens,
+                draft_model=None,
+                draft_cache=None,
+                remote_parent_group=asymmetric_parent_group,
+                remote_drafter_rank=asymmetric_drafter_rank,
+                remote_target_rank=target_rank_in_parent,
+                target_subgroup_size=target_subgroup_size,
+                pipelined_transport=session_transport,
+            )
+        except BaseException:
+            # ``make_drafter`` or ``reset_and_prefill`` raised; release
+            # the freshly-allocated session so the drafter rank doesn't
+            # hold its KV cache forever.
+            try:
+                if asymmetric_session is not None:
+                    cast(_DrafterTransport, asymmetric_session).shutdown()
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "asymmetric drafter session shutdown raised "
+                    "during error recovery; ignoring"
+                )
+            asymmetric_session = None
+            raise
     else:
         drafter = make_drafter(
             mode=draft_mode,
@@ -1061,130 +1103,153 @@ def mlx_generate(
         int(t) for t in cast(list[int], all_prompt_tokens.tolist())
     ]
 
-    for completion_tokens, out in enumerate(
-        drafter.stream(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=decode_prompt,
-            context_tokens=full_context_tokens,
-            prompt_cache=caches,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            logits_processors=logits_processors,
-            prefill_step_size=1,
-        ),
-        start=1,
-    ):
-        generated_text_parts.append(out.text)
-        accumulated_text += out.text
-        if getattr(out, "from_draft", False):
-            from_draft_count += 1
+    try:
+        for completion_tokens, out in enumerate(
+            drafter.stream(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=decode_prompt,
+                context_tokens=full_context_tokens,
+                prompt_cache=caches,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                prefill_step_size=1,
+            ),
+            start=1,
+        ):
+            generated_text_parts.append(out.text)
+            accumulated_text += out.text
+            if getattr(out, "from_draft", False):
+                from_draft_count += 1
 
-        # Check for stop sequences
-        text = out.text
-        finish_reason: FinishReason | None = cast(
-            FinishReason | None, out.finish_reason
-        )
-        stop_matched = False
-
-        if stop_sequences:
-            for stop_seq in stop_sequences:
-                if stop_seq in accumulated_text:
-                    # Trim text to just before the stop sequence
-                    stop_index = accumulated_text.find(stop_seq)
-                    text_before_stop = accumulated_text[:stop_index]
-                    chunk_start = len(accumulated_text) - len(out.text)
-                    text = text_before_stop[chunk_start:]
-                    finish_reason = "stop"
-                    stop_matched = True
-                    break
-
-        is_done = finish_reason is not None
-
-        stats: GenerationStats | None = None
-        if is_done:
-            # Drafter telemetry: only stamp the id when speculation actually
-            # ran for this request. `effective_draft_model is not None` is
-            # the source of truth -- short-skip and distributed paths zero
-            # it out, so we don't spuriously surface a drafter that didn't
-            # contribute.
-            telemetry_drafter_id: str | None = None
-            telemetry_k: int | None = None
-            if drafter.mode == "model" and effective_draft_model is not None:
-                telemetry_k = effective_num_draft_tokens
-                if drafter_model_id is not None:
-                    telemetry_drafter_id = str(drafter_model_id)
-            elif drafter.mode == "ngram":
-                telemetry_k = effective_num_draft_tokens
-
-            stats = GenerationStats(
-                prompt_tps=float(prefill_tps or out.prompt_tps),
-                generation_tps=float(out.generation_tps),
-                prompt_tokens=int(prefill_tokens + out.prompt_tokens),
-                generation_tokens=int(out.generation_tokens),
-                peak_memory_usage=Memory.from_gb(out.peak_memory),
-                drafter_model_id=telemetry_drafter_id,
-                accepted_draft_tokens=from_draft_count,
-                num_draft_tokens=telemetry_k,
-                draft_mode=drafter.mode,
+            # Check for stop sequences
+            text = out.text
+            finish_reason: FinishReason | None = cast(
+                FinishReason | None, out.finish_reason
             )
-            if not stop_matched and out.finish_reason not in get_args(FinishReason):
-                logger.warning(
-                    f"Model generated unexpected finish_reason: {out.finish_reason}"
+            stop_matched = False
+
+            if stop_sequences:
+                for stop_seq in stop_sequences:
+                    if stop_seq in accumulated_text:
+                        # Trim text to just before the stop sequence
+                        stop_index = accumulated_text.find(stop_seq)
+                        text_before_stop = accumulated_text[:stop_index]
+                        chunk_start = len(accumulated_text) - len(out.text)
+                        text = text_before_stop[chunk_start:]
+                        finish_reason = "stop"
+                        stop_matched = True
+                        break
+
+            is_done = finish_reason is not None
+
+            stats: GenerationStats | None = None
+            if is_done:
+                # Drafter telemetry: only stamp the id when speculation actually
+                # ran for this request. `effective_draft_model is not None` is
+                # the source of truth -- short-skip and distributed paths zero
+                # it out, so we don't spuriously surface a drafter that didn't
+                # contribute.
+                telemetry_drafter_id: str | None = None
+                telemetry_k: int | None = None
+                if drafter.mode == "model" and effective_draft_model is not None:
+                    telemetry_k = effective_num_draft_tokens
+                    if drafter_model_id is not None:
+                        telemetry_drafter_id = str(drafter_model_id)
+                elif drafter.mode == "ngram":
+                    telemetry_k = effective_num_draft_tokens
+
+                stats = GenerationStats(
+                    prompt_tps=float(prefill_tps or out.prompt_tps),
+                    generation_tps=float(out.generation_tps),
+                    prompt_tokens=int(prefill_tokens + out.prompt_tokens),
+                    generation_tokens=int(out.generation_tokens),
+                    peak_memory_usage=Memory.from_gb(out.peak_memory),
+                    drafter_model_id=telemetry_drafter_id,
+                    accepted_draft_tokens=from_draft_count,
+                    num_draft_tokens=telemetry_k,
+                    draft_mode=drafter.mode,
+                )
+                if not stop_matched and out.finish_reason not in get_args(FinishReason):
+                    logger.warning(
+                        f"Model generated unexpected finish_reason: {out.finish_reason}"
+                    )
+
+                total_prompt_tokens = len(all_prompt_tokens)
+                usage = Usage(
+                    prompt_tokens=total_prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_prompt_tokens + completion_tokens,
+                    prompt_tokens_details=PromptTokensDetails(
+                        cached_tokens=prefix_hit_length
+                    ),
+                    completion_tokens_details=CompletionTokensDetails(
+                        reasoning_tokens=0
+                    ),
                 )
 
-            total_prompt_tokens = len(all_prompt_tokens)
-            usage = Usage(
-                prompt_tokens=total_prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_prompt_tokens + completion_tokens,
-                prompt_tokens_details=PromptTokensDetails(
-                    cached_tokens=prefix_hit_length
-                ),
-                completion_tokens_details=CompletionTokensDetails(reasoning_tokens=0),
+            # Extract logprobs from the full vocabulary logprobs array
+            logprob: float | None = None
+            top_logprobs: list[TopLogprobItem] | None = None
+            if task.logprobs:
+                with mx.stream(generation_stream):
+                    logprob, top_logprobs = extract_top_logprobs(
+                        logprobs=out.logprobs,
+                        tokenizer=tokenizer,
+                        top_logprobs=task.top_logprobs or DEFAULT_TOP_LOGPROBS,
+                        selected_token=out.token,
+                    )
+
+            if is_done:
+                # Log generation stats
+                generation_elapsed = time.perf_counter() - generation_start_time
+                generated_tokens = len(generated_text_parts)
+                generation_tps = (
+                    generated_tokens / generation_elapsed
+                    if generation_elapsed > 0
+                    else 0.0
+                )
+                logger.debug(
+                    f"Generation complete: prefill {prompt_tokens} tokens @ "
+                    f"{prefill_tps:.1f} tok/s, generated {generated_tokens} tokens @ "
+                    f"{generation_tps:.1f} tok/s"
+                )
+            if on_generation_token is not None:
+                on_generation_token()
+
+            yield GenerationResponse(
+                text=text,
+                token=out.token,
+                logprob=logprob,
+                top_logprobs=top_logprobs,
+                finish_reason=finish_reason,
+                stats=stats,
+                usage=usage,
             )
 
-        # Extract logprobs from the full vocabulary logprobs array
-        logprob: float | None = None
-        top_logprobs: list[TopLogprobItem] | None = None
-        if task.logprobs:
-            with mx.stream(generation_stream):
-                logprob, top_logprobs = extract_top_logprobs(
-                    logprobs=out.logprobs,
-                    tokenizer=tokenizer,
-                    top_logprobs=task.top_logprobs or DEFAULT_TOP_LOGPROBS,
-                    selected_token=out.token,
+            if is_done:
+                mx_barrier(group)
+                break
+
+            # Limit accumulated_text to what's needed for stop sequence detection
+            if max_stop_len > 0 and len(accumulated_text) > max_stop_len:
+                accumulated_text = accumulated_text[-max_stop_len:]
+    finally:
+        # Free the per-request drafter-rank KV cache. ``shutdown`` is
+        # idempotent on ``_SessionHandle``; the ``try / except`` is
+        # belt-and-suspenders for the rare case where the wire is
+        # already torn down (e.g. runner shutdown raced this call).
+        if asymmetric_session is not None:
+            try:
+                from exo.worker.engines.mlx.generator.drafter_transport import (
+                    DrafterTransport as _DrafterTransport,
                 )
 
-        if is_done:
-            # Log generation stats
-            generation_elapsed = time.perf_counter() - generation_start_time
-            generated_tokens = len(generated_text_parts)
-            generation_tps = (
-                generated_tokens / generation_elapsed if generation_elapsed > 0 else 0.0
-            )
-            logger.debug(
-                f"Generation complete: prefill {prompt_tokens} tokens @ "
-                f"{prefill_tps:.1f} tok/s, generated {generated_tokens} tokens @ "
-                f"{generation_tps:.1f} tok/s"
-            )
-        if on_generation_token is not None:
-            on_generation_token()
-
-        yield GenerationResponse(
-            text=text,
-            token=out.token,
-            logprob=logprob,
-            top_logprobs=top_logprobs,
-            finish_reason=finish_reason,
-            stats=stats,
-            usage=usage,
-        )
-
-        if is_done:
-            mx_barrier(group)
-            break
-
-        # Limit accumulated_text to what's needed for stop sequence detection
-        if max_stop_len > 0 and len(accumulated_text) > max_stop_len:
-            accumulated_text = accumulated_text[-max_stop_len:]
+                cast(_DrafterTransport, asymmetric_session).shutdown()
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "asymmetric drafter session shutdown raised; the "
+                    "drafter rank will free its session cache on its "
+                    "next OP_SHUTDOWN"
+                )
