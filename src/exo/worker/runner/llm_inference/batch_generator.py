@@ -450,7 +450,7 @@ class SequentialGenerator(Engine):
             else:
                 eligible.append(prep)
 
-        logger.info(
+        logger.debug(
             f"_admit_queued_tasks candidates={len(candidates)} "
             f"eligible={len(eligible)} leftover={len(leftover)} "
             f"slack={slack} batch_enabled={batch_enabled}"

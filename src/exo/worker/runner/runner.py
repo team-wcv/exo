@@ -423,10 +423,21 @@ class Runner:
             self._burst_deferred_item = item
             break
         elapsed_ms = (time.monotonic() - start) * 1000.0
-        logger.info(
-            f"burst-coalesce drained={drained} budget_ms={budget_ms} "
-            f"elapsed_ms={elapsed_ms:.1f} deferred={self._burst_deferred_item is not None}"
-        )
+        # ``info`` when we actually batched (drained>=1) so operators see the
+        # value the coalesce delivered; ``debug`` when nothing batched, so
+        # solo-request runners stay quiet.
+        if drained >= 1:
+            logger.info(
+                f"burst-coalesce drained={drained} budget_ms={budget_ms} "
+                f"elapsed_ms={elapsed_ms:.1f} "
+                f"deferred={self._burst_deferred_item is not None}"
+            )
+        else:
+            logger.debug(
+                f"burst-coalesce drained=0 budget_ms={budget_ms} "
+                f"elapsed_ms={elapsed_ms:.1f} "
+                f"deferred={self._burst_deferred_item is not None}"
+            )
 
     def handle_generation_tasks(self, starting_task: GenerationTask):
         assert isinstance(self.current_status, RunnerReady)
