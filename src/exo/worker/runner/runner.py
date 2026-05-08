@@ -63,13 +63,25 @@ PREFILL_PICKUP_TIMEOUT_SECONDS = 3
 # Window the runner blocks on ``_work_queue`` after the initial task
 # is admitted, looking for sibling burst-arrivals that should land in
 # the same ``SequentialGenerator._admit_queued_tasks`` window so their
-# prefills can be batched. Tuned at 20ms because libp2p delivery on
-# concurrent client requests typically straggles by 5-15ms; values
-# above 50ms add user-visible TTFT for solo requests. Set
-# ``EXO_BURST_COALESCE_MS=0`` to disable (per-slot prefill on every
-# request).
+# prefills can be batched.
+#
+# Empirically (3-node TB-RDMA Big Brain, gemma-4-26b-a4b-it-4bit on
+# smbpt, 2 concurrent client requests dispatched within microseconds
+# at the bench harness): the master process records both
+# ``Executing command: TextGeneration`` events 15-33ms apart, but
+# they reach the runner subprocess's ``_work_queue`` 150-200ms apart
+# because of libp2p pubsub fan-out + mp-channel hop from the worker
+# process to the runner subprocess. The original 20ms default
+# missed slot #2 by ~130ms and ``batched_prefill`` never fired.
+# 200ms catches it reliably; the cost is +200ms TTFT for genuinely
+# solo requests, but the burst-coalesce only runs ONCE per
+# ``handle_generation_tasks`` entry (i.e. only when transitioning
+# from RunnerReady -> RunnerRunning, not on every admit), so
+# back-to-back requests on a warm instance pay this only on the
+# first wave. Set ``EXO_BURST_COALESCE_MS=0`` to disable
+# (per-slot prefill on every request).
 EXO_BURST_COALESCE_MS = "EXO_BURST_COALESCE_MS"
-DEFAULT_BURST_COALESCE_MS = 20
+DEFAULT_BURST_COALESCE_MS = 200
 
 
 def _parse_burst_coalesce_ms() -> int:
