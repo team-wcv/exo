@@ -7,6 +7,7 @@ from typing import Callable, Generator, cast, get_args
 
 import mlx.core as mx
 from mlx_lm.generate import (
+    PromptProcessingBatch,
     maybe_quantize_kv_cache,
     stream_generate,
 )
@@ -403,6 +404,165 @@ def prefill(
     return tokens_per_sec, num_tokens, snapshots[:-1] if snapshots else []
 
 
+class BatchedPrefillUnsupportedError(Exception):
+    """Raised when ``batched_prefill`` cannot run for the requested batch.
+
+    The caller is expected to recover by falling back to per-slot
+    :func:`prefill`. Reasons include cache types that do not implement
+    ``merge``/``extract`` (e.g. ``DeepseekV4Cache``), pipeline-parallel
+    targets where collective semantics differ, or any prompt being too
+    short to leave a decode-seed token after slicing.
+    """
+
+
+def batched_prefill(
+    *,
+    model: Model,
+    prompt_tokens_list: list[mx.array],
+    caches_list: list[KVCacheType],
+    on_progress: Callable[[int, int], None] | None = None,
+    prefill_step_size: int = 4096,
+) -> tuple[float, int]:
+    """Run K prefills in a single batched forward pass.
+
+    Wraps :class:`mlx_lm.generate.PromptProcessingBatch`. After return, each cache in
+    ``caches_list`` is filled in-place to offset ``len(prompt_tokens_list[i]) - 1``
+    so the decode loop can seed from the last prompt token (matching the
+    exact-prefix-hit shape ``mlx_generate`` already handles via
+    ``kv_prefix_cache.get_kv_cache``).
+
+    The K prompts are right-padded to the longest length; per-cache
+    ``prepare(lengths=, right_padding=)`` + ``finalize()`` remove the
+    padding from the cache state. Total wall-clock cost is roughly the
+    cost of one prefill at the longest prompt's length, amortising weight
+    loads across the batch — which is the whole point on a single GPU
+    where matmul throughput is otherwise weight-bandwidth-bound for the
+    sequential per-slot path.
+
+    Args:
+        model: target model. Must produce caches whose layers support
+            ``merge``/``extract`` (e.g. ``KVCache`` + ``RotatingKVCache`` for
+            Gemma-4; ``DeepseekV4Cache`` is not supported and raises
+            :class:`BatchedPrefillUnsupportedError`).
+        prompt_tokens_list: per-slot full prompt tokens. Each prompt is
+            sliced to ``prompt[:-1]`` internally so the decode seed
+            (``prompt[-1]``) is left out of the cache.
+        caches_list: per-slot fresh caches (offset 0). Mutated in place;
+            on return each cache's layers point at the extracted
+            per-sequence state from the batched forward.
+        on_progress: aggregate ``(processed_max_seq, total_max_seq)``
+            callback fired once per ``prefill_step_size`` chunk. The
+            ``processed`` count is the per-slot maximum (longest prompt's
+            chunk count) so progress monotonically increases even when
+            slots have unequal lengths.
+        prefill_step_size: chunk size for the prefill loop.
+
+    Returns:
+        ``(aggregate_tps, total_tokens)``: sum of per-slot tokens divided
+        by batched wall-clock time, useful for telemetry / bench output.
+
+    Raises:
+        BatchedPrefillUnsupportedError: cache layers do not implement
+            ``merge``/``extract`` (caller should fall back to per-slot
+            :func:`prefill`).
+        ValueError: ``len(prompt_tokens_list) != len(caches_list)`` or any
+            prompt has fewer than 2 tokens (need at least 1 prefill +
+            1 seed token).
+    """
+    if len(prompt_tokens_list) != len(caches_list):
+        raise ValueError(
+            f"prompt_tokens_list ({len(prompt_tokens_list)}) and caches_list "
+            f"({len(caches_list)}) must have the same length"
+        )
+    if not prompt_tokens_list:
+        return 0.0, 0
+    if any(int(p.size) < 2 for p in prompt_tokens_list):
+        raise ValueError(
+            "batched_prefill requires every prompt to have length >= 2 "
+            "(1 token to prefill + 1 token for the decode seed)"
+        )
+
+    # Slice off the decode seed so the post-prefill cache offset lands at
+    # ``len(prompt) - 1`` per slot — same invariant ``mlx_generate``'s
+    # exact-prefix-hit branch produces.
+    prefill_tokens: list[list[int]] = [
+        [int(t) for t in cast(list[int], p[:-1].tolist())]
+        for p in prompt_tokens_list
+    ]
+    total_tokens = sum(len(p) for p in prefill_tokens)
+    if total_tokens == 0:
+        return 0.0, 0
+
+    batch_size = len(prefill_tokens)
+    uids = list(range(batch_size))
+
+    start_time = time.perf_counter()
+
+    try:
+        batch: object = PromptProcessingBatch(
+            model=model,
+            uids=uids,
+            caches=[list(c) for c in caches_list],
+            prefill_step_size=prefill_step_size,
+        )
+    except ValueError as e:
+        # ``_merge_caches`` raises ``ValueError`` for cache types without
+        # a ``merge`` method. Surface as a typed unsupported error so the
+        # caller can fall back cleanly.
+        raise BatchedPrefillUnsupportedError(
+            f"cache layer does not support batching: {e}"
+        ) from e
+
+    logger.debug(
+        f"Batched prefill: {batch_size} slots, "
+        f"lengths={[len(p) for p in prefill_tokens]}, total={total_tokens}"
+    )
+    try:
+        # ``PromptProcessingBatch.prompt`` does the right-padding +
+        # chunked forward internally; one call processes all K
+        # sequences in lock-step.
+        batch.prompt(prefill_tokens)  # type: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
+    except Exception as e:
+        # Convert mlx-internal failures (e.g. shape mismatches between
+        # ``prepare(right_padding=...)`` and the model's attention
+        # implementation) into the typed unsupported error so the
+        # caller falls back to per-slot prefill instead of taking the
+        # whole runner down.
+        raise BatchedPrefillUnsupportedError(
+            f"PromptProcessingBatch.prompt() raised during batched prefill: {e!r}"
+        ) from e
+
+    if on_progress is not None:
+        max_len = max(len(p) for p in prefill_tokens)
+        on_progress(max_len, max_len)
+
+    # Re-extract per-sequence caches and update the original cache lists
+    # in place. Each ``extract_cache(idx)`` produces fresh per-layer
+    # cache objects of the original (non-batched) type with the
+    # post-prefill state for sequence ``idx``; we overwrite the
+    # caller-supplied list contents so any references the caller still
+    # holds (e.g. the SequentialGenerator's per-slot ``caches`` ref)
+    # see the new state.
+    for idx, original_cache in enumerate(caches_list):
+        extracted = cast(list[object], batch.extract_cache(idx))
+        if len(extracted) != len(original_cache):
+            raise BatchedPrefillUnsupportedError(
+                f"extract_cache({idx}) returned {len(extracted)} layers, "
+                f"original cache has {len(original_cache)}"
+            )
+        for i, layer in enumerate(extracted):
+            original_cache[i] = layer  # type: ignore[index]
+
+    elapsed = time.perf_counter() - start_time
+    aggregate_tps = total_tokens / elapsed if elapsed > 0 else 0.0
+    logger.debug(
+        f"Batched prefill complete: {batch_size} slots, "
+        f"{total_tokens} tokens in {elapsed:.2f}s "
+        f"({aggregate_tps:.1f} tok/s aggregate)"
+    )
+    return aggregate_tps, total_tokens
+
+
 def resolve_speculative_decoding(
     draft_model: Model | None,
     group: mx.distributed.Group | None,
@@ -633,7 +793,26 @@ def mlx_generate(
     asymmetric_parent_group: mx.distributed.Group | None = None,
     asymmetric_drafter_rank: int | None = None,
     asymmetric_drafter_transport: object | None = None,
+    precomputed_target_cache: KVCacheType | None = None,
 ) -> Generator[GenerationResponse]:
+    """Generate tokens for ``task``.
+
+    The ``precomputed_target_cache`` argument is the seam used by
+    :class:`SequentialGenerator._start_batch` to inject a target-side cache
+    that has already been prefilled (typically via :func:`batched_prefill`
+    across multiple in-flight requests on a single GPU). When supplied:
+
+    * the prefix-cache lookup is bypassed entirely (we don't pollute the
+      shared ``KVPrefixCache`` with per-request entries — V1 trade-off);
+    * the local :func:`prefill` call is a no-op (its prompt slice is
+      length 0);
+    * cache offset is assumed to be ``len(all_prompt_tokens) - 1`` so the
+      decode loop seeds from the last prompt token (identical shape to
+      the existing ``is_exact_hit`` path of ``KVPrefixCache.get_kv_cache``).
+
+    Eligibility is enforced by the caller — see
+    :meth:`SequentialGenerator._batch_eligible_for_prefill`.
+    """
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
     # TODO: Randomise task seed and set in taskparams, instead of hard coding as 42.
@@ -763,7 +942,17 @@ def mlx_generate(
     prefix_hit_length = 0
     matched_index: int | None = None
     is_exact_hit = False
-    if kv_prefix_cache is None:
+    if precomputed_target_cache is not None:
+        # External batched-prefill path: caller supplies a cache already
+        # filled to ``len(all_prompt_tokens) - 1`` and we leave a single
+        # decode-seed token in ``prompt_tokens``. ``prefill()`` below
+        # short-circuits because the slice ``prompt_tokens[:-1]`` is
+        # empty; the prefix-cache update path is also skipped because
+        # ``matched_index`` stays None and ``is_exact_hit`` stays False.
+        caches = precomputed_target_cache
+        prompt_tokens = all_prompt_tokens[-1:]
+        prefix_hit_length = int(all_prompt_tokens.size) - 1
+    elif kv_prefix_cache is None:
         caches = make_kv_cache(model=model)
         prompt_tokens = all_prompt_tokens
     else:
