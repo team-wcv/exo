@@ -785,6 +785,118 @@ def _asymmetric_tensor_rank_zero_is_socket_reachable(
     return True
 
 
+def auto_place_prefill_siblings(
+    *,
+    decode_instance_id: InstanceId,
+    decode_instance: Instance,
+    model_card: ModelCard,
+    topology: Topology,
+    current_instances: Mapping[InstanceId, Instance],
+    node_memory: Mapping[NodeId, MemoryUsage],
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+    download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
+) -> tuple[dict[InstanceId, Instance], list[InstanceId]]:
+    """Place single-rank prefill-only siblings on each viable eligible node.
+
+    Returns a tuple of ``(new_instances, new_prefill_instance_ids)`` where
+    ``new_instances`` maps newly-created prefill ``InstanceId`` to its
+    placement and ``new_prefill_instance_ids`` preserves placement order.
+    Both are empty when ``model_card.prefill_eligible_nodes`` is empty,
+    when no candidate is alive in topology, or when every candidate fails
+    feasibility (insufficient RAM, no socket reachability, etc.) -- the
+    decode instance still comes up; the caller emits no
+    ``InstanceLinkCreated`` and the user's traffic prefills locally on
+    the target rank.
+
+    The recursive ``place_instance`` call is invoked with a sanitised
+    model card (drafter and prefill eligibility cleared) and
+    ``allowed_nodes={candidate}`` to force a single-node Pipeline / PP=1
+    placement. We do NOT inherit drafter placement onto prefill siblings:
+    the prefill role is a pure remote-prefill server (TCP-only via
+    :class:`~exo.worker.disaggregated.server.PrefillServer`), so it
+    needs the target weights but not the drafter pair.
+    """
+    eligible = list(dict.fromkeys(model_card.prefill_eligible_nodes))
+    if not eligible:
+        return {}, []
+
+    decode_nodes: set[NodeId] = set(
+        decode_instance.shard_assignments.node_to_runner.keys()
+    )
+    if decode_instance.drafter_placement is not None:
+        decode_nodes.add(decode_instance.drafter_placement.drafter_node_id)
+
+    alive = set(topology.list_nodes())
+
+    candidates = [
+        node_id
+        for node_id in eligible
+        if node_id in alive and node_id not in decode_nodes
+    ]
+    if not candidates:
+        logger.warning(
+            f"Auto-prefill placement skipped for decode {decode_instance_id}: "
+            f"no eligible node alive AND outside the decode cycle. "
+            f"eligible={eligible} decode_nodes={sorted(decode_nodes)} "
+            f"alive={sorted(alive)}"
+        )
+        return {}, []
+
+    # Sanitise the recursive card so the prefill-only sibling does not
+    # itself recursively spawn drafters or further prefill siblings.
+    prefill_card = model_card.model_copy(
+        update={
+            "drafter_eligible_nodes": [],
+            "drafter_model_ids": [],
+            "prefill_eligible_nodes": [],
+        }
+    )
+
+    placed: dict[InstanceId, Instance] = {}
+    placed_ids: list[InstanceId] = []
+    accumulating_instances: dict[InstanceId, Instance] = dict(current_instances)
+
+    for candidate_node in candidates:
+        sub_command = PlaceInstance(
+            model_card=prefill_card,
+            sharding=Sharding.Pipeline,
+            instance_meta=InstanceMeta.MlxRing,
+            min_nodes=1,
+        )
+        try:
+            sub_placement = place_instance(
+                sub_command,
+                topology,
+                accumulating_instances,
+                node_memory,
+                node_network,
+                allowed_nodes={candidate_node},
+                download_status=download_status,
+            )
+        except ValueError as err:
+            logger.warning(
+                f"Auto-prefill skip {candidate_node} for decode "
+                f"{decode_instance_id}: {err}"
+            )
+            continue
+
+        new_ids_this_round = [
+            iid for iid in sub_placement if iid not in accumulating_instances
+        ]
+        if not new_ids_this_round:
+            logger.warning(
+                f"Auto-prefill on {candidate_node} returned no new "
+                f"instance for decode {decode_instance_id}; skipping"
+            )
+            continue
+        for iid in new_ids_this_round:
+            placed[iid] = sub_placement[iid]
+            placed_ids.append(iid)
+            accumulating_instances[iid] = sub_placement[iid]
+
+    return placed, placed_ids
+
+
 def delete_instance(
     command: DeleteInstance,
     current_instances: Mapping[InstanceId, Instance],
