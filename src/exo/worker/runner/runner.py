@@ -385,28 +385,36 @@ class Runner:
         """
         budget_ms = _parse_burst_coalesce_ms()
         deadline = time.monotonic() + budget_ms / 1000.0 if budget_ms > 0 else None
+        drained = 0
+        start = time.monotonic()
         for _ in range(max_drain):
             try:
                 item = self._work_queue.get_nowait()
             except queue.Empty:
                 if deadline is None:
-                    return
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return
+                    break
                 try:
                     item = self._work_queue.get(timeout=remaining)
                 except queue.Empty:
-                    return
+                    break
             if isinstance(item, TextGeneration | ImageGeneration | ImageEdits):
                 if item.task_id in self.seen:
                     continue
                 self.seen.add(item.task_id)
                 self.acknowledge_task(item)
                 self.submit_generation(item)
+                drained += 1
                 continue
             self._burst_deferred_item = item
-            return
+            break
+        elapsed_ms = (time.monotonic() - start) * 1000.0
+        logger.info(
+            f"burst-coalesce drained={drained} budget_ms={budget_ms} "
+            f"elapsed_ms={elapsed_ms:.1f} deferred={self._burst_deferred_item is not None}"
+        )
 
     def handle_generation_tasks(self, starting_task: GenerationTask):
         assert isinstance(self.current_status, RunnerReady)

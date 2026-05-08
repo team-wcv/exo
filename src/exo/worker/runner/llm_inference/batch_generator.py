@@ -450,6 +450,12 @@ class SequentialGenerator(Engine):
             else:
                 eligible.append(prep)
 
+        logger.info(
+            f"_admit_queued_tasks candidates={len(candidates)} "
+            f"eligible={len(eligible)} leftover={len(leftover)} "
+            f"slack={slack} batch_enabled={batch_enabled}"
+        )
+
         # Single-eligible: a batched forward of size 1 has no parallelism
         # win and adds the PromptBatch + merge_caches overhead, so just
         # take the per-slot path.
