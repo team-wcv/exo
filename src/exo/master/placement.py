@@ -606,10 +606,16 @@ def _select_drafter_placement(
     # (Thunderbolt-bridge first, then ethernet, then wifi) because the
     # drafter wire is small fixed-size frames where TCP latency over a
     # direct cable beats RDMA setup latency every time.
+    #
+    # ``find_ip_prioritised`` returns the SINK end of connections going
+    # ``node_id -> other_node_id``: i.e. the address ``other_node_id``
+    # advertises for that direction. We want the address target rank 0
+    # advertises *to the drafter*, so ``other_node_id`` is the target
+    # and ``node_id`` is the drafter.
     target_rank_zero = selected_cycle.node_ids[0]
     drafter_socket_host = find_ip_prioritised(
-        target_rank_zero,
         drafter_node_id,
+        target_rank_zero,
         topology,
         node_network,
         ring=True,
