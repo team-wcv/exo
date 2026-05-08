@@ -38,6 +38,7 @@ from exo.shared.types.worker.runners import (
     RunnerFailed,
     RunnerIdle,
     RunnerLoading,
+    RunnerReady,
     RunnerRunning,
     RunnerShuttingDown,
     RunnerStatus,
@@ -259,6 +260,19 @@ class RunnerSupervisor:
         except ClosedResourceError:
             self.in_progress.pop(task.task_id, None)
             logger.warning(f"Task {task} dropped, runner closed communication.")
+            return
+        # Generation tasks (Text/Image/Edits) on a warmed-up runner do not need
+        # the per-task ack-wait gate: the runner state machine accepts them
+        # in any order while ``RunnerReady``/``RunnerRunning``, and waiting
+        # for ack here serialises worker->runner dispatch one task at a time.
+        # This caps batched-prefill (in ``SequentialGenerator``) at B=2 even
+        # when the bench fires conc=4: slot #3 only ships after the runner
+        # acks slot #2, which only happens after batched_prefill completes.
+        # Lifecycle tasks (LoadModel, StartWarmup, ConnectToGroup, Shutdown,
+        # CancelTask) keep the gate so state transitions stay ordered.
+        is_generation_task = isinstance(task, (TextGeneration, ImageGeneration, ImageEdits))
+        runner_is_warm = isinstance(self.status, (RunnerReady, RunnerRunning))
+        if is_generation_task and runner_is_warm:
             return
         await event.wait()
 
