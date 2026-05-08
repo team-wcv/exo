@@ -372,6 +372,72 @@ class Runner:
         self.active_tasks[task.task_id] = task
         self.generator.submit(task)
 
+    def _drain_pending_work_items(self, max_drain: int = 32) -> "ExitCode | None":
+        """Non-blocking drain of immediately-available ``_work_queue`` items.
+
+        Called between every ``step()`` iteration in the main generation
+        loop. Submits ``GenerationTask`` siblings via the existing
+        ``submit_generation`` path so the next ``step()``'s
+        ``agree_on_tasks`` + ``_admit_queued_tasks`` sees them all in
+        the same admit window (this is what extends ``batched_prefill``
+        coverage past the initial 2-slot burst -- e.g. concurrency=4
+        where the 3rd and 4th slots straggle ~1s behind the first
+        pair).
+
+        Specials end the drain and are handled in arrival order:
+
+        * :class:`_TaskStreamClosed` -> return :attr:`ExitCode.Shutdown`
+          to break the main loop.
+        * :class:`PrefillTask` -> serve it (synchronous, blocks until
+          done) then return ``None`` so the main loop continues.
+        * :class:`Shutdown` -> shut the runner down and return
+          :attr:`ExitCode.Shutdown`.
+
+        Returns ``None`` to signal "keep looping" (queue exhausted or
+        only generation tasks were drained), an ``ExitCode`` to signal
+        the main loop should exit.
+
+        ``max_drain`` is a defensive bound. In practice the queue
+        carries 1-4 burst tasks at a time; the drain returns far
+        sooner via ``queue.Empty``.
+        """
+        for _ in range(max_drain):
+            if self._burst_deferred_item is not None:
+                item = self._burst_deferred_item
+                self._burst_deferred_item = None
+            else:
+                try:
+                    item = self._work_queue.get_nowait()
+                except queue.Empty:
+                    return None
+            if isinstance(item, _TaskStreamClosed):
+                return ExitCode.Shutdown
+            if isinstance(item, PrefillTask):
+                self._serve_prefill(item)
+                # ``_serve_prefill`` is synchronous; we yield back to
+                # the main loop here so the next ``step()`` runs
+                # before we drain more items, matching the
+                # pre-refactor cadence where one ``PrefillTask`` per
+                # iteration was the maximum.
+                return None
+            if item.task_id in self.seen:
+                logger.warning("repeat task - potential error")
+                continue
+            self.seen.add(item.task_id)
+            match item:
+                case TextGeneration() | ImageGeneration() | ImageEdits():
+                    self.acknowledge_task(item)
+                    self.submit_generation(item)
+                case Shutdown():
+                    self.shutdown(item)
+                    return ExitCode.Shutdown
+                case _:
+                    raise ValueError(
+                        f"Received {item.__class__.__name__} outside of "
+                        f"state machine in {self.current_status=}"
+                    )
+        return None
+
     def _coalesce_burst_generation_tasks(self, max_drain: int = 32) -> None:
         """Pull pending ``GenerationTask`` items into the generator's queue.
 
@@ -482,39 +548,25 @@ class Runner:
             for task_id in finished:
                 self.active_tasks.pop(task_id, None)
 
-            # Consume any item the burst-coalesce stashed before
-            # touching ``_work_queue``; this preserves FIFO between
-            # the burst-tasks already submitted and the deferred
-            # special item (e.g. a ``Shutdown`` or ``PrefillTask``
-            # that was sitting behind a burst).
-            if self._burst_deferred_item is not None:
-                item = self._burst_deferred_item
-                self._burst_deferred_item = None
-            else:
-                try:
-                    item = self._work_queue.get_nowait()
-                except queue.Empty:
-                    continue
-            if isinstance(item, _TaskStreamClosed):
-                return ExitCode.Shutdown
-            if isinstance(item, PrefillTask):
-                self._serve_prefill(item)
-                continue
-            if item.task_id in self.seen:
-                logger.warning("repeat task - potential error")
-                continue
-            self.seen.add(item.task_id)
-            match item:
-                case TextGeneration() | ImageGeneration() | ImageEdits():
-                    self.acknowledge_task(item)
-                    self.submit_generation(item)
-                case Shutdown():
-                    self.shutdown(item)
-                    return ExitCode.Shutdown
-                case _:
-                    raise ValueError(
-                        f"Received {item.__class__.__name__} outside of state machine in {self.current_status=}"
-                    )
+            # Drain ALL immediately-available items so concurrent
+            # burst-arrivals that landed during the previous
+            # ``step()`` (e.g. slots 3/4 of a concurrency=4 wave that
+            # arrived behind slots 1/2 by libp2p straggle) are
+            # submitted before the NEXT ``step()`` runs
+            # ``agree_on_tasks`` + ``_admit_queued_tasks``. Without
+            # this, the original code drained one item per iteration,
+            # so the second admit cycle still saw a single candidate
+            # and fell through to per-slot prefill -- we lose
+            # batched-prefill on every slot beyond the first wave.
+            #
+            # Specials (``_TaskStreamClosed`` / ``PrefillTask`` /
+            # ``Shutdown``) terminate the drain and are handled in
+            # arrival order. The ``_burst_deferred_item`` slot is
+            # checked first for FIFO preservation against the entry-
+            # time burst-coalesce.
+            exit_code = self._drain_pending_work_items()
+            if exit_code is not None:
+                return exit_code
 
         self.update_status(RunnerReady(prefill_server_port=self._prefill_server_port))
         logger.info("runner ready")
