@@ -1,3 +1,4 @@
+import os
 import queue
 import threading
 import time
@@ -58,6 +59,32 @@ from exo.worker.engines.base import Builder, Engine
 from exo.worker.runner.bootstrap import logger
 
 PREFILL_PICKUP_TIMEOUT_SECONDS = 3
+
+# Window the runner blocks on ``_work_queue`` after the initial task
+# is admitted, looking for sibling burst-arrivals that should land in
+# the same ``SequentialGenerator._admit_queued_tasks`` window so their
+# prefills can be batched. Tuned at 20ms because libp2p delivery on
+# concurrent client requests typically straggles by 5-15ms; values
+# above 50ms add user-visible TTFT for solo requests. Set
+# ``EXO_BURST_COALESCE_MS=0`` to disable (per-slot prefill on every
+# request).
+EXO_BURST_COALESCE_MS = "EXO_BURST_COALESCE_MS"
+DEFAULT_BURST_COALESCE_MS = 20
+
+
+def _parse_burst_coalesce_ms() -> int:
+    raw = os.environ.get(EXO_BURST_COALESCE_MS)
+    if raw is None:
+        return DEFAULT_BURST_COALESCE_MS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            f"{EXO_BURST_COALESCE_MS}={raw!r} is not a valid int; "
+            f"falling back to {DEFAULT_BURST_COALESCE_MS}ms"
+        )
+        return DEFAULT_BURST_COALESCE_MS
+    return max(0, value)
 PREFILL_FINISH_TIMEOUT_SECONDS = 300
 
 
@@ -120,6 +147,13 @@ class Runner:
         self._prefill_server: PrefillServer | None = None
         self._prefill_server_port: int | None = None
         self._work_queue: queue.Queue[WorkItem] = queue.Queue()
+        # Slot for a non-generation item picked up by
+        # ``_coalesce_burst_generation_tasks`` -- consumed by the main
+        # loop in ``handle_generation_tasks`` before its next
+        # ``_work_queue.get_nowait()`` so the FIFO order between burst
+        # text-gens and a trailing ``Shutdown`` / ``PrefillTask`` /
+        # ``_TaskStreamClosed`` is preserved.
+        self._burst_deferred_item: WorkItem | None = None
         self._task_reader_thread: threading.Thread | None = None
 
         logger.info("runner created")
@@ -326,6 +360,54 @@ class Runner:
         self.active_tasks[task.task_id] = task
         self.generator.submit(task)
 
+    def _coalesce_burst_generation_tasks(self, max_drain: int = 32) -> None:
+        """Pull pending ``GenerationTask`` items into the generator's queue.
+
+        Called from :meth:`handle_generation_tasks` after the initial
+        ``submit_generation`` so the upcoming ``step()`` call admits the
+        full burst together. Stops at the first non-generation item
+        (``PrefillTask`` / ``_TaskStreamClosed`` / ``Shutdown``) and
+        stashes that item in :attr:`_burst_deferred_item` so the main
+        loop sees it before its next ``_work_queue.get_nowait()`` --
+        re-queueing at the tail would race with the listener thread
+        and silently re-order ``Shutdown`` past burst tasks.
+
+        After draining whatever is immediately available, blocks on the
+        queue for up to ``EXO_BURST_COALESCE_MS`` (default 20ms) to
+        catch sibling burst-arrivals whose libp2p delivery straggles
+        behind the first request -- without this, two concurrent
+        client requests reliably miss the same admit window because
+        only the first arrives before the runner reaches ``step()``.
+
+        ``max_drain`` is a defensive bound so a saturated upstream
+        producer can't starve the first ``step()`` indefinitely; in
+        practice the work queue carries 1-2 burst-tasks at a time.
+        """
+        budget_ms = _parse_burst_coalesce_ms()
+        deadline = time.monotonic() + budget_ms / 1000.0 if budget_ms > 0 else None
+        for _ in range(max_drain):
+            try:
+                item = self._work_queue.get_nowait()
+            except queue.Empty:
+                if deadline is None:
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                try:
+                    item = self._work_queue.get(timeout=remaining)
+                except queue.Empty:
+                    return
+            if isinstance(item, TextGeneration | ImageGeneration | ImageEdits):
+                if item.task_id in self.seen:
+                    continue
+                self.seen.add(item.task_id)
+                self.acknowledge_task(item)
+                self.submit_generation(item)
+                continue
+            self._burst_deferred_item = item
+            return
+
     def handle_generation_tasks(self, starting_task: GenerationTask):
         assert isinstance(self.current_status, RunnerReady)
         assert isinstance(self.generator, Engine)
@@ -337,6 +419,20 @@ class Runner:
         self.seen.add(starting_task.task_id)
 
         self.submit_generation(starting_task)
+
+        # Coalesce burst-arrivals: drain TextGeneration / ImageGeneration /
+        # ImageEdits items already sitting in ``_work_queue`` and submit
+        # them BEFORE the first ``step()``. Without this, two concurrent
+        # client requests that arrive within a few ms see the runner
+        # admit task #1 alone (its prefill starts on the very first
+        # ``step()``) and task #2 only joins on the next iteration --
+        # which defeats batched-prefill admission entirely (the
+        # ``_admit_queued_tasks`` candidate list never has B>=2 tasks).
+        # Non-task items (PrefillTask / _TaskStreamClosed / Shutdown)
+        # are left in the queue so the main loop's match block handles
+        # them in order; we stop draining at the first non-task item to
+        # preserve queue ordering.
+        self._coalesce_burst_generation_tasks()
 
         while self.active_tasks:
             results = self.generator.step()
@@ -355,10 +451,19 @@ class Runner:
             for task_id in finished:
                 self.active_tasks.pop(task_id, None)
 
-            try:
-                item = self._work_queue.get_nowait()
-            except queue.Empty:
-                continue
+            # Consume any item the burst-coalesce stashed before
+            # touching ``_work_queue``; this preserves FIFO between
+            # the burst-tasks already submitted and the deferred
+            # special item (e.g. a ``Shutdown`` or ``PrefillTask``
+            # that was sitting behind a burst).
+            if self._burst_deferred_item is not None:
+                item = self._burst_deferred_item
+                self._burst_deferred_item = None
+            else:
+                try:
+                    item = self._work_queue.get_nowait()
+                except queue.Empty:
+                    continue
             if isinstance(item, _TaskStreamClosed):
                 return ExitCode.Shutdown
             if isinstance(item, PrefillTask):
