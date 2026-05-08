@@ -350,22 +350,43 @@ def _pipelined_speculative_step(
         logits = model(verify_input[None], cache=prompt_cache)
         # logits shape: (1, k_this + 1, vocab)
 
-        target_logprobs: list[mx.array] = []
-        target_tokens: list[int] = []
-        running_prev = prev_tokens
-        for i in range(k_this + 1):
-            position_logits = logits[:, i, :].squeeze(0)
-            position_logprobs = _process_logits_for_position(
-                position_logits, running_prev, logits_processors
+        target_logprobs: list[mx.array]
+        target_tokens: list[int]
+        if not logits_processors:
+            # Fast path: no per-position state. All K+1 sampling decisions
+            # are independent, so we batch them into one sampler call and
+            # one host-device sync. On a target with ~10ms step time this
+            # saves K sync points per round (~2-3ms each), which is the
+            # difference between spec-decode net-win and net-loss.
+            batched_logits = logits.squeeze(0)
+            batched_logprobs = batched_logits - mx.logsumexp(
+                batched_logits, axis=-1, keepdims=True
             )
-            sampled = sampler(position_logprobs)
-            mx.eval(sampled)
-            sampled_token = int(sampled.item())
-            target_logprobs.append(position_logprobs)
-            target_tokens.append(sampled_token)
-            running_prev = mx.concatenate(
-                [running_prev, mx.array([sampled_token], dtype=mx.uint32)]
-            )
+            sampled_batch = sampler(batched_logprobs)
+            mx.eval(sampled_batch)
+            target_tokens = [int(t) for t in sampled_batch.tolist()]  # type: ignore[reportUnknownArgumentType]
+            target_logprobs = [batched_logprobs[i] for i in range(k_this + 1)]
+        else:
+            # Stateful path: logits processors (e.g. repetition penalty)
+            # depend on ``running_prev`` which only resolves between
+            # positions, so we can't batch. Per-position sync is the
+            # cost of correctness here.
+            target_logprobs = []
+            target_tokens = []
+            running_prev = prev_tokens
+            for i in range(k_this + 1):
+                position_logits = logits[:, i, :].squeeze(0)
+                position_logprobs = _process_logits_for_position(
+                    position_logits, running_prev, logits_processors
+                )
+                sampled = sampler(position_logprobs)
+                mx.eval(sampled)
+                sampled_token = int(sampled.item())
+                target_logprobs.append(position_logprobs)
+                target_tokens.append(sampled_token)
+                running_prev = mx.concatenate(
+                    [running_prev, mx.array([sampled_token], dtype=mx.uint32)]
+                )
 
         # ----- Greedy accept loop -----
         num_accepted = 0
