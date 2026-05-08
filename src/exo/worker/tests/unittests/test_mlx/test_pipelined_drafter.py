@@ -695,9 +695,7 @@ class TestBroadcastDrafts:
             _broadcast_drafts,  # pyright: ignore[reportPrivateUsage]
         )
 
-        out = _broadcast_drafts(
-            [10, 20], k=4, target_group=None, is_root=True
-        )
+        out = _broadcast_drafts([10, 20], k=4, target_group=None, is_root=True)
         assert out == [10, 20]
 
     def test_single_rank_short_circuit_consumer_rejected(self) -> None:
@@ -708,9 +706,7 @@ class TestBroadcastDrafts:
         )
 
         with pytest.raises(RuntimeError, match="non-root"):
-            _broadcast_drafts(
-                None, k=4, target_group=None, is_root=False
-            )
+            _broadcast_drafts(None, k=4, target_group=None, is_root=False)
 
     def test_single_rank_root_requires_drafts(self) -> None:
         from exo.worker.engines.mlx.generator.pipelined_drafter import (
@@ -721,9 +717,7 @@ class TestBroadcastDrafts:
         # caller bug (the runner never has a None drafts list when it
         # owns the wire).
         with pytest.raises(RuntimeError, match="non-root"):
-            _broadcast_drafts(
-                None, k=4, target_group=None, is_root=False
-            )
+            _broadcast_drafts(None, k=4, target_group=None, is_root=False)
 
 
 class TestBroadcastTargetTokens:
@@ -802,3 +796,226 @@ def test_make_drafter_pipelined_root_rank_with_no_transport_rejected() -> None:
             target_group=_StubGroup(),
             is_target_root=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Drafter-death recovery: abort sentinel + wrap behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestDrafterAbortRecovery:
+    """Recovery contract when the drafter rank dies mid-generation.
+
+    Pre-fix failure mode: root's ``transport.forward`` raised
+    ``OSError`` and re-raised cleanly out of ``mlx_generate``, but
+    non-root target ranks blocked indefinitely on the next-round
+    draft broadcast (the sole inter-rank coordination channel for
+    spec decode). The abort sentinel + wrap + ``RemoteTransport``
+    failure flag together convert that hang into a fast, lockstep
+    exit on every rank, with the runner subprocess crashing so the
+    master's instance-deletion path can rebuild the placement.
+
+    The cluster bench covers the full multi-rank flow against real
+    ``mx.distributed``; these unit tests pin the single-rank
+    invariants that are reachable without spinning up a peer group.
+    """
+
+    def test_broadcast_abort_short_circuits_without_group(self) -> None:
+        # ``target_group is None`` (single-rank placement) means there
+        # are no peers to notify; the abort broadcast must be a no-op
+        # rather than raising or contacting any wire layer.
+        from exo.worker.engines.mlx.generator.pipelined_drafter import (
+            _broadcast_abort,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        # Should not raise; should not require any group machinery.
+        _broadcast_abort(k=4, target_group=None)
+
+    def test_sentinel_value_is_in_validator_range(self) -> None:
+        # The sentinel must satisfy ``_validate_broadcast_values``
+        # (positive int32) so a real cluster broadcast doesn't reject
+        # it before non-root ranks have a chance to decode it.
+        from exo.worker.engines.mlx.generator.pipelined_drafter import (
+            DRAFT_ABORT_SENTINEL,
+        )
+        from exo.worker.engines.mlx.utils_mlx import (
+            _MX_BROADCAST_MAX_VALUE,  # pyright: ignore[reportPrivateUsage]
+            _validate_broadcast_values,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        assert 0 < DRAFT_ABORT_SENTINEL < _MX_BROADCAST_MAX_VALUE
+        # Must also exceed any plausible draft length so it can never
+        # collide with a legitimate length-prefix.
+        assert DRAFT_ABORT_SENTINEL > 1_000_000
+        # Validator round-trip with the wire payload root would emit.
+        _validate_broadcast_values([DRAFT_ABORT_SENTINEL] + [0] * 4)
+
+    def test_broadcast_drafts_decodes_sentinel_to_abort_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Multi-rank receive path: when ``mx_broadcast_int_list``
+        # returns a buffer whose length-prefix is the sentinel,
+        # ``_broadcast_drafts`` raises ``DrafterAbortedError`` so the
+        # spec loop can exit in lockstep with the dead root rank.
+        from exo.worker.engines.mlx.generator import pipelined_drafter
+        from exo.worker.engines.mlx.generator.pipelined_drafter import (
+            DRAFT_ABORT_SENTINEL,
+            DrafterAbortedError,
+            _broadcast_drafts,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        k = 4
+
+        def fake_broadcast(
+            values: list[int] | None,
+            length: int,
+            group: object,
+            *,
+            is_root: bool,
+        ) -> list[int]:
+            del values, group, is_root
+            assert length == k + 1
+            return [DRAFT_ABORT_SENTINEL] + [0] * k
+
+        monkeypatch.setattr(pipelined_drafter, "mx_broadcast_int_list", fake_broadcast)
+
+        sentinel_group = object()  # opaque; the fake never inspects
+        with pytest.raises(DrafterAbortedError, match="drafter aborted"):
+            _broadcast_drafts(
+                None,
+                k=k,
+                target_group=sentinel_group,  # pyright: ignore[reportArgumentType]
+                is_root=False,
+            )
+
+    def test_spec_step_wrap_root_broadcasts_abort_on_oserror(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Inject a body that immediately raises OSError; the wrap
+        # must call ``_broadcast_abort`` (root path) before re-raising
+        # so non-root ranks unblock their pending broadcast.
+        from exo.worker.engines.mlx.generator import pipelined_drafter
+
+        broadcast_calls: list[tuple[int, object]] = []
+
+        def fake_abort(*, k: int, target_group: object) -> None:
+            broadcast_calls.append((k, target_group))
+
+        def fake_body(**kwargs: object):
+            del kwargs
+            raise ConnectionError("drafter rank closed mid-frame")
+            yield  # pragma: no cover -- generator marker
+
+        monkeypatch.setattr(pipelined_drafter, "_broadcast_abort", fake_abort)
+        monkeypatch.setattr(
+            pipelined_drafter,
+            "_pipelined_speculative_step_body",
+            fake_body,
+        )
+
+        sentinel_group = object()
+        gen = pipelined_drafter._pipelined_speculative_step(  # pyright: ignore[reportPrivateUsage]
+            prompt=None,  # pyright: ignore[reportArgumentType]
+            model=None,  # pyright: ignore[reportArgumentType]
+            transport=None,
+            prompt_cache=None,  # pyright: ignore[reportArgumentType]
+            max_tokens=8,
+            sampler=lambda x: x,
+            logits_processors=[],
+            num_draft_tokens=4,
+            prefill_step_size=512,
+            prompt_token_count=0,
+            target_group=sentinel_group,  # pyright: ignore[reportArgumentType]
+            is_target_root=True,
+        )
+        with pytest.raises(ConnectionError, match="drafter rank closed"):
+            next(gen)
+        assert broadcast_calls == [(4, sentinel_group)]
+
+    def test_spec_step_wrap_non_root_does_not_broadcast(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Non-root has no transport to fail on; if a non-root somehow
+        # raises OSError (e.g. a peer-side issue surfaces this way),
+        # we must NOT issue an abort broadcast -- only root owns that
+        # signal. Re-raising preserves the original error for the
+        # caller's traceback without a phantom broadcast.
+        from exo.worker.engines.mlx.generator import pipelined_drafter
+
+        broadcast_calls: list[tuple[int, object]] = []
+
+        def fake_abort(*, k: int, target_group: object) -> None:
+            broadcast_calls.append((k, target_group))
+
+        def fake_body(**kwargs: object):
+            del kwargs
+            raise ConnectionError("non-root saw socket failure somehow")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(pipelined_drafter, "_broadcast_abort", fake_abort)
+        monkeypatch.setattr(
+            pipelined_drafter,
+            "_pipelined_speculative_step_body",
+            fake_body,
+        )
+
+        gen = pipelined_drafter._pipelined_speculative_step(  # pyright: ignore[reportPrivateUsage]
+            prompt=None,  # pyright: ignore[reportArgumentType]
+            model=None,  # pyright: ignore[reportArgumentType]
+            transport=None,
+            prompt_cache=None,  # pyright: ignore[reportArgumentType]
+            max_tokens=8,
+            sampler=lambda x: x,
+            logits_processors=[],
+            num_draft_tokens=4,
+            prefill_step_size=512,
+            prompt_token_count=0,
+            target_group=object(),  # pyright: ignore[reportArgumentType]
+            is_target_root=False,
+        )
+        with pytest.raises(ConnectionError):
+            next(gen)
+        assert broadcast_calls == []
+
+    def test_spec_step_wrap_swallows_abort_broadcast_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # If the abort broadcast itself fails (e.g. ``target_group``
+        # is also dead), the original transport error must still
+        # surface intact -- the master's instance-deletion path is
+        # the SIGKILL backstop, so swallowing the recovery error
+        # avoids masking the root cause in the caller's traceback.
+        from exo.worker.engines.mlx.generator import pipelined_drafter
+
+        def fake_abort(*, k: int, target_group: object) -> None:
+            del k, target_group
+            raise RuntimeError("group is also dead")
+
+        def fake_body(**kwargs: object):
+            del kwargs
+            raise ConnectionError("primary failure")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(pipelined_drafter, "_broadcast_abort", fake_abort)
+        monkeypatch.setattr(
+            pipelined_drafter,
+            "_pipelined_speculative_step_body",
+            fake_body,
+        )
+
+        gen = pipelined_drafter._pipelined_speculative_step(  # pyright: ignore[reportPrivateUsage]
+            prompt=None,  # pyright: ignore[reportArgumentType]
+            model=None,  # pyright: ignore[reportArgumentType]
+            transport=None,
+            prompt_cache=None,  # pyright: ignore[reportArgumentType]
+            max_tokens=8,
+            sampler=lambda x: x,
+            logits_processors=[],
+            num_draft_tokens=4,
+            prefill_step_size=512,
+            prompt_token_count=0,
+            target_group=object(),  # pyright: ignore[reportArgumentType]
+            is_target_root=True,
+        )
+        with pytest.raises(ConnectionError, match="primary failure"):
+            next(gen)

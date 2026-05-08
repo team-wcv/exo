@@ -61,26 +61,50 @@ The collective overhead per round is two small ``all_sum`` calls
 (drafts ``k+1`` ints, target tokens ``k+1`` ints) -- microsecond-
 range on Thunderbolt RDMA, negligible against the verify forward.
 
-Known limitation: drafter-rank death mid-generation
-----------------------------------------------------
+Recovery: drafter-rank death mid-generation
+-------------------------------------------
 If the drafter rank crashes between rounds, root's
-``transport.forward`` raises ``ConnectionError`` and root's
-``mlx_generate`` exits via the request-level ``finally`` (which
-shuts the broken session down cleanly). Non-root target ranks are
-blocked inside :func:`_broadcast_drafts` waiting for root to feed
-drafts; they have no out-of-band signal that root has aborted, so
-they hang on the collective until the runner is restarted.
+``transport.forward`` raises :class:`OSError` (subclassed as
+``ConnectionError`` / ``BrokenPipeError`` depending on which side
+closed). The recovery is layered:
 
-This is the same failure mode as any target-side rank death (the
-TP collective stalls the survivors), and the operator-restart
-recovery path is identical. A follow-up could thread a
-"termination sentinel" through the existing length-prefix slot
-(which has unused encoding space above ``k``) so root broadcasts
-one final aborted-round signal before exiting; non-root ranks
-would then exit cleanly. Out of scope for the current pass --
-drafter death is rare in the operator-managed deployment we
-target, and the existing failure mode is fail-loud rather than
-silent corruption.
+  1. **Within-request abort** (this module). Before re-raising, the
+     :func:`_pipelined_speculative_step` wrapper broadcasts
+     :data:`DRAFT_ABORT_SENTINEL` on the draft channel. Non-root
+     ranks decode the sentinel inside :func:`_broadcast_drafts` and
+     raise :class:`DrafterAbortedError`, exiting their spec loop in
+     lockstep with root rather than blocking on a next-round
+     broadcast that will never arrive. The
+     :class:`exo.worker.engines.mlx.generator.remote_drafter.RemoteTransport`
+     also flips a sticky ``is_failed`` flag so subsequent
+     :meth:`open_session` calls fail fast instead of allocating a
+     new spec session on a dead wire.
+
+  2. **Cross-request teardown** (control plane). The runner
+     subprocess that owned the failed transport surfaces the
+     exception out of ``mlx_generate``, the runner crashes, the
+     supervisor reports :class:`RunnerFailed`, and the master's
+     worker-plan ``_kill_runner`` rule shuts every peer rank down
+     in the same instance. A fresh placement is re-issued on the
+     next planning tick.
+
+  3. **Drafter-node disconnect** (control plane). When the drafter
+     *node* goes offline (rather than the drafter *process*), the
+     master's instance-deletion loop iterates
+     ``instance.all_node_to_runner`` (target + drafter) and emits
+     :class:`InstanceDeleted` once the drafter node leaves
+     ``connected_node_ids``. Workers pick up the deletion in the
+     usual plan tick. Total time-to-recovery is bounded by the
+     master's ``node_inactivity_timeout`` (5 s) plus the
+     supervisor's SIGTERM/SIGKILL escalation budget (worst case
+     ~25 s), the same envelope as a target-rank crash.
+
+Target-rank death (a peer target rank in the TP subgroup) takes
+the same path as case 3 above: the master's instance-deletion
+loop already covered ``shard_assignments.node_to_runner``; the
+worker plan's ``_kill_runner`` rule gossips ``RunnerFailed``
+across the surviving ranks and the supervisor SIGKILL chain
+unblocks any in-flight TP collectives.
 
 Cache accounting (drafter side) -- this is the only complex bit, so
 spelled out here once and referenced from the code:
@@ -129,8 +153,9 @@ a bug, please flag it.
 
 from __future__ import annotations
 
+import contextlib
 import time
-from typing import Callable, Generator, Sequence, cast, final
+from typing import Callable, Final, Generator, Sequence, cast, final
 
 import mlx.core as mx
 from mlx_lm.generate import GenerationResponse
@@ -144,6 +169,26 @@ from exo.worker.engines.mlx.generator.drafter_transport import (
 )
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import mx_broadcast_int_list
+
+# Length-prefix slot value reserved for the "drafter aborted" signal.
+# Picked from the int32 positive range so it survives
+# ``_validate_broadcast_values`` (well above any legitimate ``K``,
+# below ``_MX_BROADCAST_MAX_VALUE`` so the validator accepts it).
+DRAFT_ABORT_SENTINEL: Final[int] = (1 << 31) - 2
+
+
+@final
+class DrafterAbortedError(RuntimeError):
+    """Raised by non-root target ranks when root signals draft abort.
+
+    Root encodes :data:`DRAFT_ABORT_SENTINEL` in the broadcast
+    length-prefix slot when its ``transport.forward()`` raises
+    (drafter rank crashed, socket dropped, etc). Non-root ranks
+    decode the sentinel inside :func:`_broadcast_drafts` and raise
+    this exception so the spec loop on every rank exits in lockstep,
+    rather than non-root hanging forever on the next-round draft
+    broadcast that root will never send.
+    """
 
 
 def _get_eos_ids(tokenizer: TokenizerWrapper) -> list[int]:
@@ -382,9 +427,7 @@ def _broadcast_drafts(
     """
     if target_group is None:
         if not is_root or drafts is None:
-            raise RuntimeError(
-                "non-root broadcast consumer requires target_group"
-            )
+            raise RuntimeError("non-root broadcast consumer requires target_group")
         return list(drafts)
     if is_root:
         if drafts is None:
@@ -395,20 +438,47 @@ def _broadcast_drafts(
                 "transport must clamp before broadcasting"
             )
         payload = [len(drafts)] + list(drafts) + [0] * (k - len(drafts))
-        broadcast = mx_broadcast_int_list(
-            payload, k + 1, target_group, is_root=True
-        )
+        broadcast = mx_broadcast_int_list(payload, k + 1, target_group, is_root=True)
     else:
-        broadcast = mx_broadcast_int_list(
-            None, k + 1, target_group, is_root=False
-        )
+        broadcast = mx_broadcast_int_list(None, k + 1, target_group, is_root=False)
     actual_len = broadcast[0]
+    if actual_len == DRAFT_ABORT_SENTINEL:
+        # Root has flagged a drafter-side failure (see
+        # :func:`_broadcast_abort`). Surface a typed exception so the
+        # spec loop on this rank exits in lockstep with root rather
+        # than waiting on the next-round broadcast that won't arrive.
+        raise DrafterAbortedError(
+            "drafter aborted; root signalled abort via length-prefix "
+            "sentinel after a transport-side failure"
+        )
     if actual_len < 0 or actual_len > k:
         raise RuntimeError(
-            f"draft broadcast decoded invalid length {actual_len} "
-            f"(buffer {broadcast})"
+            f"draft broadcast decoded invalid length {actual_len} (buffer {broadcast})"
         )
     return broadcast[1 : 1 + actual_len]
+
+
+def _broadcast_abort(
+    *,
+    k: int,
+    target_group: mx.distributed.Group | None,
+) -> None:
+    """Root-only: broadcast the abort sentinel on the draft channel.
+
+    Encodes :data:`DRAFT_ABORT_SENTINEL` as the length-prefix of an
+    otherwise-zero ``k + 1`` int payload, matching the wire shape of
+    a normal :func:`_broadcast_drafts` round so non-root ranks
+    decode it on the same fixed-size collective they were already
+    waiting on. Non-root surfaces it as :class:`DrafterAbortedError`.
+
+    Single-rank short-circuit (``target_group is None``): no peers
+    to notify, so this is a no-op. The local rank still re-raises
+    the underlying transport exception that triggered the abort.
+    """
+    if target_group is None:
+        return
+    payload = [DRAFT_ABORT_SENTINEL] + [0] * k
+    mx_broadcast_int_list(payload, k + 1, target_group, is_root=True)
 
 
 def _broadcast_target_tokens(
@@ -440,9 +510,7 @@ def _broadcast_target_tokens(
     """
     if target_group is None:
         if not is_root or target_tokens is None:
-            raise RuntimeError(
-                "non-root broadcast consumer requires target_group"
-            )
+            raise RuntimeError("non-root broadcast consumer requires target_group")
         if len(target_tokens) != k_this + 1:
             raise RuntimeError(
                 f"target_tokens length ({len(target_tokens)}) must "
@@ -460,17 +528,75 @@ def _broadcast_target_tokens(
                 "emits exactly that many tokens per round"
             )
         payload = list(target_tokens) + [0] * (k - k_this)
-        broadcast = mx_broadcast_int_list(
-            payload, k + 1, target_group, is_root=True
-        )
+        broadcast = mx_broadcast_int_list(payload, k + 1, target_group, is_root=True)
     else:
-        broadcast = mx_broadcast_int_list(
-            None, k + 1, target_group, is_root=False
-        )
+        broadcast = mx_broadcast_int_list(None, k + 1, target_group, is_root=False)
     return broadcast[: k_this + 1]
 
 
 def _pipelined_speculative_step(
+    *,
+    prompt: mx.array,
+    model: Model,
+    transport: DrafterTransport | None,
+    prompt_cache: KVCacheType,
+    max_tokens: int,
+    sampler: Callable[[mx.array], mx.array],
+    logits_processors: list[Callable[[mx.array, mx.array], mx.array]],
+    num_draft_tokens: int,
+    prefill_step_size: int,
+    prompt_token_count: int,
+    target_group: mx.distributed.Group | None = None,
+    is_target_root: bool = True,
+) -> Generator[tuple[int, mx.array, bool], None, None]:
+    """Public spec-step generator with drafter-failure recovery.
+
+    Wraps :func:`_pipelined_speculative_step_body` so that any
+    :class:`OSError` originating from the drafter wire on the root
+    rank (socket close, broken pipe, peer reset, etc.) also
+    broadcasts :data:`DRAFT_ABORT_SENTINEL` to non-root target
+    ranks. Non-root decodes it inside :func:`_broadcast_drafts`
+    and raises :class:`DrafterAbortedError`, exiting the spec loop
+    in lockstep with root. Without this wrap, root would re-raise
+    cleanly while non-root sat indefinitely on the next-round
+    draft broadcast that root will never send.
+
+    Non-root and single-rank placements pass through unchanged:
+    non-root never touches the transport (so there is nothing to
+    abort from); :func:`_broadcast_abort` short-circuits when
+    ``target_group is None`` (no peers to notify). The local rank
+    re-raises the underlying exception in both cases.
+    """
+    inner = _pipelined_speculative_step_body(
+        prompt=prompt,
+        model=model,
+        transport=transport,
+        prompt_cache=prompt_cache,
+        max_tokens=max_tokens,
+        sampler=sampler,
+        logits_processors=logits_processors,
+        num_draft_tokens=num_draft_tokens,
+        prefill_step_size=prefill_step_size,
+        prompt_token_count=prompt_token_count,
+        target_group=target_group,
+        is_target_root=is_target_root,
+    )
+    try:
+        yield from inner
+    except OSError:
+        if is_target_root:
+            # Recovery best-effort: if the abort broadcast itself
+            # fails (e.g. ``target_group`` is also dead), the
+            # supervisor SIGKILL chain still tears non-root
+            # runners down via the master's instance-deletion
+            # path. Suppression keeps the original ``OSError``
+            # intact for the caller's traceback.
+            with contextlib.suppress(Exception):
+                _broadcast_abort(k=num_draft_tokens, target_group=target_group)
+        raise
+
+
+def _pipelined_speculative_step_body(
     *,
     prompt: mx.array,
     model: Model,

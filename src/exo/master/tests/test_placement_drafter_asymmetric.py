@@ -644,3 +644,68 @@ def test_asymmetric_round_trip_serialization() -> None:
         rehydrated.drafter_placement.drafter_node_id
         == instance.drafter_placement.drafter_node_id
     )
+
+
+def test_asymmetric_all_node_to_runner_includes_drafter_for_disconnect_check() -> None:
+    """``all_node_to_runner`` must list the drafter node so the master's
+    instance-deletion loop tears the placement down when the drafter node
+    leaves the topology.
+
+    This pins the contract that the master's ``connected_node_ids``
+    check at ``master/main.py`` relies on. Iterating
+    ``shard_assignments.node_to_runner`` (target ranks only) would
+    leave the surviving target runners blocked indefinitely on
+    ``transport.forward`` against a dead socket when the drafter node
+    disconnects -- the dead-wire ``RemoteTransport.is_failed`` flag
+    is set on root only, and non-root has no out-of-band signal that
+    the spec loop should abort. Tearing the instance down on drafter-
+    node disconnect is the only consistent recovery path.
+    """
+    target_node, drafter_node = NodeId(), NodeId()
+    topology = Topology()
+    topology.add_node(target_node)
+    topology.add_node(drafter_node)
+    _bidi_socket(topology, target_node, drafter_node, ip=2)
+    _bidi_rdma(topology, target_node, drafter_node, iface=4)
+
+    card = _drafter_aware_card(
+        storage_bytes=20_000_000_000, eligible_nodes=[drafter_node]
+    )
+    command = PlaceInstance(
+        sharding=Sharding.Pipeline,
+        instance_meta=InstanceMeta.MlxRing,
+        command_id=CommandId(),
+        model_card=card,
+        min_nodes=1,
+    )
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        {
+            target_node: create_node_memory(64_000_000_000),
+            drafter_node: create_node_memory(32_000_000_000),
+        },
+        {
+            target_node: create_node_network(),
+            drafter_node: create_node_network(),
+        },
+    )
+    assert len(placements) == 1
+    instance = next(iter(placements.values()))
+    assert instance.drafter_placement is not None
+
+    # Both nodes must appear in ``all_node_to_runner`` so the master's
+    # disconnect check fires for either one.
+    assert target_node in instance.all_node_to_runner
+    assert drafter_node in instance.all_node_to_runner
+    assert (
+        instance.all_node_to_runner[drafter_node]
+        == instance.drafter_placement.drafter_runner_id
+    )
+
+    # The legacy mapping (target shards only) intentionally excludes
+    # the drafter; this is the bug the master fix addresses by
+    # iterating ``all_node_to_runner`` instead.
+    assert target_node in instance.shard_assignments.node_to_runner
+    assert drafter_node not in instance.shard_assignments.node_to_runner
