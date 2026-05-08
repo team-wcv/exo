@@ -715,6 +715,13 @@ def ban_token_ids(token_ids: list[int]) -> Callable[[mx.array, mx.array], mx.arr
             logits[..., tid] = -1e9
         return logits
 
+    # Marks the processor as not dependent on the running token history,
+    # so the speculative-decoding verify loop can apply it once to a
+    # batched ``(K+1, vocab)`` logits tensor and sample all positions
+    # in a single host-device sync. Stateful processors (e.g. repetition
+    # penalty) leave this attribute unset and force the per-position
+    # path.
+    proc.position_independent = True  # type: ignore[reportAttributeAccessIssue]
     return proc
 
 

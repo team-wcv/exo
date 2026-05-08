@@ -352,13 +352,20 @@ def _pipelined_speculative_step(
 
         target_logprobs: list[mx.array]
         target_tokens: list[int]
-        if not logits_processors:
-            # Fast path: no per-position state. All K+1 sampling decisions
-            # are independent, so we batch them into one sampler call and
-            # one host-device sync. On a target with ~10ms step time this
-            # saves K sync points per round (~2-3ms each), which is the
-            # difference between spec-decode net-win and net-loss.
+        # Fast path: every processor advertises position independence
+        # (or there are none). Apply them once to the batched
+        # ``(K+1, vocab)`` logits, sample all positions in one call,
+        # and pay a single host-device sync per round instead of K+1.
+        # On a target with ~10ms step time this saves ~10-15ms per
+        # round -- typically the difference between net-win and net-loss
+        # for spec-decode on fast quantised targets.
+        position_independent = all(
+            getattr(p, "position_independent", False) for p in logits_processors
+        )
+        if position_independent:
             batched_logits = logits.squeeze(0)
+            for proc in logits_processors:
+                batched_logits = proc(prev_tokens, batched_logits)
             batched_logprobs = batched_logits - mx.logsumexp(
                 batched_logits, axis=-1, keepdims=True
             )
