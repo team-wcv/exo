@@ -1,20 +1,19 @@
 """Tests for :mod:`remote_drafter` -- wire protocol + transport behaviour.
 
-These tests stay MLX-free where possible by exercising the pure
-encoding helpers directly and by mocking ``mx.distributed.send/recv``
-for the transport-level tests. End-to-end correctness against a real
-``mx.distributed.Group`` is exercised by the twin-machine benchmark
-runs (B10), not in unit tests.
+The asymmetric drafter wire is a plain TCP socket under the v3+ design;
+unit tests use ``socket.socketpair()`` to exercise both sides of the
+protocol end-to-end without an MLX backend or extra processes. End-to-
+end correctness against a real cluster is exercised by the multi-host
+benchmark runs, not in unit tests.
 """
 
 from __future__ import annotations
 
-from collections import deque
+import socket
+import struct
+import threading
 from collections.abc import Iterator
-from dataclasses import dataclass, field
-from typing import final
 
-import mlx.core as mx
 import pytest
 
 from exo.worker.engines.mlx.generator.remote_drafter import (
@@ -47,7 +46,6 @@ from exo.worker.engines.mlx.generator.remote_drafter import (
         (OP_PREFILL, [], 1024, 0, 1),
         (OP_PREFILL, [], 0, 0, 0),
         (OP_END_SESSION, [], 0, 0, 42),
-        # Boundary: max uint32 - 1 (SESSION_ID_NONE is the sentinel).
         (OP_FORWARD, [1], 2, 0, 0xFFFFFFFE),
     ],
 )
@@ -59,18 +57,17 @@ def test_command_frame_round_trip(
     session_id: int,
 ) -> None:
     """Every command shape we send must round-trip through encode + decode."""
-    frame = _build_command_frame(
+    flat = _build_command_frame(
         op=op,
         inputs=inputs,
         num_forwards=num_forwards,
         trim_amount=trim_amount,
         session_id=session_id,
     )
-    assert frame.shape == (COMMAND_FRAME_SIZE,)
-    assert frame.dtype == mx.uint32
+    assert len(flat) == COMMAND_FRAME_SIZE
 
     decoded_op, decoded_inputs, decoded_num_forwards, decoded_trim, decoded_sid = (
-        _decode_command_frame(frame)
+        _decode_command_frame(flat)
     )
     assert decoded_op == op
     assert decoded_inputs == inputs
@@ -102,355 +99,302 @@ def test_command_frame_rejects_session_id_out_of_uint32_range() -> None:
 
 
 def test_decode_rejects_wrong_size() -> None:
-    bogus = mx.array([0, 0, 0], dtype=mx.uint32)
     with pytest.raises(ValueError, match=r"expected 9"):
-        _decode_command_frame(bogus)
+        _decode_command_frame([0, 0, 0])
 
 
 # ---------------------------------------------------------------------------
-# RemoteTransport with a mocked mx.distributed
+# Helpers for socketpair-based wire tests
 # ---------------------------------------------------------------------------
 
 
-@final
-class _MockGroup:
-    """Stand-in for :class:`mx.distributed.Group` for unit tests.
-
-    The real group requires a backend (jaccl/ring) and at least two
-    processes to instantiate. The wire protocol only needs ``size()``
-    and ``rank()`` to be queryable, so we mock those plus an opaque
-    sentinel that ``mx.distributed.send/recv`` can dispatch on.
-    """
-
-    def __init__(self, size_value: int, rank_value: int) -> None:
-        self._size = size_value
-        self._rank = rank_value
-
-    def size(self) -> int:
-        return self._size
-
-    def rank(self) -> int:
-        return self._rank
+def _socket_pair() -> tuple[socket.socket, socket.socket]:
+    """Return ``(target_side, drafter_side)`` connected unix sockets."""
+    target_side, drafter_side = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    target_side.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    return target_side, drafter_side
 
 
-@dataclass
-class _IpcRecord:
-    """One observed mx.distributed.send/recv call."""
-
-    op: str  # "send" | "recv"
-    dst_or_src: int
-    shape: tuple[int, ...]
-    payload: list[int] = field(default_factory=list)
-
-
-@dataclass
-class _MockedDistributed:
-    """Capture every send + serve a queue of recv responses.
-
-    The transport's :meth:`forward` issues ``send(command_frame), recv(drafts_buffer)``;
-    we feed the drafts buffer the test wants returned.
-    """
-
-    sent: list[_IpcRecord] = field(default_factory=list)
-    recv_queue: deque[mx.array] = field(default_factory=deque)
-
-    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fake_send(payload: mx.array, dst: int, *, group: object) -> None:
-            del group
-            flat = [int(x) for x in payload.tolist()]  # type: ignore[reportUnknownArgumentType]
-            self.sent.append(
-                _IpcRecord(
-                    op="send",
-                    dst_or_src=dst,
-                    shape=tuple(payload.shape),
-                    payload=flat,
-                )
+def _read_uint32s(sock: socket.socket, count: int) -> list[int]:
+    needed = count * 4
+    buf = bytearray(needed)
+    received = 0
+    while received < needed:
+        view = memoryview(buf)[received:]
+        chunk = sock.recv_into(view, needed - received)
+        if chunk == 0:
+            raise ConnectionError(
+                f"socket closed mid-frame ({received}/{needed} bytes)"
             )
-
-        def fake_recv(
-            shape: tuple[int, ...],
-            dtype: object,
-            src: int,
-            *,
-            group: object,
-        ) -> mx.array:
-            del dtype, src, group
-            if not self.recv_queue:
-                raise AssertionError(
-                    f"recv() called with no queued response (shape={shape})"
-                )
-            return self.recv_queue.popleft()
-
-        monkeypatch.setattr(mx.distributed, "send", fake_send)
-        monkeypatch.setattr(mx.distributed, "recv", fake_recv)
+        received += chunk
+    return list(struct.unpack(f"<{count}I", bytes(buf)))
 
 
-def _enqueue_drafts(
-    mocked: _MockedDistributed, drafts: list[int], buffer_size: int
-) -> None:
-    padded = drafts + [0] * (buffer_size - len(drafts))
-    mocked.recv_queue.append(mx.array(padded, dtype=mx.uint32))
+def _write_uint32s(sock: socket.socket, values: list[int]) -> None:
+    sock.sendall(struct.pack(f"<{len(values)}I", *values))
 
 
-def _enqueue_ack(mocked: _MockedDistributed, status: int = ACK_OK) -> None:
-    mocked.recv_queue.append(mx.array([status], dtype=mx.uint32))
+def _make_transport(
+    num_draft_tokens: int = 4,
+) -> tuple[RemoteTransport, socket.socket]:
+    """Build a :class:`RemoteTransport` paired with a drafter-side socket."""
+    target_sock, drafter_sock = _socket_pair()
+    transport = RemoteTransport(num_draft_tokens=num_draft_tokens, sock=target_sock)
+    return transport, drafter_sock
 
 
-def _make_transport() -> tuple[RemoteTransport, _MockedDistributed]:
-    """Helper: construct a 2-rank :class:`RemoteTransport` over mocked IPC."""
-    mocked = _MockedDistributed()
-    group = _MockGroup(size_value=2, rank_value=0)
-    transport = RemoteTransport(
-        num_draft_tokens=4,
-        group=group,  # type: ignore[arg-type]
-        drafter_rank=1,
-        target_rank=0,
-    )
-    return transport, mocked
+# ---------------------------------------------------------------------------
+# RemoteTransport (target side) over a real socket pair
+# ---------------------------------------------------------------------------
 
 
-def test_open_session_allocates_unique_session_ids(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Each ``open_session`` call must yield a fresh session id."""
-    transport, mocked = _make_transport()
-    mocked.install(monkeypatch)
+def test_open_session_allocates_unique_session_ids() -> None:
+    transport, drafter_side = _make_transport()
+    try:
+        a = transport.open_session()
+        b = transport.open_session()
+        c = transport.open_session()
+        assert a.session_id != b.session_id
+        assert b.session_id != c.session_id
+        assert a.num_draft_tokens == transport.num_draft_tokens
+    finally:
+        # Drain anything pending (forwarding ends + transport shutdown).
+        # We never sent any commands, so the wire is clean. Close the
+        # drafter side first so the transport's shutdown gets a clean
+        # peer-closed signal instead of hanging on the ack recv.
+        drafter_side.close()
+        transport.shutdown()
 
-    session_a = transport.open_session()
-    session_b = transport.open_session()
-    session_c = transport.open_session()
-    assert session_a.session_id != session_b.session_id
-    assert session_b.session_id != session_c.session_id
-    # ``num_draft_tokens`` is shared across sessions (transport-level
-    # wire-protocol budget).
-    assert session_a.num_draft_tokens == transport.num_draft_tokens
 
-    _enqueue_ack(mocked)
+def test_session_handle_forward_serialises_command_with_session_id() -> None:
+    transport, drafter_side = _make_transport()
+    try:
+        session = transport.open_session()
+        future = session.forward([42], num_forwards=4)
+
+        cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
+        op, inputs, num_forwards, trim, sid = _decode_command_frame(cmd)
+        assert op == OP_FORWARD
+        assert inputs == [42]
+        assert num_forwards == 4
+        assert trim == 0
+        assert sid == session.session_id
+
+        # Reply with K+1 = 5 drafts; the spec loop slices to num_forwards.
+        _write_uint32s(drafter_side, [10, 11, 12, 13, 0])
+        assert future.result() == [10, 11, 12, 13]
+    finally:
+        drafter_side.close()
+        transport.shutdown()
+
+
+def test_session_handle_trim_cache_emits_session_scoped_command() -> None:
+    transport, drafter_side = _make_transport()
+    try:
+        session = transport.open_session()
+
+        def _trim() -> None:
+            session.trim_cache(3)
+
+        thread = threading.Thread(target=_trim)
+        thread.start()
+        cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
+        op, _, _, trim, sid = _decode_command_frame(cmd)
+        assert op == OP_TRIM_CACHE
+        assert trim == 3
+        assert sid == session.session_id
+        _write_uint32s(drafter_side, [ACK_OK])
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+    finally:
+        drafter_side.close()
+        transport.shutdown()
+
+
+def test_session_handle_trim_cache_zero_is_noop() -> None:
+    transport, drafter_side = _make_transport()
+    try:
+        session = transport.open_session()
+        session.trim_cache(0)
+        # Nothing must have been written: drafter_side.recv with
+        # MSG_DONTWAIT should fail with BlockingIOError.
+        drafter_side.setblocking(False)
+        with pytest.raises(BlockingIOError):
+            drafter_side.recv(1)
+    finally:
+        drafter_side.setblocking(True)
+        drafter_side.close()
+        transport.shutdown()
+
+
+def test_session_handle_reset_and_prefill_sends_command_array_and_recv_ack() -> None:
+    transport, drafter_side = _make_transport()
+    try:
+        session = transport.open_session()
+        prompt = [101, 102, 103, 104, 105]
+
+        def _prefill() -> None:
+            session.reset_and_prefill(prompt)
+
+        thread = threading.Thread(target=_prefill)
+        thread.start()
+
+        cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
+        op, inputs, num_forwards, trim, sid = _decode_command_frame(cmd)
+        assert op == OP_PREFILL
+        assert inputs == []
+        assert num_forwards == len(prompt)
+        assert trim == 0
+        assert sid == session.session_id
+
+        # Length-prefixed prompt tail: 1 uint32 header + N tokens.
+        header = _read_uint32s(drafter_side, 1)[0]
+        assert header == len(prompt)
+        tokens = _read_uint32s(drafter_side, len(prompt))
+        assert tokens == prompt
+
+        _write_uint32s(drafter_side, [ACK_OK])
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+    finally:
+        drafter_side.close()
+        transport.shutdown()
+
+
+def test_session_handle_reset_and_prefill_empty_prompt_skips_array_send() -> None:
+    transport, drafter_side = _make_transport()
+    try:
+        session = transport.open_session()
+
+        def _prefill() -> None:
+            session.reset_and_prefill([])
+
+        thread = threading.Thread(target=_prefill)
+        thread.start()
+
+        cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
+        op, _, num_forwards, _, _ = _decode_command_frame(cmd)
+        assert op == OP_PREFILL
+        assert num_forwards == 0
+
+        # No length-prefixed payload should follow on an empty prompt.
+        # Confirm by acking immediately and joining.
+        _write_uint32s(drafter_side, [ACK_OK])
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+    finally:
+        drafter_side.close()
+        transport.shutdown()
+
+
+def test_session_handle_shutdown_sends_op_end_session() -> None:
+    transport, drafter_side = _make_transport()
+    try:
+        session = transport.open_session()
+
+        def _shutdown() -> None:
+            session.shutdown()
+
+        thread = threading.Thread(target=_shutdown)
+        thread.start()
+
+        cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
+        op, _, _, _, sid = _decode_command_frame(cmd)
+        assert op == OP_END_SESSION
+        assert sid == session.session_id
+        _write_uint32s(drafter_side, [ACK_OK])
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+
+        # Idempotent: a second shutdown is a no-op (no new wire op).
+        session.shutdown()
+        drafter_side.setblocking(False)
+        with pytest.raises(BlockingIOError):
+            drafter_side.recv(1)
+    finally:
+        drafter_side.setblocking(True)
+        drafter_side.close()
+        transport.shutdown()
+
+
+def test_session_handle_rejects_use_after_shutdown() -> None:
+    transport, drafter_side = _make_transport()
+    try:
+        session = transport.open_session()
+
+        def _shutdown_then_ack() -> None:
+            cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
+            op, _, _, _, _ = _decode_command_frame(cmd)
+            assert op == OP_END_SESSION
+            _write_uint32s(drafter_side, [ACK_OK])
+
+        thread = threading.Thread(target=_shutdown_then_ack)
+        thread.start()
+        session.shutdown()
+        thread.join(timeout=2.0)
+
+        with pytest.raises(RuntimeError, match="after shutdown"):
+            _ = session.forward([1], num_forwards=2)
+        with pytest.raises(RuntimeError, match="after shutdown"):
+            session.trim_cache(2)
+        with pytest.raises(RuntimeError, match="after shutdown"):
+            session.reset_and_prefill([1, 2, 3])
+    finally:
+        drafter_side.close()
+        transport.shutdown()
+
+
+def test_remote_transport_shutdown_sends_op_and_drains_executor() -> None:
+    transport, drafter_side = _make_transport()
+    try:
+
+        def _ack_shutdown() -> None:
+            cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
+            op, _, _, _, _ = _decode_command_frame(cmd)
+            assert op == OP_SHUTDOWN
+            _write_uint32s(drafter_side, [ACK_OK])
+
+        thread = threading.Thread(target=_ack_shutdown)
+        thread.start()
+        transport.shutdown()
+        thread.join(timeout=2.0)
+
+        # Idempotent: a second shutdown is a no-op (no new wire op).
+        transport.shutdown()
+    finally:
+        drafter_side.close()
+
+
+def test_remote_transport_rejects_use_after_shutdown() -> None:
+    transport, drafter_side = _make_transport()
+
+    def _ack_shutdown() -> None:
+        try:
+            cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
+            op, _, _, _, _ = _decode_command_frame(cmd)
+            assert op == OP_SHUTDOWN
+            _write_uint32s(drafter_side, [ACK_OK])
+        except (ConnectionError, OSError):
+            pass
+
+    thread = threading.Thread(target=_ack_shutdown)
+    thread.start()
     transport.shutdown()
-
-
-def test_session_handle_forward_serialises_command_with_session_id(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``session.forward`` must encode the session id into the command frame."""
-    transport, mocked = _make_transport()
-    mocked.install(monkeypatch)
-
-    session = transport.open_session()
-    _enqueue_drafts(mocked, [10, 11, 12, 13], buffer_size=5)
-    drafts = session.forward([42], num_forwards=4).result()
-    assert drafts == [10, 11, 12, 13]
-
-    sends = [r for r in mocked.sent if r.op == "send"]
-    assert len(sends) == 1
-    op, inputs, num_forwards, trim, session_id = _decode_command_frame(
-        mx.array(sends[0].payload, dtype=mx.uint32)
-    )
-    assert op == OP_FORWARD
-    assert inputs == [42]
-    assert num_forwards == 4
-    assert trim == 0
-    assert session_id == session.session_id
-
-    _enqueue_ack(mocked)  # for end_session
-    session.shutdown()
-    _enqueue_ack(mocked)  # for transport shutdown
-    transport.shutdown()
-
-
-def test_session_handle_trim_cache_emits_session_scoped_command(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    transport, mocked = _make_transport()
-    mocked.install(monkeypatch)
-
-    session = transport.open_session()
-    _enqueue_ack(mocked)
-    session.trim_cache(3)
-
-    sends = [r for r in mocked.sent if r.op == "send"]
-    assert len(sends) == 1
-    op, _, _, trim, session_id = _decode_command_frame(
-        mx.array(sends[0].payload, dtype=mx.uint32)
-    )
-    assert op == OP_TRIM_CACHE
-    assert trim == 3
-    assert session_id == session.session_id
-
-    _enqueue_ack(mocked)  # end_session
-    session.shutdown()
-    _enqueue_ack(mocked)  # transport shutdown
-    transport.shutdown()
-
-
-def test_session_handle_trim_cache_zero_is_noop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    transport, mocked = _make_transport()
-    mocked.install(monkeypatch)
-
-    session = transport.open_session()
-    session.trim_cache(0)
-    assert mocked.sent == []
-
-    _enqueue_ack(mocked)
-    session.shutdown()
-    _enqueue_ack(mocked)
-    transport.shutdown()
-
-
-def test_session_handle_reset_and_prefill_sends_command_array_and_recv_ack(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """reset_and_prefill must send OP_PREFILL frame, prompt array, then await ack."""
-    transport, mocked = _make_transport()
-    mocked.install(monkeypatch)
-
-    session = transport.open_session()
-    prompt = [101, 102, 103, 104, 105]
-    _enqueue_ack(mocked)
-    session.reset_and_prefill(prompt)
-
-    sends = [r for r in mocked.sent if r.op == "send"]
-    assert len(sends) == 2
-    op, inputs, num_forwards, trim, session_id = _decode_command_frame(
-        mx.array(sends[0].payload, dtype=mx.uint32)
-    )
-    assert op == OP_PREFILL
-    assert inputs == []
-    assert num_forwards == len(prompt)
-    assert trim == 0
-    assert session_id == session.session_id
-    # Second send: prompt token array.
-    assert sends[1].shape == (len(prompt),)
-    assert sends[1].payload == prompt
-
-    _enqueue_ack(mocked)
-    session.shutdown()
-    _enqueue_ack(mocked)
-    transport.shutdown()
-
-
-def test_session_handle_reset_and_prefill_empty_prompt_skips_array_send(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    transport, mocked = _make_transport()
-    mocked.install(monkeypatch)
-
-    session = transport.open_session()
-    _enqueue_ack(mocked)
-    session.reset_and_prefill([])
-
-    sends = [r for r in mocked.sent if r.op == "send"]
-    assert len(sends) == 1
-    op, _, num_forwards, _, _ = _decode_command_frame(
-        mx.array(sends[0].payload, dtype=mx.uint32)
-    )
-    assert op == OP_PREFILL
-    assert num_forwards == 0
-
-    _enqueue_ack(mocked)
-    session.shutdown()
-    _enqueue_ack(mocked)
-    transport.shutdown()
-
-
-def test_session_handle_shutdown_sends_op_end_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``session.shutdown`` must send OP_END_SESSION (not OP_SHUTDOWN)."""
-    transport, mocked = _make_transport()
-    mocked.install(monkeypatch)
-
-    session = transport.open_session()
-    _enqueue_ack(mocked)
-    session.shutdown()
-
-    sends = [r for r in mocked.sent if r.op == "send"]
-    assert len(sends) == 1
-    op, _, _, _, session_id = _decode_command_frame(
-        mx.array(sends[0].payload, dtype=mx.uint32)
-    )
-    assert op == OP_END_SESSION
-    assert session_id == session.session_id
-
-    # Idempotent: a second shutdown is a no-op.
-    session.shutdown()
-    assert len([r for r in mocked.sent if r.op == "send"]) == 1
-
-    _enqueue_ack(mocked)
-    transport.shutdown()
-
-
-def test_session_handle_rejects_use_after_shutdown(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    transport, mocked = _make_transport()
-    mocked.install(monkeypatch)
-
-    session = transport.open_session()
-    _enqueue_ack(mocked)
-    session.shutdown()
-
-    with pytest.raises(RuntimeError, match="after shutdown"):
-        _ = session.forward([1], num_forwards=2)
-    with pytest.raises(RuntimeError, match="after shutdown"):
-        session.trim_cache(2)
-    with pytest.raises(RuntimeError, match="after shutdown"):
-        session.reset_and_prefill([1, 2, 3])
-
-    _enqueue_ack(mocked)
-    transport.shutdown()
-
-
-def test_remote_transport_shutdown_sends_op_and_drains_executor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    transport, mocked = _make_transport()
-    mocked.install(monkeypatch)
-
-    _enqueue_ack(mocked)
-    transport.shutdown()
-
-    sends = [r for r in mocked.sent if r.op == "send"]
-    assert len(sends) == 1
-    op, _, _, _, _ = _decode_command_frame(mx.array(sends[0].payload, dtype=mx.uint32))
-    assert op == OP_SHUTDOWN
-
-    # Idempotent: a second shutdown is a no-op.
-    transport.shutdown()
-    assert len([r for r in mocked.sent if r.op == "send"]) == 1
-
-
-def test_remote_transport_rejects_use_after_shutdown(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    transport, mocked = _make_transport()
-    mocked.install(monkeypatch)
-
-    _enqueue_ack(mocked)
-    transport.shutdown()
+    thread.join(timeout=2.0)
 
     with pytest.raises(RuntimeError, match="after shutdown"):
         _ = transport.open_session()
+    drafter_side.close()
 
 
-def test_remote_transport_rank_validation() -> None:
-    group = _MockGroup(size_value=2, rank_value=0)
-    with pytest.raises(ValueError, match="differ"):
-        RemoteTransport(
-            num_draft_tokens=4,
-            group=group,  # type: ignore[arg-type]
-            drafter_rank=0,
-            target_rank=0,
-        )
-    with pytest.raises(ValueError, match="out of bounds"):
-        RemoteTransport(
-            num_draft_tokens=4,
-            group=group,  # type: ignore[arg-type]
-            drafter_rank=2,
-            target_rank=0,
-        )
+def test_remote_transport_rejects_invalid_num_draft_tokens() -> None:
+    target_sock, drafter_sock = _socket_pair()
+    try:
+        with pytest.raises(ValueError, match="num_draft_tokens"):
+            RemoteTransport(num_draft_tokens=0, sock=target_sock)
+    finally:
+        target_sock.close()
+        drafter_sock.close()
 
 
 # ---------------------------------------------------------------------------
@@ -463,329 +407,132 @@ def _empty_cache_factory() -> object:
     return []
 
 
-def test_drafter_serve_loop_handles_shutdown_immediately(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_drafter_serve_loop_handles_shutdown_immediately() -> None:
     """A bare OP_SHUTDOWN frame must terminate the serve loop with an ACK."""
     from exo.worker.engines.mlx.generator.remote_drafter import drafter_serve_loop
 
-    sent: list[mx.array] = []
+    target_sock, drafter_sock = _socket_pair()
+    try:
+        # Write the shutdown frame from the target side BEFORE entering
+        # the serve loop so the recv inside the loop completes
+        # immediately.
+        shutdown_frame = _build_command_frame(
+            op=OP_SHUTDOWN,
+            inputs=[],
+            num_forwards=0,
+            trim_amount=0,
+            session_id=SESSION_ID_NONE,
+        )
+        _write_uint32s(target_sock, shutdown_frame)
 
-    def fake_send(payload: mx.array, dst: int, *, group: object) -> None:
-        del dst, group
-        sent.append(payload)
-
-    shutdown_frame = _build_command_frame(
-        op=OP_SHUTDOWN,
-        inputs=[],
-        num_forwards=0,
-        trim_amount=0,
-        session_id=SESSION_ID_NONE,
-    )
-    recv_iter: Iterator[mx.array] = iter([shutdown_frame])
-
-    def fake_recv(
-        shape: tuple[int, ...],
-        dtype: object,
-        src: int,
-        *,
-        group: object,
-    ) -> mx.array:
-        del shape, dtype, src, group
-        return next(recv_iter)
-
-    monkeypatch.setattr(mx.distributed, "send", fake_send)
-    monkeypatch.setattr(mx.distributed, "recv", fake_recv)
-
-    group = _MockGroup(size_value=2, rank_value=1)
-    drafter_serve_loop(
-        draft_model=None,  # pyright: ignore[reportArgumentType]
-        make_draft_cache=_empty_cache_factory,  # pyright: ignore[reportArgumentType]
-        num_draft_tokens=4,
-        group=group,  # pyright: ignore[reportArgumentType]
-        target_rank=0,
-    )
-
-    assert len(sent) == 1
-    assert sent[0].shape == (ACK_FRAME_SIZE,)
-    assert int(sent[0][0].item()) == ACK_OK
-
-
-def test_drafter_serve_loop_handles_prefill_then_trim_then_end_then_shutdown(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Full session lifecycle: PREFILL allocates, TRIM operates, END_SESSION frees."""
-    from exo.worker.engines.mlx.generator.remote_drafter import drafter_serve_loop
-
-    sent: list[mx.array] = []
-
-    def fake_send(payload: mx.array, dst: int, *, group: object) -> None:
-        del dst, group
-        sent.append(payload)
-
-    session_id = 7
-    prefill_frame = _build_command_frame(
-        op=OP_PREFILL,
-        inputs=[],
-        num_forwards=0,  # empty prompt -- skip prompt-array recv
-        trim_amount=0,
-        session_id=session_id,
-    )
-    trim_frame = _build_command_frame(
-        op=OP_TRIM_CACHE,
-        inputs=[],
-        num_forwards=0,
-        trim_amount=2,
-        session_id=session_id,
-    )
-    end_frame = _build_command_frame(
-        op=OP_END_SESSION,
-        inputs=[],
-        num_forwards=0,
-        trim_amount=0,
-        session_id=session_id,
-    )
-    shutdown_frame = _build_command_frame(
-        op=OP_SHUTDOWN,
-        inputs=[],
-        num_forwards=0,
-        trim_amount=0,
-        session_id=SESSION_ID_NONE,
-    )
-    recv_iter: Iterator[mx.array] = iter(
-        [prefill_frame, trim_frame, end_frame, shutdown_frame]
-    )
-
-    def fake_recv(
-        shape: tuple[int, ...],
-        dtype: object,
-        src: int,
-        *,
-        group: object,
-    ) -> mx.array:
-        del shape, dtype, src, group
-        return next(recv_iter)
-
-    monkeypatch.setattr(mx.distributed, "send", fake_send)
-    monkeypatch.setattr(mx.distributed, "recv", fake_recv)
-
-    # Cache-trim helper is exercised under TRIM; mock it to avoid
-    # mlx_lm version-dependent behaviour on empty caches.
-    def _noop_trim(cache: object, n: int) -> None:
-        del cache, n
-
-    monkeypatch.setattr(
-        "exo.worker.engines.mlx.generator.remote_drafter.mlx_trim_prompt_cache",
-        _noop_trim,
-    )
-
-    cache_calls: list[None] = []
-
-    def _cache_factory() -> object:
-        cache_calls.append(None)
-        return []
-
-    group = _MockGroup(size_value=2, rank_value=1)
-    drafter_serve_loop(
-        draft_model=None,  # pyright: ignore[reportArgumentType]
-        make_draft_cache=_cache_factory,  # pyright: ignore[reportArgumentType]
-        num_draft_tokens=4,
-        group=group,  # pyright: ignore[reportArgumentType]
-        target_rank=0,
-    )
-
-    # Four acks: prefill, trim, end_session, shutdown.
-    assert len(sent) == 4
-    for ack in sent:
-        assert ack.shape == (ACK_FRAME_SIZE,)
-        assert int(ack[0].item()) == ACK_OK
-    # Cache factory was called exactly once (on PREFILL).
-    assert len(cache_calls) == 1
-
-
-def test_drafter_serve_loop_rejects_forward_for_unknown_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """OP_FORWARD against an unallocated session_id is a wire-protocol violation."""
-    from exo.worker.engines.mlx.generator.remote_drafter import drafter_serve_loop
-
-    forward_frame = _build_command_frame(
-        op=OP_FORWARD,
-        inputs=[1],
-        num_forwards=1,
-        trim_amount=0,
-        session_id=99,  # never PREFILL'd
-    )
-    recv_iter: Iterator[mx.array] = iter([forward_frame])
-
-    def fake_send(payload: mx.array, dst: int, *, group: object) -> None:
-        del payload, dst, group
-
-    def fake_recv(
-        shape: tuple[int, ...],
-        dtype: object,
-        src: int,
-        *,
-        group: object,
-    ) -> mx.array:
-        del shape, dtype, src, group
-        return next(recv_iter)
-
-    monkeypatch.setattr(mx.distributed, "send", fake_send)
-    monkeypatch.setattr(mx.distributed, "recv", fake_recv)
-
-    group = _MockGroup(size_value=2, rank_value=1)
-    with pytest.raises(RuntimeError, match="unknown session"):
         drafter_serve_loop(
             draft_model=None,  # pyright: ignore[reportArgumentType]
             make_draft_cache=_empty_cache_factory,  # pyright: ignore[reportArgumentType]
             num_draft_tokens=4,
-            group=group,  # pyright: ignore[reportArgumentType]
-            target_rank=0,
+            sock=drafter_sock,
         )
 
-
-def test_drafter_serve_loop_end_session_is_idempotent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """OP_END_SESSION for a never-prefilled session_id must ack OK (not raise)."""
-    from exo.worker.engines.mlx.generator.remote_drafter import drafter_serve_loop
-
-    sent: list[mx.array] = []
-
-    def fake_send(payload: mx.array, dst: int, *, group: object) -> None:
-        del dst, group
-        sent.append(payload)
-
-    end_frame = _build_command_frame(
-        op=OP_END_SESSION,
-        inputs=[],
-        num_forwards=0,
-        trim_amount=0,
-        session_id=12345,  # never PREFILL'd
-    )
-    shutdown_frame = _build_command_frame(
-        op=OP_SHUTDOWN,
-        inputs=[],
-        num_forwards=0,
-        trim_amount=0,
-        session_id=SESSION_ID_NONE,
-    )
-    recv_iter: Iterator[mx.array] = iter([end_frame, shutdown_frame])
-
-    def fake_recv(
-        shape: tuple[int, ...],
-        dtype: object,
-        src: int,
-        *,
-        group: object,
-    ) -> mx.array:
-        del shape, dtype, src, group
-        return next(recv_iter)
-
-    monkeypatch.setattr(mx.distributed, "send", fake_send)
-    monkeypatch.setattr(mx.distributed, "recv", fake_recv)
-
-    group = _MockGroup(size_value=2, rank_value=1)
-    drafter_serve_loop(
-        draft_model=None,  # pyright: ignore[reportArgumentType]
-        make_draft_cache=_empty_cache_factory,  # pyright: ignore[reportArgumentType]
-        num_draft_tokens=4,
-        group=group,  # pyright: ignore[reportArgumentType]
-        target_rank=0,
-    )
-
-    # Two acks (end_session, shutdown), both OK.
-    assert len(sent) == 2
-    for ack in sent:
-        assert int(ack[0].item()) == ACK_OK
+        ack = _read_uint32s(target_sock, ACK_FRAME_SIZE)
+        assert ack[0] == ACK_OK
+    finally:
+        target_sock.close()
+        drafter_sock.close()
 
 
-def test_drafter_serve_loop_rejects_unknown_op(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An unknown op code must raise so the target's IPC surfaces it."""
-    from exo.worker.engines.mlx.generator.remote_drafter import drafter_serve_loop
+def test_drafter_serve_loop_handles_end_session_for_unknown_session() -> None:
+    """``OP_END_SESSION`` for an unknown session is a successful no-op ack.
 
-    bogus_frame = mx.array([99, 0, 0, 0, 0, 0, 0, 0, 0], dtype=mx.uint32)
-    recv_iter: Iterator[mx.array] = iter([bogus_frame])
-
-    def fake_send(payload: mx.array, dst: int, *, group: object) -> None:
-        del payload, dst, group
-
-    def fake_recv(
-        shape: tuple[int, ...],
-        dtype: object,
-        src: int,
-        *,
-        group: object,
-    ) -> mx.array:
-        del shape, dtype, src, group
-        return next(recv_iter)
-
-    monkeypatch.setattr(mx.distributed, "send", fake_send)
-    monkeypatch.setattr(mx.distributed, "recv", fake_recv)
-
-    group = _MockGroup(size_value=2, rank_value=1)
-    with pytest.raises(RuntimeError, match="Unknown op code"):
-        drafter_serve_loop(
-            draft_model=None,  # pyright: ignore[reportArgumentType]
-            make_draft_cache=_empty_cache_factory,  # pyright: ignore[reportArgumentType]
-            num_draft_tokens=4,
-            group=group,  # pyright: ignore[reportArgumentType]
-            target_rank=0,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Concurrent sessions on a single transport
-# ---------------------------------------------------------------------------
-
-
-def test_two_sessions_carry_distinct_session_ids_in_frames(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Concurrent target requests must tag their wire ops with distinct session_ids.
-
-    Verifies the target side: each ``_SessionHandle`` stamps its own
-    session_id into every command it issues, so the drafter rank can
-    multiplex its per-session caches without ambiguity. The wire stays
-    serial via the transport's single ``ThreadPoolExecutor``; this
-    test asserts the ordering and routing on the target side, not the
-    drafter side (drafter-side multiplexing is covered above).
+    Idempotent semantics: a target that crashed without sending
+    ``OP_END_SESSION`` for a session is cleaned up by the next
+    ``OP_SHUTDOWN``; targets that retry ``OP_END_SESSION`` after a
+    transient network error still see an ack.
     """
-    transport, mocked = _make_transport()
-    mocked.install(monkeypatch)
+    from exo.worker.engines.mlx.generator.remote_drafter import drafter_serve_loop
 
-    session_a = transport.open_session()
-    session_b = transport.open_session()
+    target_sock, drafter_sock = _socket_pair()
+    try:
+        end_frame = _build_command_frame(
+            op=OP_END_SESSION,
+            inputs=[],
+            num_forwards=0,
+            trim_amount=0,
+            session_id=99,
+        )
+        shutdown_frame = _build_command_frame(
+            op=OP_SHUTDOWN,
+            inputs=[],
+            num_forwards=0,
+            trim_amount=0,
+            session_id=SESSION_ID_NONE,
+        )
+        _write_uint32s(target_sock, end_frame)
+        _write_uint32s(target_sock, shutdown_frame)
 
-    # Interleave forwards: A.forward, B.forward, A.forward.
-    _enqueue_drafts(mocked, [10, 11, 12, 13], buffer_size=5)
-    _enqueue_drafts(mocked, [20, 21, 22, 23], buffer_size=5)
-    _enqueue_drafts(mocked, [30, 31, 32, 33], buffer_size=5)
+        drafter_serve_loop(
+            draft_model=None,  # pyright: ignore[reportArgumentType]
+            make_draft_cache=_empty_cache_factory,  # pyright: ignore[reportArgumentType]
+            num_draft_tokens=4,
+            sock=drafter_sock,
+        )
 
-    drafts_a1 = session_a.forward([1], num_forwards=4).result()
-    drafts_b = session_b.forward([2], num_forwards=4).result()
-    drafts_a2 = session_a.forward([3], num_forwards=4).result()
+        ack_end = _read_uint32s(target_sock, ACK_FRAME_SIZE)
+        ack_shutdown = _read_uint32s(target_sock, ACK_FRAME_SIZE)
+        assert ack_end[0] == ACK_OK
+        assert ack_shutdown[0] == ACK_OK
+    finally:
+        target_sock.close()
+        drafter_sock.close()
 
-    assert drafts_a1 == [10, 11, 12, 13]
-    assert drafts_b == [20, 21, 22, 23]
-    assert drafts_a2 == [30, 31, 32, 33]
 
-    # Each command frame carries the session id of the issuing handle.
-    sends = [r for r in mocked.sent if r.op == "send"]
-    assert len(sends) == 3
-    sids = [
-        _decode_command_frame(mx.array(s.payload, dtype=mx.uint32))[4] for s in sends
-    ]
-    assert sids[0] == session_a.session_id
-    assert sids[1] == session_b.session_id
-    assert sids[2] == session_a.session_id
+def test_drafter_serve_loop_rejects_unknown_op() -> None:
+    """An unknown op code must crash the serve loop loudly."""
+    from exo.worker.engines.mlx.generator.remote_drafter import drafter_serve_loop
 
-    _enqueue_ack(mocked)  # end session_a
-    session_a.shutdown()
-    _enqueue_ack(mocked)  # end session_b
-    session_b.shutdown()
-    _enqueue_ack(mocked)  # transport shutdown
-    transport.shutdown()
+    target_sock, drafter_sock = _socket_pair()
+    try:
+        # Hand-build an unknown op code (255 is not a defined op).
+        bogus = [255, 0, 0, 0, 0, 0, 0, 0, 0]
+        _write_uint32s(target_sock, bogus)
+
+        with pytest.raises(RuntimeError, match="Unknown op code"):
+            drafter_serve_loop(
+                draft_model=None,  # pyright: ignore[reportArgumentType]
+                make_draft_cache=_empty_cache_factory,  # pyright: ignore[reportArgumentType]
+                num_draft_tokens=4,
+                sock=drafter_sock,
+            )
+    finally:
+        target_sock.close()
+        drafter_sock.close()
+
+
+def test_drafter_serve_loop_rejects_op_for_unknown_session() -> None:
+    """``OP_TRIM_CACHE`` / ``OP_FORWARD`` against an unallocated session crashes."""
+    from exo.worker.engines.mlx.generator.remote_drafter import drafter_serve_loop
+
+    target_sock, drafter_sock = _socket_pair()
+    try:
+        trim_frame = _build_command_frame(
+            op=OP_TRIM_CACHE,
+            inputs=[],
+            num_forwards=0,
+            trim_amount=2,
+            session_id=42,
+        )
+        _write_uint32s(target_sock, trim_frame)
+
+        with pytest.raises(RuntimeError, match="OP_TRIM_CACHE for unknown session"):
+            drafter_serve_loop(
+                draft_model=None,  # pyright: ignore[reportArgumentType]
+                make_draft_cache=_empty_cache_factory,  # pyright: ignore[reportArgumentType]
+                num_draft_tokens=4,
+                sock=drafter_sock,
+            )
+    finally:
+        target_sock.close()
+        drafter_sock.close()
+
+
+# Used by other tests that need to import _ from this module without
+# triggering "unused" linter errors on intermediate Iterator hints.
+_ = Iterator

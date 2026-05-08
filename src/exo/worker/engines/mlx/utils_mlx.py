@@ -201,39 +201,42 @@ def mlx_distributed_init(
 @final
 @dataclass(frozen=True)
 class MlxGroupSplit:
-    """Parent ``mx.distributed`` group split into target subgroup + (optional) drafter rank.
+    """Target-side view of an instance's distributed wiring.
 
-    Symmetric placement: ``parent is target_subgroup`` (all ranks are
-    target ranks; ``drafter_rank_in_parent`` is ``None``).
+    Pre-v3 the asymmetric drafter rank was a member of the parent
+    ``mx.distributed`` group, and this struct carried the parent + a
+    target-only subgroup. Under the v3+ wire the drafter is NOT in any
+    ``mx.distributed.Group`` -- target ranks form their own group of
+    size ``target_world_size`` and the drafter dials a TCP socket. The
+    struct now carries:
 
-    Asymmetric placement: ``parent`` spans N+1 ranks (N target + 1
-    drafter at rank ``parent.size() - 1``). Target ranks see a
-    ``target_subgroup`` of size N for tensor / pipeline collectives;
-    the drafter rank sees ``target_subgroup is None`` because the
-    drafter never runs target-side collectives. ``parent`` is reserved
-    for ``RemoteTransport.send/recv`` between target rank 0 and the
-    drafter rank.
-
-    For V1 N=1 (single target rank, parent_size == 2) the target rank
-    also sets ``target_subgroup = None``. ``None`` is the well-known
-    "single rank, no collectives needed" signal that
-    :func:`load_mlx_items`, :func:`mx_barrier`, :func:`mx_any`, etc.
-    already understand and short-circuit on. We don't synthesize a
-    size-1 ``mx.distributed.Group`` because MLX's ring and jaccl
-    backends do not implement ``Group.split`` on Apple Silicon, and a
-    pure-Python stub fails the C++ ``mx.distributed.all_sum`` nanobind
-    type check.
-
-    The drafter rank is always last in the parent group, by placement
-    convention. This avoids needing to broadcast the drafter rank index
-    out of band -- callers can read it from the instance metadata
-    (``DrafterPlacement.drafter_rank``) and trust that it equals
-    ``parent.size() - 1``.
+      * ``parent`` / ``target_subgroup`` -- aliases for the same target
+        group (``parent is target_subgroup`` always under v3). Both
+        fields are retained so existing callers (builder.py, image
+        builder, generate.py) keep working without rev. ``None`` when
+        the target world size is 1 (the well-known "single rank, no
+        collectives needed" signal that
+        :func:`load_mlx_items`, :func:`mx_barrier`, :func:`mx_any`
+        already short-circuit on).
+      * ``drafter_socket`` -- the connected TCP socket between target
+        rank 0 and the drafter rank. Set ONLY on target rank 0 of an
+        asymmetric placement; ``None`` for any other rank.
+      * ``drafter_rank_in_parent`` -- advisory placement index of the
+        drafter (``placement.drafter_rank``). Carried for telemetry
+        and the few legacy call sites that branch on "is asymmetric";
+        ``None`` for symmetric placement.
     """
 
-    parent: mx.distributed.Group
+    parent: mx.distributed.Group | None
     target_subgroup: mx.distributed.Group | None
     drafter_rank_in_parent: int | None
+    drafter_socket: object | None = None
+    """Connected ``socket.socket`` from target rank 0 to the drafter.
+
+    Typed as ``object`` to keep the dataclass importable from modules
+    that don't import ``socket`` directly. Runtime callers
+    (:mod:`builder`) cast back to ``socket.socket`` before passing to
+    :func:`make_remote_transport`."""
 
     @property
     def is_asymmetric(self) -> bool:
@@ -241,64 +244,120 @@ class MlxGroupSplit:
 
 
 def initialize_mlx(bound_instance: BoundInstance) -> MlxGroupSplit:
-    """Bring up the parent group and split off a target subgroup.
+    """Bring up the target ``mx.distributed`` group + (rank 0) drafter socket.
 
-    For symmetric placement (no drafter) returns a split where parent
-    and target subgroup are the same object. For asymmetric placement
-    returns three things in one struct: the parent (used for drafter
-    IPC), the target subgroup (used for tensor / pipeline collectives,
-    or ``None`` for V1 N=1), and the drafter rank index in the parent
-    group.
+    Target ranks: initialise an ``mx.distributed.Group`` of size
+    ``parent_group_size`` (which under v3+ equals the number of target
+    shards -- the drafter is NOT a member of this group). Single-target
+    instances (``parent_group_size == 1``) short-circuit and return a
+    split with ``parent / target_subgroup = None``.
+
+    Target rank 0 of an asymmetric placement additionally binds a TCP
+    listener on ``DrafterPlacement.drafter_socket_port`` and accepts
+    the drafter's incoming connection. The connected socket flows
+    through :class:`MlxGroupSplit.drafter_socket` to the builder, which
+    hands it to :func:`make_remote_transport`.
+
+    The drafter rank does NOT call this function; its bootstrap
+    (:class:`DrafterRunner._handle_connect`) dials the socket directly
+    without touching ``mx.distributed`` at all.
     """
+    assert not bound_instance.is_drafter_rank, (
+        "initialize_mlx should not be called on a drafter rank under "
+        "the v3+ asymmetric wire; DrafterRunner._handle_connect dials "
+        "the drafter socket directly without joining mx.distributed."
+    )
     # should we unseed it?
     # TODO: pass in seed from params
     mx.random.seed(42)
 
-    parent_size = bound_instance.instance.parent_group_size
-    assert parent_size > 1, (
-        f"Tried to initialize mlx for a single-rank instance "
-        f"(parent_group_size={parent_size}); the single-device runner skips "
-        "mx.distributed entirely."
-    )
-    parent = mlx_distributed_init(bound_instance)
+    target_world_size = bound_instance.instance.parent_group_size
     placement = bound_instance.instance.drafter_placement
-    if placement is None:
-        return MlxGroupSplit(
-            parent=parent,
-            target_subgroup=parent,
-            drafter_rank_in_parent=None,
-        )
 
-    drafter_rank = placement.drafter_rank
-    parent_size = parent.size()
+    # Single-target instance: no mx.distributed group needed (other
+    # ranks short-circuit on the ``group is None`` signal). Drafter
+    # wire still exists for asymmetric placement.
+    parent: mx.distributed.Group | None = (
+        None if target_world_size <= 1 else mlx_distributed_init(bound_instance)
+    )
 
-    # V1 boundary: single target rank + drafter rank (parent_size == 2).
-    # MLX's ring and jaccl backends do not implement ``Group.split`` on
-    # Apple Silicon (only the MPI backend does), so we cannot construct
-    # a real target-only subgroup. Fortunately V1 only supports a
-    # single target rank, where TP=1 / PP=1 means the target never
-    # invokes target-subgroup collectives at all -- the existing
-    # ``group is None`` short-circuits in ``load_mlx_items``,
-    # ``mx_barrier``, and ``mx_any`` cover us.
-    #
-    # When V2 lands (multi-target asymmetric, parent_size > 2), the
-    # target subgroup MUST exclude the drafter rank because TP/PP
-    # collectives would otherwise hang waiting on the drafter. At that
-    # point either MPI is required or we add a backend-level split
-    # implementation; the assertion below pins the V1 contract.
-    if parent_size > 2:
-        raise NotImplementedError(
-            f"Asymmetric placement with multi-target subgroup "
-            f"(parent_size={parent_size}) requires a backend that "
-            "implements ``Group.split``. MLX's ring and jaccl backends "
-            "do not support split on Apple Silicon today; V1 supports a "
-            "single target rank (parent_size == 2)."
-        )
+    drafter_rank_in_parent = placement.drafter_rank if placement is not None else None
+
+    drafter_socket = _maybe_accept_drafter_socket(
+        bound_instance=bound_instance,
+        target_world_size=target_world_size,
+        placement=placement,
+    )
+
     return MlxGroupSplit(
         parent=parent,
-        target_subgroup=None,
-        drafter_rank_in_parent=drafter_rank,
+        target_subgroup=parent,
+        drafter_rank_in_parent=drafter_rank_in_parent,
+        drafter_socket=drafter_socket,
     )
+
+
+def _maybe_accept_drafter_socket(
+    *,
+    bound_instance: BoundInstance,
+    target_world_size: int,
+    placement: object,
+) -> object | None:
+    """Bind + accept the drafter dial on target rank 0; otherwise return ``None``.
+
+    Only target rank 0 of an asymmetric placement owns the drafter
+    wire. Other target ranks (rank >= 1) and symmetric placements
+    return ``None``. The caller embeds the result in
+    :class:`MlxGroupSplit.drafter_socket`.
+
+    The accept call is sequential after :func:`mlx_distributed_init`
+    in the parent function. The drafter's :func:`dial_target` retries
+    with backoff for up to two minutes, which comfortably covers the
+    target group's bootstrap latency. If accept times out (drafter
+    unreachable / crashed), this raises :class:`socket.timeout`; the
+    runner surface bubbles it up as a connect-task failure so the
+    cluster doesn't sit silently wedged.
+    """
+    from exo.shared.types.worker.instances import DrafterPlacement
+
+    if placement is None:
+        return None
+    if not isinstance(placement, DrafterPlacement):
+        raise TypeError(
+            f"drafter_placement must be DrafterPlacement, got {type(placement)!r}"
+        )
+    # Target rank 0 binds; other target ranks no-op. Symmetric placements
+    # land in the ``placement is None`` branch above.
+    if bound_instance.parent_rank != 0:
+        return None
+    del target_world_size  # not needed once we know we're rank 0
+    # Imported lazily to avoid pulling the socket transport into module
+    # import unless this code path is exercised.
+    from exo.worker.engines.mlx.generator.drafter_socket import (
+        accept_drafter,
+        bind_target_listener,
+    )
+
+    # Bind to all interfaces so the drafter can dial whichever address
+    # ``DrafterPlacement.drafter_socket_host`` resolves to (LAN,
+    # Thunderbolt-bridge, Tailscale, etc.). The placement-time IP only
+    # serves as the address the drafter dials; target rank 0 doesn't
+    # need to advertise a specific bind address.
+    listener = bind_target_listener("0.0.0.0", placement.drafter_socket_port)
+    try:
+        logger.info(
+            f"target rank 0 listening for drafter on "
+            f"0.0.0.0:{placement.drafter_socket_port} "
+            f"(advertised {placement.drafter_socket_host})"
+        )
+        conn = accept_drafter(listener, timeout_seconds=180.0)
+        logger.info("target rank 0 accepted drafter connection")
+        return conn
+    finally:
+        # Listener is single-shot (drafter dials once and stays
+        # connected for the instance lifetime); close it as soon as
+        # accept returns to free the port.
+        listener.close()
 
 
 EXO_DISABLE_DRAFTER_ENV = "EXO_DISABLE_DRAFTER"

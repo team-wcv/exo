@@ -8,6 +8,7 @@ from loguru import logger
 from exo.master.placement_utils import (
     Cycle,
     filter_cycles_by_memory,
+    find_ip_prioritised,
     get_mlx_jaccl_coordinators,
     get_mlx_jaccl_devices_matrix,
     get_mlx_ring_hosts_by_node,
@@ -35,7 +36,7 @@ from exo.shared.types.events import (
 from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import MemoryUsage, NodeNetworkInfo
 from exo.shared.types.tasks import Task, TaskId, TaskStatus
-from exo.shared.types.topology import RDMAConnection, SocketConnection
+from exo.shared.types.topology import SocketConnection
 from exo.shared.types.worker.downloads import (
     DownloadCompleted,
     DownloadFailed,
@@ -362,6 +363,7 @@ def place_instance(
         instance_meta=instance_meta,
         topology=topology,
         node_memory=node_memory,
+        node_network=node_network,
         instance_id=instance_id,
         on_drafter_placement_degraded=on_drafter_placement_degraded,
     )
@@ -378,17 +380,16 @@ def place_instance(
     ):
         instance_meta = InstanceMeta.MlxRing
 
-    # Asymmetric placement extends the parent ``mx.distributed`` group to
-    # include the drafter rank as the last rank. Subgraph + connectivity
-    # tables (hosts_by_node / jaccl_devices) must cover both target nodes
-    # and the drafter node; ``shard_assignments`` stays target-only because
-    # the drafter has no target shard.
-    if drafter_placement is not None:
-        nodes_for_group = list(selected_cycle.node_ids) + [
-            drafter_placement.drafter_node_id
-        ]
-    else:
-        nodes_for_group = list(selected_cycle.node_ids)
+    # Asymmetric placement (``drafter_placement is not None``) keeps the
+    # drafter rank OUT of the parent ``mx.distributed`` group: the
+    # drafter talks to target rank 0 over a direct TCP socket
+    # (``DrafterPlacement.drafter_socket_host``/``port``). Subgraph +
+    # connectivity tables (``hosts_by_node`` / ``jaccl_devices``)
+    # therefore cover only target nodes -- this lets target ranks of
+    # any size run TP/PP collectives without requiring
+    # ``Group.split`` (jaccl/ring backends do not implement split on
+    # Apple Silicon).
+    nodes_for_group = list(selected_cycle.node_ids)
     cycle_digraph: Topology = topology.get_subgraph_from_nodes(nodes_for_group)
 
     target_instances = dict(deepcopy(current_instances))
@@ -472,6 +473,7 @@ def _select_drafter_placement(
     instance_meta: InstanceMeta,
     topology: Topology,
     node_memory: Mapping[NodeId, MemoryUsage],
+    node_network: Mapping[NodeId, NodeNetworkInfo],
     instance_id: InstanceId,
     on_drafter_placement_degraded: (Callable[[DrafterPlacementDegraded], None] | None),
 ) -> DrafterPlacement | None:
@@ -596,11 +598,49 @@ def _select_drafter_placement(
     drafter_model_id = drafter_candidates[0]
     drafter_runner_id = RunnerId()
     drafter_rank = len(selected_cycle)
+
+    # Resolve target rank 0's IP from the drafter's perspective. Target
+    # rank 0 == selected_cycle.node_ids[0] by construction (every shard
+    # assigner enumerates the cycle in order; ``device_rank`` is the
+    # enumeration index). We pick the same priority order ``ring`` uses
+    # (Thunderbolt-bridge first, then ethernet, then wifi) because the
+    # drafter wire is small fixed-size frames where TCP latency over a
+    # direct cable beats RDMA setup latency every time.
+    target_rank_zero = selected_cycle.node_ids[0]
+    drafter_socket_host = find_ip_prioritised(
+        target_rank_zero,
+        drafter_node_id,
+        topology,
+        node_network,
+        ring=True,
+    )
+    if drafter_socket_host is None:
+        # ``_drafter_node_is_reachable`` already checked the directional
+        # edge; if topology says reachable but no IP is exposed, the
+        # node is misconfigured. Bail out loudly via degradation rather
+        # than picking ``0.0.0.0`` (which the drafter cannot dial).
+        _emit_drafter_degraded(
+            on_drafter_placement_degraded,
+            command=command,
+            instance_id=instance_id,
+            target_node_ids=target_node_ids,
+            eligible_nodes=eligible_nodes,
+            reason=DrafterPlacementDegradationReason.NoReachablePathFromTargetRankZero,
+            fallback=fallback,
+            detail=(
+                f"Target rank 0 ({target_rank_zero}) has no IP address "
+                f"reachable from drafter node {drafter_node_id} in topology"
+            ),
+        )
+        return None
+    drafter_socket_port = random_ephemeral_port()
     return DrafterPlacement(
         drafter_node_id=drafter_node_id,
         drafter_runner_id=drafter_runner_id,
         drafter_model_id=drafter_model_id,
         drafter_rank=drafter_rank,
+        drafter_socket_host=drafter_socket_host,
+        drafter_socket_port=drafter_socket_port,
     )
 
 
@@ -650,38 +690,36 @@ def _drafter_node_is_reachable(
     target_node_ids: list[NodeId],
     drafter_node: NodeId,
     topology: Topology,
-    requires_rdma: bool,
+    requires_rdma: bool,  # retained for ABI parity; unused under v3+ wire
 ) -> bool:
-    """Drafter must reach every target rank (and be reached from each).
+    """Drafter must be socket-reachable from target rank 0 only.
 
-    For ``MlxJaccl``: ``get_mlx_jaccl_devices_matrix`` enforces all-to-all
-    RDMA across the parent group. The drafter is part of that group, so
-    it needs bidirectional RDMA edges to *every* target node, not just
-    rank 0.
+    Under the v3+ asymmetric wire (this module's :class:`DrafterPlacement`
+    + ``RemoteTransport``) the drafter is NOT a member of the target
+    ranks' ``mx.distributed.Group``. The only edge the wire actually
+    needs is a TCP socket between target rank 0 and the drafter node.
+    Every other "all target ranks must reach drafter" requirement from
+    the v2 wire (where drafter was an mx.distributed peer) is gone.
 
-    For ``MlxRing``: target rank 0 (the rank that does send/recv with the
-    drafter via ``RemoteTransport``) must reach the drafter directly. The
-    ring backend additionally wires drafter <-> rank N-1 (drafter's left
-    neighbor in the parent ring). Both edges have to exist as sockets.
-    Requiring all target ranks to be socket-reachable from drafter is
-    over-conservative for ring, but in practice every multi-node exo
-    deployment already has all-pairs socket discovery, and the cost of
-    requiring it is zero. Keeps the predicate simple and matches jaccl's
-    behaviour.
+    ``requires_rdma`` is accepted but ignored: the drafter wire is plain
+    TCP regardless of whether the target ranks talk to each other over
+    JACCL/RDMA or ring/TCP. The argument is retained so callers don't
+    need to rev simultaneously with this module.
     """
-    edge_check: Callable[[object], bool]
-    if requires_rdma:
-        edge_check = lambda c: isinstance(c, RDMAConnection)  # noqa: E731
-    else:
-        edge_check = lambda c: isinstance(c, SocketConnection)  # noqa: E731
-    for target in target_node_ids:
-        forward = list(topology.get_all_connections_between(target, drafter_node))
-        backward = list(topology.get_all_connections_between(drafter_node, target))
-        if not any(edge_check(c) for c in forward):
-            return False
-        if not any(edge_check(c) for c in backward):
-            return False
-    return True
+    del requires_rdma  # documented above; the v3 wire is socket-only
+    if not target_node_ids:
+        return False
+    target_rank_zero = target_node_ids[0]
+    socket_check: Callable[[object], bool] = lambda c: isinstance(  # noqa: E731
+        c, SocketConnection
+    )
+    forward = list(topology.get_all_connections_between(target_rank_zero, drafter_node))
+    backward = list(
+        topology.get_all_connections_between(drafter_node, target_rank_zero)
+    )
+    return any(socket_check(c) for c in forward) and any(
+        socket_check(c) for c in backward
+    )
 
 
 # Conservative floor for the drafter's wired-memory bump. The drafter

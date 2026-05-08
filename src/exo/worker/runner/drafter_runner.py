@@ -1,11 +1,20 @@
 """Runner for an asymmetric drafter rank.
 
-The asymmetric placement layer (``master.placement``) appends a drafter
-rank to the parent ``mx.distributed`` group whenever a model card lists
-:attr:`ModelCard.drafter_eligible_nodes` and an eligible host is
-reachable from every target rank. The drafter loads its own (smaller)
-drafter model on a separate node and runs :func:`drafter_serve_loop`
-to field forwards from target rank 0 over ``RemoteTransport``.
+The asymmetric placement layer (``master.placement``) selects a
+drafter-eligible node whenever a model card lists
+:attr:`ModelCard.drafter_eligible_nodes` and at least one eligible host
+is socket-reachable from target rank 0. The drafter loads its own
+(smaller) drafter model on that node and runs :func:`drafter_serve_loop`
+to field forwards from target rank 0 over a direct TCP socket.
+
+Under the v3+ wire the drafter rank is NOT a member of the target
+ranks' ``mx.distributed.Group``. It does not call
+``mx.distributed.init`` at all -- it dials
+``DrafterPlacement.drafter_socket_host:drafter_socket_port`` and runs
+the serve loop over the resulting socket. Decoupling drafter IPC from
+``mx.distributed`` lets target ranks of any size run TP/PP collectives
+without requiring ``Group.split`` (which jaccl/ring backends do not
+implement on Apple Silicon).
 
 This module follows the same lifecycle as :class:`exo.worker.runner.runner.Runner`
 (``Idle -> Connecting -> Connected -> Loading -> Loaded -> WarmingUp ->
@@ -18,9 +27,8 @@ The internals differ:
     weights.
   * No ``Engine`` wrapper. ``StartWarmup`` does a single forward to
     JIT-compile Metal kernels, then the drafter steps directly into
-    :func:`drafter_serve_loop`, which blocks on
-    :func:`mx.distributed.recv` until the target rank sends
-    ``OP_SHUTDOWN``.
+    :func:`drafter_serve_loop`, which blocks on socket recv until the
+    target rank sends ``OP_SHUTDOWN``.
   * ``Shutdown`` arrives via the worker plan after target ranks have
     already sent ``OP_SHUTDOWN``; on the drafter side we just clean up
     state.
@@ -33,6 +41,8 @@ import time stay tight.
 
 from __future__ import annotations
 
+import contextlib
+import socket
 import time
 from typing import TYPE_CHECKING, cast, final
 
@@ -106,8 +116,7 @@ class DrafterRunner:
         self.event_sender = event_sender
         self.task_receiver = task_receiver
 
-        self.parent_group: mx.distributed.Group | None = None
-        self.target_subgroup: mx.distributed.Group | None = None
+        self.drafter_socket: socket.socket | None = None
         self.draft_model: Model | None = None
 
         self._setup_start = time.perf_counter()
@@ -149,22 +158,30 @@ class DrafterRunner:
         return True
 
     def _handle_connect(self, task: Task) -> None:
-        from exo.worker.engines.mlx.utils_mlx import initialize_mlx
+        """Dial target rank 0's drafter listener; no mx.distributed init.
+
+        Under the v3+ wire the drafter is outside the target's
+        ``mx.distributed.Group``. ``ConnectToGroup`` is the natural
+        place to establish the drafter wire (the lifecycle stage runs
+        in parallel with target ranks initialising mx.distributed,
+        which gives target rank 0 time to bind before we dial).
+        :func:`dial_target` retries with backoff up to two minutes,
+        comfortably covering target rank 0's bind delay.
+        """
+        from exo.worker.engines.mlx.generator.drafter_socket import dial_target
 
         self._update_status(RunnerConnecting())
         self._acknowledge(task)
-        split = initialize_mlx(self.bound_instance)
-        assert split.is_asymmetric, (
-            "DrafterRunner reached ConnectToGroup but MlxGroupSplit reports "
-            "symmetric placement; placement layer should have set "
-            "drafter_placement on this instance"
-        )
-        self.parent_group = split.parent
-        self.target_subgroup = split.target_subgroup
+        host = self._placement.drafter_socket_host
+        port = self._placement.drafter_socket_port
         loguru_logger.info(
-            f"DrafterRunner connected: parent_size={split.parent.size()} "
-            f"my_rank={split.parent.rank()} "
-            f"drafter_rank_in_parent={split.drafter_rank_in_parent}"
+            f"DrafterRunner dialing target rank 0 at {host}:{port} "
+            f"(drafter_model_id={self._placement.drafter_model_id})"
+        )
+        self.drafter_socket = dial_target(host, port)
+        loguru_logger.info(
+            f"DrafterRunner connected over socket "
+            f"(drafter_rank={self._placement.drafter_rank})"
         )
         self._send_task_status(task.task_id, TaskStatus.Complete)
         self._update_status(RunnerConnected())
@@ -211,7 +228,7 @@ class DrafterRunner:
     def _handle_start_warmup(self, task: Task) -> None:
         from exo.worker.engines.mlx.cache import make_kv_cache
 
-        assert self.parent_group is not None
+        assert self.drafter_socket is not None
         assert self.draft_model is not None
 
         self._update_status(RunnerWarmingUp())
@@ -254,22 +271,16 @@ class DrafterRunner:
         from exo.worker.engines.mlx.cache import make_kv_cache
         from exo.worker.engines.mlx.generator.remote_drafter import drafter_serve_loop
 
-        assert self.parent_group is not None
+        assert self.drafter_socket is not None
         assert self.draft_model is not None
 
-        # Target rank that drives drafter IPC. By placement convention
-        # rank 0 of the parent group owns sampling decisions and so is
-        # the rank that calls ``_SessionHandle.forward / trim_cache /
-        # reset_and_prefill`` (and the wire-level
-        # ``RemoteTransport.shutdown``).
-        target_rank = 0
         # ``num_draft_tokens`` here only sizes the response buffer; the
         # spec loop on the target side may issue forwards with
         # ``num_forwards`` up to K+1, so we mirror exactly its config.
         num_draft_tokens = self._num_draft_tokens()
         loguru_logger.info(
             f"DrafterRunner entering serve_loop "
-            f"(K={num_draft_tokens}, target_rank={target_rank})"
+            f"(K={num_draft_tokens}, transport=tcp_socket)"
         )
         # Capture ``draft_model`` in the closure so the serve loop can
         # allocate per-session caches lazily without re-entering
@@ -285,8 +296,7 @@ class DrafterRunner:
             draft_model=draft_model,
             make_draft_cache=_make_session_cache,
             num_draft_tokens=num_draft_tokens,
-            group=self.parent_group,
-            target_rank=target_rank,
+            sock=self.drafter_socket,
         )
         loguru_logger.info("DrafterRunner serve_loop exited via OP_SHUTDOWN")
 
@@ -312,8 +322,10 @@ class DrafterRunner:
         # by :func:`drafter_serve_loop`; they were dropped when the
         # loop returned via ``OP_SHUTDOWN``.
         self.draft_model = None
-        self.parent_group = None
-        self.target_subgroup = None
+        if self.drafter_socket is not None:
+            with contextlib.suppress(OSError):
+                self.drafter_socket.close()
+            self.drafter_socket = None
         import gc
 
         gc.collect()

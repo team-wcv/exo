@@ -279,8 +279,15 @@ class InProcessTransport:
 # ---------------------------------------------------------------------------
 
 
-ALL_TRANSPORT_KINDS: Final[tuple[str, ...]] = ("inprocess", "remote")
-"""Recognised values of ``EXO_DRAFTER_TRANSPORT``."""
+ALL_TRANSPORT_KINDS: Final[tuple[str, ...]] = ("inprocess",)
+"""Recognised values of ``EXO_DRAFTER_TRANSPORT``.
+
+The ``"remote"`` option was retired alongside the ``mx.distributed``-
+backed drafter wire (the v3+ asymmetric path uses a builder-supplied
+:class:`RemoteTransport` bound to a TCP socket; it cannot be
+constructed via this env-var factory because the socket comes from
+target rank 0's listener and isn't available at process startup).
+"""
 
 EXO_DRAFTER_TRANSPORT_ENV: Final[str] = "EXO_DRAFTER_TRANSPORT"
 
@@ -378,21 +385,16 @@ _TransportFactory = Callable[..., object]
 def transport_factory_for(kind: str) -> _TransportFactory:
     """Return the factory for the requested transport kind.
 
+    Only ``"inprocess"`` is constructible via this factory; the
+    asymmetric remote transport (``RemoteTransport``) is built
+    directly from the runner bootstrap with a connected socket from
+    target rank 0's drafter listener.
+
     Raises:
         ValueError: ``kind`` is not in :data:`ALL_TRANSPORT_KINDS`.
-        ImportError: ``kind == "remote"`` and the distributed transport's
-            runtime dependencies are unavailable.
     """
     if kind == "inprocess":
         return make_inprocess_transport
-    if kind == "remote":
-        # Imported lazily so the in-process path doesn't pull in any
-        # distributed-only modules.
-        from exo.worker.engines.mlx.generator.remote_drafter import (
-            make_remote_transport,
-        )
-
-        return make_remote_transport
     raise ValueError(f"Unknown drafter transport kind: {kind!r}")
 
 

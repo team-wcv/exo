@@ -159,19 +159,22 @@ def test_asymmetric_single_node_target_auto_upgrades_to_jaccl() -> None:
     assert placement.drafter_node_id == drafter_node
     assert placement.drafter_model_id == ModelId("mlx-community/gemma-4-e2b-it-8bit")
     assert placement.drafter_rank == 1  # target=1 rank, drafter is last (rank 1)
-    assert instance.parent_group_size == 2
+    # v3+ wire: drafter does not join mx.distributed -> parent_group_size
+    # is the target-only rank count.
+    assert instance.parent_group_size == 1
     assert len(instance.shard_assignments.runner_to_shard) == 1
 
 
-def test_asymmetric_ring_socket_only_falls_back_to_symmetric_ring() -> None:
-    """Single-node target + ring + drafter eligible but only socket reach.
+def test_asymmetric_ring_socket_only_places_drafter_over_socket() -> None:
+    """Single-node ring target + socket-only drafter places drafter over TCP.
 
-    Ring backend can't run asymmetric (no split / send/recv). Auto-upgrade
-    to jaccl fails because there's no RDMA path to the drafter node, so
-    drafter selection emits a degradation event and placement reverts to
-    symmetric ``MlxRing`` (no drafter). The user's request still completes;
-    they get a non-speculative ring instance and a loud degradation event
-    pointing at the missing RDMA edge.
+    v3+ wire decoupled the drafter from ``mx.distributed`` -- the wire
+    runs over a plain TCP socket. RDMA is therefore no longer required
+    for asymmetric placement; a socket-only path between target rank 0
+    and the drafter node is sufficient. The instance still upgrades
+    ``MlxRing -> MlxJaccl`` because the target ranks (1 here) are
+    fine to leave on jaccl, but the drafter wire itself runs over TCP
+    regardless of the target backend.
     """
     target_node, drafter_node = NodeId(), NodeId()
     topology = Topology()
@@ -208,13 +211,11 @@ def test_asymmetric_ring_socket_only_falls_back_to_symmetric_ring() -> None:
 
     assert len(placements) == 1
     instance = next(iter(placements.values()))
-    assert isinstance(instance, MlxRingInstance)
-    assert instance.drafter_placement is None
-    assert len(degradations) == 1
-    assert (
-        degradations[0].reason
-        == DrafterPlacementDegradationReason.NoReachablePathFromTargetRankZero
-    )
+    assert instance.drafter_placement is not None
+    assert instance.drafter_placement.drafter_node_id == drafter_node
+    # Target stays single-rank; drafter rides TCP regardless.
+    assert instance.parent_group_size == 1
+    assert not degradations
 
 
 def test_asymmetric_jaccl_places_drafter_with_rdma_reachability() -> None:
@@ -283,29 +284,32 @@ def test_asymmetric_jaccl_places_drafter_with_rdma_reachability() -> None:
     assert instance.drafter_placement is not None
     placement = instance.drafter_placement
     assert placement.drafter_node_id == drafter_node
-    assert placement.drafter_rank == 2  # 2 target ranks + drafter at rank 2
-    assert instance.parent_group_size == 3
-    # Devices matrix must cover all three ranks (2 target + 1 drafter)
-    assert len(instance.jaccl_devices) == 3
-    assert len(instance.jaccl_devices[0]) == 3
-    assert drafter_node in instance.jaccl_coordinators
+    assert placement.drafter_rank == 2  # logical telemetry index past target ranks
+    # v3+ wire: drafter is on a TCP socket, not in mx.distributed.
+    # parent_group_size and jaccl_devices cover only the 2 target ranks.
+    assert instance.parent_group_size == 2
+    assert len(instance.jaccl_devices) == 2
+    assert len(instance.jaccl_devices[0]) == 2
+    # Drafter node does not coordinate the target's mx.distributed group.
+    assert drafter_node not in instance.jaccl_coordinators
 
 
-def test_asymmetric_jaccl_degrades_when_only_socket_path_to_drafter(
+def test_asymmetric_jaccl_socket_only_drafter_succeeds(
     loguru_capture: list[str],
 ) -> None:
-    """Two-node target with jaccl, drafter only socket-reachable => degrade.
+    """Two-node jaccl target + socket-only drafter places successfully.
 
-    Pure jaccl placement requires RDMA all-to-all; if the drafter has only
-    a socket edge to target ranks, asymmetric placement must reject it
-    and fall back to multi-node target without a drafter rank.
+    v3+ wire: drafter IPC runs over a plain TCP socket independent of
+    the target's ``mx.distributed`` group. So a socket-only path from
+    target rank 0 to the drafter node is sufficient even when the
+    target ranks themselves are coordinating over jaccl/RDMA. No
+    degradation event should fire.
     """
     target_a, target_b, drafter_node = NodeId(), NodeId(), NodeId()
     topology = Topology()
     for n in (target_a, target_b, drafter_node):
         topology.add_node(n)
-    # Target cycle has bidirectional RDMA; drafter only has socket edges
-    # (no RDMA edge to either target rank).
+    # Target cycle has bidirectional RDMA; drafter only has socket edges.
     _bidi_rdma(topology, target_a, target_b, iface=30)
     _bidi_socket(topology, target_a, target_b, ip=32)
     _bidi_socket(topology, target_a, drafter_node, ip=34)
@@ -323,7 +327,7 @@ def test_asymmetric_jaccl_degrades_when_only_socket_path_to_drafter(
         instance_meta=InstanceMeta.MlxJaccl,
         command_id=CommandId(),
         model_card=card,
-        min_nodes=2,  # force multi-node target so MlxJaccl is preserved
+        min_nodes=2,
     )
     degradations: list[DrafterPlacementDegraded] = []
 
@@ -347,18 +351,14 @@ def test_asymmetric_jaccl_degrades_when_only_socket_path_to_drafter(
     assert len(placements) == 1
     instance = next(iter(placements.values()))
     assert isinstance(instance, MlxJacclInstance)
-    assert instance.drafter_placement is None
-    assert len(degradations) == 1
-    event = degradations[0]
-    assert (
-        event.reason
-        == DrafterPlacementDegradationReason.NoReachablePathFromTargetRankZero
-    )
-    # Multi-node target without drafter rank cannot fall back to single-device.
-    assert event.fallback == "no_drafter"
-    assert set(event.target_node_ids) == {target_a, target_b}
+    assert instance.drafter_placement is not None
+    assert instance.drafter_placement.drafter_node_id == drafter_node
+    # 2 target ranks + drafter on socket; mx.distributed is target-only.
+    assert instance.parent_group_size == 2
+    assert not degradations
+    # No degradation log line either.
     joined = "\n".join(loguru_capture)
-    assert "Drafter placement degraded" in joined
+    assert "Drafter placement degraded" not in joined
 
 
 def test_asymmetric_degrades_when_eligible_node_missing_from_topology(

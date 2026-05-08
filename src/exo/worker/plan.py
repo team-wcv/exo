@@ -110,7 +110,11 @@ def _kill_runner(
         # case ``LoadModel``), so warmup-gate predicates need to keep
         # waiting rather than tearing the cluster down.
         instance = runner.bound_instance.instance
-        is_multi_rank_instance = instance.parent_group_size > 1
+        # Use ``all_runner_ids`` (target + drafter) so the staleness
+        # predicate fires for asymmetric placements where the drafter
+        # is the only peer (single-target + drafter on a different
+        # node).
+        is_multi_rank_instance = len(instance.all_runner_ids) > 1
         local_is_running = isinstance(runner.status, RunnerRunning)
 
         for global_runner_id in instance.all_runner_ids:
@@ -221,41 +225,68 @@ def _init_distributed_backend(
 ):
     for runner in runners.values():
         instance = runner.bound_instance.instance
-
-        is_single_rank_instance = instance.parent_group_size == 1
-        if is_single_rank_instance:
-            continue
+        runner_id = runner.bound_instance.bound_runner_id
+        bound_instance = runner.bound_instance
 
         runner_is_idle = isinstance(runner.status, RunnerIdle)
-        all_runners_connecting = all(
-            isinstance(
-                all_runners.get(global_runner_id),
-                (RunnerConnecting, RunnerIdle),
-            )
-            for global_runner_id in instance.all_runner_ids
-        )
-
-        if not (runner_is_idle and all_runners_connecting):
+        if not runner_is_idle:
             continue
 
-        runner_id = runner.bound_instance.bound_runner_id
+        # Asymmetric drafter rank: dial-only, no ``mx.distributed`` init.
+        # Dispatch the ConnectToGroup task as soon as the drafter is
+        # idle. ``dial_target`` retries with backoff so an early dial
+        # before target rank 0 binds is recoverable. Decoupling the
+        # drafter from the target's collective barrier is what lets a
+        # multi-target asymmetric instance work without
+        # ``Group.split``.
+        if bound_instance.is_drafter_rank:
+            return ConnectToGroup(instance_id=instance.instance_id)
 
-        # Use parent group size + parent rank so the same predicate
-        # works for symmetric placement (drafter rank doesn't exist)
-        # and asymmetric placement (drafter is the last rank, hence
-        # the "connecting" rank that triggers the ConnectToGroup
-        # collective when all earlier ranks are already RunnerConnecting).
-        parent_size = instance.parent_group_size
-        parent_rank = runner.bound_instance.parent_rank
+        # Single-target symmetric: no mx.distributed group at all.
+        # Single-target asymmetric *with* a drafter still needs the
+        # target rank to enter ``ConnectToGroup`` so it can bind the
+        # drafter listener. Differentiate via the placement.
+        is_single_rank_target = instance.parent_group_size == 1
+        if is_single_rank_target and instance.drafter_placement is None:
+            continue
+
+        # Target-only barrier: drafter ranks are dispatched in the
+        # branch above and are NOT members of any ``mx.distributed``
+        # group under the v3+ wire. Iterate ``shard_assignments`` so
+        # we get the target ranks alone.
+        target_runner_ids = list(instance.shard_assignments.runner_to_shard.keys())
+        all_target_connecting = all(
+            isinstance(
+                all_runners.get(target_runner_id),
+                (RunnerConnecting, RunnerIdle),
+            )
+            for target_runner_id in target_runner_ids
+        )
+
+        if not all_target_connecting:
+            continue
+
+        if is_single_rank_target:
+            # Single target rank in asymmetric placement: it still has
+            # to enter ConnectToGroup to bind the drafter listener and
+            # accept the dial. No mx.distributed barrier to honour.
+            return ConnectToGroup(instance_id=instance.instance_id)
+
+        # Multi-target ranks: keep the original ordering -- earlier
+        # ranks dispatch immediately, the last target rank dispatches
+        # once every other target rank is already RunnerConnecting (or
+        # later).
+        parent_size = instance.parent_group_size  # target ranks only
+        parent_rank = bound_instance.parent_rank
         assert parent_rank < parent_size
         assert parent_rank >= 0
 
         accepting_ranks = parent_rank < parent_size - 1
 
         connecting_rank_ready = parent_rank == parent_size - 1 and all(
-            isinstance(all_runners.get(global_runner_id, None), RunnerConnecting)
-            for global_runner_id in instance.all_runner_ids
-            if global_runner_id != runner_id
+            isinstance(all_runners.get(target_runner_id, None), RunnerConnecting)
+            for target_runner_id in target_runner_ids
+            if target_runner_id != runner_id
         )
 
         if not (accepting_ranks or connecting_rank_ready):
@@ -291,8 +322,19 @@ def _load_model(
         if not all_local_downloads_complete:
             continue
 
-        is_single_rank_instance = instance.parent_group_size == 1
-        if is_single_rank_instance and isinstance(runner.status, RunnerIdle):
+        # Single-target SYMMETRIC instance: no mx.distributed group and
+        # no drafter wire, so the runner can skip the ConnectToGroup
+        # collective and go straight to LoadModel. Single-target
+        # ASYMMETRIC (drafter on a different node) still has to enter
+        # ConnectToGroup so target rank 0 can bind the drafter socket
+        # listener; it falls through to the barrier check below.
+        is_single_rank_target = instance.parent_group_size == 1
+        is_symmetric_placement = instance.drafter_placement is None
+        if (
+            is_single_rank_target
+            and is_symmetric_placement
+            and isinstance(runner.status, RunnerIdle)
+        ):
             return LoadModel(instance_id=instance.instance_id)
 
         is_runner_waiting = isinstance(runner.status, RunnerConnected)
@@ -318,17 +360,11 @@ def _ready_to_warmup(
     for runner in runners.values():
         instance = runner.bound_instance.instance
         runner_id = runner.bound_instance.bound_runner_id
-
-        # Use parent rank/size so warmup ordering applies to drafter
-        # ranks too: rank 0 is the warmup "connector"; higher ranks
-        # (including the drafter at rank parent_size-1) are accepting.
-        parent_rank = runner.bound_instance.parent_rank
-        parent_size = instance.parent_group_size
+        bound_instance = runner.bound_instance
 
         is_runner_loaded = isinstance(runner.status, RunnerLoaded)
-
-        assert parent_rank < parent_size
-        assert parent_rank >= 0
+        if not is_runner_loaded:
+            continue
 
         # ``RunnerWarmingUp`` is the canonical "ready to run warmup" state
         # for an accepting rank, but a peer that has already advanced past
@@ -344,21 +380,37 @@ def _ready_to_warmup(
             RunnerRunning,
         )
 
+        # Drafter rank: warmup is independent (one drafter forward) so
+        # dispatch as soon as the drafter is RunnerLoaded.
+        if bound_instance.is_drafter_rank:
+            return StartWarmup(instance_id=instance.instance_id)
+
+        # Target ranks: keep the rank-0-connector ordering across
+        # target-only ranks. The drafter rank is excluded from this
+        # barrier (its own warmup is independent).
+        parent_rank = bound_instance.parent_rank
+        parent_size = instance.parent_group_size  # target ranks only
+
+        assert parent_rank < parent_size
+        assert parent_rank >= 0
+
+        target_runner_ids = list(instance.shard_assignments.runner_to_shard.keys())
+
         accepting_ranks_ready = parent_rank > 0 and all(
             isinstance(
-                all_runners.get(global_runner_id, None),
+                all_runners.get(target_runner_id, None),
                 (RunnerLoaded, *post_loaded_states),
             )
-            for global_runner_id in instance.all_runner_ids
+            for target_runner_id in target_runner_ids
         )
 
         connecting_rank_ready = parent_rank == 0 and all(
-            isinstance(all_runners.get(global_runner_id, None), post_loaded_states)
-            for global_runner_id in instance.all_runner_ids
-            if global_runner_id != runner_id
+            isinstance(all_runners.get(target_runner_id, None), post_loaded_states)
+            for target_runner_id in target_runner_ids
+            if target_runner_id != runner_id
         )
 
-        if is_runner_loaded and (accepting_ranks_ready or connecting_rank_ready):
+        if accepting_ranks_ready or connecting_rank_ready:
             return StartWarmup(instance_id=instance.instance_id)
 
     return None

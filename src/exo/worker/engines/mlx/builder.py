@@ -1,7 +1,9 @@
 import contextlib
 import os
+import socket
 from collections.abc import Generator
 from dataclasses import dataclass
+from typing import cast
 
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -44,16 +46,18 @@ class MlxBuilder(Builder):
     cancel_receiver: MpReceiver[TaskId]
     inference_model: Model | None = None
     tokenizer: TokenizerWrapper | None = None
-    # ``group`` is the *target subgroup* (excludes the drafter rank when
-    # asymmetric). Pipeline / tensor / batch collectives all run on it,
-    # so existing call sites that pass ``self.group`` work unchanged
-    # under both symmetric and asymmetric placement.
+    # ``group`` is the target ranks' ``mx.distributed.Group``: pipeline
+    # / tensor / batch collectives all run on it. Under the v3+ wire
+    # the drafter is NOT a member of this group (asymmetric drafters
+    # talk to target rank 0 over a TCP socket; see ``drafter_socket``
+    # below).
     group: mx.distributed.Group | None = None
-    # The full parent group (size == target world + 1 when asymmetric).
-    # Reserved for ``RemoteTransport`` send/recv between target rank 0
-    # and the drafter rank. ``None`` for single-device builds and for
-    # symmetric multi-rank builds (where ``group`` is the parent).
-    parent_group: mx.distributed.Group | None = None
+    # Connected TCP socket from target rank 0 to the drafter rank.
+    # Set ONLY on target rank 0 of an asymmetric placement; ``None``
+    # everywhere else (other target ranks don't drive drafter IPC, and
+    # single-device / symmetric multi-rank builds have no drafter
+    # wire at all).
+    drafter_socket: socket.socket | None = None
     drafter_rank_in_parent: int | None = None
     vision_processor: VisionProcessor | None = None
     draft_model: Model | None = None
@@ -62,10 +66,15 @@ class MlxBuilder(Builder):
     def connect(self, bound_instance: BoundInstance) -> None:
         split = initialize_mlx(bound_instance)
         self.group = split.target_subgroup
-        # When symmetric, parent and target_subgroup are the same group;
-        # leave ``parent_group`` as None so callers can branch on
-        # ``parent_group is not None`` to mean "asymmetric drafter".
-        self.parent_group = split.parent if split.is_asymmetric else None
+        # Only target rank 0 in an asymmetric placement holds a drafter
+        # socket; every other rank sees ``None`` here. ``MlxGroupSplit``
+        # types it as ``object | None`` to keep the dataclass importable
+        # without ``socket``; cast back to the concrete type for
+        # consumers.
+        if split.drafter_socket is not None:
+            self.drafter_socket = cast(socket.socket, split.drafter_socket)
+        else:
+            self.drafter_socket = None
         self.drafter_rank_in_parent = split.drafter_rank_in_parent
 
     def load(self, bound_instance: BoundInstance) -> Generator[ModelLoadingResponse]:
@@ -84,8 +93,10 @@ class MlxBuilder(Builder):
             del self.tokenizer
         with contextlib.suppress(NameError, AttributeError):
             del self.group
-        with contextlib.suppress(NameError, AttributeError):
-            del self.parent_group
+        if self.drafter_socket is not None:
+            with contextlib.suppress(OSError):
+                self.drafter_socket.close()
+            self.drafter_socket = None
         with contextlib.suppress(NameError, AttributeError):
             del self.draft_model
 
@@ -140,14 +151,18 @@ class MlxBuilder(Builder):
             or configured_draft_mode in ("ngram", "pipelined")
         )
 
-        # Asymmetric placement: parent group spans all target ranks +
-        # the drafter rank, drafter lives on a separate MLX rank.
+        # Asymmetric placement: drafter lives on a separate node; only
+        # target rank 0 owns the drafter wire (``drafter_socket``).
         # Force the SequentialGenerator path (BatchGenerator has no
         # spec-decoding hook) and build a long-lived RemoteTransport
         # that the spec loop reuses across requests.
-        is_asymmetric = (
-            self.parent_group is not None and self.drafter_rank_in_parent is not None
-        )
+        #
+        # Other target ranks in an asymmetric placement (rank >= 1) see
+        # ``drafter_socket is None`` and treat their build the same as
+        # symmetric multi-rank: they participate in target collectives
+        # but never call drafter ops directly. The spec loop's
+        # rank-0-only sampling decision keeps that invariant.
+        is_asymmetric_target_rank_zero = self.drafter_socket is not None
         # Long-lived ``RemoteTransport`` (NOT a per-task DrafterTransport).
         # Each in-flight request opens its own session via
         # :meth:`RemoteTransport.open_session`; the session handle is the
@@ -157,9 +172,8 @@ class MlxBuilder(Builder):
         from exo.worker.engines.mlx.generator.remote_drafter import RemoteTransport
 
         remote_drafter_transport: RemoteTransport | None = None
-        if is_asymmetric:
-            assert self.parent_group is not None
-            assert self.drafter_rank_in_parent is not None
+        if is_asymmetric_target_rank_zero:
+            assert self.drafter_socket is not None
             from exo.worker.engines.mlx.generator.remote_drafter import (
                 make_remote_transport,
             )
@@ -167,22 +181,30 @@ class MlxBuilder(Builder):
             num_draft_tokens_remote = parse_env_int(
                 EXO_NUM_DRAFT_TOKENS, DEFAULT_NUM_DRAFT_TOKENS
             )
-            target_rank_in_parent = self.parent_group.rank()
+            target_world_size = self.group.size() if self.group is not None else 1
             logger.info(
                 "Allocating long-lived RemoteTransport: "
-                f"parent_group_size={self.parent_group.size()} "
-                f"target_rank_in_parent={target_rank_in_parent} "
-                f"drafter_rank_in_parent={self.drafter_rank_in_parent} "
-                f"K={num_draft_tokens_remote}"
+                f"target_world_size={target_world_size} "
+                f"drafter_rank={self.drafter_rank_in_parent} "
+                f"K={num_draft_tokens_remote} "
+                f"transport=tcp_socket"
             )
             remote_drafter_transport = make_remote_transport(
                 draft_model=None,
                 draft_cache=None,
                 num_draft_tokens=num_draft_tokens_remote,
-                group=self.parent_group,
-                drafter_rank=self.drafter_rank_in_parent,
-                target_rank=target_rank_in_parent,
+                sock=self.drafter_socket,
             )
+
+        # Asymmetric "is the cluster speculative-decoding-aware" check.
+        # Used below to force ``SequentialGenerator`` and to log mode
+        # selection. Non-zero ranks of an asymmetric instance do NOT
+        # set this flag (they don't own the wire) but they still enter
+        # the same generator path because the placement-time decision
+        # to enable the drafter is uniform across target ranks.
+        is_asymmetric = (
+            is_asymmetric_target_rank_zero or self.drafter_rank_in_parent is not None
+        )
 
         if (
             os.environ.get("EXO_NO_BATCH")
@@ -259,7 +281,6 @@ class MlxBuilder(Builder):
                 num_draft_tokens=num_draft_tokens,
                 drafter_min_output_tokens=drafter_min_output_tokens,
                 adaptive_draft_tokens=adaptive_draft_tokens,
-                parent_group=self.parent_group,
                 drafter_rank_in_parent=self.drafter_rank_in_parent,
                 remote_drafter_transport=remote_drafter_transport,
                 max_concurrent_tasks=max_concurrent_tasks,

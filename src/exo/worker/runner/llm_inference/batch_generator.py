@@ -184,13 +184,14 @@ class SequentialGenerator(Engine):
     # of observed acceptance fractions. Disabled by default so K stays
     # predictable for benchmarking.
     adaptive_draft_tokens: bool = False
-    # Asymmetric placement: parent group spans all target ranks + the
-    # drafter rank. ``parent_group`` is None for symmetric/single-device
-    # builds (in which case ``self.group`` is the only group). When set
+    # Asymmetric placement telemetry: ``drafter_rank_in_parent`` mirrors
+    # :attr:`DrafterPlacement.drafter_rank` (advisory only; the drafter
+    # is NOT a member of any ``mx.distributed.Group`` under the v3+
+    # wire). ``None`` for symmetric/single-device builds. When set
     # together with ``remote_drafter_transport``, every request runs
     # the pipelined+remote drafter path: the spec loop talks to the
-    # drafter via ``mx.distributed.send/recv`` on the parent group.
-    parent_group: mx.distributed.Group | None = None
+    # drafter via the dedicated drafter TCP socket owned by
+    # ``RemoteTransport`` rather than ``mx.distributed`` collectives.
     drafter_rank_in_parent: int | None = None
     # Long-lived transport bound to the drafter rank. Allocated once at
     # builder.build() time; reused across requests so the executor
@@ -734,7 +735,6 @@ class SequentialGenerator(Engine):
             drafter_model_id=self.draft_model_id,
             num_draft_tokens=effective_num_draft_tokens,
             drafter_min_output_tokens=self.drafter_min_output_tokens,
-            asymmetric_parent_group=self.parent_group,
             asymmetric_drafter_rank=self.drafter_rank_in_parent,
             asymmetric_drafter_transport=self.remote_drafter_transport,
             precomputed_target_cache=precomputed_target_cache,

@@ -22,17 +22,22 @@ class InstanceMeta(str, Enum):
 class DrafterPlacement(FrozenModel):
     """Locator for an asymmetric drafter rank inside an :class:`Instance`.
 
-    The drafter runs on a separate node from the target ranks but
-    participates in the same parent ``mx.distributed`` group, so the
-    target rank that owns sampling decisions (``target_subgroup`` rank
-    0) can reach it via point-to-point ``send/recv``. Target ranks split
-    off into ``target_subgroup`` for their own collectives; the drafter
-    drops into a size-1 subgroup of its own. The parent group is
-    reserved for target<->drafter point-to-point IPC.
+    The drafter runs on a separate node from the target ranks. It is
+    intentionally NOT a member of the target ranks'
+    ``mx.distributed.Group``: the target group is target-only, and
+    drafter <-> target IPC flows over a direct TCP socket established
+    at instance bootstrap. Decoupling the drafter from
+    ``mx.distributed`` lets target ranks of any size use TP/PP
+    collectives without requiring ``Group.split`` (which jaccl/ring
+    backends do not implement on Apple Silicon).
 
-    Convention: ``drafter_rank`` is the **last** rank in the parent
-    group (``parent_world_size - 1``). Placement enforces this so the
-    runtime never has to guess where the drafter lives.
+    Convention: ``drafter_rank`` is preserved as a logical placement
+    index (always equal to ``len(target_ranks)``) for telemetry and
+    tests, but no longer corresponds to a rank inside an
+    ``mx.distributed.Group``. The drafter dials
+    ``drafter_socket_host:drafter_socket_port`` to reach target rank 0;
+    target rank 0 binds and listens on that endpoint at instance
+    bootstrap.
 
     Fields:
         drafter_node_id:    Where the drafter runner lives.
@@ -45,26 +50,39 @@ class DrafterPlacement(FrozenModel):
                             of the entries in the target's
                             ``ModelCard.drafter_model_ids`` list
                             (placement enforces this invariant).
-        drafter_rank:       Rank of the drafter inside the parent
-                            ``mx.distributed`` group. Conventionally
-                            ``parent_world_size - 1``.
+        drafter_rank:       Logical placement index of the drafter
+                            inside the conceptual parent group
+                            (target_world_size). Retained for
+                            placement bookkeeping; not a real
+                            ``mx.distributed`` rank in the v3+ wire.
+        drafter_socket_host: Host (LAN/Thunderbolt-bridge IP or
+                             hostname) target rank 0 advertises for
+                             the drafter wire. The drafter dials this
+                             host to reach target rank 0.
+        drafter_socket_port: TCP port target rank 0 binds on for
+                             drafter wire ops. Allocated at placement
+                             time; the runner bootstrap binds that
+                             specific port (failure is a hard error).
     """
 
     drafter_node_id: NodeId
     drafter_runner_id: RunnerId
     drafter_model_id: ModelId
     drafter_rank: int = Field(ge=0)
+    drafter_socket_host: str
+    drafter_socket_port: int = Field(ge=1, le=65535)
 
 
 class BaseInstance(TaggedModel):
     instance_id: InstanceId
     shard_assignments: ShardAssignments
     # When set, this instance places the drafter on a separate node from
-    # the target ranks and routes drafter/verify IPC over the parent
-    # ``mx.distributed`` group. ``None`` (the default) preserves legacy
-    # symmetric placement: every rank in ``shard_assignments`` runs a
-    # target shard, and any drafter declared on the model card is loaded
-    # in-process alongside the target on the single-device cycle.
+    # the target ranks and routes drafter/verify IPC over a direct TCP
+    # socket (see :class:`DrafterPlacement`). ``None`` (the default)
+    # preserves legacy symmetric placement: every rank in
+    # ``shard_assignments`` runs a target shard, and any drafter
+    # declared on the model card is loaded in-process alongside the
+    # target on the single-device cycle.
     drafter_placement: DrafterPlacement | None = None
 
     def shard(self, runner_id: RunnerId) -> ShardMetadata | None:
@@ -72,16 +90,16 @@ class BaseInstance(TaggedModel):
 
     @property
     def parent_group_size(self) -> int:
-        """Size of the parent ``mx.distributed`` group.
+        """Size of the target ranks' ``mx.distributed`` group.
 
-        Equals ``len(shard_assignments.runner_to_shard)`` for symmetric
-        placement (every rank is a target shard), or that count + 1 when
-        an asymmetric drafter rank is appended.
+        Always equals ``len(shard_assignments.runner_to_shard)``: in
+        the v3+ asymmetric wire the drafter rank does NOT join the
+        target ``mx.distributed.Group`` (it talks to target rank 0 via
+        a direct TCP socket). Symmetric and asymmetric placement
+        therefore both report the same size here, equal to the number
+        of target shards.
         """
-        target_world_size = len(self.shard_assignments.runner_to_shard)
-        if self.drafter_placement is not None:
-            return target_world_size + 1
-        return target_world_size
+        return len(self.shard_assignments.runner_to_shard)
 
     def is_drafter_runner(self, runner_id: RunnerId) -> bool:
         return (

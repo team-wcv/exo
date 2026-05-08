@@ -147,12 +147,28 @@ _KIND_DEFAULT: Final[str] = "inprocess"
         ("inprocess", "inprocess"),
         ("INPROCESS", "inprocess"),
         ("  inprocess  ", "inprocess"),
-        ("remote", "remote"),
-        ("Remote", "remote"),
     ],
 )
 def test_parse_transport_kind_recognised(raw: str | None, expected: str) -> None:
+    """Only ``inprocess`` is a valid transport-kind keyword.
+
+    The legacy ``"remote"`` keyword was a factory hint for the
+    ``mx.distributed``-backed asymmetric drafter; the v3+ asymmetric
+    wire is built directly from the runner bootstrap with a connected
+    socket and never goes through the env-var factory.
+    """
     assert parse_transport_kind(raw, _KIND_DEFAULT) == expected
+
+
+def test_parse_transport_kind_rejects_legacy_remote() -> None:
+    """Legacy ``"remote"`` keyword falls back to the default with a warning.
+
+    The asymmetric remote transport is built directly from the runner
+    bootstrap in v3+; an env-var hint of ``"remote"`` no longer has a
+    factory backing and must degrade to ``inprocess`` rather than crash.
+    """
+    assert parse_transport_kind("remote", _KIND_DEFAULT) == _KIND_DEFAULT
+    assert parse_transport_kind("Remote", _KIND_DEFAULT) == _KIND_DEFAULT
 
 
 def test_parse_transport_kind_falls_back_for_unknown() -> None:
@@ -417,23 +433,21 @@ def test_pipelined_drafter_shutdown_delegates() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_make_drafter_pipelined_resolves_transport_from_env(
+def test_make_drafter_pipelined_without_model_or_transport_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``make_drafter("pipelined", ...)`` should consult ``EXO_DRAFTER_TRANSPORT``.
+    """``make_drafter("pipelined", ...)`` requires either a model+cache or a transport.
 
-    Without a real MLX drafter model we can't construct an in-process
-    transport here; we just assert the env var is read and that the
-    dispatch reaches :func:`transport_factory_for` (which raises a
-    ``ValueError`` for unknown kinds).
+    The env-var-driven factory path is gone in v3+ (asymmetric remote
+    transport is constructed directly by the runner bootstrap). Calling
+    ``make_drafter`` with neither a builder-supplied transport nor a
+    drafter model + cache must raise a clear error -- it has no way to
+    construct the in-process transport.
     """
     from exo.worker.engines.mlx.generator.drafter import make_drafter
 
-    monkeypatch.setenv(EXO_DRAFTER_TRANSPORT_ENV, "totally-bogus")
-    # Bogus kind warns and falls back to ``inprocess``; ``make_drafter``
-    # then fails because we passed no model/cache. The error message
-    # should reference both ``pipelined`` and the missing pieces.
-    with pytest.raises(ValueError, match="pipelined.*inprocess"):
+    monkeypatch.delenv(EXO_DRAFTER_TRANSPORT_ENV, raising=False)
+    with pytest.raises(ValueError, match="pipelined"):
         make_drafter(
             mode="pipelined",
             num_draft_tokens=4,

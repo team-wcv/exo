@@ -797,7 +797,6 @@ def mlx_generate(
     drafter_model_id: ModelId | None = None,
     num_draft_tokens: int | None = None,
     drafter_min_output_tokens: int | None = None,
-    asymmetric_parent_group: mx.distributed.Group | None = None,
     asymmetric_drafter_rank: int | None = None,
     asymmetric_drafter_transport: object | None = None,
     precomputed_target_cache: KVCacheType | None = None,
@@ -873,18 +872,19 @@ def mlx_generate(
     ) or 0
     max_tokens = task.max_output_tokens or MAX_TOKENS
     asymmetric_drafter_active = (
-        asymmetric_parent_group is not None
-        and asymmetric_drafter_rank is not None
+        asymmetric_drafter_rank is not None
+        and asymmetric_drafter_transport is not None
         and request_use_drafter is not False
     )
     if asymmetric_drafter_active:
-        # Asymmetric placement: the drafter lives on a separate MLX
-        # rank, communicating via mx.distributed.send/recv on the
-        # parent group. This bypasses the legacy "group is not None ->
-        # draft_mode = none" demotion (which exists because mlx_lm's
-        # own speculative_generate_step doesn't handle pipeline
-        # collectives). The pipelined+remote path is the whole point
-        # of the asymmetric topology, so honor it unconditionally.
+        # Asymmetric placement: the drafter lives on a separate node,
+        # talking to target rank 0 over a TCP socket owned by the
+        # ``RemoteTransport`` wire. This bypasses the legacy "group is
+        # not None -> draft_mode = none" demotion (which exists because
+        # mlx_lm's own speculative_generate_step doesn't handle
+        # pipeline collectives). The pipelined+remote path is the
+        # whole point of the asymmetric topology, so honor it
+        # unconditionally.
         draft_mode: DraftMode = "pipelined"
     elif group is not None:
         draft_mode = "none"
@@ -1209,9 +1209,7 @@ def mlx_generate(
     # drafter rank until the runner shuts down.
     asymmetric_session: object | None = None
     if asymmetric_drafter_active:
-        assert asymmetric_parent_group is not None
         assert asymmetric_drafter_rank is not None
-        target_rank_in_parent = asymmetric_parent_group.rank()
         target_subgroup_size = group.size() if group is not None else 1
         # ``asymmetric_drafter_transport`` is the long-lived wire owner
         # (``RemoteTransport``) supplied by the runner; per-request the
@@ -1260,9 +1258,6 @@ def mlx_generate(
                 num_draft_tokens=effective_num_draft_tokens,
                 draft_model=None,
                 draft_cache=None,
-                remote_parent_group=asymmetric_parent_group,
-                remote_drafter_rank=asymmetric_drafter_rank,
-                remote_target_rank=target_rank_in_parent,
                 target_subgroup_size=target_subgroup_size,
                 pipelined_transport=session_transport,
             )

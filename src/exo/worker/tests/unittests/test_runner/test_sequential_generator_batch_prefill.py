@@ -104,7 +104,6 @@ def _bare_seq_generator(
     g.num_draft_tokens = None
     g.drafter_min_output_tokens = None
     g.adaptive_draft_tokens = False
-    g.parent_group = None
     g.drafter_rank_in_parent = None
     g.remote_drafter_transport = None
     g.check_for_cancel_every = 50

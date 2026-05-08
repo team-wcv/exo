@@ -748,9 +748,6 @@ def make_drafter(
     num_draft_tokens: int,
     draft_model: Model | None,
     draft_cache: KVCacheType | None,
-    remote_parent_group: "mx.distributed.Group | None" = None,
-    remote_drafter_rank: int | None = None,
-    remote_target_rank: int | None = None,
     target_subgroup_size: int = 1,
     pipelined_transport: object | None = None,
 ) -> Drafter:
@@ -760,26 +757,22 @@ def make_drafter(
     requested without a loaded drafter; callers should resolve that via
     :func:`resolve_draft_mode` (which downgrades silently).
 
-    For ``mode == "pipelined"`` the transport kind is selected as:
+    For ``mode == "pipelined"`` the transport is selected as:
 
-      * ``"remote"`` when ``remote_parent_group`` is non-None (asymmetric
-        placement: drafter lives on a separate MLX rank). ``draft_model``
-        / ``draft_cache`` are ignored on the target rank.
-      * ``"inprocess"`` otherwise (single-process pipelining win, no
-        remote IPC). Requires both ``draft_model`` and ``draft_cache``.
+      * The supplied ``pipelined_transport`` (asymmetric placement:
+        the runner bootstrap allocates a long-lived ``RemoteTransport``
+        bound to the drafter socket and the spec loop opens a
+        per-request session view of it). ``draft_model`` /
+        ``draft_cache`` are ignored on the target rank in this path.
+      * Otherwise an in-process transport built from the supplied
+        ``draft_model`` / ``draft_cache`` (single-process pipelining
+        win, no remote IPC).
 
-    ``EXO_DRAFTER_TRANSPORT`` is honored only when ``remote_parent_group``
-    is None (debug/dev override for forcing remote transport in tests
-    is intentionally not exposed as an env var; the real remote path
-    requires the runner-bootstrap-supplied parent group).
-
-    V1 asymmetric constraint: the remote transport assumes
-    ``target_subgroup_size == 1`` (a single target rank issuing drafter
-    IPC). Multi-target asymmetric (``target_subgroup_size > 1``) requires
-    broadcasting drafts on the target subgroup to keep ranks in lockstep
-    and is rejected loudly here until that lands; placement still emits
-    a successful asymmetric :class:`DrafterPlacement` so telemetry is
-    accurate, but the runner side fails to construct a transport.
+    Multi-target asymmetric (``target_subgroup_size > 1``) requires
+    broadcasting drafts on the target subgroup to keep target ranks in
+    lockstep, which is a planned follow-up. Single-target asymmetric
+    (the case where ``RemoteTransport`` ships drafts to one consumer)
+    is supported today.
     """
     if mode == "none":
         return NoSpecDrafter()
@@ -810,10 +803,8 @@ def make_drafter(
         # Imported here to keep the module's import surface minimal in
         # the common (model/ngram/none) paths.
         from exo.worker.engines.mlx.generator.drafter_transport import (
-            EXO_DRAFTER_TRANSPORT_ENV,
             DrafterTransport,
-            parse_transport_kind,
-            transport_factory_for,
+            make_inprocess_transport,
         )
         from exo.worker.engines.mlx.generator.pipelined_drafter import (
             PipelinedModelDrafter,
@@ -842,73 +833,22 @@ def make_drafter(
                 num_draft_tokens=num_draft_tokens,
             )
 
-        if remote_parent_group is not None:
-            transport_kind = "remote"
-        else:
-            transport_kind = parse_transport_kind(
-                os.environ.get(EXO_DRAFTER_TRANSPORT_ENV), default="inprocess"
-            )
-
-        if transport_kind == "remote":
-            if remote_parent_group is None:
-                raise ValueError(
-                    "draft_mode='pipelined' with remote transport requires "
-                    "remote_parent_group; the runner bootstrap supplies it "
-                    "from the asymmetric MlxGroupSplit"
-                )
-            if remote_drafter_rank is None or remote_target_rank is None:
-                raise ValueError(
-                    "draft_mode='pipelined' with remote transport requires "
-                    "remote_drafter_rank and remote_target_rank"
-                )
-            if target_subgroup_size > 1:
-                # V1 boundary; see docstring.
-                raise NotImplementedError(
-                    f"Asymmetric drafter with target_subgroup_size="
-                    f"{target_subgroup_size} (> 1) requires broadcasting "
-                    "drafts on the target subgroup. V1 supports a single "
-                    "target rank (twins topology); multi-target "
-                    "asymmetric is a planned follow-up."
-                )
-
-        factory = transport_factory_for(transport_kind)
-        if transport_kind == "inprocess" and (
-            draft_model is None or draft_cache is None
-        ):
+        # No builder-supplied transport: in-process is the only sensible
+        # default. Asymmetric placements always supply
+        # ``pipelined_transport`` from the builder; reaching this branch
+        # without one means a single-process pipelined drafter.
+        if draft_model is None or draft_cache is None:
             raise ValueError(
-                "draft_mode='pipelined' with EXO_DRAFTER_TRANSPORT='inprocess' "
-                "requires both draft_model and draft_cache"
+                "draft_mode='pipelined' without a builder-supplied "
+                "transport requires both draft_model and draft_cache"
             )
-        constructed = factory(
+        constructed = make_inprocess_transport(
             draft_model=draft_model,
             draft_cache=draft_cache,
             num_draft_tokens=num_draft_tokens,
-            group=remote_parent_group,
-            drafter_rank=remote_drafter_rank,
-            target_rank=remote_target_rank,
         )
-        # ``RemoteTransport`` is the wire owner -- callers must
-        # ``open_session()`` to get a per-request :class:`DrafterTransport`
-        # view. The env-var fallback is a single-session path (one
-        # ``mlx_generate`` call per ``make_drafter``) so we open a session
-        # eagerly and bind it to this drafter; the wire owner leaks for
-        # the lifetime of the process, which matches how production
-        # asymmetric placement (builder-supplied ``pipelined_transport``)
-        # already manages it.
-        from exo.worker.engines.mlx.generator.remote_drafter import RemoteTransport
-
-        if isinstance(constructed, RemoteTransport):
-            spec_transport: DrafterTransport = constructed.open_session()
-        elif isinstance(constructed, DrafterTransport):
-            spec_transport = constructed
-        else:
-            raise TypeError(
-                f"transport factory returned unsupported type "
-                f"{type(constructed).__name__}; expected RemoteTransport or "
-                "DrafterTransport"
-            )
         return PipelinedModelDrafter(
-            transport=spec_transport,
+            transport=constructed,
             num_draft_tokens=num_draft_tokens,
         )
     # Exhaustiveness: DraftMode is a closed Literal. Any other value is a
