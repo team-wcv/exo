@@ -18,8 +18,69 @@ is ~0.1-0.3 (parallelism is bounded by memory-bandwidth contention,
 not GPU saturation). The architecture's payoff scales with topology:
 on a multi-machine deployment where target verify includes a network
 round-trip, the speculative drafter forward fully overlaps the
-network latency and the gain unlocks. Layer B of this PR ships
-:class:`RemoteTransport` which is precisely that case.
+network latency and the gain unlocks. :class:`RemoteTransport` ships
+exactly that case.
+
+Multi-target asymmetric placement (V2 ``target_subgroup_size > 1``)
+--------------------------------------------------------------------
+The target group is tensor-parallel across N nodes; the drafter lives
+on a different node and talks to target rank 0 over a TCP socket. Per-
+round flow:
+
+  1. **Drafter -> target rank 0 (socket).** Rank 0 issues an
+     ``OP_FORWARD`` over the wire, gets back ``k_this`` drafts.
+  2. **Rank 0 -> all target ranks (collective).** Rank 0 broadcasts
+     the drafts on the target subgroup via :func:`_broadcast_drafts`.
+     Non-root ranks receive into the same buffer shape; the broadcast
+     uses :func:`mx_broadcast_int_list` (a length-prefixed
+     ``all_sum``). Drafter-rank does NOT participate -- it isn't a
+     member of the target subgroup.
+  3. **All target ranks (collective).** Run the verify forward
+     ``model([seed, *drafts])`` -- a TP all-reduce inside the model
+     makes logits byte-identical on every target rank.
+  4. **Rank 0 samples + broadcasts target tokens.** The sampler is
+     non-deterministic (temperature > 0 uses MLX's per-rank PRNG) so
+     each rank would otherwise produce divergent ``target_tokens``,
+     diverge on ``num_accepted``, trim the prompt cache by different
+     amounts, and desync at the next TP forward. Rank 0 samples
+     locally and broadcasts the chosen tokens via
+     :func:`_broadcast_target_tokens`; non-root ranks consume the
+     broadcast and skip the sampler entirely. Determinism then falls
+     out of the broadcast contract rather than relying on RNG state
+     coordination.
+  5. **All target ranks compute identical accept/reject.** Both ranks
+     compare ``target_tokens`` (now identical from broadcast) against
+     ``drafts`` (also identical from step 2), reach the same
+     ``num_accepted``, and trim the prompt cache by the same amount.
+  6. **Drafter cache reconciliation on rank 0 only.** Rank 0 issues
+     any required ``OP_TRIM_CACHE`` / next-round ``OP_FORWARD`` over
+     the socket; non-root just waits for the next draft broadcast
+     round at step 2.
+
+The collective overhead per round is two small ``all_sum`` calls
+(drafts ``k+1`` ints, target tokens ``k+1`` ints) -- microsecond-
+range on Thunderbolt RDMA, negligible against the verify forward.
+
+Known limitation: drafter-rank death mid-generation
+----------------------------------------------------
+If the drafter rank crashes between rounds, root's
+``transport.forward`` raises ``ConnectionError`` and root's
+``mlx_generate`` exits via the request-level ``finally`` (which
+shuts the broken session down cleanly). Non-root target ranks are
+blocked inside :func:`_broadcast_drafts` waiting for root to feed
+drafts; they have no out-of-band signal that root has aborted, so
+they hang on the collective until the runner is restarted.
+
+This is the same failure mode as any target-side rank death (the
+TP collective stalls the survivors), and the operator-restart
+recovery path is identical. A follow-up could thread a
+"termination sentinel" through the existing length-prefix slot
+(which has unused encoding space above ``k``) so root broadcasts
+one final aborted-round signal before exiting; non-root ranks
+would then exit cleanly. Out of scope for the current pass --
+drafter death is rare in the operator-managed deployment we
+target, and the existing failure mode is fail-loud rather than
+silent corruption.
 
 Cache accounting (drafter side) -- this is the only complex bit, so
 spelled out here once and referenced from the code:
@@ -350,6 +411,65 @@ def _broadcast_drafts(
     return broadcast[1 : 1 + actual_len]
 
 
+def _broadcast_target_tokens(
+    target_tokens: list[int] | None,
+    *,
+    k: int,
+    k_this: int,
+    target_group: mx.distributed.Group | None,
+    is_root: bool,
+) -> list[int]:
+    """Rank-0 broadcast of post-verify sampled tokens, slot count ``k + 1``.
+
+    Why a separate broadcast from the drafts: the sampler is the only
+    non-deterministic step in the verify path. With temperature > 0
+    each target rank's MLX PRNG advances independently, so identical
+    logits produce divergent ``target_tokens`` and the ranks desync on
+    the next TP forward. Broadcasting the chosen tokens from rank 0
+    makes the sampler effectively a rank-0 operation; non-root ranks
+    skip the sampler entirely.
+
+    Wire format: fixed-size ``k + 1`` int buffer (the verify forward
+    always produces exactly ``k_this + 1`` tokens; trailing slots are
+    zero-padded so the buffer shape doesn't change with ``k_this``).
+    Both ranks know ``k_this`` from the prior draft broadcast, so we
+    skip the length prefix and slice on receive.
+
+    Single-rank short-circuit (``target_group is None``): identity on
+    root; programming error on consumer (no broadcast peer).
+    """
+    if target_group is None:
+        if not is_root or target_tokens is None:
+            raise RuntimeError(
+                "non-root broadcast consumer requires target_group"
+            )
+        if len(target_tokens) != k_this + 1:
+            raise RuntimeError(
+                f"target_tokens length ({len(target_tokens)}) must "
+                f"equal k_this + 1 ({k_this + 1}); the verifier always "
+                "emits exactly that many tokens per round"
+            )
+        return list(target_tokens)
+    if is_root:
+        if target_tokens is None:
+            raise RuntimeError("root broadcaster requires target_tokens")
+        if len(target_tokens) != k_this + 1:
+            raise RuntimeError(
+                f"target_tokens length ({len(target_tokens)}) must "
+                f"equal k_this + 1 ({k_this + 1}); the verifier always "
+                "emits exactly that many tokens per round"
+            )
+        payload = list(target_tokens) + [0] * (k - k_this)
+        broadcast = mx_broadcast_int_list(
+            payload, k + 1, target_group, is_root=True
+        )
+    else:
+        broadcast = mx_broadcast_int_list(
+            None, k + 1, target_group, is_root=False
+        )
+    return broadcast[: k_this + 1]
+
+
 def _pipelined_speculative_step(
     *,
     prompt: mx.array,
@@ -487,6 +607,18 @@ def _pipelined_speculative_step(
         # On a target with ~10ms step time this saves ~10-15ms per
         # round -- typically the difference between net-win and net-loss
         # for spec-decode on fast quantised targets.
+        #
+        # Multi-target determinism: ``logits`` is byte-identical across
+        # target ranks because the model's final layer all-reduces it
+        # via TP. Logits processors are pure functions of ``logits`` and
+        # ``prev_tokens`` (also identical across ranks), so logprobs are
+        # identical too. The sampler is the only non-deterministic step
+        # (``mx.random.categorical`` uses MLX's per-rank PRNG). Rank 0
+        # samples; non-root ranks skip the sampler and pick up tokens
+        # from the broadcast below. Logprobs are still computed locally
+        # on every rank because they're cheap and the yield contract
+        # passes them upward (the user only ever sees rank 0's, but
+        # keeping the local view matches the single-rank path).
         position_independent = all(
             getattr(p, "position_independent", False) for p in logits_processors
         )
@@ -497,15 +629,31 @@ def _pipelined_speculative_step(
             batched_logprobs = batched_logits - mx.logsumexp(
                 batched_logits, axis=-1, keepdims=True
             )
-            sampled_batch = sampler(batched_logprobs)
-            mx.eval(sampled_batch)
-            target_tokens = [int(t) for t in sampled_batch.tolist()]  # type: ignore[reportUnknownArgumentType]
             target_logprobs = [batched_logprobs[i] for i in range(k_this + 1)]
+            if is_target_root:
+                sampled_batch = sampler(batched_logprobs)
+                mx.eval(sampled_batch)
+                target_tokens = [int(t) for t in sampled_batch.tolist()]  # type: ignore[reportUnknownArgumentType]
+            else:
+                # Filled by broadcast below; skip the sampler entirely.
+                target_tokens = []
         else:
             # Stateful path: logits processors (e.g. repetition penalty)
             # depend on ``running_prev`` which only resolves between
             # positions, so we can't batch. Per-position sync is the
             # cost of correctness here.
+            #
+            # Cross-rank determinism subtlety: the loop's ``running_prev``
+            # advances by the sampled token at each position. On rank 0
+            # we sample to advance it; on non-root ranks we don't have
+            # the token yet (the broadcast happens after the loop), so
+            # we'd advance with the wrong tokens. To keep the per-rank
+            # codepath identical we sample on every rank and broadcast
+            # after; the broadcast then overwrites ``target_tokens`` so
+            # downstream accept/reject is identical. Per-rank sampler
+            # divergence inside this loop is harmless because nothing
+            # consumes ``target_tokens`` between sampler call and
+            # broadcast; it gets clobbered before use.
             target_logprobs = []
             target_tokens = []
             running_prev = prev_tokens
@@ -522,6 +670,18 @@ def _pipelined_speculative_step(
                 running_prev = mx.concatenate(
                     [running_prev, mx.array([sampled_token], dtype=mx.uint32)]
                 )
+
+        # Broadcast rank-0's chosen tokens to every target rank so
+        # accept/reject decisions are bit-identical. Single-rank
+        # placements (``target_group is None``) short-circuit to
+        # identity, so this is free for the non-multi-target paths.
+        target_tokens = _broadcast_target_tokens(
+            target_tokens if is_target_root else None,
+            k=k,
+            k_this=k_this,
+            target_group=target_group,
+            is_root=is_target_root,
+        )
 
         # ----- Greedy accept loop -----
         num_accepted = 0

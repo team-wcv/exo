@@ -7,7 +7,7 @@ import time
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast, final
+from typing import TYPE_CHECKING, Any, Final, cast, final
 
 if TYPE_CHECKING:
     from exo.worker.engines.mlx.vision import VisionProcessor
@@ -1242,6 +1242,18 @@ def mx_barrier(group: mx.distributed.Group | None):
     )
 
 
+# ``int32`` lower / upper bounds. Values broadcast through
+# :func:`mx_broadcast_int_list` must be non-negative (the wire protocol
+# uses unsigned token IDs and length prefixes) AND fit in int32 with
+# room for the all-sum to land back in range. Since exactly one rank
+# contributes the values and the rest contribute zero, the sum is the
+# root's values per element regardless of group size, so the per-element
+# bound is plain int32 max. We tighten to ``2**31 - 1`` (positive int32
+# max) and reject negatives explicitly so a caller passing a Python
+# ``-1`` doesn't silently wrap into a 4-billion-ish "valid" int32.
+_MX_BROADCAST_MAX_VALUE: Final[int] = (1 << 31) - 1
+
+
 def mx_broadcast_int_list(
     values: list[int] | None,
     length: int,
@@ -1264,8 +1276,10 @@ def mx_broadcast_int_list(
 
     Args:
       values: On root, a list of exactly ``length`` ints to broadcast.
-        Ignored on non-root ranks.
-      length: Buffer size, agreed by all ranks.
+        Each value must be in ``[0, 2**31 - 1]``. Negative values are
+        rejected explicitly so a stray ``-1`` doesn't silently wrap to
+        ``0xFFFFFFFF`` and corrupt the broadcast. Ignored on non-root.
+      length: Buffer size, agreed by all ranks. Must be ``>= 1``.
       group: Distributed group; ``None`` is a single-rank short-circuit
         that simply returns ``values`` (root-only).
       is_root: ``True`` on the rank holding the source values; ``False``
@@ -1274,14 +1288,28 @@ def mx_broadcast_int_list(
     Returns:
       A list of ``length`` ints identical on every rank in ``group``,
       equal to root's ``values``.
+
+    Raises:
+      ValueError: ``length`` is non-positive, the root's ``values`` are
+        ``None`` or wrong length, or any root value is out of int32
+        range. These are caller bugs, not runtime conditions.
     """
+    if length < 1:
+        raise ValueError(f"mx_broadcast_int_list length must be >= 1, got {length}")
+
     if group is None:
+        if not is_root:
+            raise ValueError(
+                "mx_broadcast_int_list: single-rank short-circuit requires "
+                "is_root=True (only the root has source values)"
+            )
         if values is None or len(values) != length:
             raise ValueError(
                 "mx_broadcast_int_list: single-rank call requires "
                 f"values of length {length}, got "
                 f"{None if values is None else len(values)}"
             )
+        _validate_broadcast_values(values)
         return list(values)
 
     if is_root:
@@ -1290,6 +1318,7 @@ def mx_broadcast_int_list(
                 "mx_broadcast_int_list root rank requires values of "
                 f"length {length}, got {None if values is None else len(values)}"
             )
+        _validate_broadcast_values(values)
         buffer = mx.array(values, dtype=mx.int32)
     else:
         buffer = mx.zeros((length,), dtype=mx.int32)
@@ -1299,6 +1328,26 @@ def mx_broadcast_int_list(
     )
     mx.eval(summed)
     return [int(v) for v in cast(list[int], summed.tolist())]
+
+
+def _validate_broadcast_values(values: list[int]) -> None:
+    """Range-check root-side broadcast values.
+
+    Centralised so both the single-rank short-circuit and the multi-
+    rank all-sum path enforce identical contracts. Linear scan; for
+    ``length`` values this is microseconds and runs once per round on
+    the spec-decode hot path -- amortised free against an MLX
+    collective.
+    """
+    for index, value in enumerate(values):
+        if value < 0 or value > _MX_BROADCAST_MAX_VALUE:
+            raise ValueError(
+                f"mx_broadcast_int_list values must be in "
+                f"[0, {_MX_BROADCAST_MAX_VALUE}]; "
+                f"index {index} = {value} is out of range "
+                f"(negatives wrap silently in int32 all-sum; values "
+                f">= 2**31 overflow)"
+            )
 
 
 def _parse_kimi_tool_calls(text: str):
@@ -1358,17 +1407,58 @@ def mx_all_gather_tasks(
     # than the int32 we wrote (observed: count gather returning
     # ``[1, 1068875521]`` -> 0x3FB80001 / a float32 representation), which
     # forced a 144 GB padded-buffer allocation and crashed the runner with
-    # ``[metal::malloc] Attempting to allocate ...``. Padding to a fixed
-    # 32-slot UUID buffer reproduced the same corruption at larger sizes
-    # (``can't convert negative int to unsigned`` from ``decode_task_id``).
+    # ``[metal::malloc] Attempting to allocate ...``.
     #
     # The agreement protocol is *defensive*: in practice the master pushes
     # the same task list to every target rank via the worker plan, so each
-    # rank's local view already matches its peers. Until the JACCL gather
-    # is fixed (or we replace it with a target-side TCP coordinator like
-    # the drafter wire) we trust that local view. If the master ever
-    # diverges across ranks the next step (the TP forward) will hang on
-    # the model collective rather than silently completing on stale data,
-    # which is the same failure mode as a corrupted all-gather of the
-    # task IDs.
+    # rank's local view already matches its peers. Rather than re-running
+    # the unreliable all-gather, we run a one-collective drift detector
+    # over the well-tested ``all_sum`` primitive: each rank computes a
+    # 31-bit hash of its task list, root broadcasts its hash via
+    # :func:`mx_broadcast_int_list`, every other rank compares against
+    # its own. A mismatch signals master divergence and raises locally
+    # (which propagates to the runner's main loop and surfaces in
+    # ``handle_generation_tasks`` rather than corrupting later TP
+    # forwards on stale state).
+    local_hash = _hash_task_list(tasks)
+    is_root = group.rank() == 0
+    expected_hash = mx_broadcast_int_list(
+        [local_hash] if is_root else None,
+        length=1,
+        group=group,
+        is_root=is_root,
+    )[0]
+    if expected_hash != local_hash:
+        raise RuntimeError(
+            "mx_all_gather_tasks: target ranks disagree on the task list "
+            f"(rank {group.rank()} hash={local_hash}, root hash={expected_hash}); "
+            "the master should be pushing identical plans to every target "
+            "rank -- this is a master/event-sourcing bug, not a runtime "
+            "condition. Refusing to silently desync the next TP forward."
+        )
     return list(tasks), []
+
+
+def _hash_task_list(tasks: list[TextGeneration]) -> int:
+    """Stable 31-bit hash of a task list for cross-rank drift detection.
+
+    31-bit because :func:`mx_broadcast_int_list` rejects values >=
+    ``2**31`` (the int32 broadcast buffer would otherwise wrap on
+    all-sum). Hashing the task IDs is sufficient because the master
+    schedules tasks by ID -- two ranks with the same ID set + ordering
+    are by construction working on the same plan; the rest of the task
+    payload is content-addressed off that ID.
+    """
+    # FNV-1a-style polynomial hash with an explicit per-byte mix so
+    # transpositions are caught (a plain byte-sum over task IDs
+    # collides on permutations). Deterministic across runner
+    # subprocesses because we bypass Python's salted ``hash()``;
+    # folded to 31 bits because :func:`mx_broadcast_int_list` rejects
+    # negatives and values >= ``2**31``.
+    h = 0
+    for task in tasks:
+        for byte in task.task_id.encode("utf-8"):
+            h = ((h * 1000003) ^ byte) & 0x7FFFFFFF
+        # Separator byte so [a, b] and [ab] hash distinctly.
+        h = ((h * 1000003) ^ 0x1F) & 0x7FFFFFFF
+    return h

@@ -609,6 +609,173 @@ def test_make_drafter_pipelined_consumer_rank_requires_target_group() -> None:
         )
 
 
+def test_make_drafter_pipelined_consumer_for_three_target_ranks() -> None:
+    """V2 multi-target with N target ranks (N >= 2): every non-root rank
+    constructs the same transport-less consumer drafter. Exercise N=3
+    explicitly so the broadcast contract is not implicitly bound to
+    ``target_subgroup_size == 2`` (the case the cluster bench covers).
+    """
+    from exo.worker.engines.mlx.generator.drafter import make_drafter
+    from exo.worker.engines.mlx.generator.pipelined_drafter import (
+        PipelinedModelDrafter,
+    )
+
+    class _StubGroup:
+        def size(self) -> int:
+            return 3
+
+        def rank(self) -> int:
+            return 2
+
+    drafter = make_drafter(
+        mode="pipelined",
+        num_draft_tokens=4,
+        draft_model=None,
+        draft_cache=None,
+        pipelined_transport=None,
+        target_subgroup_size=3,
+        target_group=_StubGroup(),
+        is_target_root=False,
+    )
+    assert isinstance(drafter, PipelinedModelDrafter)
+    assert drafter.mode == "pipelined"
+    assert drafter.num_draft_tokens == 4
+
+
+def test_make_drafter_pipelined_root_for_three_target_ranks() -> None:
+    """V2 multi-target root with N=3 ranks: identical contract to N=2
+    -- the root owns the transport and broadcasts on the target group.
+    The collective is N-ary (``mx.distributed.all_sum``), so the
+    construction has no special-casing for N == 2 and we want a test
+    asserting that explicitly.
+    """
+    from exo.worker.engines.mlx.generator.drafter import make_drafter
+    from exo.worker.engines.mlx.generator.pipelined_drafter import (
+        PipelinedModelDrafter,
+    )
+
+    class _StubGroup:
+        def size(self) -> int:
+            return 3
+
+        def rank(self) -> int:
+            return 0
+
+    transport = FakeTransport(num_draft_tokens_value=4)
+    drafter = make_drafter(
+        mode="pipelined",
+        num_draft_tokens=4,
+        draft_model=None,
+        draft_cache=None,
+        pipelined_transport=transport,
+        target_subgroup_size=3,
+        target_group=_StubGroup(),
+        is_target_root=True,
+    )
+    assert isinstance(drafter, PipelinedModelDrafter)
+
+
+# ---------------------------------------------------------------------------
+# Broadcast helpers (single-rank short-circuit)
+# ---------------------------------------------------------------------------
+
+
+class TestBroadcastDrafts:
+    """``_broadcast_drafts`` length-prefix encoding contract.
+
+    Multi-rank behaviour is covered by the cluster bench (real
+    ``mx.distributed.all_sum``). The single-rank short-circuit is the
+    only path we can exercise in unit tests, but it captures the most
+    important contract bug: the length-prefix decoder rejecting
+    nonsensical lengths from a corrupted broadcast.
+    """
+
+    def test_single_rank_short_circuit_root(self) -> None:
+        from exo.worker.engines.mlx.generator.pipelined_drafter import (
+            _broadcast_drafts,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        out = _broadcast_drafts(
+            [10, 20], k=4, target_group=None, is_root=True
+        )
+        assert out == [10, 20]
+
+    def test_single_rank_short_circuit_consumer_rejected(self) -> None:
+        # Consumer rank in single-rank mode is a configuration bug --
+        # there's no peer to broadcast from. Surface it loudly.
+        from exo.worker.engines.mlx.generator.pipelined_drafter import (
+            _broadcast_drafts,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        with pytest.raises(RuntimeError, match="non-root"):
+            _broadcast_drafts(
+                None, k=4, target_group=None, is_root=False
+            )
+
+    def test_single_rank_root_requires_drafts(self) -> None:
+        from exo.worker.engines.mlx.generator.pipelined_drafter import (
+            _broadcast_drafts,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        # ``drafts is None`` on root in the short-circuit path is a
+        # caller bug (the runner never has a None drafts list when it
+        # owns the wire).
+        with pytest.raises(RuntimeError, match="non-root"):
+            _broadcast_drafts(
+                None, k=4, target_group=None, is_root=False
+            )
+
+
+class TestBroadcastTargetTokens:
+    """``_broadcast_target_tokens`` carries the verifier's sampled
+    tokens from rank 0 to non-root target ranks so accept/reject is
+    bit-identical across the target subgroup.
+
+    Without this broadcast, every rank's ``mx.random.categorical`` call
+    returns RNG-divergent tokens (default temperature is 0.7 in the
+    API path), the ranks reach different ``num_accepted``, trim the
+    target's prompt cache by different amounts, and the next TP
+    forward consumes mismatched cache state -- a silent garbage-output
+    bug. These tests pin the contract so a future refactor can't
+    accidentally drop the broadcast.
+    """
+
+    def test_single_rank_short_circuit_root(self) -> None:
+        from exo.worker.engines.mlx.generator.pipelined_drafter import (
+            _broadcast_target_tokens,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        # k_this + 1 == 3 tokens: the seed-bonus + drafts emitted per
+        # round in a K=4, k_this=2 partial round.
+        out = _broadcast_target_tokens(
+            [10, 20, 30], k=4, k_this=2, target_group=None, is_root=True
+        )
+        assert out == [10, 20, 30]
+
+    def test_single_rank_consumer_rejected(self) -> None:
+        from exo.worker.engines.mlx.generator.pipelined_drafter import (
+            _broadcast_target_tokens,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        with pytest.raises(RuntimeError, match="non-root"):
+            _broadcast_target_tokens(
+                None, k=4, k_this=2, target_group=None, is_root=False
+            )
+
+    def test_root_rejects_wrong_length(self) -> None:
+        # Verifier always emits exactly ``k_this + 1`` tokens; anything
+        # else means the spec loop is calling the broadcast with stale
+        # state. Raise rather than silently right-pad.
+        from exo.worker.engines.mlx.generator.pipelined_drafter import (
+            _broadcast_target_tokens,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        with pytest.raises(RuntimeError, match="must equal k_this"):
+            _broadcast_target_tokens(
+                [10, 20], k=4, k_this=2, target_group=None, is_root=True
+            )
+
+
 def test_make_drafter_pipelined_root_rank_with_no_transport_rejected() -> None:
     """Configuration error: ``is_target_root=True`` implies this rank owns
     the drafter socket; the caller must pass a transport. Reaching the

@@ -299,11 +299,32 @@
               </span>
             {/if}
             {#if message.drafterStats}
+              <!-- Mode label distinguishes asymmetric pipelined drafting
+                   (drafter on a separate node, drafts arrive over a TCP
+                   socket) from the in-process model drafter. Falls back
+                   to the generic "SPEC" pill for older runner builds
+                   that don't surface ``draft_mode``. -->
+              {@const modeLabel = (() => {
+                switch (message.drafterStats.draftMode) {
+                  case "pipelined":
+                    return "PIPELINED";
+                  case "model":
+                    return "MODEL";
+                  case "ngram":
+                    return "NGRAM";
+                  case "eagle":
+                    return "EAGLE";
+                  case "lookahead":
+                    return "LOOKAHEAD";
+                  default:
+                    return "SPEC";
+                }
+              })()}
               <span
                 class="text-xs text-exo-light-gray/80 font-mono ml-2"
-                title={`Drafter: ${message.drafterStats.modelId}\nAccepted: ${message.drafterStats.acceptedDraftTokens}/${message.drafterStats.generationTokens}${message.drafterStats.numDraftTokens !== null ? `\nK=${message.drafterStats.numDraftTokens}` : ""}`}
+                title={`Drafter: ${message.drafterStats.modelId}\nMode: ${message.drafterStats.draftMode ?? "unknown"}\nAccepted: ${message.drafterStats.acceptedDraftTokens}/${message.drafterStats.generationTokens}${message.drafterStats.numDraftTokens !== null ? `\nK=${message.drafterStats.numDraftTokens}` : ""}`}
               >
-                <span class="text-exo-light-gray/50">SPEC</span>
+                <span class="text-exo-light-gray/50">{modeLabel}</span>
                 {(message.drafterStats.acceptanceFraction * 100).toFixed(0)}%{#if message.drafterStats.numDraftTokens !== null}<span
                     class="text-exo-light-gray/30 mx-1">•</span
                   ><span class="text-exo-light-gray/50">K=</span

@@ -298,6 +298,14 @@ export interface DrafterStats {
   generationTokens: number;
   numDraftTokens: number | null;
   acceptanceFraction: number; // accepted / generation_tokens
+  /** Drafting strategy that actually ran:
+   *   - "model": local in-process drafter via mlx_lm.speculative_generate_step
+   *   - "pipelined": asymmetric remote drafter on a separate node (V2 socket wire)
+   *   - "ngram": in-context suffix lookup (no extra weights)
+   *   - "eagle" / "lookahead": reserved
+   * ``null`` when the engine doesn't surface a mode (older runner builds);
+   * UI should fall back to the generic "SPEC" pill in that case. */
+  draftMode: "model" | "pipelined" | "ngram" | "eagle" | "lookahead" | null;
 }
 
 export interface Message {
@@ -1848,6 +1856,14 @@ class AppStore {
               drafter_model_id?: string | null;
               accepted_draft_tokens?: number;
               num_draft_tokens?: number | null;
+              draft_mode?:
+                | "model"
+                | "pipelined"
+                | "ngram"
+                | "eagle"
+                | "lookahead"
+                | "none"
+                | null;
             };
             if (stats.generation_tps > 0) {
               this.tps = stats.generation_tps;
@@ -1860,6 +1876,11 @@ class AppStore {
                 numDraftTokens: stats.num_draft_tokens ?? null,
                 acceptanceFraction:
                   (stats.accepted_draft_tokens ?? 0) / stats.generation_tokens,
+                // ``"none"`` from the API maps to ``null`` here because the
+                // dashboard treats it as "no spec ran" -- the type contract
+                // for ``DrafterStats`` already gates on a non-null
+                // ``modelId``, so a "none" mode would be inconsistent.
+                draftMode: stats.draft_mode === "none" ? null : (stats.draft_mode ?? null),
               };
             }
           },
@@ -2078,6 +2099,14 @@ class AppStore {
               drafter_model_id?: string | null;
               accepted_draft_tokens?: number;
               num_draft_tokens?: number | null;
+              draft_mode?:
+                | "model"
+                | "pipelined"
+                | "ngram"
+                | "eagle"
+                | "lookahead"
+                | "none"
+                | null;
             };
             if (stats.generation_tps > 0) {
               this.tps = stats.generation_tps;
@@ -2090,6 +2119,11 @@ class AppStore {
                 numDraftTokens: stats.num_draft_tokens ?? null,
                 acceptanceFraction:
                   (stats.accepted_draft_tokens ?? 0) / stats.generation_tokens,
+                // ``"none"`` from the API maps to ``null`` here because the
+                // dashboard treats it as "no spec ran" -- the type contract
+                // for ``DrafterStats`` already gates on a non-null
+                // ``modelId``, so a "none" mode would be inconsistent.
+                draftMode: stats.draft_mode === "none" ? null : (stats.draft_mode ?? null),
               };
             }
           },
@@ -2707,6 +2741,14 @@ class AppStore {
               drafter_model_id?: string | null;
               accepted_draft_tokens?: number;
               num_draft_tokens?: number | null;
+              draft_mode?:
+                | "model"
+                | "pipelined"
+                | "ngram"
+                | "eagle"
+                | "lookahead"
+                | "none"
+                | null;
             };
 
             if (stats.generation_tps > 0) {
@@ -2725,6 +2767,11 @@ class AppStore {
                 numDraftTokens: stats.num_draft_tokens ?? null,
                 acceptanceFraction:
                   (stats.accepted_draft_tokens ?? 0) / stats.generation_tokens,
+                // ``"none"`` from the API maps to ``null`` here because the
+                // dashboard treats it as "no spec ran" -- the type contract
+                // for ``DrafterStats`` already gates on a non-null
+                // ``modelId``, so a "none" mode would be inconsistent.
+                draftMode: stats.draft_mode === "none" ? null : (stats.draft_mode ?? null),
               };
             }
           },
