@@ -1225,11 +1225,6 @@ def mlx_cleanup(
 def mx_any(bool_: bool, group: mx.distributed.Group | None) -> bool:
     if group is None:
         return bool_
-    # Stream alignment: see :func:`mx_broadcast_int_list` for the full
-    # rationale. ``mx_any`` participates in the spec-decode hot path
-    # via ``agree_on_cancellations`` and runs on the same target group
-    # the model TP uses; staying on the default stream keeps JACCL's
-    # collective FIFO intact across CPU and Metal dispatches.
     num_true = mx.distributed.all_sum(mx.array(bool_), group=group)
     mx.eval(num_true)
     return num_true.item() > 0
@@ -1238,8 +1233,6 @@ def mx_any(bool_: bool, group: mx.distributed.Group | None) -> bool:
 def mx_barrier(group: mx.distributed.Group | None):
     if group is None:
         return
-    # Same stream-alignment rationale as :func:`mx_any` /
-    # :func:`mx_broadcast_int_list`.
     mx.eval(mx.distributed.all_sum(mx.array(1.0), group=group))
 
 
@@ -1264,16 +1257,29 @@ def mx_broadcast_int_list(
 ) -> list[int]:
     """Broadcast a fixed-length int list from one rank to all peers.
 
-    Implementation: all-sum of an ``int32`` buffer where non-root ranks
-    contribute zeros. Reuses MLX's well-exercised ``all_sum`` collective
-    (the same one the model's TP forward depends on every step), so the
-    primitive's reliability is bounded by JACCL's ``all_sum`` rather than
-    its problematic ``all_gather`` (see :func:`mx_all_gather_tasks`).
+    Implementation: rank-0-fanout via :func:`mx.distributed.send` /
+    :func:`mx.distributed.recv`. Root issues one send to every peer in
+    the group; each peer issues exactly one matching recv from rank 0.
+
+    History note: previous revisions used ``all_sum`` of an int32
+    buffer where non-root ranks contributed zeros, which seems
+    elegant but turned out to corrupt the wire on multi-target spec
+    decode under JACCL. The model's TP layers also use ``all_sum`` on
+    the same target group, every layer, on float32 buffers; the
+    spec-decode hot path interleaved one ``all_sum`` for drafts and
+    one for sampled tokens between every pair of TP all-reduces. With
+    >100 in-flight ``all_sum`` collectives per round all on the same
+    group, JACCL's pairing logic occasionally matched our int32
+    "broadcast" on rank A against the model's float32 TP all-reduce
+    on rank B, scrambling the int32 buffer. Symptom: token ids
+    ~10^9 emitted by the spec loop, IndexError deep in the SPM
+    detokenizer. Switching to ``send`` / ``recv`` makes the
+    broadcast a fundamentally different primitive than the TP
+    all-reduce, so JACCL has no opportunity to merge them.
 
     The fixed-length contract means the caller pads to ``length`` on
-    root and both ranks agree on ``length`` ahead of time. This avoids
-    a count-then-payload two-collective handshake that would double the
-    wire round-trips on the spec-decode hot path.
+    root and both ranks agree on ``length`` ahead of time, which keeps
+    the recv shape known statically.
 
     Args:
       values: On root, a list of exactly ``length`` ints to broadcast.
@@ -1313,6 +1319,8 @@ def mx_broadcast_int_list(
         _validate_broadcast_values(values)
         return list(values)
 
+    group_size = group.size()
+
     if is_root:
         if values is None or len(values) != length:
             raise ValueError(
@@ -1320,24 +1328,22 @@ def mx_broadcast_int_list(
                 f"length {length}, got {None if values is None else len(values)}"
             )
         _validate_broadcast_values(values)
-        buffer = mx.array(values, dtype=mx.int32)
-    else:
-        buffer = mx.zeros((length,), dtype=mx.int32)
+        send_buffer = mx.array(values, dtype=mx.int32)
+        # Send to every peer in turn. Sequential sends keep the wire
+        # ordering deterministic across rank pairs, which matters
+        # when the same send/recv primitive is used for the
+        # follow-up ``target_tokens`` broadcast in the same spec
+        # round: peers must receive drafts before tokens.
+        for dst in range(1, group_size):
+            sent = mx.distributed.send(send_buffer, dst=dst, group=group)
+            mx.eval(sent)
+        return list(values)
 
-    # Stream alignment: the model's TP all-reduces dispatch on the
-    # default (Metal) stream. If we issued this broadcast on the CPU
-    # stream, JACCL would observe two independent dispatch queues per
-    # rank and could pair a CPU collective on rank A with a Metal
-    # collective on rank B (cross-stream rendezvous), corrupting the
-    # buffers. Symptom in the wild: drafter spec-decode emitted
-    # token IDs > vocab_size which crashed the SPM detokenizer with
-    # ``IndexError: list index out of range`` on rank-1 within ~1
-    # round of decode start. Keeping every collective on the same
-    # stream as the model TP makes JACCL's matching FIFO across the
-    # whole hot path. ``stream=None`` means "default for ``buffer``".
-    summed = mx.distributed.all_sum(buffer, group=group)
-    mx.eval(summed)
-    return [int(v) for v in cast(list[int], summed.tolist())]
+    received = mx.distributed.recv(
+        shape=(length,), dtype=mx.int32, src=0, group=group
+    )
+    mx.eval(received)
+    return [int(v) for v in cast(list[int], received.tolist())]
 
 
 def mx_all_sum_int_list(
@@ -1387,9 +1393,12 @@ def mx_all_sum_int_list(
     if group is None:
         return list(values)
     buffer = mx.array(values, dtype=mx.int32)
-    # Same stream-alignment rationale as :func:`mx_broadcast_int_list`:
-    # match the model's TP all-reduce stream so JACCL serialises every
-    # group collective into one FIFO per rank.
+    # ``all_sum`` is acceptable here because :func:`mx_all_sum_int_list`
+    # is only called from the task agreement protocol, which fires at
+    # admit boundaries -- not on the per-token spec-decode hot path.
+    # The thrash that broke the broadcast helper (interleaving with
+    # the model's TP all-reduce 100+ times per round) does not apply
+    # at this call frequency.
     summed = mx.distributed.all_sum(buffer, group=group)
     mx.eval(summed)
     return [int(v) for v in cast(list[int], summed.tolist())]
