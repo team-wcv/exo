@@ -2474,3 +2474,102 @@ def test_jaccl_placement_allows_nodes_with_partial_interface_typing(
         "positive evidence of bad config. Pre-fix the verdict was "
         "``known_no_path`` and placement was rejected."
     )
+
+
+def test_jaccl_placement_rejects_nodes_with_only_vpn_tunnel_unknown_typing(
+    model_card: ModelCard,
+) -> None:
+    """Codex P1 (PR #11 round-(N+12) follow-up, placement.py:597):
+    the round-(N+12) "couple unknown-typing with routable IPv4"
+    refinement was still too permissive. ``get_network_interfaces``
+    assigns ``"unknown"`` to interfaces missing from
+    ``networksetup -listallhardwareports``, which matches every
+    macOS VPN/tunnel adapter (``utun*`` for Tailscale/Wireguard,
+    ``tun*`` / ``tap*`` for OpenVPN, ``ipsec*`` for IPsec, etc.).
+    Those tunnels typically advertise routable ``10.x``/``100.x``
+    IPv4 addresses, so the round-(N+12) ``unknown`` + routable-IPv4
+    combo still fired on Wi-Fi-only nodes that happened to be on a
+    Tailscale tailnet -- the JACCL preflight was bypassed and
+    placement progressed to a runtime JACCL failure instead of the
+    intended early ``bb rdma repair`` error.
+
+    Round-(N+13) further restricts the permissive fallback to the
+    Apple ``en\\d+`` naming convention via
+    :func:`_is_plausible_thunderbolt_candidate`. Tunnel adapters
+    (``utun3``, ``wg0``, ``tun0``) and Apple Wireless Direct Link
+    (``awdl0``) all fail the name check, so this Wi-Fi-only +
+    Tailscale node correctly resolves to ``known_no_path`` and the
+    placement is rejected with the actionable ``bb rdma repair``
+    error. The legitimate Thunderbolt-bridge case (``en3`` with a
+    routable IPv4 whose hardware-port line failed to parse) is
+    still covered by
+    ``test_jaccl_placement_allows_nodes_with_partial_interface_typing``.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(2))
+    )
+
+    node_network = {
+        node_a: create_jaccl_node_network("192.168.10.10"),
+        node_b: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.50",
+                    interface_type="wifi",
+                ),
+                # Tailscale tunnel: ``utun*`` is unknown-typed AND
+                # has a routable ``100.x`` IPv4. Pre-(N+13) this
+                # tripped the permissive branch; post-fix the
+                # ``en\\d+`` name check rejects it.
+                NetworkInterfaceInfo(
+                    name="utun3",
+                    ip_address="100.67.7.42",
+                    interface_type="unknown",
+                ),
+                # WireGuard / OpenVPN tunnel: same trap, different
+                # naming convention. The plausibility check should
+                # still reject ``wg0``.
+                NetworkInterfaceInfo(
+                    name="wg0",
+                    ip_address="10.0.0.5",
+                    interface_type="unknown",
+                ),
+            ]
+        ),
+    }
+
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    with pytest.raises(ValueError, match="bb rdma repair"):
+        place_instance(
+            command,
+            topology,
+            {},
+            {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
+            node_network,
+        )

@@ -1,3 +1,4 @@
+import re
 from collections.abc import Mapping
 from copy import deepcopy
 from os import environ
@@ -31,7 +32,11 @@ from exo.shared.types.events import (
     TaskStatusUpdated,
 )
 from exo.shared.types.memory import Memory
-from exo.shared.types.profiling import MemoryUsage, NodeNetworkInfo
+from exo.shared.types.profiling import (
+    MemoryUsage,
+    NetworkInterfaceInfo,
+    NodeNetworkInfo,
+)
 from exo.shared.types.tasks import Task, TaskId, TaskStatus
 from exo.shared.types.topology import SocketConnection
 from exo.shared.types.worker.downloads import (
@@ -540,6 +545,39 @@ def _node_has_or_lacks_known_jaccl_path(
     return "known_no_path"
 
 
+_THUNDERBOLT_CANDIDATE_INTERFACE_NAME = re.compile(r"^en\d+$")
+
+
+def _is_plausible_thunderbolt_candidate(
+    interface: NetworkInterfaceInfo,
+) -> bool:
+    """Return whether an ``"unknown"``-typed interface could plausibly
+    be a Thunderbolt bridge whose hardware-port line wasn't classified.
+
+    The heuristic limits the permissive ``unknown``-typing fallback to
+    interfaces that *could* legitimately be a Thunderbolt bridge:
+
+    * the interface name matches ``en\\d+`` -- the canonical Apple
+      ``ifconfig`` naming for physical/bridged ethernet-style adapters
+      (Wi-Fi is ``en0`` / ``en1``, Thunderbolt bridges sit on
+      ``en2`` / ``en3`` / ``en4`` on every cluster machine we ship),
+      AND
+    * the interface advertises a routable IPv4 (filters out loopback,
+      link-local, and unset addresses via
+      :func:`_is_routable_jaccl_ipv4`).
+
+    Tunnel/VPN adapters (``utun*``, ``tun*``, ``tap*``, ``wg*``,
+    ``gif*``, ``stf*``, ``ipsec*``), Apple Wireless Direct Link
+    (``awdl*`` / ``llw*``), packet-capture (``pktap*``), and
+    loopback (``lo*``) all fail the name check, so a Wi-Fi-only node
+    that happens to have a Tailscale ``utun3`` link with a routable
+    ``100.x`` IPv4 no longer slips through the JACCL preflight.
+    """
+    if not _THUNDERBOLT_CANDIDATE_INTERFACE_NAME.match(interface.name):
+        return False
+    return _is_routable_jaccl_ipv4(interface.ip_address)
+
+
 def _interface_typing_is_missing(network_info: NodeNetworkInfo) -> bool:
     """Heuristic for "the gatherer couldn't classify this node's
     interfaces" vs "the gatherer reports a node with no TB interfaces".
@@ -551,10 +589,11 @@ def _interface_typing_is_missing(network_info: NodeNetworkInfo) -> bool:
     * **every** interface has ``interface_type == "unknown"`` (the
       gatherer's parse of ``networksetup -listallhardwareports``
       failed across the board), OR
-    * **some** interface has ``interface_type == "unknown"`` AND a
-      routable IPv4 address (the unknown interface could plausibly
-      be a Thunderbolt bridge whose hardware-port line didn't
-      classify -- e.g. ``en3`` with a routable IP).
+    * **some** interface has ``interface_type == "unknown"`` AND
+      passes :func:`_is_plausible_thunderbolt_candidate` (interface
+      name matches ``en\\d+`` AND has a routable IPv4) -- this
+      narrows the permissive fallback to genuine TB-bridge
+      candidates rather than VPN/tunnel adapters with routable IPs.
 
     Returns ``False`` when typing IS available for every routable
     candidate -- the node has positive evidence of bad config and
@@ -576,14 +615,23 @@ def _interface_typing_is_missing(network_info: NodeNetworkInfo) -> bool:
     permissive behavior on misconfigured clusters too -- the user
     only saw the runtime JACCL failure later.
 
-    Round-(N+12) (this commit) couples the unknown check with
-    routable-IPv4 candidacy. Loopback (``127.x.x.x``) and
-    link-local (``169.254.x.x``) interfaces are filtered out by
-    :func:`_is_routable_jaccl_ipv4` (the same predicate the JACCL
-    preflight uses), so an ``"unknown"``-typed loopback no longer
-    fires the permissive branch. A routable-IPv4 interface that
-    is unknown-typed -- the ``en3`` Thunderbolt-bridge case with a
-    failed hardware-port parse -- still defers to ``unknown``.
+    Round-(N+12) coupled the unknown check with routable-IPv4
+    candidacy. That filtered out loopback and link-local interfaces
+    but VPN/tunnel adapters (``utun*`` from Tailscale/Wireguard)
+    are typed as ``"unknown"`` AND have routable ``10.x``/``100.x``
+    IPv4s, so the permissive branch still fired on Wi-Fi-only nodes
+    with VPNs and bypassed the preflight (Codex P1 PR #11
+    round-(N+12) follow-up at placement.py:597).
+
+    Round-(N+13) (this commit) further restricts the permissive
+    fallback to the Apple ``en\\d+`` naming convention via
+    :func:`_is_plausible_thunderbolt_candidate`. ``utun*`` /
+    ``wg*`` / ``tun*`` / ``awdl*`` / ``lo*`` no longer satisfy the
+    plausibility check, so a Wi-Fi-only node with a Tailscale tunnel
+    correctly resolves to ``known_no_path`` (and the actionable
+    ``bb rdma repair`` error). The legitimate Thunderbolt-bridge
+    case -- ``en3`` with a routable IPv4 whose hardware-port line
+    failed to parse -- still defers to ``unknown``.
     """
     if not network_info.interfaces:
         return True
@@ -593,7 +641,7 @@ def _interface_typing_is_missing(network_info: NodeNetworkInfo) -> bool:
         return True
     return any(
         interface.interface_type == "unknown"
-        and _is_routable_jaccl_ipv4(interface.ip_address)
+        and _is_plausible_thunderbolt_candidate(interface)
         for interface in network_info.interfaces
     )
 
