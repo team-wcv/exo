@@ -25,6 +25,7 @@ from exo.download.shard_downloader import ShardDownloader
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
 from exo.shared.types.commands import (
     CancelDownload,
+    DeleteDownload,
     ForwarderDownloadCommand,
     StartDownload,
 )
@@ -1012,6 +1013,334 @@ async def test_failed_target_top_level_call_still_skips_drafter_chain() -> None:
             "_start_download (drafter is useless without target); "
             f"ensured={downloader.ensured!r}"
         )
+
+
+async def test_shared_drafter_in_flight_survives_cancel_of_one_target() -> None:
+    """Codex P1 (PR #18 round-(N+11), coordinator.py:212): with this
+    commit's Gemma 4 cards multiple targets reference the same
+    drafter (e.g. ``gemma-4-26b`` and ``gemma-4-31b`` both list
+    e2b/e4b drafters). Pre-fix the cancel cascade tore down every
+    linked drafter for the canceled target, even when the drafter
+    was *still downloading* on behalf of another target -- that
+    drafter went straight to ``DownloadPending`` and silently
+    disabled speculative decoding on the surviving target.
+
+    This regression test exercises the in-flight case: the shared
+    drafter is held in ``DownloadOngoing`` (never reaches
+    ``ensure_shard``-completed), then target A is cancelled. The
+    drafter MUST remain in ``DownloadOngoing`` because target B
+    still depends on it. Once B is also cancelled, the drafter
+    flips to ``DownloadPending`` (last parent gone, cascade fires).
+    """
+    from exo.shared.types.worker.downloads import (
+        DownloadOngoing,
+        DownloadPending,
+    )
+
+    target_a_id = ModelId("test-org/target-a")
+    target_b_id = ModelId("test-org/target-b")
+    shared_drafter_id = ModelId("test-org/shared-drafter")
+    target_a_card = ModelCard(
+        model_id=target_a_id,
+        storage_size=Memory.from_mb(500),
+        n_layers=32,
+        hidden_size=2048,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        drafter_model_ids=[shared_drafter_id],
+    )
+    target_b_card = ModelCard(
+        model_id=target_b_id,
+        storage_size=Memory.from_mb(700),
+        n_layers=40,
+        hidden_size=2560,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        drafter_model_ids=[shared_drafter_id],
+    )
+    shared_drafter_card = ModelCard(
+        model_id=shared_drafter_id,
+        storage_size=Memory.from_mb(50),
+        n_layers=12,
+        hidden_size=768,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+    )
+    target_a_shard = _make_shard(target_a_card)
+    target_b_shard = _make_shard(target_b_card)
+
+    async def fake_load(model_id: ModelId) -> ModelCard:
+        if model_id == shared_drafter_id:
+            return shared_drafter_card
+        raise AssertionError(f"unexpected ModelCard.load for {model_id}")
+
+    # Custom downloader: targets complete immediately, drafter hangs
+    # so we can observe DownloadOngoing while the cancel races run.
+    drafter_release = anyio.Event()
+    drafter_started = anyio.Event()
+
+    class _SuspendingDownloader(_RecordingShardDownloader):
+        async def ensure_shard(
+            self,
+            shard: ShardMetadata,
+            config_only: bool = False,  # noqa: ARG002
+        ) -> Path:
+            self.ensured.append(shard.model_card.model_id)
+            if shard.model_card.model_id == shared_drafter_id:
+                # Emit an ongoing progress event so the coordinator
+                # marks DownloadOngoing.
+                ongoing = RepoDownloadProgress(
+                    repo_id=str(shard.model_card.model_id),
+                    repo_revision="main",
+                    shard=shard,
+                    completed_files=0,
+                    total_files=1,
+                    downloaded=Memory.from_bytes(1),
+                    downloaded_this_session=Memory.from_bytes(1),
+                    total=shard.model_card.storage_size,
+                    overall_speed=0,
+                    overall_eta=timedelta(seconds=0),
+                    status="in_progress",
+                )
+                for cb in self._progress_callbacks:
+                    await cb(shard, ongoing)
+                drafter_started.set()
+                # Hang until the test releases us.
+                await drafter_release.wait()
+            progress = RepoDownloadProgress(
+                repo_id=str(shard.model_card.model_id),
+                repo_revision="main",
+                shard=shard,
+                completed_files=1,
+                total_files=1,
+                downloaded=shard.model_card.storage_size,
+                downloaded_this_session=shard.model_card.storage_size,
+                total=shard.model_card.storage_size,
+                overall_speed=0,
+                overall_eta=timedelta(seconds=0),
+                status="complete",
+            )
+            for cb in self._progress_callbacks:
+                await cb(shard, progress)
+            return Path("/fake/models") / shard.model_card.model_id.normalize()
+
+    with patch.object(ModelCard, "load", side_effect=fake_load):
+        downloader = _SuspendingDownloader()
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            cmd_send,
+            event_recv,
+        ):
+            for shard in (target_a_shard, target_b_shard):
+                await cmd_send.send(
+                    ForwarderDownloadCommand(
+                        origin=SystemId("test"),
+                        command=StartDownload(
+                            target_node_id=NODE_ID, shard_metadata=shard
+                        ),
+                    )
+                )
+
+            # Wait for both targets to complete; drafter stays mid-download.
+            completed_ids: set[ModelId] = set()
+            async with asyncio.timeout(5.0):
+                while {target_a_id, target_b_id} - completed_ids:
+                    event = await event_recv.receive()
+                    if isinstance(event, NodeDownloadProgress) and isinstance(
+                        event.download_progress, DownloadCompleted
+                    ):
+                        completed_ids.add(
+                            event.download_progress.shard_metadata.model_card.model_id
+                        )
+
+            # Make sure the drafter is genuinely in DownloadOngoing so
+            # the cancel cascade CAN flip it to DownloadPending.
+            with anyio.fail_after(2.0):
+                await drafter_started.wait()
+            await asyncio.sleep(0.05)
+            drafter_status = coordinator.download_status.get(shared_drafter_id)
+            assert isinstance(drafter_status, DownloadOngoing), (
+                f"drafter must be DownloadOngoing while suspended; got "
+                f"{type(drafter_status).__name__}"
+            )
+
+            parents = coordinator._drafter_parents.get(shared_drafter_id)  # pyright: ignore[reportPrivateUsage]
+            assert parents is not None and parents == {target_a_id, target_b_id}
+
+            # Cancel target A. Drafter MUST stay DownloadOngoing.
+            await cmd_send.send(
+                ForwarderDownloadCommand(
+                    origin=SystemId("test"),
+                    command=CancelDownload(
+                        target_node_id=NODE_ID, model_id=target_a_id
+                    ),
+                )
+            )
+            await asyncio.sleep(0.1)
+
+            drafter_status_after_a = coordinator.download_status.get(shared_drafter_id)
+            assert isinstance(drafter_status_after_a, DownloadOngoing), (
+                "shared drafter must remain DownloadOngoing after one of "
+                "its parents is cancelled; pre-fix the cascade flipped "
+                f"it to DownloadPending. got={type(drafter_status_after_a).__name__}"
+            )
+            parents_after_a = coordinator._drafter_parents.get(shared_drafter_id)  # pyright: ignore[reportPrivateUsage]
+            assert parents_after_a == {target_b_id}, (
+                f"cancel of target A must remove A from drafter parent "
+                f"set; got parents={parents_after_a!r}"
+            )
+
+            # Cancel target B. Now the drafter is genuinely orphaned;
+            # cascade must fire and flip it to DownloadPending.
+            await cmd_send.send(
+                ForwarderDownloadCommand(
+                    origin=SystemId("test"),
+                    command=CancelDownload(
+                        target_node_id=NODE_ID, model_id=target_b_id
+                    ),
+                )
+            )
+            await asyncio.sleep(0.1)
+
+            drafter_status_final = coordinator.download_status.get(shared_drafter_id)
+            assert isinstance(drafter_status_final, DownloadPending), (
+                "drafter must be cancelled (DownloadPending) once the "
+                f"LAST parent is cancelled; got "
+                f"{type(drafter_status_final).__name__}"
+            )
+            assert shared_drafter_id not in coordinator._drafter_parents, (  # pyright: ignore[reportPrivateUsage]
+                "_drafter_parents must be cleaned up once empty"
+            )
+
+            # Allow the suspended ensure_shard to unwind so shutdown
+            # doesn't leak the task.
+            drafter_release.set()
+
+
+async def test_shared_drafter_survives_delete_of_one_target() -> None:
+    """Codex P1 (PR #18 round-(N+11), coordinator.py:743): the
+    delete-cascade companion to
+    ``test_shared_drafter_in_flight_survives_cancel_of_one_target``.
+    With shared drafters across Gemma 4 cards, deleting one target
+    must NOT also delete the drafter the other still-installed
+    target depends on.
+
+    We mock ``delete_model`` to a recorder so the test does not
+    touch the filesystem, and assert it is called for the deleted
+    target but NOT for the shared drafter (until the second target
+    is deleted too).
+    """
+    target_a_id = ModelId("test-org/target-a")
+    target_b_id = ModelId("test-org/target-b")
+    shared_drafter_id = ModelId("test-org/shared-drafter")
+    target_a_card = ModelCard(
+        model_id=target_a_id,
+        storage_size=Memory.from_mb(500),
+        n_layers=32,
+        hidden_size=2048,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        drafter_model_ids=[shared_drafter_id],
+    )
+    target_b_card = ModelCard(
+        model_id=target_b_id,
+        storage_size=Memory.from_mb(700),
+        n_layers=40,
+        hidden_size=2560,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        drafter_model_ids=[shared_drafter_id],
+    )
+    shared_drafter_card = ModelCard(
+        model_id=shared_drafter_id,
+        storage_size=Memory.from_mb(50),
+        n_layers=12,
+        hidden_size=768,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+    )
+    target_a_shard = _make_shard(target_a_card)
+    target_b_shard = _make_shard(target_b_card)
+
+    async def fake_load(model_id: ModelId) -> ModelCard:
+        if model_id == shared_drafter_id:
+            return shared_drafter_card
+        raise AssertionError(f"unexpected ModelCard.load for {model_id}")
+
+    deleted_ids: list[ModelId] = []
+
+    async def fake_delete(model_id: ModelId) -> bool:
+        deleted_ids.append(model_id)
+        return True
+
+    with (
+        patch.object(ModelCard, "load", side_effect=fake_load),
+        patch("exo.download.coordinator.delete_model", side_effect=fake_delete),
+    ):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            cmd_send,
+            event_recv,
+        ):
+            for shard in (target_a_shard, target_b_shard):
+                await cmd_send.send(
+                    ForwarderDownloadCommand(
+                        origin=SystemId("test"),
+                        command=StartDownload(
+                            target_node_id=NODE_ID, shard_metadata=shard
+                        ),
+                    )
+                )
+            completed_ids: set[ModelId] = set()
+            wanted = {target_a_id, target_b_id, shared_drafter_id}
+            async with asyncio.timeout(5.0):
+                while wanted - completed_ids:
+                    event = await event_recv.receive()
+                    if isinstance(event, NodeDownloadProgress) and isinstance(
+                        event.download_progress, DownloadCompleted
+                    ):
+                        completed_ids.add(
+                            event.download_progress.shard_metadata.model_card.model_id
+                        )
+            await asyncio.sleep(0.1)
+
+            assert coordinator._drafter_parents.get(shared_drafter_id) == {  # pyright: ignore[reportPrivateUsage]
+                target_a_id,
+                target_b_id,
+            }
+
+            # Delete target A. Drafter MUST stay -- target B still references it.
+            await cmd_send.send(
+                ForwarderDownloadCommand(
+                    origin=SystemId("test"),
+                    command=DeleteDownload(
+                        target_node_id=NODE_ID, model_id=target_a_id
+                    ),
+                )
+            )
+            await asyncio.sleep(0.1)
+            assert deleted_ids == [target_a_id], (
+                "delete of target A must NOT cascade into the shared "
+                f"drafter; got deleted_ids={deleted_ids!r}"
+            )
+            assert coordinator._drafter_parents.get(shared_drafter_id) == {target_b_id}  # pyright: ignore[reportPrivateUsage]
+
+            # Delete target B. Now the drafter is genuinely orphaned.
+            await cmd_send.send(
+                ForwarderDownloadCommand(
+                    origin=SystemId("test"),
+                    command=DeleteDownload(
+                        target_node_id=NODE_ID, model_id=target_b_id
+                    ),
+                )
+            )
+            await asyncio.sleep(0.1)
+            assert shared_drafter_id in deleted_ids, (
+                "drafter must be deleted once the LAST parent is "
+                f"deleted; got deleted_ids={deleted_ids!r}"
+            )
+            assert shared_drafter_id not in coordinator._drafter_parents  # pyright: ignore[reportPrivateUsage]
 
 
 async def test_chained_drafter_does_not_recursively_chain_via_inner_path() -> None:

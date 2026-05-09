@@ -78,6 +78,27 @@ class DownloadCoordinator:
     # children).
     _drafter_children: dict[ModelId, list[ModelId]] = field(default_factory=dict)
 
+    # Codex P1 (PR #18 round-(N+11), coordinator.py:212/743): reverse
+    # mapping of drafter -> {target_ids_that_reference_it}. With this
+    # commit's Gemma 4 cards multiple targets share the same drafter
+    # (e.g. ``gemma-4-26b`` and ``gemma-4-31b`` both name the
+    # ``gemma-4-e2b`` / ``gemma-4-e4b`` drafters). Pre-fix the
+    # cancel/delete cascade unconditionally tore down every linked
+    # drafter for the canceled/deleted target, so canceling one
+    # silently disabled speculative decoding on the *other* still-
+    # installed target -- the user only saw a regression in tokens/sec
+    # and would not connect that to the unrelated cancel they issued.
+    #
+    # The reverse map is updated transactionally with
+    # ``_drafter_children``: every ``remember_drafter_link`` adds the
+    # current target to ``_drafter_parents[drafter_id]``, and every
+    # cascade pops the *current* target from each child's parent set
+    # but only actually cascades the cancel/delete when the child has
+    # no remaining parents. This is many-to-many bookkeeping but the
+    # cardinality is bounded by the cluster's installed model set
+    # (single-digit drafters per cluster in practice).
+    _drafter_parents: dict[ModelId, set[ModelId]] = field(default_factory=dict)
+
     # Codex P2 (PR #18 round-(N+3), coordinator.py:224): per-model
     # in-flight marker for ``_start_download``. Pre-fix, the function
     # treated only ``DownloadOngoing``/``DownloadCompleted`` as
@@ -241,11 +262,40 @@ class DownloadCoordinator:
         # but recursing unconditionally here keeps the cascade
         # symmetric with future state extensions and ensures the
         # cancel intent reaches every registered child.
+        #
+        # Codex P1 (PR #18 round-(N+11), coordinator.py:212): when
+        # a drafter is shared across multiple targets (e.g. Gemma 4
+        # 26B and 31B both name the same e2b/e4b drafters), only
+        # cascade the cancel to the drafter once NO target still
+        # references it. Pre-fix the cascade tore down a drafter the
+        # other still-installed target depended on, silently
+        # disabling speculative decoding on that target with no
+        # signal back to the user beyond a tokens/sec regression.
         children = self._drafter_children.pop(model_id, [])
         for child_model_id in children:
+            parents = self._drafter_parents.get(child_model_id)
+            if parents is None:
+                # Drafter may have been cancelled or deleted directly;
+                # mapping was cleared. Recurse to be defensive.
+                logger.info(
+                    f"Cascading cancel to chained drafter {child_model_id} "
+                    f"alongside target {model_id} (no parent map)"
+                )
+                await self._cancel_download(child_model_id)
+                continue
+            parents.discard(model_id)
+            if parents:
+                logger.info(
+                    f"Drafter {child_model_id} is still referenced by "
+                    f"{sorted(map(str, parents))}; skipping cancel "
+                    f"cascade for it (parent cancel was for {model_id})"
+                )
+                continue
+            # Last reference: clean up the empty parent set and cascade.
+            self._drafter_parents.pop(child_model_id, None)
             logger.info(
                 f"Cascading cancel to chained drafter {child_model_id} "
-                f"alongside target {model_id}"
+                f"alongside target {model_id} (last referencing target)"
             )
             await self._cancel_download(child_model_id)
 
@@ -578,6 +628,19 @@ class DownloadCoordinator:
         def remember_drafter_link(drafter_id: ModelId) -> None:
             if drafter_id not in chained:
                 chained.append(drafter_id)
+            # Codex P1 (PR #18 round-(N+11)): keep the reverse map in
+            # sync. ``setdefault`` makes the first observer create the
+            # set; subsequent ``.add`` calls are idempotent. This must
+            # be invoked unconditionally (not only on first append)
+            # because a drafter that is *already* tracked for one
+            # target may become referenced by a NEW target via a
+            # later chain run -- e.g. user starts gemma-4-26b
+            # (drafter linked once), then starts gemma-4-31b which
+            # shares the same drafter; without this re-add the second
+            # target would not appear in the parent set and a cancel
+            # of the first target would tear the drafter down even
+            # though the second target still depends on it.
+            self._drafter_parents.setdefault(drafter_id, set()).add(target_model_id)
 
         for drafter_id in drafter_ids:
             if cancelled():
@@ -740,15 +803,38 @@ class DownloadCoordinator:
         # spawned alongside it should not keep running or stay on disk
         # past the target's lifetime. Pop the mapping so we don't
         # double-cascade on a subsequent delete of the same target.
+        #
+        # Codex P1 (PR #18 round-(N+11), coordinator.py:743): when
+        # the drafter is shared across multiple targets (Gemma 4 26B
+        # and 31B both name e2b/e4b), only delete it once NO other
+        # target still references it. Pre-fix deleting one target
+        # would also remove the drafter the other still-installed
+        # target depended on, silently degrading that target back to
+        # non-speculative behaviour and forcing an unnecessary
+        # re-download next time the user reissued StartDownload for
+        # it.
         children = self._drafter_children.pop(model_id, [])
         for child_model_id in children:
+            parents = self._drafter_parents.get(child_model_id)
+            if parents is not None:
+                parents.discard(model_id)
+                if parents:
+                    logger.info(
+                        f"Drafter {child_model_id} is still referenced by "
+                        f"{sorted(map(str, parents))}; preserving on disk "
+                        f"and in-flight (delete cascade was for {model_id})"
+                    )
+                    continue
+                # Last reference: clean up the empty parent set so
+                # the drafter is genuinely orphaned for this delete.
+                self._drafter_parents.pop(child_model_id, None)
             if (
                 child_model_id in self.active_downloads
                 or child_model_id in self.download_status
             ):
                 logger.info(
                     f"Deleting chained drafter {child_model_id} alongside "
-                    f"target {model_id}"
+                    f"target {model_id} (last referencing target)"
                 )
                 await self._delete_download(child_model_id)
 
