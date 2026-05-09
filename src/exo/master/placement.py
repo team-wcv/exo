@@ -268,7 +268,38 @@ def place_instance(
             raise ValueError(
                 "Requested RDMA (MlxJaccl) but no RDMA-connected cycles available"
             )
-        smallest_cycles = smallest_rdma_cycles
+        # Filter to cycles whose every node advertises a valid Thunderbolt
+        # IPv4 peer path BEFORE the scoring/selection pass. Previously the
+        # preflight only ran on the already-chosen cycle, so a single
+        # unrepaired node could fail placement even when another RDMA cycle
+        # of the same size was perfectly valid (e.g. mixed clusters where
+        # only one node is still on 169.254-only paths). When no candidate
+        # is eligible we deliberately fall back to the full RDMA pool so
+        # the post-selection ``_validate_jaccl_thunderbolt_ipv4_paths``
+        # check still surfaces the actionable, node-specific error message
+        # (which lists the missing nodes) instead of a generic
+        # "no candidates" failure here.
+        #
+        # Codex P2 (PR #11 round 4): the JACCL prefilter must NOT run on
+        # singleton cycles. A ``MlxJaccl`` request with ``min_nodes=1``
+        # gets downgraded to ``MlxRing`` further down (single-node
+        # JACCL is meaningless because target ranks have no peers to
+        # talk to over Thunderbolt RDMA), and that downgraded ring
+        # placement does not require a TB-IPv4 path. Pre-fix, requiring
+        # TB-IPv4 on length-1 candidates pushed the selector toward
+        # nodes that happened to have TB metadata (lower memory /
+        # download score in mixed clusters) instead of letting the
+        # ring downgrade pick the actual best singleton.
+        jaccl_eligible_rdma_cycles = [
+            cycle
+            for cycle in smallest_rdma_cycles
+            if len(cycle) == 1
+            or all(
+                _has_jaccl_thunderbolt_ipv4(node_network.get(node_id))
+                for node_id in cycle.node_ids
+            )
+        ]
+        smallest_cycles = jaccl_eligible_rdma_cycles or smallest_rdma_cycles
 
     resolved_download_status = download_status or {}
 
@@ -293,10 +324,32 @@ def place_instance(
             topology=topology,
         )
 
-    # Single-node: force Pipeline/Ring (Tensor and Jaccl require multi-node)
+    # Single-node: force Pipeline/Ring (Tensor and Jaccl require multi-node).
+    # Has to run BEFORE the JACCL Thunderbolt IPv4 preflight: a singleton
+    # cycle is RDMA-capable on its own (``is_rdma_cycle`` admits length-1
+    # cycles), but a JACCL request with ``min_nodes=1`` should fall through
+    # to MlxRing exactly as the comment promises -- the preflight is a
+    # multi-node JACCL contract (target ranks talk to each other over
+    # Thunderbolt RDMA), so running it on a singleton cycle would
+    # incorrectly reject placements that the downgrade-to-ring branch
+    # below would have happily satisfied.
     if len(selected_cycle) == 1:
         instance_meta = InstanceMeta.MlxRing
         sharding = Sharding.Pipeline
+
+    # Two independent post-selection adjustments. They land in this
+    # order so the JACCL preflight fails fast (raising a node-specific
+    # error message) before we go through the work of computing the
+    # singleton total-memory expansion. The two checks are mutually
+    # exclusive in practice -- the JACCL preflight only fires when
+    # ``instance_meta == MlxJaccl`` (multi-node) and the
+    # ``allow_single_node_total_memory`` expansion only fires for
+    # singleton cycles, which were already downgraded to ``MlxRing``
+    # by the block above -- but we keep both unconditional so the
+    # invariant is encoded in the code itself rather than in a
+    # comment about ordering.
+    if instance_meta == InstanceMeta.MlxJaccl:
+        _validate_jaccl_thunderbolt_ipv4_paths(selected_cycle, node_network)
 
     placement_node_memory = (
         _node_memory_with_total_capacity(selected_cycle, node_memory)
@@ -402,6 +455,133 @@ def _node_memory_with_total_capacity(
         )
         for node_id, memory_usage in node_memory.items()
     }
+
+
+def _validate_jaccl_thunderbolt_ipv4_paths(
+    cycle: Cycle,
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+) -> None:
+    missing_nodes = [
+        node_id
+        for node_id in cycle.node_ids
+        if not _has_jaccl_thunderbolt_ipv4(node_network.get(node_id))
+    ]
+    if missing_nodes:
+        raise ValueError(
+            "Requested RDMA (MlxJaccl), but the selected nodes do not advertise "
+            "MLX/JACCL Thunderbolt IPv4 peer paths. Run `bb rdma repair all` and "
+            "`bb rdma jaccl-status all`, then retry. Missing nodes: "
+            + ", ".join(str(node_id) for node_id in missing_nodes)
+        )
+
+
+def _has_jaccl_thunderbolt_ipv4(network_info: NodeNetworkInfo | None) -> bool:
+    """Return whether the node advertises at least one Thunderbolt-style
+    routable IPv4 interface usable as a JACCL peer path.
+
+    Why ``maybe_ethernet`` is accepted alongside ``thunderbolt``:
+    :func:`exo.utils.info_gatherer.system_info._get_interface_types_from_networksetup`
+    reclassifies any ``en*`` adapter that isn't ``en0`` / ``en1`` to
+    ``"maybe_ethernet"`` regardless of what ``networksetup
+    -listallhardwareports`` reports the hardware port as. On every
+    cluster machine we ship, the Thunderbolt bridge sits on ``en2`` /
+    ``en3`` / ``en4``, so its interface_type ends up as
+    ``"maybe_ethernet"`` even though the underlying hardware is in
+    fact a Thunderbolt link. Restricting the preflight to
+    ``interface_type == "thunderbolt"`` rejected those (correctly
+    repaired) bridges as missing, breaking placement on real
+    deployments. The upstream guard ``instance_meta ==
+    InstanceMeta.MlxJaccl`` already requires an RDMA-connected cycle
+    (libp2p only forms RDMA edges over Thunderbolt on Apple Silicon),
+    so accepting ``maybe_ethernet`` here cannot let a true LAN
+    ethernet sneak past -- nodes without TB hardware would have been
+    filtered upstream by the missing RDMA edge.
+    """
+    if network_info is None:
+        return False
+    return any(
+        interface.interface_type in ("thunderbolt", "maybe_ethernet")
+        and _is_routable_jaccl_ipv4(interface.ip_address)
+        for interface in network_info.interfaces
+    )
+
+
+def _is_routable_jaccl_ipv4(ip_address: str) -> bool:
+    """Return True iff ``ip_address`` is a syntactically-valid, unicast
+    IPv4 address that's plausibly usable as a JACCL peer path.
+
+    A valid IPv4 here is *exactly* four numeric octets in 0..255
+    separated by dots, and the first octet must fall in the unicast
+    range (1..223). We deliberately do not use ``ipaddress.IPv4Address``
+    because that class accepts a few legacy alternate forms (e.g.
+    integer-only ``"3232235521"``) that we don't want to allow as
+    Thunderbolt peer paths -- the upstream gatherer always reports
+    dotted-quad form, so anything else is malformed interface data
+    we'd rather reject fast than parse leniently.
+
+    Octet validation matters because malformed strings like
+    ``"999.1.1.1"`` or ``"1..2.3"`` would otherwise satisfy the
+    preflight (they have four split components on the dot delimiter)
+    and let an ``MlxJaccl`` placement reach the runtime layer, where
+    it'd fail with a far less actionable error when the JACCL backend
+    tries to resolve unusable peer addresses.
+
+    Non-unicast ranges rejected (in addition to the loopback /
+    link-local / all-zero prefixes already filtered):
+
+    - ``224.0.0.0/4`` (multicast 224..239) -- a peer path can never
+      be a multicast group;
+    - ``240.0.0.0/4`` (reserved / experimental 240..254) -- not
+      assigned for general use, including the misconfiguration
+      target ranges some Thunderbolt utilities default to;
+    - ``255.255.255.255`` (limited broadcast) -- specifically
+      called out by the codex review because the previous rule
+      accepted it as a "valid IPv4" even though it cannot be a
+      peer path.
+
+    The unicast cap at 223 covers all three above (Class D starts at
+    224, Class E at 240, broadcast falls inside Class E).
+    """
+    if ":" in ip_address:
+        return False
+    if ip_address.startswith(("0.", "127.", "169.254.")):
+        return False
+    octets = ip_address.split(".")
+    if len(octets) != 4:
+        return False
+    parsed: list[int] = []
+    for octet in octets:
+        # Reject empty fields ("1..2.3"), non-digit characters, leading
+        # whitespace, signs, etc. We don't allow leading zeros either
+        # ("01.2.3.4"), since networksetup never emits them and they
+        # historically trigger octal-style parsing in some libc tools.
+        #
+        # Codex P3 (PR #11 round 4): ``str.isdigit()`` returns True for
+        # Unicode digit characters (e.g. superscript digits like
+        # ``"\u00b2"``) that ``int()`` then rejects with
+        # ``ValueError``. The earlier guard let those through to
+        # ``int(octet)``, so a malformed network string from a
+        # corrupted info-gatherer payload would raise instead of
+        # cleanly returning False, aborting placement instead of
+        # surfacing the routine "no eligible cycle" path. Restrict to
+        # the ASCII 0-9 range explicitly.
+        if not octet.isascii() or not octet.isdigit():
+            return False
+        if len(octet) > 1 and octet.startswith("0"):
+            return False
+        value = int(octet)
+        if value < 0 or value > 255:
+            return False
+        parsed.append(value)
+    # First octet in unicast range only (1..223). 0.* is already
+    # caught above by the prefix block, but we re-check the full
+    # range here for clarity and because the unicast bound rejects
+    # multicast (224..239), reserved/experimental (240..254), and
+    # broadcast (255). The directed-broadcast case (e.g.
+    # ``192.168.10.255``) on a /24 is not generally distinguishable
+    # without subnet info -- we accept it as syntactically unicast
+    # and let the JACCL backend reject it on actual bind.
+    return 1 <= parsed[0] <= 223
 
 
 def _order_asymmetric_tensor_cycle(

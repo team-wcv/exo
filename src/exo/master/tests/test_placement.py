@@ -1,6 +1,7 @@
 import pytest
 
 from exo.master.placement import (
+    _is_routable_jaccl_ipv4,  # pyright: ignore[reportPrivateUsage]
     get_transition_events,
     place_instance,
 )
@@ -52,6 +53,26 @@ from exo.shared.types.worker.shards import (
     PipelineShardMetadata,
     Sharding,
 )
+
+
+def create_jaccl_node_network(
+    thunderbolt_ip_address: str,
+    ethernet_ip_address: str = "192.168.1.10",
+) -> NodeNetworkInfo:
+    return NodeNetworkInfo(
+        interfaces=[
+            NetworkInterfaceInfo(
+                name="en1",
+                ip_address=thunderbolt_ip_address,
+                interface_type="thunderbolt",
+            ),
+            NetworkInterfaceInfo(
+                name="en9",
+                ip_address=ethernet_ip_address,
+                interface_type="ethernet",
+            ),
+        ]
+    )
 
 
 @pytest.fixture
@@ -498,18 +519,14 @@ def test_tensor_rdma_backend_connectivity_matrix(
         node_c: create_node_memory(500),
     }
 
-    ethernet_interface = NetworkInterfaceInfo(
-        name="en0",
-        ip_address="10.0.0.1",
-    )
     ethernet_conn = SocketConnection(
         sink_multiaddr=Multiaddr(address="/ip4/10.0.0.1/tcp/8000")
     )
 
     node_network = {
-        node_a: NodeNetworkInfo(interfaces=[ethernet_interface]),
-        node_b: NodeNetworkInfo(interfaces=[ethernet_interface]),
-        node_c: NodeNetworkInfo(interfaces=[ethernet_interface]),
+        node_a: create_jaccl_node_network("192.168.0.1"),
+        node_b: create_jaccl_node_network("192.168.0.2"),
+        node_c: create_jaccl_node_network("192.168.0.5"),
     }
 
     topology.add_node(node_a)
@@ -644,8 +661,8 @@ def test_qwen3_5_tensor_auto_upgrade_requires_opt_in(
             small_node: create_node_memory(48_000_000_000),
         },
         {
-            large_node: create_node_network(),
-            small_node: create_node_network(),
+            large_node: create_jaccl_node_network("192.168.0.1"),
+            small_node: create_jaccl_node_network("192.168.0.2"),
         },
     )
     instance_without_opt_in = next(iter(placements_without_opt_in.values()))
@@ -670,8 +687,8 @@ def test_qwen3_5_tensor_auto_upgrade_requires_opt_in(
             small_node: create_node_memory(48_000_000_000),
         },
         {
-            large_node: create_node_network(),
-            small_node: create_node_network(),
+            large_node: create_jaccl_node_network("192.168.0.1"),
+            small_node: create_jaccl_node_network("192.168.0.2"),
         },
     )
 
@@ -977,20 +994,8 @@ def test_jaccl_placement_uses_advertised_lan_ip_for_rdma_coordinator(
         node_b: create_node_memory(1000),
     }
     node_network = {
-        node_a: NodeNetworkInfo(
-            interfaces=[
-                NetworkInterfaceInfo(
-                    name="en9", ip_address="192.168.1.10", interface_type="ethernet"
-                )
-            ]
-        ),
-        node_b: NodeNetworkInfo(
-            interfaces=[
-                NetworkInterfaceInfo(
-                    name="en9", ip_address="192.168.1.11", interface_type="ethernet"
-                )
-            ]
-        ),
+        node_a: create_jaccl_node_network("192.168.0.1", "192.168.1.10"),
+        node_b: create_jaccl_node_network("192.168.0.2", "192.168.1.11"),
     }
     command = PlaceInstance(
         sharding=Sharding.Tensor,
@@ -1009,6 +1014,425 @@ def test_jaccl_placement_uses_advertised_lan_ip_for_rdma_coordinator(
         coordinator.startswith("192.168.1.")
         for coordinator in instance.jaccl_coordinators.values()
     )
+
+
+def test_jaccl_placement_skips_thunderbolt_preflight_for_single_node_fallback(
+    model_card: ModelCard,
+) -> None:
+    """A ``MlxJaccl`` request with ``min_nodes=1`` on a singleton cycle
+    must downgrade to ``MlxRing`` instead of failing the JACCL
+    Thunderbolt IPv4 preflight.
+
+    The preflight enforces a multi-node JACCL contract -- every target
+    rank must advertise a routable Thunderbolt IPv4 address so the
+    JACCL coordinator can dial each peer. A singleton cycle has no
+    peers to dial: the placement code immediately downgrades to
+    Pipeline / Ring at line ``len(selected_cycle) == 1``. Running the
+    preflight before the downgrade means a single-node placement
+    request on a host without TB IPv4 (e.g. a developer laptop on
+    Wi-Fi) would raise instead of falling back to Ring, breaking
+    operator-facing placement previews and any API callers that probe
+    JACCL with ``min_nodes=1``.
+
+    Cluster shape: a single node with only a Wi-Fi interface (no TB
+    IPv4). Pre-fix this raised the ``bb rdma repair all`` ValueError;
+    post-fix the placement returns a single ``MlxRingInstance``.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(800),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    solo_node = NodeId()
+    topology.add_node(solo_node)
+
+    node_network = {
+        solo_node: NodeNetworkInfo(
+            interfaces=[
+                # No Thunderbolt and no maybe_ethernet bridge -- only
+                # Wi-Fi. Pre-fix this passed all the upstream checks
+                # (no peers, so no RDMA edges to demand) and then hit
+                # the preflight, which rejected it.
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.50",
+                    interface_type="wifi",
+                ),
+            ]
+        ),
+    }
+
+    command = PlaceInstance(
+        sharding=Sharding.Pipeline,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=1,
+    )
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        {solo_node: create_node_memory(1000)},
+        node_network,
+    )
+
+    assert len(placements) == 1
+    instance = next(iter(placements.values()))
+    # The downgrade-to-ring branch fires because the cycle has length
+    # 1; the JACCL preflight is skipped because the request can no
+    # longer be a JACCL placement at this point.
+    assert isinstance(instance, MlxRingInstance)
+
+
+def test_jaccl_placement_accepts_maybe_ethernet_thunderbolt_bridge(
+    model_card: ModelCard,
+) -> None:
+    """JACCL preflight accepts ``maybe_ethernet`` interfaces with
+    routable IPv4 addresses, not only literal ``"thunderbolt"``.
+
+    On every cluster machine we ship, the Thunderbolt bridge sits on
+    ``en2`` / ``en3`` / ``en4``, and ``system_info._get_interface_types_from_networksetup``
+    reclassifies any ``en*`` adapter that isn't ``en0`` / ``en1`` to
+    ``"maybe_ethernet"`` regardless of what ``networksetup`` reports
+    the hardware port as. Restricting the preflight to
+    ``interface_type == "thunderbolt"`` rejected (correctly repaired)
+    Thunderbolt bridges as missing, causing false placement failures
+    in real deployments. The upstream RDMA-cycle requirement keeps a
+    real LAN ethernet from sneaking past: libp2p only forms RDMA
+    edges over Thunderbolt on Apple Silicon, so a node reaching this
+    branch with ``maybe_ethernet`` must already have a TB hardware
+    link.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(2))
+    )
+
+    node_network = {
+        node_a: NodeNetworkInfo(
+            interfaces=[
+                # Real-world setup: Thunderbolt bridge at en3 with a
+                # routable IPv4. ``system_info`` reclassifies en2+ to
+                # ``maybe_ethernet`` even when ``networksetup`` reports
+                # the hardware port as Thunderbolt.
+                NetworkInterfaceInfo(
+                    name="en3",
+                    ip_address="192.168.10.10",
+                    interface_type="maybe_ethernet",
+                )
+            ]
+        ),
+        node_b: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en3",
+                    ip_address="192.168.10.11",
+                    interface_type="maybe_ethernet",
+                )
+            ]
+        ),
+    }
+
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
+        node_network,
+    )
+
+    assert len(placements) == 1
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxJacclInstance)
+
+
+def test_jaccl_placement_requires_repaired_thunderbolt_ipv4_paths(
+    model_card: ModelCard,
+) -> None:
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(2))
+    )
+
+    node_network = {
+        node_a: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en1",
+                    ip_address="169.254.1.10",
+                    interface_type="thunderbolt",
+                )
+            ]
+        ),
+        node_b: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en1",
+                    ip_address="169.254.1.11",
+                    interface_type="thunderbolt",
+                )
+            ]
+        ),
+    }
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    with pytest.raises(ValueError, match="bb rdma repair all"):
+        place_instance(
+            command,
+            topology,
+            {},
+            {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
+            node_network,
+        )
+
+
+def test_jaccl_placement_falls_back_to_eligible_cycle_when_another_cycle_has_invalid_path(
+    model_card: ModelCard,
+) -> None:
+    """Mixed clusters where one node still lacks a valid Thunderbolt
+    IPv4 path must not block placement: as long as at least one
+    candidate RDMA cycle of the smallest size has every node on a
+    routable JACCL TB IPv4, placement should pick that cycle and
+    succeed.
+
+    Pre-fix the preflight ran AFTER ``selected_cycle = max(...)`` had
+    already chosen a cycle, so a higher-memory or higher-download cycle
+    that happened to contain one unrepaired node would propagate to the
+    post-selection check and raise -- even when another size-2 cycle
+    of equal class was perfectly valid. This test stages exactly that
+    shape.
+
+    Cluster shape::
+
+        node_a (good TB) <-> node_b (good TB)            <- valid cycle
+        node_c (good TB) <-> node_d (169.254-only)       <- invalid cycle
+
+    Both cycles are RDMA-connected size 2. Without the candidate-time
+    filter, scoring by ``(download_score, total_memory, has_leaf)``
+    could pick either pair; we want to guarantee that the invalid pair
+    is *never* selected when a valid one exists. We deliberately bias
+    the invalid pair to look more attractive to the scorer (more total
+    memory) so the test fails on the legacy code path even when the
+    selection happens to be deterministic.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    good_a = NodeId()
+    good_b = NodeId()
+    bad_c = NodeId()
+    bad_d = NodeId()
+
+    for node in (good_a, good_b, bad_c, bad_d):
+        topology.add_node(node)
+
+    # Two independent RDMA pairs (cycles of size 2):
+    topology.add_connection(
+        Connection(source=good_a, sink=good_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=good_b, sink=good_a, edge=create_rdma_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=bad_c, sink=bad_d, edge=create_rdma_connection(3))
+    )
+    topology.add_connection(
+        Connection(source=bad_d, sink=bad_c, edge=create_rdma_connection(4))
+    )
+
+    node_network = {
+        good_a: create_jaccl_node_network("192.168.10.1", "10.0.0.1"),
+        good_b: create_jaccl_node_network("192.168.10.2", "10.0.0.2"),
+        bad_c: create_jaccl_node_network("192.168.10.3", "10.0.0.3"),
+        bad_d: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en1",
+                    ip_address="169.254.1.99",
+                    interface_type="thunderbolt",
+                )
+            ]
+        ),
+    }
+
+    # Bias the broken cycle to look more attractive to the scorer
+    # (higher total memory). The legacy code path picked by score and
+    # then raised on the post-selection preflight; the fix moves the
+    # filter upstream so the broken cycle is never selected.
+    node_memory = {
+        good_a: create_node_memory(1000),
+        good_b: create_node_memory(1000),
+        bad_c: create_node_memory(2000),
+        bad_d: create_node_memory(2000),
+    }
+
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    placements = place_instance(command, topology, {}, node_memory, node_network)
+
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxJacclInstance)
+    selected_node_ids = set(instance.shard_assignments.node_to_runner.keys())
+    # Must pick the all-good pair, not the pair that contains the
+    # node with the unrepaired 169.254-only Thunderbolt path.
+    assert selected_node_ids == {good_a, good_b}
+
+
+def test_jaccl_placement_prefers_eligible_cycle_among_multiple_size_2_cycles(
+    model_card: ModelCard,
+) -> None:
+    """Even when *every* size-2 cycle in the smallest-cycles set is
+    RDMA-connected, the JACCL Thunderbolt IPv4 preflight must
+    short-circuit any cycle whose nodes don't all advertise routable
+    JACCL paths. Pre-fix this only happened after selection.
+
+    Cluster shape: two RDMA pairs that share a node. Pair (a,b) has
+    valid TB IPv4 on both ends; pair (a,c) is broken on the c side.
+    The scorer picks by (download_score, total_memory, has_leaf), and
+    we tilt c's memory higher so the pair (a,c) would beat (a,b)
+    without the upstream filter.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+    node_c = NodeId()
+
+    for node in (node_a, node_b, node_c):
+        topology.add_node(node)
+
+    # Two overlapping RDMA pairs.
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=node_a, sink=node_c, edge=create_rdma_connection(3))
+    )
+    topology.add_connection(
+        Connection(source=node_c, sink=node_a, edge=create_rdma_connection(4))
+    )
+
+    node_network = {
+        node_a: create_jaccl_node_network("192.168.10.1", "10.0.0.1"),
+        node_b: create_jaccl_node_network("192.168.10.2", "10.0.0.2"),
+        node_c: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en1",
+                    # Broken node: only 169.254 link-local, no routable
+                    # peer path.
+                    ip_address="169.254.5.5",
+                    interface_type="thunderbolt",
+                )
+            ]
+        ),
+    }
+
+    node_memory = {
+        node_a: create_node_memory(1000),
+        node_b: create_node_memory(1000),
+        # ``node_c`` is fatter so its cycle would otherwise win on
+        # total-memory tiebreak.
+        node_c: create_node_memory(5000),
+    }
+
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    placements = place_instance(command, topology, {}, node_memory, node_network)
+
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxJacclInstance)
+    selected_node_ids = set(instance.shard_assignments.node_to_runner.keys())
+    assert selected_node_ids == {node_a, node_b}
 
 
 def test_placement_prefers_socket_reachable_rank_zero(
@@ -1361,3 +1785,235 @@ def test_placement_does_not_prefer_cycle_with_failed_download(
     assigned_nodes = set(instance.shard_assignments.node_to_runner.keys())
     # node_a should win on RAM tiebreaker since failed download scores 0.0
     assert assigned_nodes == {node_a}
+
+
+# ----------------------------------------------------------------------
+# _is_routable_jaccl_ipv4 - octet validation
+# ----------------------------------------------------------------------
+
+
+def test_is_routable_jaccl_ipv4_accepts_valid_thunderbolt_ranges() -> None:
+    """Common Thunderbolt-bridge IPv4 ranges we deploy on must pass.
+
+    These are the ranges JACCL preflight is gating on -- a regression
+    that rejects any of these would silently disable RDMA placement on
+    real clusters.
+    """
+    for ip in (
+        "192.168.10.10",
+        "192.168.10.255",
+        "10.0.0.1",
+        "172.16.0.42",
+        "1.2.3.4",
+        "223.255.255.254",  # last unicast address before Class D
+    ):
+        assert _is_routable_jaccl_ipv4(ip), f"{ip} unexpectedly rejected"
+
+
+def test_is_routable_jaccl_ipv4_rejects_non_unicast_ranges() -> None:
+    """Multicast (224..239), reserved (240..254), and broadcast (255)
+    must be rejected.
+
+    Codex (PR #11 round 3) flagged that ``255.255.255.255`` was
+    previously accepted because the syntactic check passed. A
+    misconfigured Thunderbolt/``maybe_ethernet`` interface with a
+    non-unicast address would otherwise pass preflight and fail
+    later during JACCL backend init -- defeating the purpose of
+    failing early with actionable guidance.
+    """
+    for ip in (
+        # Multicast 224..239
+        "224.0.0.1",
+        "239.255.255.255",
+        # Reserved 240..254
+        "240.0.0.1",
+        "254.0.0.1",
+        # Limited broadcast 255.255.255.255 (specifically called out
+        # by the codex review)
+        "255.255.255.255",
+        "255.0.0.1",
+    ):
+        assert not _is_routable_jaccl_ipv4(ip), f"{ip} unexpectedly accepted"
+
+
+def test_is_routable_jaccl_ipv4_rejects_first_octet_zero() -> None:
+    """First octet 0 is still rejected by the prefix block."""
+    assert not _is_routable_jaccl_ipv4("0.1.2.3")
+    assert not _is_routable_jaccl_ipv4("0.0.0.1")
+
+
+def test_is_routable_jaccl_ipv4_rejects_out_of_range_octets() -> None:
+    """Octets outside 0..255 must be rejected.
+
+    Codex (PR #11 round 2) flagged that the previous implementation
+    accepted ``"999.1.1.1"`` because it only checked
+    ``len(split('.')) == 4``. That let malformed interface data
+    pass preflight and reach the JACCL backend, where it fails with
+    a far less actionable error.
+    """
+    for ip in ("999.1.1.1", "256.0.0.1", "1.256.1.1", "1.1.256.1", "1.1.1.256"):
+        assert not _is_routable_jaccl_ipv4(ip), f"{ip} unexpectedly accepted"
+
+
+def test_is_routable_jaccl_ipv4_rejects_empty_or_missing_octets() -> None:
+    """Strings with the right number of dots but empty/missing octets
+    must be rejected.
+
+    ``"1..2.3"`` has four split components but the second is empty.
+    ``"1.2.3."`` has four components but the last is empty. The old
+    implementation accepted both."""
+    for ip in ("1..2.3", "1.2.3.", ".1.2.3", "...", ""):
+        assert not _is_routable_jaccl_ipv4(ip), f"{ip!r} unexpectedly accepted"
+
+
+def test_is_routable_jaccl_ipv4_rejects_non_digit_octets() -> None:
+    """Non-numeric octets must be rejected (letters, signs, hex)."""
+    for ip in ("1.2.3.x", "abc.1.2.3", "-1.2.3.4", "1.2.3.-4", "1.2.3.0xff"):
+        assert not _is_routable_jaccl_ipv4(ip), f"{ip!r} unexpectedly accepted"
+
+
+def test_is_routable_jaccl_ipv4_rejects_leading_zero_octets() -> None:
+    """Leading zeros in octets must be rejected.
+
+    ``networksetup`` never emits them and they historically trigger
+    octal-style parsing in some libc tools, so we treat them as
+    malformed even though numerically valid."""
+    for ip in ("01.2.3.4", "1.02.3.4", "1.2.03.4", "1.2.3.04", "001.2.3.4"):
+        assert not _is_routable_jaccl_ipv4(ip), f"{ip!r} unexpectedly accepted"
+
+
+def test_is_routable_jaccl_ipv4_rejects_wrong_octet_count() -> None:
+    """Strings with the wrong number of octets must be rejected."""
+    for ip in ("1.2.3", "1.2.3.4.5", "1.2", "1", "1.2.3.4.5.6.7"):
+        assert not _is_routable_jaccl_ipv4(ip), f"{ip!r} unexpectedly accepted"
+
+
+def test_is_routable_jaccl_ipv4_rejects_link_local_and_loopback() -> None:
+    """The existing prefix block (loopback, link-local, all-zero) must
+    still be enforced after octet validation tightens."""
+    for ip in ("127.0.0.1", "169.254.10.10", "0.0.0.0"):
+        assert not _is_routable_jaccl_ipv4(ip), f"{ip} unexpectedly accepted"
+
+
+def test_is_routable_jaccl_ipv4_rejects_ipv6() -> None:
+    """IPv6 addresses must be rejected (any colon disqualifies)."""
+    for ip in ("::1", "fe80::1", "2001:db8::1"):
+        assert not _is_routable_jaccl_ipv4(ip), f"{ip} unexpectedly accepted"
+
+
+def test_jaccl_placement_singleton_fallback_picks_best_node_regardless_of_tb(
+    model_card: ModelCard,
+) -> None:
+    """Codex P2 (PR #11 round 4): the candidate-time JACCL prefilter
+    must NOT restrict singleton cycles, because a ``MlxJaccl`` request
+    with ``min_nodes=1`` always downgrades to ``MlxRing`` further down
+    (single-node JACCL is meaningless because target ranks have no
+    peers to dial over Thunderbolt RDMA). Pre-fix the prefilter
+    rejected non-TB nodes from the candidate pool, so the selector
+    picked the TB-equipped node even when a non-TB node had more
+    available memory or a better download score -- a worse single-node
+    placement.
+
+    Cluster shape: two unconnected solo nodes::
+
+        wifi_node  -- only Wi-Fi, more memory
+        tb_node    -- Thunderbolt + Ethernet, less memory
+
+    Both are length-1 RDMA cycles (singletons trivially pass
+    ``is_rdma_cycle``). Pre-fix, the prefilter eliminated
+    ``wifi_node`` (no TB-IPv4) and the selector was forced to pick
+    ``tb_node``. Post-fix, the selector sees both candidates and
+    picks the higher-memory one.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(800),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    wifi_node = NodeId()
+    tb_node = NodeId()
+    topology.add_node(wifi_node)
+    topology.add_node(tb_node)
+
+    node_network = {
+        wifi_node: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.50",
+                    interface_type="wifi",
+                ),
+            ]
+        ),
+        tb_node: create_jaccl_node_network("192.168.10.2", "192.168.1.51"),
+    }
+
+    # Bias the wifi-only node to have MORE memory so the selector
+    # would pick it if not blocked by the prefilter. Pre-fix the
+    # prefilter dropped it from the candidate pool so the selector
+    # was forced to pick ``tb_node`` regardless.
+    node_memory = {
+        wifi_node: create_node_memory(2000),
+        tb_node: create_node_memory(1000),
+    }
+
+    command = PlaceInstance(
+        sharding=Sharding.Pipeline,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=1,
+    )
+
+    placements = place_instance(command, topology, {}, node_memory, node_network)
+
+    assert len(placements) == 1
+    instance = next(iter(placements.values()))
+    # Must downgrade to ring (singleton placement).
+    assert isinstance(instance, MlxRingInstance)
+    selected_node_ids = set(instance.shard_assignments.node_to_runner.keys())
+    # Must pick the higher-memory node (wifi), not the TB one. Pre-fix
+    # the wifi node was eliminated by the JACCL prefilter and the
+    # selector was forced to pick the lower-memory TB node.
+    assert selected_node_ids == {wifi_node}, (
+        "min_nodes=1 placement must consider non-TB candidates because "
+        "the singleton fallback downgrades to MlxRing (which doesn't "
+        f"need TB-IPv4); got {selected_node_ids!r}"
+    )
+
+
+def test_is_routable_jaccl_ipv4_rejects_unicode_digit_octets() -> None:
+    """Codex P3 (PR #11 round 4): ``str.isdigit()`` returns True for
+    Unicode digit characters that ``int()`` then rejects. Pre-fix
+    these strings reached ``int(octet)`` and raised ``ValueError``,
+    aborting placement instead of cleanly returning False.
+    """
+    # Superscript digits ('\u00b2' = '²', '\u00b9' = '¹') are
+    # ``isdigit() == True`` but not parseable by ``int()``.
+    # Arabic-Indic digits ('\u0660'..) and bengali digits ('\u09e6')
+    # also satisfy ``isdigit()`` but ``int()`` does accept some of
+    # them, so the regression we're guarding against is the
+    # superscript / fractional / no-base-10-mapping case.
+    superscript_two = "\u00b2"
+    superscript_three = "\u00b3"
+    superscript_one = "\u00b9"
+    cases = [
+        f"{superscript_one}.2.3.4",
+        f"1.{superscript_two}.3.4",
+        f"1.2.{superscript_three}.4",
+        f"1.2.3.{superscript_one}",
+        # Mixed ASCII + superscript (e.g. ``1²``) -- entire octet is
+        # rejected because ``isascii()`` fails on the non-ASCII char.
+        f"1{superscript_two}.2.3.4",
+    ]
+    for ip in cases:
+        # Must not raise; must return False cleanly.
+        assert not _is_routable_jaccl_ipv4(ip), (
+            f"unicode-digit octet {ip!r} unexpectedly accepted"
+        )
