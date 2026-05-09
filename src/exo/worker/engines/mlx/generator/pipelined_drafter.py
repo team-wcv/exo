@@ -173,6 +173,7 @@ from exo.worker.engines.mlx.utils_mlx import (
     mx_broadcast_int_list,
     target_peer_broadcast_int_list,
 )
+from exo.worker.runner.bootstrap import logger as _diag_logger
 
 # Length-prefix slot value reserved for the "drafter aborted" signal.
 # Picked from the int32 positive range so it survives
@@ -767,18 +768,42 @@ def _pipelined_speculative_step_body(
     k = num_draft_tokens
     y = prompt.astype(mx.uint32)
 
+    _diag_rank = (
+        target_group.rank()
+        if target_group is not None
+        else (0 if is_target_root else -1)
+    )
+    _diag_logger.info(
+        f"[spec-diag] rank {_diag_rank}: spec body entered "
+        f"(prompt size={int(prompt.size)}, k={k}, root={is_target_root})"
+    )
+
     # Mirror mlx_lm._prefill: caller has aligned ``prompt_cache`` to
     # ``context_tokens[:-2]`` via ``exo.prefill`` + ``trim(2)``; this loop
     # advances the cache by one more token, leaving ``y`` (length 1) as
     # the seed for the spec loop.
+    _diag_prefill_iters = 0
     while y.size > 1:
+        _diag_prefill_t0 = time.perf_counter()
         n_to_process = min(prefill_step_size, y.size - 1)
         model(y[:n_to_process][None], cache=prompt_cache)
         mx.eval([c.state for c in prompt_cache])  # type: ignore[reportArgumentType]
         y = y[n_to_process:]
         mx.clear_cache()
+        _diag_logger.info(
+            f"[spec-diag] rank {_diag_rank}: spec-body prefill iter "
+            f"{_diag_prefill_iters} done in "
+            f"{(time.perf_counter() - _diag_prefill_t0) * 1000:.1f}ms "
+            f"(remaining y.size={int(y.size)})"
+        )
+        _diag_prefill_iters += 1
 
+    _diag_seed_t0 = time.perf_counter()
     seed = int(y.item())
+    _diag_logger.info(
+        f"[spec-diag] rank {_diag_rank}: seed materialized in "
+        f"{(time.perf_counter() - _diag_seed_t0) * 1000:.1f}ms (seed={seed})"
+    )
     # ``prev_tokens`` carries the running token sequence (prompt +
     # emitted) so logits processors with state see consistent context.
     # Mirror :func:`drafter._ngram_speculative_step`: start from prompt.
@@ -790,16 +815,36 @@ def _pipelined_speculative_step_body(
     # drafter forward issues a socket round-trip; on non-root target
     # ranks we skip that and just receive the broadcast.
     if transport is not None:
+        _diag_fwd_t0 = time.perf_counter()
+        _diag_logger.info(
+            f"[spec-diag] rank {_diag_rank}: round 0 about to call "
+            f"transport.forward([seed], k={k})"
+        )
         drafts_future = transport.forward([seed], k)
         drafts_local: list[int] | None = drafts_future.result()
+        _diag_logger.info(
+            f"[spec-diag] rank {_diag_rank}: round 0 transport.forward "
+            f"returned in {(time.perf_counter() - _diag_fwd_t0) * 1000:.1f}ms "
+            f"(drafts_local len={len(drafts_local) if drafts_local else 0})"
+        )
     else:
         drafts_local = None
+    _diag_bcast_t0 = time.perf_counter()
+    _diag_logger.info(
+        f"[spec-diag] rank {_diag_rank}: round 0 about to call "
+        f"_broadcast_drafts (root={is_target_root})"
+    )
     drafts = _broadcast_drafts(
         drafts_local,
         k=k,
         target_group=target_group,
         target_peer_fanout=target_peer_fanout,
         is_root=is_target_root,
+    )
+    _diag_logger.info(
+        f"[spec-diag] rank {_diag_rank}: round 0 _broadcast_drafts done "
+        f"in {(time.perf_counter() - _diag_bcast_t0) * 1000:.1f}ms "
+        f"(drafts len={len(drafts)})"
     )
 
     speculative_future: DraftFuture | None = None

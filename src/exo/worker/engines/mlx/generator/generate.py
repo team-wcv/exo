@@ -1258,12 +1258,27 @@ def mlx_generate(
             # with prompt[:-2] (matching ``_spec_drafter_prefill``'s
             # invariant: align the drafter's offset to ``len(prompt) - 2``
             # so the spec loop's first OP_FORWARD seeds from prompt[-2]).
+            _diag_t0 = time.perf_counter()
+            logger.info(
+                f"[spec-diag] rank 0: about to materialize prefill_prompt "
+                f"via tolist() ({all_prompt_tokens.size} prompt tokens total)"
+            )
             prefill_prompt: list[int] = [
                 int(t) for t in cast(list[int], all_prompt_tokens[:-2].tolist())
             ]
+            logger.info(
+                f"[spec-diag] rank 0: prefill_prompt materialized in "
+                f"{(time.perf_counter() - _diag_t0) * 1000:.1f}ms "
+                f"(len={len(prefill_prompt)}); about to send OP_PREFILL"
+            )
             try:
+                _diag_t1 = time.perf_counter()
                 cast(_DrafterTransport, session_transport).reset_and_prefill(
                     prefill_prompt
+                )
+                logger.info(
+                    f"[spec-diag] rank 0: OP_PREFILL ACK received in "
+                    f"{(time.perf_counter() - _diag_t1) * 1000:.1f}ms"
                 )
                 drafter: Drafter = make_drafter(
                     mode=draft_mode,
@@ -1331,6 +1346,12 @@ def mlx_generate(
     full_context_tokens: list[int] = [
         int(t) for t in cast(list[int], all_prompt_tokens.tolist())
     ]
+    _spec_diag_rank = group.rank() if group is not None else 0
+    logger.info(
+        f"[spec-diag] rank {_spec_diag_rank}: about to enter drafter.stream() "
+        f"(decode_prompt size={int(decode_prompt.size)}, "
+        f"max_tokens={max_tokens}, mode={draft_mode})"
+    )
 
     try:
         for completion_tokens, out in enumerate(
