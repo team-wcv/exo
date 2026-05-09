@@ -98,6 +98,10 @@ class SequentialGenerator(Engine):
     cancel_receiver: MpReceiver[TaskId]
     event_sender: MpSender[Event]
     vision_processor: VisionProcessor | None = None
+    # Optional draft model for speculative decoding (single-device only).
+    # `mlx_generate` itself enforces ``draft_model=None`` whenever ``group is
+    # not None``; this field is only ever populated for single-device runners.
+    draft_model: Model | None = None
     check_for_cancel_every: int = 50
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
@@ -295,10 +299,22 @@ class SequentialGenerator(Engine):
             on_generation_token=on_generation_token,
             group=self.group,
             vision_processor=self.vision_processor,
+            draft_model=self.draft_model,
         )
 
     def close(self) -> None:
-        del self.model, self.tokenizer, self.group
+        # Codex P2 (PR #18, batch_generator.py:104): release the
+        # drafter model alongside the target model. ``draft_model``
+        # is a second large MLX model reference held by
+        # ``SequentialGenerator`` for speculative decoding; if we
+        # only delete ``self.model``, the drafter weights stay
+        # resident on GPU until the runner subprocess exits, which
+        # leaks ~drafter_size of VRAM across runner restarts (and
+        # across instance teardown when the runner is recycled
+        # rather than killed). MLX has no explicit free hook beyond
+        # dropping the last reference, so the ``del`` here is the
+        # only release point.
+        del self.model, self.tokenizer, self.group, self.draft_model
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
         cache = run_prefill_for_request(

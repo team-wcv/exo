@@ -49,6 +49,11 @@ class ModelListModel(BaseModel):
     base_model: str = Field(default="")
     capabilities: list[str] = Field(default_factory=list)
     reasoning_dialect: ReasoningDialect = "none"
+    # Smaller draft models the runner can load alongside this target for
+    # speculative decoding. Listed in preference order (`fastest` first).
+    # Surfaced so dashboards and clients can pre-download a drafter and
+    # pick which one to use at request time.
+    drafter_model_ids: list[str] = Field(default_factory=list)
 
 
 class ModelList(BaseModel):

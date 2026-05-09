@@ -352,6 +352,7 @@ def test_http_agent_models_returns_backing_model(
             "quantization": "",
             "base_model": "",
             "capabilities": [],
+            "drafter_model_ids": [],
         }
     ]
 
