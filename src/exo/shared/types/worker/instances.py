@@ -78,9 +78,14 @@ class DrafterPlacement(FrozenModel):
                              :func:`find_ip_prioritised`; differs
                              per peer because Thunderbolt /30 meshes
                              expose a unique IP per node pair. Keys
-                             are device ranks (string-encoded for
-                             Pydantic dict-key serialisation), not
-                             node ids.
+                             are device ranks **stored as strings**
+                             so the type round-trips cleanly through
+                             JSON (the wire format used by
+                             :mod:`event_router`); ``dict[int, str]``
+                             would fail strict re-validation because
+                             JSON has no int dict keys. Convert to
+                             int at the consumer (see
+                             :func:`_maybe_setup_target_peer_fanout`).
     """
 
     drafter_node_id: NodeId
@@ -90,7 +95,7 @@ class DrafterPlacement(FrozenModel):
     drafter_socket_host: str
     drafter_socket_port: int = Field(ge=1, le=65535)
     target_peer_socket_port: int = Field(ge=1, le=65535)
-    target_peer_hosts_by_rank: dict[int, str] = Field(default_factory=dict)
+    target_peer_hosts_by_rank: dict[str, str] = Field(default_factory=dict)
 
 
 class BaseInstance(TaggedModel):

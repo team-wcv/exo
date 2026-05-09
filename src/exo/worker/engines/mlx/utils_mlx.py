@@ -523,11 +523,11 @@ def _maybe_setup_target_peer_fanout(
             expected_world_size=expected_world_size,
         )
 
-    rank_zero_host = placement.target_peer_hosts_by_rank.get(rank)
+    rank_zero_host = placement.target_peer_hosts_by_rank.get(str(rank))
     if rank_zero_host is None:
         raise RuntimeError(
-            f"target peer rank {rank} has no entry in "
-            f"DrafterPlacement.target_peer_hosts_by_rank "
+            f"target peer rank {rank} (key={str(rank)!r}) has no entry "
+            f"in DrafterPlacement.target_peer_hosts_by_rank "
             f"({placement.target_peer_hosts_by_rank}); placement is "
             "malformed"
         )

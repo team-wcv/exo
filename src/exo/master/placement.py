@@ -651,7 +651,11 @@ def _select_drafter_placement(
     # placement time so workers don't re-do the topology dance at
     # bootstrap.
     target_peer_socket_port = random_ephemeral_port()
-    target_peer_hosts_by_rank: dict[int, str] = {}
+    # Keys stored as strings so the dict round-trips through the
+    # event-router JSON wire (JSON has no int dict keys, and pydantic
+    # strict mode rejects str keys for a ``dict[int, _]`` field at
+    # re-validation). Consumers stringify the rank before lookup.
+    target_peer_hosts_by_rank: dict[str, str] = {}
     for peer_rank, peer_node_id in enumerate(selected_cycle.node_ids):
         if peer_rank == 0:
             continue
@@ -685,7 +689,7 @@ def _select_drafter_placement(
                 ),
             )
             return None
-        target_peer_hosts_by_rank[peer_rank] = peer_view_of_rank_zero
+        target_peer_hosts_by_rank[str(peer_rank)] = peer_view_of_rank_zero
     return DrafterPlacement(
         drafter_node_id=drafter_node_id,
         drafter_runner_id=drafter_runner_id,
