@@ -1,7 +1,7 @@
 from collections.abc import Mapping
 from copy import deepcopy
 from os import environ
-from typing import Sequence
+from typing import Literal, Sequence
 
 from loguru import logger
 
@@ -295,7 +295,8 @@ def place_instance(
             for cycle in smallest_rdma_cycles
             if len(cycle) == 1
             or all(
-                _has_jaccl_thunderbolt_ipv4(node_network.get(node_id))
+                _node_has_or_lacks_known_jaccl_path(node_network, node_id)
+                != "known_no_path"
                 for node_id in cycle.node_ids
             )
         ]
@@ -461,10 +462,32 @@ def _validate_jaccl_thunderbolt_ipv4_paths(
     cycle: Cycle,
     node_network: Mapping[NodeId, NodeNetworkInfo],
 ) -> None:
+    """Reject the placement only when we have *positive evidence* that
+    a node lacks a TB-IPv4 peer path.
+
+    Codex P1 (PR #11 round 5): ``State.node_network`` is populated by
+    a best-effort async watcher and starts empty on cold-boot, so
+    ``node_network.get(node_id)`` returning ``None`` is not the same
+    thing as ``the node has no Thunderbolt interface``. The original
+    guard collapsed both into "missing" and rejected ``MlxJaccl``
+    placements whenever the gatherer hadn't run yet (or failed
+    transiently for a node), even on clusters with healthy RDMA
+    topology. We now distinguish the two:
+
+    * ``known_no_path`` -- the node has gathered network info and
+      none of its interfaces satisfy the Thunderbolt IPv4 predicate.
+      That is genuine misconfiguration; raise with the actionable
+      ``bb rdma repair`` guidance.
+    * ``unknown`` -- the node has no entry in ``node_network`` (yet).
+      We let placement proceed because the topology-derived RDMA
+      edge already attests that some real connection exists; the
+      JACCL backend will surface a clearer per-link error if the
+      address turns out to be unusable at bind time.
+    """
     missing_nodes = [
         node_id
         for node_id in cycle.node_ids
-        if not _has_jaccl_thunderbolt_ipv4(node_network.get(node_id))
+        if _node_has_or_lacks_known_jaccl_path(node_network, node_id) == "known_no_path"
     ]
     if missing_nodes:
         raise ValueError(
@@ -473,6 +496,26 @@ def _validate_jaccl_thunderbolt_ipv4_paths(
             "`bb rdma jaccl-status all`, then retry. Missing nodes: "
             + ", ".join(str(node_id) for node_id in missing_nodes)
         )
+
+
+def _node_has_or_lacks_known_jaccl_path(
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+    node_id: NodeId,
+) -> Literal["has_path", "known_no_path", "unknown"]:
+    """Three-valued JACCL preflight verdict for a single node.
+
+    Returns ``"unknown"`` when ``node_id`` has no entry in
+    ``node_network`` (best-effort gatherer hasn't reported yet),
+    ``"has_path"`` when at least one Thunderbolt-style interface
+    advertises a routable IPv4, and ``"known_no_path"`` when network
+    info is present but no qualifying interface exists. Callers use
+    this to distinguish "we have no data" (be permissive) from "we
+    have data and it's bad" (reject with actionable guidance).
+    """
+    info = node_network.get(node_id)
+    if info is None:
+        return "unknown"
+    return "has_path" if _has_jaccl_thunderbolt_ipv4(info) else "known_no_path"
 
 
 def _has_jaccl_thunderbolt_ipv4(network_info: NodeNetworkInfo | None) -> bool:

@@ -2017,3 +2017,149 @@ def test_is_routable_jaccl_ipv4_rejects_unicode_digit_octets() -> None:
         assert not _is_routable_jaccl_ipv4(ip), (
             f"unicode-digit octet {ip!r} unexpectedly accepted"
         )
+
+
+def test_jaccl_placement_allows_nodes_with_unknown_network_info(
+    model_card: ModelCard,
+) -> None:
+    """Codex P1 (PR #11 round 5): ``State.node_network`` is populated
+    by a best-effort async watcher, so on cold-boot (or after a
+    transient ``info_gatherer`` failure) some nodes have no entry in
+    the map. Pre-fix the JACCL preflight collapsed
+    "no entry in node_network" and "node has interfaces but none are
+    Thunderbolt IPv4" into the same negative verdict, blocking
+    ``MlxJaccl`` placements on healthy RDMA topologies whenever the
+    gatherer hadn't run yet -- with a misleading "run bb rdma repair"
+    error. We now treat missing entries as "unknown" and let
+    placement proceed; only nodes with positive evidence of a
+    non-TB-IPv4 setup are rejected.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(2))
+    )
+    # libp2p establishes both RDMA and Socket edges per direction in
+    # real deployments; including the socket edges lets the JACCL
+    # coordinator selector resolve a peer IP from topology metadata
+    # alone (via ``_find_connection_ip``) when ``node_network`` is
+    # empty. This is the realistic cold-boot shape for the regression
+    # we're guarding against.
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_socket_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_socket_connection(1))
+    )
+
+    # ``node_network`` is empty -- simulates the pre-watcher cold-boot
+    # window or a transient gatherer failure on both nodes. The RDMA
+    # topology is healthy, so placement should proceed.
+    node_network: dict[NodeId, NodeNetworkInfo] = {}
+
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
+        node_network,
+    )
+
+    assert len(placements) == 1
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxJacclInstance), (
+        "MlxJaccl placement must succeed when node_network has no "
+        "entries (best-effort gatherer hasn't reported yet); the "
+        "JACCL preflight must distinguish 'unknown' from 'known-no-TB'."
+    )
+
+
+def test_jaccl_placement_still_rejects_nodes_with_known_non_tb_paths(
+    model_card: ModelCard,
+) -> None:
+    """Sibling regression to the unknown-info test above: when
+    ``node_network`` *does* contain an entry for a node and that
+    entry has no qualifying Thunderbolt IPv4 interface (e.g. only
+    Wi-Fi, or only link-local 169.254 addresses), preflight must
+    still reject with the actionable repair-guidance error message.
+    Otherwise loosening the preflight to allow ``unknown`` nodes
+    would also let through nodes with positive evidence of bad
+    network configuration, defeating the purpose of the check.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(2))
+    )
+
+    # ``node_a`` has a TB-IPv4 path; ``node_b`` has only Wi-Fi
+    # (positive evidence of bad config). Placement must reject.
+    node_network = {
+        node_a: create_jaccl_node_network("192.168.10.10"),
+        node_b: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.50",
+                    interface_type="wifi",
+                ),
+            ]
+        ),
+    }
+
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    with pytest.raises(ValueError, match="bb rdma repair"):
+        place_instance(
+            command,
+            topology,
+            {},
+            {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
+            node_network,
+        )
