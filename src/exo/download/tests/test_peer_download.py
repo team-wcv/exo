@@ -32,7 +32,7 @@ async def temp_models_dir(tmp_path: Path) -> AsyncIterator[Path]:
 @pytest.fixture
 async def peer_server(temp_models_dir: Path) -> AsyncIterator[PeerFileServer]:
     """Start a PeerFileServer on a random port for testing."""
-    server = PeerFileServer(host="127.0.0.1", port=0, models_dir=temp_models_dir)
+    server = PeerFileServer(host="127.0.0.1", port=0, models_dirs=[temp_models_dir])
     # Use port 0 to let OS assign a free port
     from aiohttp import web
 
@@ -262,6 +262,78 @@ class TestPeerFileServer:
             ) as r,
         ):
             assert r.status == 404
+
+
+class TestPeerFileServerMultipleDirectories:
+    """The peer file server must look for the model in *every* configured
+    models directory. Otherwise a node that lands a model in a non-default
+    writable directory (custom path, low-disk fallback, or read-only mount)
+    would silently fail to advertise it to peers and force them back onto
+    HuggingFace -- defeating the whole peer download path.
+    """
+
+    async def test_serves_model_from_secondary_writable_dir(
+        self, tmp_path: Path
+    ) -> None:
+        primary = tmp_path / "primary"
+        secondary = tmp_path / "secondary"
+        await aios.makedirs(primary, exist_ok=True)
+        await aios.makedirs(secondary, exist_ok=True)
+
+        model_dir = secondary / "test--model"
+        await aios.makedirs(model_dir, exist_ok=True)
+        async with aiofiles.open(model_dir / "config.json", "wb") as f:
+            await f.write(b'{"hello":"world"}')
+
+        server = PeerFileServer(
+            host="127.0.0.1", port=0, models_dirs=[primary, secondary]
+        )
+
+        from aiohttp import web
+
+        server._runner = web.AppRunner(server._app)
+        await server._runner.setup()
+        site = web.TCPSite(server._runner, "127.0.0.1", 0)
+        await site.start()
+        port_int: int = cast(int, site._server.sockets[0].getsockname()[1])  # type: ignore[union-attr]
+        server.port = port_int
+        try:
+            files = await get_peer_file_status("127.0.0.1", port_int, "test--model")
+            assert files is not None
+            assert {f.path for f in files} == {"config.json"}
+        finally:
+            await server.shutdown()
+
+    async def test_serves_model_from_read_only_mount(self, tmp_path: Path) -> None:
+        writable = tmp_path / "writable"
+        read_only = tmp_path / "ro_mount"
+        await aios.makedirs(writable, exist_ok=True)
+        await aios.makedirs(read_only / "ro--model", exist_ok=True)
+        async with aiofiles.open(read_only / "ro--model" / "config.json", "wb") as f:
+            await f.write(b"{}")
+
+        server = PeerFileServer(
+            host="127.0.0.1", port=0, models_dirs=[writable, read_only]
+        )
+
+        from aiohttp import web
+
+        server._runner = web.AppRunner(server._app)
+        await server._runner.setup()
+        site = web.TCPSite(server._runner, "127.0.0.1", 0)
+        await site.start()
+        port_int: int = cast(int, site._server.sockets[0].getsockname()[1])  # type: ignore[union-attr]
+        server.port = port_int
+        try:
+            files = await get_peer_file_status("127.0.0.1", port_int, "ro--model")
+            assert files is not None
+            assert {f.path for f in files} == {"config.json"}
+        finally:
+            await server.shutdown()
+
+    async def test_constructor_rejects_empty_directory_list(self) -> None:
+        with pytest.raises(ValueError, match="at least one models directory"):
+            PeerFileServer(host="127.0.0.1", port=0, models_dirs=[])
 
 
 class TestPeerDownloadClient:

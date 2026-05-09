@@ -22,7 +22,12 @@ from exo.download.peer_file_server import PeerFileServer
 from exo.master.main import Master
 from exo.routing.event_router import EventRouter
 from exo.routing.router import Router, get_node_id_keypair
-from exo.shared.constants import EXO_DEFAULT_MODELS_DIR, EXO_LOG, EXO_PEER_DOWNLOAD_PORT
+from exo.shared.constants import (
+    EXO_LOG,
+    EXO_MODELS_DIRS,
+    EXO_MODELS_READ_ONLY_DIRS,
+    EXO_PEER_DOWNLOAD_PORT,
+)
 from exo.shared.election import Election, ElectionResult
 from exo.shared.logging import logger_cleanup, logger_set_context, logger_setup
 from exo.shared.types.common import NodeId, SessionId
@@ -114,10 +119,17 @@ class Node:
             worker = None
 
         if peer_download_enabled:
+            # Serve from every configured model directory so peers can fetch
+            # any locally-resident shard regardless of which directory the
+            # downloader landed it in. ``EXO_MODELS_DIRS`` already includes
+            # ``EXO_DEFAULT_MODELS_DIR`` as its first entry; ``EXO_MODELS_READ_ONLY_DIRS``
+            # captures pre-populated mounts (e.g. shared NFS caches) that
+            # ``select_download_dir_for_shard`` excludes from new writes but
+            # which other peers still benefit from being able to read.
             peer_file_server = PeerFileServer(
                 host="0.0.0.0",
                 port=args.peer_download_port,
-                models_dir=EXO_DEFAULT_MODELS_DIR,
+                models_dirs=(*EXO_MODELS_DIRS, *EXO_MODELS_READ_ONLY_DIRS),
             )
 
         if not args.no_downloads:

@@ -83,44 +83,47 @@ def _resolve_peer_endpoint(
     peer_download_port: int,
     status: str,
 ) -> PeerEndpoint | None:
-    """Resolve a peer's IP address and connection type from the topology."""
+    """Resolve a peer's IP address and connection type from the topology.
+
+    Iteration order over ``out_edges`` is not guaranteed to surface RDMA
+    edges before socket edges, so we scan the full edge set once: any
+    RDMA edge wins (we use the peer's socket address for the actual TCP
+    connect since RDMA edges don't carry routable IPs), and only when no
+    RDMA edge exists do we fall back to the socket endpoint. Returning
+    on the first non-RDMA hit would otherwise mislabel peers as
+    ``socket`` whenever the socket edge happens to be visited first.
+    """
     try:
-        # Check for RDMA connections first (highest priority)
-        for conn in state.topology.out_edges(node_id):
-            if conn.sink != peer_node_id:
-                continue
-            if isinstance(conn.edge, RDMAConnection):
-                # RDMA peer — still need IP from a socket connection
-                ip = _find_socket_ip(node_id, peer_node_id, state)
-                if ip:
-                    return PeerEndpoint(
-                        node_id=peer_node_id,
-                        ip=ip,
-                        port=peer_download_port,
-                        status=status,
-                        connection_type="rdma",
-                    )
-            else:
-                return PeerEndpoint(
-                    node_id=peer_node_id,
-                    ip=conn.edge.sink_multiaddr.ip_address,
-                    port=peer_download_port,
-                    status=status,
-                    connection_type="socket",
-                )
+        edges = [
+            conn
+            for conn in state.topology.out_edges(node_id)
+            if conn.sink == peer_node_id
+        ]
+        has_rdma = any(isinstance(conn.edge, RDMAConnection) for conn in edges)
+        socket_ip = next(
+            (
+                conn.edge.sink_multiaddr.ip_address
+                for conn in edges
+                if isinstance(conn.edge, SocketConnection)
+            ),
+            None,
+        )
+        if has_rdma and socket_ip:
+            return PeerEndpoint(
+                node_id=peer_node_id,
+                ip=socket_ip,
+                port=peer_download_port,
+                status=status,
+                connection_type="rdma",
+            )
+        if socket_ip:
+            return PeerEndpoint(
+                node_id=peer_node_id,
+                ip=socket_ip,
+                port=peer_download_port,
+                status=status,
+                connection_type="socket",
+            )
     except Exception as e:
         logger.debug(f"Could not resolve endpoint for peer {peer_node_id}: {e}")
-    return None
-
-
-def _find_socket_ip(
-    node_id: NodeId, peer_node_id: NodeId, state: State
-) -> str | None:
-    """Find a socket connection IP for a peer (used as fallback for RDMA peers)."""
-    try:
-        for conn in state.topology.out_edges(node_id):
-            if conn.sink == peer_node_id and isinstance(conn.edge, SocketConnection):
-                return conn.edge.sink_multiaddr.ip_address
-    except Exception:
-        pass
     return None

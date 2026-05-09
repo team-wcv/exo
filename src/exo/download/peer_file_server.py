@@ -1,15 +1,25 @@
 """Lightweight HTTP file server for peer-to-peer model downloads.
 
-Each exo node runs a PeerFileServer that serves model files from the local
-cache directory. When one node finishes downloading a model from HuggingFace,
-other nodes on the same LAN can fetch it directly over HTTP instead of
+Each exo node runs a PeerFileServer that serves model files from its local
+caches. When one node finishes downloading a model from HuggingFace, other
+nodes on the same LAN can fetch it directly over HTTP instead of
 re-downloading from the internet.
 
 Supports serving in-progress downloads via .partial.meta files that track
 how many bytes have been safely flushed to disk.
+
+The server is given the *full* set of directories the local node may store
+models in (the writable ``EXO_MODELS_DIRS`` plus any read-only mounts under
+``EXO_MODELS_READ_ONLY_DIRS``) so that peers can fetch any locally-resident
+model regardless of which directory the downloader picked. Restricting the
+server to a single hard-coded directory would silently disable the peer
+download path whenever ``select_download_dir_for_shard`` placed the model
+in a non-default directory (custom path, low-disk fallback, or a read-only
+mount).
 """
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TypeAlias, cast
 
@@ -24,15 +34,17 @@ PartialMeta: TypeAlias = dict[str, int | str]
 class PeerFileServer:
     """HTTP server that exposes local model files for peer download."""
 
-    def __init__(self, host: str, port: int, models_dir: Path) -> None:
+    def __init__(self, host: str, port: int, models_dirs: Sequence[Path]) -> None:
+        if not models_dirs:
+            raise ValueError("PeerFileServer requires at least one models directory")
         self.host = host
         self.port = port
-        self.models_dir = models_dir
+        # Preserve caller order so callers can prefer writable dirs over
+        # read-only dirs without us re-sorting them.
+        self.models_dirs: tuple[Path, ...] = tuple(models_dirs)
         self._app = web.Application()
         self._app.router.add_get("/status/{model_id}", self._handle_status)
-        self._app.router.add_get(
-            "/files/{model_id}/{file_path:.+}", self._handle_file
-        )
+        self._app.router.add_get("/files/{model_id}/{file_path:.+}", self._handle_file)
         self._app.router.add_get("/health", self._handle_health)
         self._runner: web.AppRunner | None = None
 
@@ -53,11 +65,9 @@ class PeerFileServer:
     async def _handle_status(self, request: web.Request) -> web.Response:
         """Return status of all files for a model (complete + in-progress)."""
         model_id = request.match_info["model_id"]
-        model_dir = _resolve_child(self.models_dir, model_id)
+        model_dir = await self._locate_model_dir(model_id)
         if model_dir is None:
-            return web.Response(status=404, text="Model not found")
-
-        if not await aios.path.exists(model_dir):
+            # No matching directory containing this model.
             return web.json_response({"files": []})
 
         files: list[dict[str, object]] = []
@@ -105,7 +115,7 @@ class PeerFileServer:
         model_id = request.match_info["model_id"]
         file_path = request.match_info["file_path"]
 
-        model_dir = _resolve_child(self.models_dir, model_id)
+        model_dir = await self._locate_model_dir(model_id)
         if model_dir is None:
             return web.Response(status=404, text="Model not found")
 
@@ -175,6 +185,22 @@ class PeerFileServer:
 
         await response.write_eof()
         return response
+
+    async def _locate_model_dir(self, model_id: str) -> Path | None:
+        """Return the first configured directory that contains ``model_id``.
+
+        Each candidate root is path-traversal-checked independently before we
+        probe the filesystem. We prefer the first directory in ``models_dirs``
+        that has a matching subdirectory; this preserves caller-specified
+        priority (e.g. writable before read-only) without re-sorting.
+        """
+        for root in self.models_dirs:
+            candidate = _resolve_child(root, model_id)
+            if candidate is None:
+                continue
+            if await aios.path.exists(candidate):
+                return candidate
+        return None
 
 
 def _resolve_child(root: Path, relative_path: str) -> Path | None:
