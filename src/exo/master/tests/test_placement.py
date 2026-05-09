@@ -2288,6 +2288,89 @@ def test_jaccl_placement_still_rejects_nodes_with_known_non_tb_paths(
         )
 
 
+def test_jaccl_placement_rejects_nodes_with_only_loopback_unknown_typing(
+    model_card: ModelCard,
+) -> None:
+    """Codex P1 (PR #11 round-(N+12), placement.py:589): the
+    round-(N+11) widening of ``_interface_typing_is_missing`` to
+    ``any(...)`` was too permissive. ``get_network_interfaces``
+    assigns ``"unknown"`` to interfaces not present in
+    ``networksetup`` output (loopback, tunnel, etc.), so almost
+    every node has at least one unknown interface and the JACCL
+    preflight reverted to permissive behavior -- placement could
+    proceed even when the only proper-typed candidate interfaces
+    were Wi-Fi (no TB).
+
+    Round-(N+12) couples the unknown check with routable-IPv4
+    candidacy: an ``"unknown"``-typed loopback (``127.x.x.x``) or
+    link-local (``169.254.x.x``) interface no longer triggers the
+    permissive branch because :func:`_is_routable_jaccl_ipv4`
+    filters them out. So the rejection guard fires again on a node
+    whose only proper-typed candidate is Wi-Fi, even when an
+    unknown-typed loopback also exists.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(2))
+    )
+
+    node_network = {
+        node_a: create_jaccl_node_network("192.168.10.10"),
+        node_b: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.50",
+                    interface_type="wifi",
+                ),
+                # Unknown loopback: pre-(N+12) this would have flipped
+                # the verdict to "unknown" and bypassed the preflight,
+                # but loopback is filtered by _is_routable_jaccl_ipv4
+                # so we still classify the node as known_no_path.
+                NetworkInterfaceInfo(
+                    name="lo0",
+                    ip_address="127.0.0.1",
+                    interface_type="unknown",
+                ),
+            ]
+        ),
+    }
+
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    with pytest.raises(ValueError, match="bb rdma repair"):
+        place_instance(
+            command,
+            topology,
+            {},
+            {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
+            node_network,
+        )
+
+
 def test_jaccl_placement_allows_nodes_with_partial_interface_typing(
     model_card: ModelCard,
 ) -> None:

@@ -544,34 +544,57 @@ def _interface_typing_is_missing(network_info: NodeNetworkInfo) -> bool:
     """Heuristic for "the gatherer couldn't classify this node's
     interfaces" vs "the gatherer reports a node with no TB interfaces".
 
-    Returns ``True`` when ``network_info`` has no interfaces at all,
-    or when **any** interface has ``interface_type == "unknown"`` (the
-    field's default and the value
-    :func:`exo.utils.info_gatherer.system_info._get_interface_types_from_networksetup`
-    writes when its parse fails). This distinguishes the "transient
-    gatherer failure" case (treat as ``unknown``, permissive) from
-    the "node legitimately has only wifi/ethernet" case (treat as
-    ``known_no_path``, reject with repair guidance).
+    Returns ``True`` when:
 
-    Codex P1 (PR #11 round-(N+11), placement.py:589): pre-fix this
-    helper required *every* interface to be ``"unknown"`` before it
-    classified the typing as missing. That was too strict. On a
-    node with mixed typing -- for example, Wi-Fi correctly typed as
-    ``"wifi"`` plus an unclassified ``en3`` Thunderbolt bridge whose
-    ``networksetup -listallhardwareports`` line failed to parse and
-    fell back to ``"unknown"`` -- the helper would return ``False``
-    and the verdict was ``known_no_path``, hard-failing JACCL
-    placement on healthy clusters. The unknown candidate could in
-    fact be the working Thunderbolt link, so we have no positive
-    evidence the node lacks a TB path. Treat any single unknown
-    interface as enough signal to defer to ``unknown`` and let the
-    JACCL backend surface a clearer per-link error if the IP turns
-    out to be unusable at bind time.
+    * ``network_info`` has no interfaces at all (gatherer reported
+      nothing), OR
+    * **every** interface has ``interface_type == "unknown"`` (the
+      gatherer's parse of ``networksetup -listallhardwareports``
+      failed across the board), OR
+    * **some** interface has ``interface_type == "unknown"`` AND a
+      routable IPv4 address (the unknown interface could plausibly
+      be a Thunderbolt bridge whose hardware-port line didn't
+      classify -- e.g. ``en3`` with a routable IP).
+
+    Returns ``False`` when typing IS available for every routable
+    candidate -- the node has positive evidence of bad config and
+    placement should reject with the actionable
+    ``bb rdma repair`` error.
+
+    Codex history:
+
+    Round-(N+2) introduced the helper using ``all(...)`` --
+    correctly handles total parse failure but rejects mixed-typing
+    nodes (Wi-Fi typed plus unparsed TB bridge).
+
+    Round-(N+11) widened to ``any(interface.interface_type ==
+    "unknown" ...)`` to admit the partial-typing case. That was
+    too permissive: ``get_network_interfaces`` assigns ``"unknown"``
+    to interfaces not present in ``networksetup`` output (loopback,
+    tunnel, etc.) so virtually every node had at least one
+    unknown interface and the JACCL preflight reverted to
+    permissive behavior on misconfigured clusters too -- the user
+    only saw the runtime JACCL failure later.
+
+    Round-(N+12) (this commit) couples the unknown check with
+    routable-IPv4 candidacy. Loopback (``127.x.x.x``) and
+    link-local (``169.254.x.x``) interfaces are filtered out by
+    :func:`_is_routable_jaccl_ipv4` (the same predicate the JACCL
+    preflight uses), so an ``"unknown"``-typed loopback no longer
+    fires the permissive branch. A routable-IPv4 interface that
+    is unknown-typed -- the ``en3`` Thunderbolt-bridge case with a
+    failed hardware-port parse -- still defers to ``unknown``.
     """
     if not network_info.interfaces:
         return True
-    return any(
+    if all(
         interface.interface_type == "unknown" for interface in network_info.interfaces
+    ):
+        return True
+    return any(
+        interface.interface_type == "unknown"
+        and _is_routable_jaccl_ipv4(interface.ip_address)
+        for interface in network_info.interfaces
     )
 
 
