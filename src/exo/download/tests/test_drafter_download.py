@@ -45,6 +45,30 @@ TARGET_ID = ModelId("test-org/test-target")
 DRAFTER_ID = ModelId("test-org/test-drafter")
 
 
+@contextlib.contextmanager
+def _patch_card_loaders(side_effect: object):
+    """Patch both ``ModelCard.load`` and ``ModelCard.load_cached_only``.
+
+    The coordinator's drafter-chain and delete-cascade paths call
+    :meth:`ModelCard.load_cached_only` (introduced in PR #18 round-
+    (N+15) to avoid Hugging Face round-trips on the command-processor
+    coroutine), while older surfaces still call :meth:`ModelCard.load`.
+    Tests need both methods to return the same mock card so the
+    side-effect contract holds across both call sites without each
+    test caring which entrypoint the coordinator happens to use.
+
+    A side-effect that raises on unexpected ids can therefore be
+    applied uniformly via the same helper; passing a callable that
+    raises ``AssertionError`` for unmatched ids stays meaningful
+    against either entrypoint.
+    """
+    with (
+        patch.object(ModelCard, "load", side_effect=side_effect),
+        patch.object(ModelCard, "load_cached_only", side_effect=side_effect),
+    ):
+        yield
+
+
 def _make_target_card(drafters: list[ModelId]) -> ModelCard:
     return ModelCard(
         model_id=TARGET_ID,
@@ -218,7 +242,7 @@ async def test_target_with_drafter_chains_drafter_download() -> None:
             return drafter_card
         raise AssertionError(f"unexpected ModelCard.load for {model_id}")
 
-    with patch.object(ModelCard, "load", side_effect=fake_load):
+    with _patch_card_loaders(fake_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (_, cmd_send, event_recv):
             await cmd_send.send(
@@ -242,7 +266,7 @@ async def test_target_without_drafter_does_not_chain() -> None:
     async def fail_load(_: ModelId) -> ModelCard:
         raise AssertionError("ModelCard.load should not be called when no drafter")
 
-    with patch.object(ModelCard, "load", side_effect=fail_load):
+    with _patch_card_loaders(fail_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (_, cmd_send, event_recv):
             await cmd_send.send(
@@ -270,7 +294,7 @@ async def test_drafter_chain_skipped_when_disabled_by_env(
             "ModelCard.load should not be called when EXO_DISABLE_DRAFTER set"
         )
 
-    with patch.object(ModelCard, "load", side_effect=fail_load):
+    with _patch_card_loaders(fail_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (_, cmd_send, event_recv):
             await cmd_send.send(
@@ -296,7 +320,7 @@ async def test_drafter_chain_swallows_card_load_error() -> None:
     async def boom(_: ModelId) -> ModelCard:
         raise RuntimeError("simulated card load failure")
 
-    with patch.object(ModelCard, "load", side_effect=boom):
+    with _patch_card_loaders(boom):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (_, cmd_send, event_recv):
             await cmd_send.send(
@@ -340,7 +364,7 @@ async def test_drafter_chain_skipped_in_offline_mode() -> None:
             "(would trigger a HuggingFace fetch)"
         )
 
-    with patch.object(ModelCard, "load", side_effect=fail_load):
+    with _patch_card_loaders(fail_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader, offline=True) as (
             coordinator,
@@ -383,7 +407,7 @@ async def test_drafter_chain_runs_off_command_processing_path() -> None:
     # is still responsive even while the drafter chain is hung.
     second_target = ModelId("test-org/second-target")
 
-    with patch.object(ModelCard, "load", side_effect=slow_load):
+    with _patch_card_loaders(slow_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (
             _coordinator,
@@ -463,7 +487,7 @@ async def test_cancel_during_chain_aborts_drafter_download() -> None:
             return drafter_card
         raise AssertionError(f"unexpected ModelCard.load for {model_id}")
 
-    with patch.object(ModelCard, "load", side_effect=slow_load):
+    with _patch_card_loaders(slow_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (
             coordinator,
@@ -543,7 +567,7 @@ async def test_failed_target_does_not_chain_drafter() -> None:
             "already in DownloadFailed state"
         )
 
-    with patch.object(ModelCard, "load", side_effect=fail_load):
+    with _patch_card_loaders(fail_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (
             coordinator,
@@ -602,7 +626,7 @@ async def test_restart_target_re_chains_cancelled_drafter() -> None:
             return drafter_card
         raise AssertionError(f"unexpected ModelCard.load for {model_id}")
 
-    with patch.object(ModelCard, "load", side_effect=fake_load):
+    with _patch_card_loaders(fake_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (
             coordinator,
@@ -729,7 +753,7 @@ async def test_rechain_preserves_drafter_link_for_cancel_cascade() -> None:
             return drafter_card
         raise AssertionError(f"unexpected ModelCard.load for {model_id}")
 
-    with patch.object(ModelCard, "load", side_effect=fake_load):
+    with _patch_card_loaders(fake_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (
             coordinator,
@@ -853,7 +877,7 @@ async def test_concurrent_chain_does_not_double_start_pending_drafter() -> None:
             return drafter_card
         raise AssertionError(f"unexpected ModelCard.load for {model_id}")
 
-    with patch.object(ModelCard, "load", side_effect=fake_load):
+    with _patch_card_loaders(fake_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (
             _,
@@ -916,9 +940,15 @@ async def test_failed_drafter_retries_on_target_re_chain() -> None:
     drafter_shard = _make_shard(drafter_card)
 
     downloader = _RecordingShardDownloader()
-    with patch(
-        "exo.download.coordinator.ModelCard.load",
-        return_value=drafter_card,
+    with (
+        patch(
+            "exo.download.coordinator.ModelCard.load",
+            return_value=drafter_card,
+        ),
+        patch(
+            "exo.download.coordinator.ModelCard.load_cached_only",
+            return_value=drafter_card,
+        ),
     ):
         async with _running_coordinator(downloader) as (
             coordinator,
@@ -1124,7 +1154,7 @@ async def test_shared_drafter_in_flight_survives_cancel_of_one_target() -> None:
                 await cb(shard, progress)
             return Path("/fake/models") / shard.model_card.model_id.normalize()
 
-    with patch.object(ModelCard, "load", side_effect=fake_load):
+    with _patch_card_loaders(fake_load):
         downloader = _SuspendingDownloader()
         async with _running_coordinator(downloader) as (
             coordinator,
@@ -1275,6 +1305,7 @@ async def test_shared_drafter_survives_delete_of_one_target() -> None:
 
     with (
         patch.object(ModelCard, "load", side_effect=fake_load),
+        patch.object(ModelCard, "load_cached_only", side_effect=fake_load),
         patch("exo.download.coordinator.delete_model", side_effect=fake_delete),
     ):
         downloader = _RecordingShardDownloader()
@@ -1388,7 +1419,7 @@ async def test_chained_drafter_does_not_recursively_chain_via_inner_path() -> No
             return second_level_card
         raise AssertionError(f"unexpected ModelCard.load for {model_id}")
 
-    with patch.object(ModelCard, "load", side_effect=fake_load):
+    with _patch_card_loaders(fake_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (
             _coordinator,
@@ -1483,12 +1514,10 @@ async def test_drafter_chain_does_not_run_when_target_download_fails() -> None:
         ) -> Path:
             self.ensured.append(shard.model_card.model_id)
             if shard.model_card.model_id == TARGET_ID:
-                raise RuntimeError(
-                    "simulated HF auth failure for gated target repo"
-                )
+                raise RuntimeError("simulated HF auth failure for gated target repo")
             return Path("/fake/models") / shard.model_card.model_id.normalize()
 
-    with patch.object(ModelCard, "load", side_effect=fail_load):
+    with _patch_card_loaders(fail_load):
         downloader = _FailingDownloader()
         async with _running_coordinator(downloader) as (
             _coordinator,
@@ -1542,7 +1571,7 @@ async def test_delete_cascade_rebuilds_drafter_links_after_restart() -> None:
 
     deleted_ids: list[ModelId] = []
 
-    with patch.object(ModelCard, "load", side_effect=fake_load):
+    with _patch_card_loaders(fake_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (
             coordinator,
@@ -1598,9 +1627,7 @@ async def test_delete_cascade_rebuilds_drafter_links_after_restart() -> None:
     )
 
 
-async def test_reissue_during_ongoing_target_does_not_chain_drafters() -> (
-    None
-):
+async def test_reissue_during_ongoing_target_does_not_chain_drafters() -> None:
     """Codex P2 (PR #18 round-(N+13), coordinator.py:337): the
     ``_start_download`` fast-path branch chains drafters when a
     re-issued ``StartDownload`` arrives for a target that's
@@ -1631,7 +1658,7 @@ async def test_reissue_during_ongoing_target_does_not_chain_drafters() -> (
             "download_wrapper handles the chain on success"
         )
 
-    with patch.object(ModelCard, "load", side_effect=fail_load):
+    with _patch_card_loaders(fail_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (
             coordinator,
@@ -1679,9 +1706,7 @@ async def test_reissue_during_ongoing_target_does_not_chain_drafters() -> (
     )
 
 
-async def test_self_referential_drafter_card_does_not_recurse_on_delete() -> (
-    None
-):
+async def test_self_referential_drafter_card_does_not_recurse_on_delete() -> None:
     """Codex P2 (PR #18 round-(N+13), coordinator.py:337): a model
     card with a self-referential ``drafter_model_ids = [self]`` or
     a cycle like ``A -> B -> A`` would drive the recursive delete
@@ -1715,7 +1740,7 @@ async def test_self_referential_drafter_card_does_not_recurse_on_delete() -> (
 
     deleted_ids: list[ModelId] = []
 
-    with patch.object(ModelCard, "load", side_effect=fake_load):
+    with _patch_card_loaders(fake_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (
             coordinator,
@@ -1793,7 +1818,7 @@ async def test_cyclic_drafter_cards_do_not_recurse_on_delete() -> None:
 
     deleted_ids: list[ModelId] = []
 
-    with patch.object(ModelCard, "load", side_effect=fake_load):
+    with _patch_card_loaders(fake_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (
             coordinator,
@@ -1870,7 +1895,7 @@ async def test_delete_cascade_runs_when_drafter_status_cache_cold() -> None:
 
     deleted_ids: list[ModelId] = []
 
-    with patch.object(ModelCard, "load", side_effect=fake_load):
+    with _patch_card_loaders(fake_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (
             coordinator,
@@ -1921,9 +1946,7 @@ async def test_delete_cascade_runs_when_drafter_status_cache_cold() -> None:
     )
 
 
-async def test_delete_cascade_rebuild_respects_other_referencing_target() -> (
-    None
-):
+async def test_delete_cascade_rebuild_respects_other_referencing_target() -> None:
     """Codex P2 (PR #18 round-(N+12), coordinator.py:817) shared-drafter
     follow-up: rebuilding drafter links on delete MUST still honour
     the shared-drafter cascade gate. After a restart, two targets
@@ -1980,7 +2003,7 @@ async def test_delete_cascade_rebuild_respects_other_referencing_target() -> (
 
     deleted_ids: list[ModelId] = []
 
-    with patch.object(ModelCard, "load", side_effect=fake_load):
+    with _patch_card_loaders(fake_load):
         downloader = _RecordingShardDownloader()
         async with _running_coordinator(downloader) as (
             coordinator,
@@ -2131,6 +2154,7 @@ async def test_delete_cascade_rebuilds_other_parents_for_installed_targets(
 
     with (
         patch.object(ModelCard, "load", side_effect=fake_load),
+        patch.object(ModelCard, "load_cached_only", side_effect=fake_load),
         patch(
             "exo.download.coordinator.get_model_cards",
             side_effect=fake_get_model_cards,
@@ -2258,6 +2282,7 @@ async def test_delete_cascade_does_not_block_on_uninstalled_other_parents(
 
     with (
         patch.object(ModelCard, "load", side_effect=fake_load),
+        patch.object(ModelCard, "load_cached_only", side_effect=fake_load),
         patch(
             "exo.download.coordinator.get_model_cards",
             side_effect=fake_get_model_cards,

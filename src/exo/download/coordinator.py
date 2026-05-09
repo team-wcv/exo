@@ -719,17 +719,40 @@ class DownloadCoordinator:
             # ``ModelCard.load`` + ``_start_download`` block below
             # restores the drafter on the next chain run.
 
+            # Codex P1 (PR #18, coordinator.py:723): use the cache-
+            # only loader so the command-processing coroutine does not
+            # block on a Hugging Face round-trip when ``drafter_id``
+            # is not on local disk. ``_command_processor`` serves a
+            # single coroutine; an HTTP stall here freezes every
+            # subsequent ``StartDownload`` / ``DeleteDownload`` /
+            # ``CancelDownload`` until the request times out, and in
+            # offline / disconnected environments the queue can stay
+            # frozen indefinitely. Treating "card not cached locally"
+            # (return ``None``) or "disk read failure" (caught
+            # exception) as "skip this drafter for now"; a subsequent
+            # ``StartDownload`` for the same target after the operator
+            # brings the cluster online (or pre-loads the drafter card
+            # via the dashboard) will re-attempt the chain.
             try:
-                drafter_card = await ModelCard.load(drafter_id)
+                drafter_card = await ModelCard.load_cached_only(drafter_id)
             except Exception as exc:
                 logger.warning(
                     f"Could not load drafter card {drafter_id} for "
-                    f"{target_model_id}; skipping drafter download: {exc}"
+                    f"{target_model_id} from local cache; skipping "
+                    f"drafter download: {exc}"
+                )
+                continue
+            if drafter_card is None:
+                logger.warning(
+                    f"Drafter card {drafter_id} for {target_model_id} "
+                    f"is not cached locally; skipping drafter download. "
+                    f"Run with the drafter card pre-loaded to enable "
+                    f"speculative decoding for this target."
                 )
                 continue
 
             # Re-check after the card-load await: a cancel could have
-            # arrived during the HF round-trip. Without this re-check
+            # arrived during the cache lookup. Without this re-check
             # we'd kick off ``_start_download`` for a drafter whose
             # parent the user has already cancelled.
             if cancelled():
@@ -903,13 +926,36 @@ class DownloadCoordinator:
            semantic, so this matches it.
         """
         existing = list(self._drafter_children.pop(model_id, []))
+        # Codex P1 (PR #18, coordinator.py:908): cache-only load so
+        # the delete-cascade does not block on a Hugging Face round-
+        # trip when ``model_id``'s card is not on local disk. This
+        # path runs from ``_command_processor``, so an HTTP stall
+        # would freeze every subsequent download command.
+        #
+        # ``None`` from :meth:`load_cached_only` means "no card cached
+        # locally"; an exception means a disk-read failure during
+        # ``_refresh_card_cache``. Both fall back to the in-memory
+        # ``_drafter_children`` entries (which captures any links
+        # established during this process's lifetime). A post-restart
+        # delete of a target whose card is neither cached nor in
+        # memory is rare in practice (the target had to have been
+        # downloaded to be deletable, and downloading caches the
+        # card) and the graceful skip is preferable to blocking the
+        # command queue.
         try:
-            target_card = await ModelCard.load(model_id)
+            target_card = await ModelCard.load_cached_only(model_id)
         except Exception as exc:
             logger.debug(
                 f"Could not reload card for {model_id} during delete "
                 f"cascade rebuild ({exc}); using in-memory drafter "
                 f"links only ({len(existing)} entries)"
+            )
+            return existing
+        if target_card is None:
+            logger.debug(
+                f"Card for {model_id} not in local cache during delete "
+                f"cascade rebuild; using in-memory drafter links only "
+                f"({len(existing)} entries)"
             )
             return existing
 

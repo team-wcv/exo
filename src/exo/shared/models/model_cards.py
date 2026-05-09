@@ -222,6 +222,36 @@ class ModelCard(FrozenModel):
         return mc
 
     @staticmethod
+    async def load_cached_only(model_id: ModelId) -> "ModelCard | None":
+        """Local-only variant of :meth:`load`.
+
+        Returns the cached :class:`ModelCard` for ``model_id`` if one
+        is present in the in-memory cache or any of the on-disk built-
+        in / custom card directories. Returns ``None`` when no cached
+        copy exists; never falls back to :meth:`fetch_from_hf`.
+
+        Codex P1 (PR #18, coordinator.py:723 + 908). The full
+        :meth:`load` path is unsafe on the master's command-processing
+        coroutine because ``fetch_from_hf`` issues blocking HTTP
+        requests to Hugging Face when the card is not already on disk.
+        That path is reached during ``StartDownload`` /
+        ``DeleteDownload`` cascade rebuilds for any drafter or
+        previously-installed target whose card was not saved to a
+        custom dir; in offline / disconnected environments it stalls
+        the entire command queue. The delete-cascade and
+        drafter-chain code paths only need cards that are actually on
+        the local disk (otherwise the parent target could not have
+        been downloaded in the first place), so they should call this
+        cache-only variant and treat ``None`` as "no rediscovered
+        links". The full :meth:`load` is reserved for paths that
+        legitimately need to pull a previously-unseen card from HF
+        (initial ``StartDownload`` of a third-party model id).
+        """
+        if model_id not in _card_cache:
+            await _refresh_card_cache()
+        return _card_cache.get(model_id)
+
+    @staticmethod
     async def fetch_from_hf(model_id: ModelId) -> "ModelCard":
         """Fetches storage size and number of layers for a Hugging Face model, returns Pydantic ModelMeta.
 
