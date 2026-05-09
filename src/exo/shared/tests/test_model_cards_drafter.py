@@ -8,10 +8,34 @@ models that runners may load alongside the target. Coverage:
   quantisation, in fastest-first order.
 """
 
-import pytest
+from pathlib import Path
 
+import pytest
+from anyio import Path as AsyncPath
+
+from exo.shared.models import model_cards
 from exo.shared.models.model_cards import ModelCard, ModelId, get_model_cards
 from exo.shared.types.memory import Memory
+
+
+@pytest.fixture(autouse=True)
+def _isolate_custom_cards(  # pyright: ignore[reportUnusedFunction]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Insulate these tests from operator-local custom card overrides.
+
+    ``_custom_cards_dir`` resolves to ``$EXO_DATA_HOME/custom_model_cards``,
+    which on dev workstations holds operator-edited cards (e.g. trimmed
+    drafter lists for memory-constrained clusters). Those overrides are
+    layered on top of the shipped TOML, so without isolation the assertions
+    below describe whatever the operator last wrote, not the shipped data
+    the gate is supposed to protect. Reset the in-memory cache too so the
+    next test refreshes from the now-empty custom dir.
+    """
+    custom_dir = tmp_path / "custom_model_cards"
+    custom_dir.mkdir()
+    monkeypatch.setattr(model_cards, "_custom_cards_dir", AsyncPath(custom_dir))
+    monkeypatch.setattr(model_cards, "_card_cache", {})
 
 
 @pytest.mark.asyncio
