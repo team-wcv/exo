@@ -1,9 +1,11 @@
 import argparse
+import ipaddress
 import multiprocessing as mp
 import os
 import resource
 import signal
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Self
@@ -45,6 +47,7 @@ class Node:
     node_id: NodeId
     offline: bool
     _api_port: int
+    _libp2p_port: int
     peer_file_server: PeerFileServer | None = None
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
 
@@ -159,6 +162,7 @@ class Node:
             node_id,
             args.offline,
             args.api_port,
+            args.libp2p_port,
             peer_file_server,
         )
         logger_set_context(
@@ -187,6 +191,12 @@ class Node:
                 tg.start_soon(self.master.run)
             if self.api:
                 tg.start_soon(self.api.run)
+            if sys.platform == "darwin" and self._libp2p_port != 0:
+                tg.start_soon(
+                    _darwin_mdns_broadcast_announcer,
+                    self.node_id,
+                    self._libp2p_port,
+                )
             tg.start_soon(self._elect_loop)
             tg.start_soon(self._diagnostic_snapshot_loop)
 
@@ -380,6 +390,77 @@ class Node:
             name = identity.friendly_name if identity is not None else str(node_id)
             ages[name] = round((now - last_seen).total_seconds(), 3)
         return ages
+
+
+def _darwin_en0_ip_address() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["ipconfig", "getifaddr", "en0"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _darwin_en0_broadcast_address(ip_address: str) -> str | None:
+    try:
+        subnet_mask = subprocess.check_output(
+            ["ipconfig", "getoption", "en0", "subnet_mask"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        interface = ipaddress.IPv4Interface(f"{ip_address}/{subnet_mask}")
+        return str(interface.network.broadcast_address)
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return None
+
+
+async def _darwin_mdns_broadcast_announcer(
+    node_id: NodeId, libp2p_port: int
+) -> None:
+    ip_address = _darwin_en0_ip_address()
+    if not ip_address:
+        logger.debug("Darwin mDNS broadcast announcer disabled: no en0 IPv4 address")
+        return
+
+    broadcast_address = _darwin_en0_broadcast_address(ip_address)
+    logger.debug(
+        f"Darwin mDNS announcer advertising {node_id} at {ip_address}:{libp2p_port}"
+    )
+    command = [
+        sys.executable,
+        "-m",
+        "exo.routing.mdns_announcer",
+        "--node-id",
+        str(node_id),
+        "--ip-address",
+        ip_address,
+        "--libp2p-port",
+        str(libp2p_port),
+    ]
+    if broadcast_address is not None:
+        command.extend(["--broadcast-address", broadcast_address])
+    process = subprocess.Popen(
+        command,
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+    )
+    try:
+        while process.poll() is None:
+            await anyio.sleep(60)
+        logger.debug(
+            f"Darwin mDNS announcer subprocess exited with {process.returncode}"
+        )
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            with anyio.move_on_after(2):
+                while process.poll() is None:
+                    await anyio.sleep(0.1)
+            if process.poll() is None:
+                process.kill()
+                await anyio.sleep(0)
 
 
 def main():
