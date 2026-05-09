@@ -545,17 +545,32 @@ def _interface_typing_is_missing(network_info: NodeNetworkInfo) -> bool:
     interfaces" vs "the gatherer reports a node with no TB interfaces".
 
     Returns ``True`` when ``network_info`` has no interfaces at all,
-    or when every interface has ``interface_type == "unknown"`` (the
+    or when **any** interface has ``interface_type == "unknown"`` (the
     field's default and the value
     :func:`exo.utils.info_gatherer.system_info._get_interface_types_from_networksetup`
     writes when its parse fails). This distinguishes the "transient
     gatherer failure" case (treat as ``unknown``, permissive) from
     the "node legitimately has only wifi/ethernet" case (treat as
     ``known_no_path``, reject with repair guidance).
+
+    Codex P1 (PR #11 round-(N+11), placement.py:589): pre-fix this
+    helper required *every* interface to be ``"unknown"`` before it
+    classified the typing as missing. That was too strict. On a
+    node with mixed typing -- for example, Wi-Fi correctly typed as
+    ``"wifi"`` plus an unclassified ``en3`` Thunderbolt bridge whose
+    ``networksetup -listallhardwareports`` line failed to parse and
+    fell back to ``"unknown"`` -- the helper would return ``False``
+    and the verdict was ``known_no_path``, hard-failing JACCL
+    placement on healthy clusters. The unknown candidate could in
+    fact be the working Thunderbolt link, so we have no positive
+    evidence the node lacks a TB path. Treat any single unknown
+    interface as enough signal to defer to ``unknown`` and let the
+    JACCL backend surface a clearer per-link error if the IP turns
+    out to be unusable at bind time.
     """
     if not network_info.interfaces:
         return True
-    return all(
+    return any(
         interface.interface_type == "unknown" for interface in network_info.interfaces
     )
 

@@ -2286,3 +2286,108 @@ def test_jaccl_placement_still_rejects_nodes_with_known_non_tb_paths(
             {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
             node_network,
         )
+
+
+def test_jaccl_placement_allows_nodes_with_partial_interface_typing(
+    model_card: ModelCard,
+) -> None:
+    """Codex P1 (PR #11 round-(N+11), placement.py:589): mixed-typing
+    case. When a node's network info contains *some* classified
+    interfaces (e.g. Wi-Fi) plus *some* unclassified candidates
+    (e.g. an ``en3`` Thunderbolt bridge whose
+    ``networksetup -listallhardwareports`` line failed to parse and
+    fell back to ``"unknown"``), pre-fix ``_interface_typing_is_missing``
+    returned ``False`` because not *every* interface was unknown,
+    so the verdict collapsed to ``known_no_path`` and the placement
+    was rejected with bb-rdma-repair guidance even though the
+    unknown interface might be the working TB link.
+
+    Post-fix, *any* unknown interface is enough signal to defer the
+    verdict to ``"unknown"`` (permissive). Placement proceeds and
+    the JACCL backend surfaces a clearer per-link error if the IP
+    turns out to be unusable at bind time.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_socket_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_socket_connection(1))
+    )
+
+    node_network = {
+        node_a: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.50",
+                    interface_type="wifi",
+                ),
+                NetworkInterfaceInfo(
+                    name="en3",
+                    ip_address="192.168.10.10",
+                    interface_type="unknown",
+                ),
+            ]
+        ),
+        node_b: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.51",
+                    interface_type="wifi",
+                ),
+                NetworkInterfaceInfo(
+                    name="en3",
+                    ip_address="192.168.10.11",
+                    interface_type="unknown",
+                ),
+            ]
+        ),
+    }
+
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
+        node_network,
+    )
+
+    assert len(placements) == 1
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxJacclInstance), (
+        "MlxJaccl placement must succeed when ANY candidate interface "
+        "has unknown typing (gatherer parse partial failure case); the "
+        "unknown interface might be the working TB link, so we have no "
+        "positive evidence of bad config. Pre-fix the verdict was "
+        "``known_no_path`` and placement was rejected."
+    )
