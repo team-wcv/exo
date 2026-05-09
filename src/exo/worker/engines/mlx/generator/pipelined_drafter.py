@@ -154,12 +154,6 @@ a bug, please flag it.
 from __future__ import annotations
 
 import contextlib
-
-# Side-channel file logger for diagnostics. The runner subprocess on
-# some hosts (smbpt observed during gemma-4 bring-up) does not flush
-# its loguru output anywhere we can read; this fallback writes plain
-# timestamped lines to ``/tmp/spec_diag_<pid>.log`` so we always have
-# something to grep, regardless of how loguru / stdout are wired.
 import os as _diag_os
 import sys as _diag_sys
 import time
@@ -183,17 +177,33 @@ from exo.worker.engines.mlx.utils_mlx import (
 )
 from exo.worker.runner.bootstrap import logger as _diag_logger
 
+# Per-round spec-decode diagnostics. Off by default; set
+# ``EXO_SPEC_DIAG=1`` to enable. When enabled, each call writes both
+# to loguru and to ``/tmp/spec_diag_<pid>.log`` so diagnostics survive
+# whatever's swallowing the runner subprocess's stdout (loguru
+# forwarding has been observed to drop on some nodes in our cluster).
+#
+# Added during gemma-4 asymmetric-drafter bring-up to localize a
+# TP-collective deadlock; the hooks are kept (gated) so future
+# correctness regressions can be isolated quickly without redeploying
+# with new logging.
+_SPEC_DIAG_ENABLED: Final[bool] = _diag_os.environ.get("EXO_SPEC_DIAG", "") in (
+    "1",
+    "true",
+    "yes",
+)
+
 
 def _spec_diag(message: str) -> None:
-    """Log to loguru AND a per-pid side-channel file. Best effort."""
+    """Emit a spec-decode diagnostic line. No-op unless ``EXO_SPEC_DIAG``."""
+    if not _SPEC_DIAG_ENABLED:
+        return
     _diag_logger.info(message)
     try:
         path = f"/tmp/spec_diag_{_diag_os.getpid()}.log"
         with open(path, "a", encoding="utf-8") as fh:
             _ = fh.write(f"{time.time():.6f} {message}\n")
     except OSError:
-        # Filesystem unavailable; fall back to stderr so something
-        # still surfaces.
         try:
             _ = _diag_sys.stderr.write(f"[spec-diag fallback] {message}\n")
             _diag_sys.stderr.flush()
