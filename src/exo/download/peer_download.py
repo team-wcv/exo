@@ -176,17 +176,57 @@ async def download_file_from_peer(
                     await aios.remove(partial_path)
                     n_read = 0
                 elif r.status in (200, 206):
+                    # Codex P1 (PR #16 round-(N+8), peer_download.py:187):
+                    # bound the inner read by ``expected_size - n_read``
+                    # and treat any extra bytes as a peer protocol
+                    # violation. Pre-fix the loop kept appending until
+                    # EOF and only checked ``n_read < expected_size``
+                    # afterward, so an oversized response (peer
+                    # serving a stale/wrong blob) was accepted as
+                    # success and renamed into the model cache. In
+                    # offline mode hash verification is skipped, so
+                    # this silently poisoned local weights. Now we
+                    # cap each chunk at the remaining budget and bail
+                    # out the moment a peer tries to send extra data.
+                    oversized_response = False
                     async with aiofiles.open(
                         partial_path, "ab" if n_read > 0 else "wb"
                     ) as f:
                         while True:
-                            chunk = await r.content.read(chunk_size)
+                            remaining = expected_size - n_read
+                            if remaining <= 0:
+                                # We have everything we need. Read one
+                                # more byte to detect peer
+                                # over-supplying; if the stream isn't
+                                # EOF, the peer is sending more bytes
+                                # than ``expected_size`` claims.
+                                tail = await r.content.read(1)
+                                if tail:
+                                    oversized_response = True
+                                break
+                            chunk = await r.content.read(min(chunk_size, remaining))
                             if not chunk:
                                 break
                             written = await f.write(chunk)
                             n_read += written
                             got_bytes = True
                             on_progress(n_read, expected_size, False)
+                    if oversized_response:
+                        # Discard the partial: we cannot trust any
+                        # bytes from a peer that violates the
+                        # advertised file size, especially in
+                        # offline mode where hash verification is
+                        # skipped. Restart from zero on the next
+                        # iteration so a fresh request gets a
+                        # well-bounded response.
+                        logger.warning(
+                            f"Peer {peer_host} returned oversized response for "
+                            f"{file_path} (advertised {expected_size} bytes, "
+                            "stream still had data when budget was exhausted); "
+                            "discarding partial and restarting from zero"
+                        )
+                        await aios.remove(partial_path)
+                        n_read = 0
                 elif r.status == 404:
                     logger.debug(f"File {file_path} not found on peer {peer_host}")
                     return None

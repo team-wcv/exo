@@ -547,6 +547,113 @@ class TestPeerDownloadClient:
         finally:
             await runner.cleanup()
 
+    async def test_oversized_peer_response_is_rejected_and_restarted(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P1 (PR #16 round-(N+8), peer_download.py:187): the
+        download loop used to keep appending bytes until EOF and only
+        check ``n_read < expected_size`` afterwards. A non-compliant
+        peer that serves *more* bytes than the advertised
+        ``expected_size`` would push ``n_read`` past it, the file
+        would be renamed as a successful download, and -- because
+        offline mode skips hash verification -- silently poison the
+        model cache.
+
+        We stand up a tiny aiohttp server that always returns
+        ``len(canonical) + 8`` bytes regardless of how much was
+        requested. Pre-fix this would land a corrupt file in the
+        cache. Post-fix the client must discard each oversized
+        response and never end up with a final file containing extra
+        bytes."""
+        from aiohttp import web
+
+        canonical = b"the canonical model weights"
+        # The payload the bad peer always serves: the canonical
+        # bytes plus extra trailing bytes the peer claimed wouldn't
+        # exist. This is the attack/bug the fix guards against.
+        oversized_payload = canonical + b"POISONED"
+        request_count = 0
+        max_requests = 4  # keep test fast: client retries a few times
+
+        async def handler(request: web.Request) -> web.Response:
+            nonlocal request_count
+            request_count += 1
+            del request
+            if request_count > max_requests:
+                # Surface a definitive failure if the client keeps
+                # hammering the bad peer; that means the fix
+                # regressed and we'd otherwise hang.
+                return web.Response(body=b"", status=500)
+            return web.Response(body=oversized_payload, status=200)
+
+        app = web.Application()
+        _ = app.router.add_get("/files/test/weights.bin", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        try:
+            port: int = cast(
+                int,
+                site._server.sockets[0].getsockname()[1],  # type: ignore[union-attr]
+            )
+
+            download_dir = tmp_path / "downloads" / "test"
+            await aios.makedirs(download_dir, exist_ok=True)
+
+            result = await download_file_from_peer(
+                "127.0.0.1",
+                port,
+                "test",
+                "weights.bin",
+                download_dir,
+                len(canonical),
+            )
+
+            # The bad peer never serves a well-bounded response, so
+            # the client cannot complete. The contract is "no
+            # corrupt data lands in the cache". We tolerate either
+            # outcome:
+            #   1. ``result is None`` (client gave up after retries); or
+            #   2. ``result == canonical`` (a future improvement
+            #      where we keep the canonical-prefix bytes after
+            #      stripping the over-supply).
+            # The forbidden outcome is the final file containing
+            # the trailing "POISONED" bytes.
+            partial_path = download_dir / "weights.bin.partial"
+            target_path = download_dir / "weights.bin"
+
+            if result is not None:
+                async with aiofiles.open(result, "rb") as f:
+                    downloaded = await f.read()
+                assert downloaded == canonical, (
+                    "if the client claims success, the final file MUST "
+                    "be exactly the canonical bytes; oversized peer "
+                    "responses must never land trailing junk in the "
+                    f"cache. got len={len(downloaded)} bytes: {downloaded!r}"
+                )
+            # In the giving-up branch, neither file should remain
+            # poisoned. The partial is removed every time we detect
+            # over-supply, and we never rename to ``target_path``
+            # without a clean-budgeted final write.
+            if target_path.exists():
+                async with aiofiles.open(target_path, "rb") as f:
+                    final = await f.read()
+                assert final == canonical, (
+                    f"target path was renamed but contains "
+                    f"{len(final)} bytes (expected {len(canonical)}); "
+                    "oversized response made it into the cache"
+                )
+            if partial_path.exists():
+                size = (await aios.stat(partial_path)).st_size
+                assert size <= len(canonical), (
+                    f"partial path retains {size} bytes after "
+                    f"oversized response (expected <= {len(canonical)}); "
+                    "over-supply must be discarded, not preserved"
+                )
+        finally:
+            await runner.cleanup()
+
     async def test_skip_already_complete(
         self, peer_server: PeerFileServer, temp_models_dir: Path, tmp_path: Path
     ) -> None:

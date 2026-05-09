@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from exo_pyo3_bindings import Keypair
 
 from exo.routing.router import (
@@ -308,6 +309,83 @@ class TestNodeIdKeypairScope:
             libp2p_port=4001, api_port=52415, peer_download_port=52416
         )
         assert _node_id_keypair_scope(args) == _node_id_keypair_scope(args)
+
+    def test_libp2p_port_zero_uses_pid_for_per_process_isolation(self) -> None:
+        """Codex P1 (PR #16 round-(N+8), main.py:457): with
+        ``--libp2p-port 0`` the configured port is the literal ``0``
+        even though each process binds a different ephemeral port at
+        runtime. Without per-process discrimination two same-host
+        worker-only processes (no API, no peer download) sharing the
+        default ``peer_download_port`` and ``api_port`` would collide
+        on the same scoped keypair. The scope must therefore fold in
+        ``os.getpid()`` (or another guaranteed per-process
+        discriminator) when ``libp2p_port == 0``."""
+        import os
+
+        from exo.main import (
+            _node_id_keypair_scope,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        scope = _node_id_keypair_scope(
+            self._build_args(
+                libp2p_port=0,
+                api_port=52415,
+                peer_download_port=52416,
+                no_peer_download=True,
+                spawn_api=False,
+            )
+        )
+
+        assert f"pid-{os.getpid()}" in scope, (
+            f"libp2p_port=0 must mix in os.getpid() to discriminate "
+            f"same-host processes binding ephemeral libp2p ports; "
+            f"got scope={scope!r}"
+        )
+
+    def test_libp2p_port_zero_in_two_processes_yield_distinct_scopes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end: simulate two same-host processes both binding
+        ``libp2p_port=0`` and otherwise default ports. Pre-fix they
+        collided on a single keypair file; post-fix the scopes
+        differ because each carries its own PID."""
+        import os
+
+        from exo.main import (
+            _node_id_keypair_scope,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        # Process A: real PID
+        scope_a = _node_id_keypair_scope(
+            self._build_args(
+                libp2p_port=0,
+                api_port=52415,
+                peer_download_port=52416,
+                no_peer_download=True,
+                spawn_api=False,
+            )
+        )
+
+        # Process B: simulate a different PID via monkeypatch
+        real_pid = os.getpid()
+        monkeypatch.setattr(os, "getpid", lambda: real_pid + 1)
+        scope_b = _node_id_keypair_scope(
+            self._build_args(
+                libp2p_port=0,
+                api_port=52415,
+                peer_download_port=52416,
+                no_peer_download=True,
+                spawn_api=False,
+            )
+        )
+
+        assert scope_a != scope_b, (
+            "two same-host processes both binding libp2p_port=0 with "
+            "identical api/peer ports must produce distinct keypair "
+            "scopes; otherwise they load the same on-disk keypair "
+            "and collide on NodeId, breaking routing/election "
+            f"invariants. scope_a={scope_a!r} scope_b={scope_b!r}"
+        )
 
 
 def test_legacy_migration_adopts_into_scoped_path(tmp_path: Path) -> None:

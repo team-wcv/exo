@@ -452,7 +452,28 @@ def _node_id_keypair_scope(args: "Args") -> str:
     on the default ``peer_download_port`` since no socket is
     actually being bound). See Codex P1 (PR #16 round-(N+3),
     main.py:74).
+
+    Codex P1 (PR #16 round-(N+8), main.py:457): when
+    ``--libp2p-port 0`` is set, the configured value is the literal
+    ``0`` even though each process actually binds a different
+    ephemeral port at runtime. Two same-host worker-only processes
+    (no API, no peer download) sharing the default
+    ``peer_download_port`` and ``api_port`` -- but each binding
+    ``libp2p_port=0`` -- would otherwise produce identical scope
+    strings ``"libp2p-0.api-...peer-..."`` and load the same
+    keypair file, breaking the unique-NodeId invariant.
+    Stability across restarts is impossible in this configuration
+    anyway (the OS hands out a different ephemeral port on every
+    bind), so fold in ``os.getpid()`` as a per-process
+    discriminator. The trade-off (ephemeral identity for
+    ephemeral ports) is the right semantic: the operator opted
+    into ephemeral binding by setting ``libp2p_port=0``.
     """
+    if args.libp2p_port == 0:
+        return (
+            f"libp2p-pid-{os.getpid()}."
+            f"api-{args.api_port}.peer-{args.peer_download_port}"
+        )
     return (
         f"libp2p-{args.libp2p_port}.api-{args.api_port}.peer-{args.peer_download_port}"
     )
