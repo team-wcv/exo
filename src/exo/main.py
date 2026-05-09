@@ -1,9 +1,11 @@
 import argparse
+import ipaddress
 import multiprocessing as mp
 import os
 import resource
 import signal
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Self
@@ -16,10 +18,16 @@ import exo.routing.topics as topics
 from exo.api.main import API
 from exo.download.coordinator import DownloadCoordinator
 from exo.download.impl_shard_downloader import exo_shard_downloader
+from exo.download.peer_file_server import PeerFileServer
 from exo.master.main import Master
 from exo.routing.event_router import EventRouter
 from exo.routing.router import Router, get_node_id_keypair
-from exo.shared.constants import EXO_LOG
+from exo.shared.constants import (
+    EXO_LOG,
+    EXO_MODELS_DIRS,
+    EXO_MODELS_READ_ONLY_DIRS,
+    EXO_PEER_DOWNLOAD_PORT,
+)
 from exo.shared.election import Election, ElectionResult
 from exo.shared.logging import logger_cleanup, logger_set_context, logger_setup
 from exo.shared.types.common import NodeId, SessionId
@@ -44,11 +52,34 @@ class Node:
     node_id: NodeId
     offline: bool
     _api_port: int
+    _libp2p_port: int
+    _peer_download_port: int
+    peer_file_server: PeerFileServer | None = None
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
 
     @classmethod
     async def create(cls, args: "Args") -> Self:
-        keypair = get_node_id_keypair()
+        # Codex P1 (PR #16 round-(N+3), main.py:74): scope the on-disk
+        # node-ID keypair by the *combination* of ports the operator
+        # has chosen, not just ``--peer-download-port``. The earlier
+        # peer-download-only scope leaked identity collisions when
+        # ``--no-downloads`` / ``--no-peer-download`` is set: that
+        # mode doesn't bind the peer file server, so two same-host
+        # processes can legitimately keep the default
+        # ``peer_download_port`` and would then load the same scoped
+        # keypair file -- producing identical ``NodeId``s and
+        # breaking election/routing's unique-NodeId invariants.
+        #
+        # Combined-port scoping is robust against every same-host
+        # multi-process configuration: at least one of the listening
+        # ports MUST differ between processes (libp2p, peer-download,
+        # api -- each is a distinct local socket bind), so the scope
+        # tuple differs whenever the actual configuration differs.
+        # Single-process deployments on default ports keep a stable
+        # filename (e.g. ``node_id.libp2p-0.api-52415.peer-52416.keypair``)
+        # so identity persists across restarts.
+        process_scope = _node_id_keypair_scope(args)
+        keypair = get_node_id_keypair(process_scope=process_scope)
         node_id = NodeId(keypair.to_node_id())
         session_id = SessionId(master_node_id=node_id, election_clock=0)
         router = Router.create(
@@ -71,17 +102,8 @@ class Node:
 
         logger.info(f"Starting node {node_id}")
 
-        # Create DownloadCoordinator (unless --no-downloads)
-        if not args.no_downloads:
-            download_coordinator = DownloadCoordinator(
-                node_id,
-                exo_shard_downloader(offline=args.offline),
-                event_sender=event_router.sender(),
-                download_command_receiver=router.receiver(topics.DOWNLOAD_COMMANDS),
-                offline=args.offline,
-            )
-        else:
-            download_coordinator = None
+        peer_file_server: PeerFileServer | None = None
+        peer_download_enabled = not args.no_peer_download and not args.no_downloads
 
         if args.spawn_api:
             api = API(
@@ -103,9 +125,46 @@ class Node:
                 command_sender=router.sender(topics.COMMANDS),
                 download_command_sender=router.sender(topics.DOWNLOAD_COMMANDS),
                 api_port=args.api_port,
+                # Each node now binds its own peer-download listener on
+                # ``--peer-download-port`` (default ``EXO_PEER_DOWNLOAD_PORT``).
+                # The Worker uses this same value when discovering peers,
+                # so all nodes in a cluster MUST agree on it (typically
+                # via the shared ``EXO_PEER_DOWNLOAD_PORT`` env var).
+                # Pre-fix this was a single import-time module constant,
+                # making same-host multi-node setups impossible (Codex
+                # P2, PR #16 round 3).
+                peer_download_port=args.peer_download_port,
             )
         else:
             worker = None
+
+        if peer_download_enabled:
+            # Serve from every configured model directory so peers can fetch
+            # any locally-resident shard regardless of which directory the
+            # downloader landed it in. ``EXO_MODELS_DIRS`` already includes
+            # ``EXO_DEFAULT_MODELS_DIR`` as its first entry; ``EXO_MODELS_READ_ONLY_DIRS``
+            # captures pre-populated mounts (e.g. shared NFS caches) that
+            # ``select_download_dir_for_shard`` excludes from new writes but
+            # which other peers still benefit from being able to read.
+            peer_file_server = PeerFileServer(
+                host="0.0.0.0",
+                port=args.peer_download_port,
+                models_dirs=(*EXO_MODELS_DIRS, *EXO_MODELS_READ_ONLY_DIRS),
+            )
+
+        if not args.no_downloads:
+            download_coordinator: DownloadCoordinator | None = DownloadCoordinator(
+                node_id,
+                exo_shard_downloader(
+                    offline=args.offline,
+                    peer_download_enabled=peer_download_enabled,
+                ),
+                event_sender=event_router.sender(),
+                download_command_receiver=router.receiver(topics.DOWNLOAD_COMMANDS),
+                offline=args.offline,
+            )
+        else:
+            download_coordinator = None
 
         # We start every node with a master
         master = Master(
@@ -144,6 +203,9 @@ class Node:
             node_id,
             args.offline,
             args.api_port,
+            args.libp2p_port,
+            args.peer_download_port,
+            peer_file_server,
         )
         logger_set_context(
             node_id=node_id, role="master" if args.force_master else "node"
@@ -161,6 +223,8 @@ class Node:
             tg.start_soon(self.router.run)
             tg.start_soon(self.event_router.run)
             tg.start_soon(self.election.run)
+            if self.peer_file_server:
+                tg.start_soon(self.peer_file_server.run)
             if self.download_coordinator:
                 tg.start_soon(self.download_coordinator.run)
             if self.worker:
@@ -169,6 +233,12 @@ class Node:
                 tg.start_soon(self.master.run)
             if self.api:
                 tg.start_soon(self.api.run)
+            if sys.platform == "darwin" and self._libp2p_port != 0:
+                tg.start_soon(
+                    _darwin_mdns_broadcast_announcer,
+                    self.node_id,
+                    self._libp2p_port,
+                )
             tg.start_soon(self._elect_loop)
             tg.start_soon(self._diagnostic_snapshot_loop)
 
@@ -252,7 +322,10 @@ class Node:
                         await self.download_coordinator.shutdown()
                         self.download_coordinator = DownloadCoordinator(
                             self.node_id,
-                            exo_shard_downloader(offline=self.offline),
+                            exo_shard_downloader(
+                                offline=self.offline,
+                                peer_download_enabled=self.peer_file_server is not None,
+                            ),
                             event_sender=self.event_router.sender(),
                             download_command_receiver=self.router.receiver(
                                 topics.DOWNLOAD_COMMANDS
@@ -272,6 +345,7 @@ class Node:
                                 topics.DOWNLOAD_COMMANDS
                             ),
                             api_port=self._api_port,
+                            peer_download_port=self._peer_download_port,
                         )
                         self._tg.start_soon(self.worker.run)
                     if self.api:
@@ -361,6 +435,119 @@ class Node:
         return ages
 
 
+def _node_id_keypair_scope(args: "Args") -> str:
+    """Produce a stable per-process scope for the node-ID keypair file.
+
+    Combines every listening port the operator could plausibly
+    distinguish between same-host processes: ``--libp2p-port``,
+    ``--api-port``, and ``--peer-download-port``. At least one of
+    these MUST differ between two processes that share a host (each
+    is a distinct local socket bind), so the resulting scope is
+    always unique per process while remaining stable across
+    restarts of the same configuration.
+
+    Used by :func:`get_node_id_keypair` to avoid two same-host
+    processes loading the same scoped keypair file when peer
+    download is disabled (which would otherwise let them collide
+    on the default ``peer_download_port`` since no socket is
+    actually being bound). See Codex P1 (PR #16 round-(N+3),
+    main.py:74).
+
+    Codex P1 (PR #16 round-(N+8), main.py:457): when
+    ``--libp2p-port 0`` is set, the configured value is the literal
+    ``0`` even though each process actually binds a different
+    ephemeral port at runtime. Two same-host worker-only processes
+    (no API, no peer download) sharing the default
+    ``peer_download_port`` and ``api_port`` -- but each binding
+    ``libp2p_port=0`` -- would otherwise produce identical scope
+    strings ``"libp2p-0.api-...peer-..."`` and load the same
+    keypair file, breaking the unique-NodeId invariant.
+    Stability across restarts is impossible in this configuration
+    anyway (the OS hands out a different ephemeral port on every
+    bind), so fold in ``os.getpid()`` as a per-process
+    discriminator. The trade-off (ephemeral identity for
+    ephemeral ports) is the right semantic: the operator opted
+    into ephemeral binding by setting ``libp2p_port=0``.
+    """
+    if args.libp2p_port == 0:
+        return (
+            f"libp2p-pid-{os.getpid()}."
+            f"api-{args.api_port}.peer-{args.peer_download_port}"
+        )
+    return (
+        f"libp2p-{args.libp2p_port}.api-{args.api_port}.peer-{args.peer_download_port}"
+    )
+
+
+def _darwin_en0_ip_address() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["ipconfig", "getifaddr", "en0"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _darwin_en0_broadcast_address(ip_address: str) -> str | None:
+    try:
+        subnet_mask = subprocess.check_output(
+            ["ipconfig", "getoption", "en0", "subnet_mask"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        interface = ipaddress.IPv4Interface(f"{ip_address}/{subnet_mask}")
+        return str(interface.network.broadcast_address)
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return None
+
+
+async def _darwin_mdns_broadcast_announcer(node_id: NodeId, libp2p_port: int) -> None:
+    ip_address = _darwin_en0_ip_address()
+    if not ip_address:
+        logger.debug("Darwin mDNS broadcast announcer disabled: no en0 IPv4 address")
+        return
+
+    broadcast_address = _darwin_en0_broadcast_address(ip_address)
+    logger.debug(
+        f"Darwin mDNS announcer advertising {node_id} at {ip_address}:{libp2p_port}"
+    )
+    command = [
+        sys.executable,
+        "-m",
+        "exo.routing.mdns_announcer",
+        "--node-id",
+        str(node_id),
+        "--ip-address",
+        ip_address,
+        "--libp2p-port",
+        str(libp2p_port),
+    ]
+    if broadcast_address is not None:
+        command.extend(["--broadcast-address", broadcast_address])
+    process = subprocess.Popen(
+        command,
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+    )
+    try:
+        while process.poll() is None:
+            await anyio.sleep(60)
+        logger.debug(
+            f"Darwin mDNS announcer subprocess exited with {process.returncode}"
+        )
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            with anyio.move_on_after(2):
+                while process.poll() is None:
+                    await anyio.sleep(0.1)
+            if process.poll() is None:
+                process.kill()
+                await anyio.sleep(0)
+
+
 def main():
     args = Args.parse()
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -385,6 +572,13 @@ def main():
     if args.no_batch:
         os.environ["EXO_NO_BATCH"] = "1"
         logger.info("Continuous batching disabled (--no-batch)")
+
+    # Set trust_remote_code override env var for runner subprocesses
+    if args.trust_remote_code:
+        os.environ["EXO_TRUST_REMOTE_CODE"] = "1"
+        logger.warning(
+            "--trust-remote-code enabled: models may execute arbitrary code during loading"
+        )
 
     # Set FAST_SYNCH override env var for runner subprocesses
     if args.fast_synch is True:
@@ -430,11 +624,24 @@ class Args(FrozenModel):
     tb_only: bool = False
     no_worker: bool = False
     no_downloads: bool = False
+    no_peer_download: bool = False
     offline: bool = os.getenv("EXO_OFFLINE", "false").lower() == "true"
     no_batch: bool = False
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
     bootstrap_peers: list[str] = []
     libp2p_port: int
+    # Per-process listener port for peer-to-peer model file serving.
+    # Defaults to ``EXO_PEER_DOWNLOAD_PORT`` so existing single-node-per-
+    # host deployments keep working unchanged. Operators running
+    # multiple nodes on the same host MUST set this to a distinct value
+    # for each process; the cluster-wide convention is that every node
+    # exposes the same port, since peer discovery currently uses each
+    # node's local value as the assumed remote endpoint (see
+    # ``Worker._peer_download_port``). A future state-sync change can
+    # advertise per-node ports across the cluster -- tracked as a
+    # follow-up to Codex P2 (PR #16 round 3).
+    peer_download_port: PositiveInt = EXO_PEER_DOWNLOAD_PORT
+    trust_remote_code: bool = False
 
     @classmethod
     def parse(cls) -> Self:
@@ -482,6 +689,11 @@ class Args(FrozenModel):
             help="Disable the download coordinator (node won't download models)",
         )
         parser.add_argument(
+            "--no-peer-download",
+            action="store_true",
+            help="Disable peer-to-peer model downloads (each node downloads from HuggingFace independently)",
+        )
+        parser.add_argument(
             "--offline",
             action="store_true",
             default=os.getenv("EXO_OFFLINE", "false").lower() == "true",
@@ -491,6 +703,11 @@ class Args(FrozenModel):
             "--no-batch",
             action="store_true",
             help="Disable continuous batching, use sequential generation",
+        )
+        parser.add_argument(
+            "--trust-remote-code",
+            action="store_true",
+            help="Allow models to execute custom code during tokenizer loading (security-sensitive, CLI-only)",
         )
         parser.add_argument(
             "--bootstrap-peers",
@@ -507,6 +724,22 @@ class Args(FrozenModel):
             default=0,
             dest="libp2p_port",
             help="Fixed TCP port for libp2p to listen on (0 = OS-assigned).",
+        )
+        parser.add_argument(
+            "--peer-download-port",
+            type=int,
+            default=EXO_PEER_DOWNLOAD_PORT,
+            dest="peer_download_port",
+            help=(
+                "TCP port for peer-to-peer model file serving (default: "
+                "EXO_PEER_DOWNLOAD_PORT, currently 52416). Required to "
+                "differ between processes when running multiple nodes "
+                "on the same host; otherwise the second node's "
+                "PeerFileServer hits 'address already in use'. All "
+                "nodes in a cluster must use the same value (peer "
+                "discovery uses the local port as the assumed remote "
+                "port)."
+            ),
         )
         fast_synch_group = parser.add_mutually_exclusive_group()
         fast_synch_group.add_argument(

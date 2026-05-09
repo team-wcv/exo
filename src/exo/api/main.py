@@ -730,6 +730,7 @@ class API:
                 topology=self.state.topology,
                 current_instances=self.state.instances,
                 download_status=self.state.downloads,
+                node_rdma_ctl=self.state.node_rdma_ctl,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -794,6 +795,7 @@ class API:
                     allowed_nodes=allowed_nodes,
                     allow_single_node_total_memory=allowed_nodes is not None,
                     download_status=self.state.downloads,
+                    node_rdma_ctl=self.state.node_rdma_ctl,
                 )
             except ValueError as exc:
                 if (model_card.model_id, sharding, instance_meta, 0) not in seen:

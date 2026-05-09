@@ -3,11 +3,12 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 import anyio
-from anyio import fail_after, to_thread
+from anyio import fail_after, move_on_after, to_thread
 from loguru import logger
 
 from exo.api.types import ImageEditsTaskParams
 from exo.download.download_utils import is_read_only_model_dir, resolve_existing_model
+from exo.download.peer_state import discover_peers_for_model
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_MAX_INSTANCE_RETRIES
 from exo.shared.models.model_cards import ModelId, add_to_card_cache, delete_custom_card
@@ -72,6 +73,7 @@ class Worker:
         command_sender: Sender[ForwarderCommand],
         download_command_sender: Sender[ForwarderDownloadCommand],
         api_port: int,
+        peer_download_port: int,
     ):
         self.node_id: NodeId = node_id
         self.event_receiver = event_receiver
@@ -79,6 +81,14 @@ class Worker:
         self.command_sender = command_sender
         self.download_command_sender = download_command_sender
         self.api_port = api_port
+        # Codex P2 (PR #16 round 3): the peer-download listener port is
+        # now per-process configurable instead of a module-level
+        # constant. Use the local value when computing
+        # ``discover_peers_for_model`` results because peers in the
+        # current architecture all bind the same port (cluster-wide
+        # convention enforced via ``EXO_PEER_DOWNLOAD_PORT`` /
+        # ``--peer-download-port``).
+        self._peer_download_port = peer_download_port
 
         self.state: State = State()
         self.runners: dict[RunnerId, RunnerSupervisor] = {}
@@ -109,6 +119,7 @@ class Worker:
                 tg.start_soon(self._forward_info, info_recv)
                 tg.start_soon(self.plan_step)
                 tg.start_soon(self._event_applier)
+                tg.start_soon(self._reconcile_instance_backoff)
                 tg.start_soon(self._poll_connection_updates)
         finally:
             # Actual shutdown code - waits for all tasks to complete before executing.
@@ -178,6 +189,17 @@ class Worker:
 
                 if isinstance(event, CustomModelCardDeleted):
                     await delete_custom_card(event.model_id)
+
+    async def _reconcile_instance_backoff(self) -> None:
+        while True:
+            await anyio.sleep(1)
+            self._reconcile_instance_backoff_once()
+
+    def _reconcile_instance_backoff_once(self) -> None:
+        live_instances = set(self.state.instances)
+        for instance_id in self._instance_backoff.tracked_keys():
+            if instance_id not in live_instances:
+                self._instance_backoff.reset(instance_id)
 
     async def plan_step(self):
         while True:
@@ -252,12 +274,19 @@ class Worker:
                             )
                         )
                     else:
+                        peers = discover_peers_for_model(
+                            self.node_id,
+                            self.state,
+                            shard.model_card.model_id.normalize(),
+                            self._peer_download_port,
+                        )
                         await self.download_command_sender.send(
                             ForwarderDownloadCommand(
                                 origin=self._system_id,
                                 command=StartDownload(
                                     target_node_id=self.node_id,
                                     shard_metadata=shard,
+                                    available_peers=peers,
                                 ),
                             )
                         )
@@ -356,8 +385,16 @@ class Worker:
                     await self._start_runner_task(task)
 
     async def shutdown(self):
+        self.event_sender.close()
+        self.command_sender.close()
+        self.download_command_sender.close()
+        for runner in self.runners.values():
+            runner.shutdown()
         self._tg.cancel_tasks()
-        await self._stopped.wait()
+        with move_on_after(5) as scope:
+            await self._stopped.wait()
+        if scope.cancel_called:
+            logger.warning("Timed out waiting for Worker shutdown")
 
     async def _start_runner_task(self, task: Task):
         if (instance := self.state.instances.get(task.instance_id)) is not None:

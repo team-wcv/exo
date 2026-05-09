@@ -392,6 +392,7 @@ class Master:
                                 self.state.node_memory,
                                 self.state.node_network,
                                 download_status=self.state.downloads,
+                                node_rdma_ctl=self.state.node_rdma_ctl,
                             )
                             transition_events = get_transition_events(
                                 self.state.instances, placement, self.state.tasks
@@ -481,6 +482,20 @@ class Master:
 
     # These plan loops are the cracks showing in our event sourcing architecture - more things could be commands
     async def _plan(self) -> None:
+        # Codex P1 (PR #16 round-(N+9), master/main.py:486): the
+        # inactivity timeout MUST stay safely above ``NodeGatheredInfo``
+        # cadence jitter -- 5s was too tight (any node that didn't
+        # publish telemetry within 5s, e.g. when fast probes are
+        # unavailable or delayed, would be marked timed out and have
+        # its instances deleted in the same _plan loop). Because
+        # this loop now ticks every second, normal jitter caused
+        # repeated false-positive ``NodeTimedOut`` events and
+        # unnecessary instance churn. Restore the upstream-safe
+        # 30s budget while keeping the 1s tick so the master still
+        # reacts quickly when a node *does* genuinely time out.
+        node_inactivity_timeout = timedelta(seconds=30)
+        tick_interval_seconds = 1.0
+
         while True:
             # kill broken instances
             connected_node_ids = set(self.state.topology.list_nodes())
@@ -503,7 +518,7 @@ class Master:
             # time out dead nodes
             for node_id, time in self.state.last_seen.items():
                 now = datetime.now(tz=timezone.utc)
-                if now - time > timedelta(seconds=30):
+                if now - time > node_inactivity_timeout:
                     impacted_instances = [
                         str(instance_id)
                         for instance_id, instance in self.state.instances.items()
@@ -520,7 +535,7 @@ class Master:
                     )
                     await self.event_sender.send(NodeTimedOut(node_id=node_id))
 
-            await anyio.sleep(10)
+            await anyio.sleep(tick_interval_seconds)
 
     async def _event_processor(self) -> None:
         with self.local_event_receiver as local_events:
