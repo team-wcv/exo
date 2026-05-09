@@ -695,7 +695,13 @@ class TestBroadcastDrafts:
             _broadcast_drafts,  # pyright: ignore[reportPrivateUsage]
         )
 
-        out = _broadcast_drafts([10, 20], k=4, target_group=None, is_root=True)
+        out: list[int] = _broadcast_drafts(
+            [10, 20],
+            k=4,
+            target_group=None,
+            target_peer_fanout=None,
+            is_root=True,
+        )
         assert out == [10, 20]
 
     def test_single_rank_short_circuit_consumer_rejected(self) -> None:
@@ -706,7 +712,13 @@ class TestBroadcastDrafts:
         )
 
         with pytest.raises(RuntimeError, match="non-root"):
-            _broadcast_drafts(None, k=4, target_group=None, is_root=False)
+            _broadcast_drafts(
+                None,
+                k=4,
+                target_group=None,
+                target_peer_fanout=None,
+                is_root=False,
+            )
 
     def test_single_rank_root_requires_drafts(self) -> None:
         from exo.worker.engines.mlx.generator.pipelined_drafter import (
@@ -717,7 +729,13 @@ class TestBroadcastDrafts:
         # caller bug (the runner never has a None drafts list when it
         # owns the wire).
         with pytest.raises(RuntimeError, match="non-root"):
-            _broadcast_drafts(None, k=4, target_group=None, is_root=False)
+            _broadcast_drafts(
+                None,
+                k=4,
+                target_group=None,
+                target_peer_fanout=None,
+                is_root=False,
+            )
 
 
 class TestBroadcastTargetTokens:
@@ -741,8 +759,13 @@ class TestBroadcastTargetTokens:
 
         # k_this + 1 == 3 tokens: the seed-bonus + drafts emitted per
         # round in a K=4, k_this=2 partial round.
-        out = _broadcast_target_tokens(
-            [10, 20, 30], k=4, k_this=2, target_group=None, is_root=True
+        out: list[int] = _broadcast_target_tokens(
+            [10, 20, 30],
+            k=4,
+            k_this=2,
+            target_group=None,
+            target_peer_fanout=None,
+            is_root=True,
         )
         assert out == [10, 20, 30]
 
@@ -753,7 +776,12 @@ class TestBroadcastTargetTokens:
 
         with pytest.raises(RuntimeError, match="non-root"):
             _broadcast_target_tokens(
-                None, k=4, k_this=2, target_group=None, is_root=False
+                None,
+                k=4,
+                k_this=2,
+                target_group=None,
+                target_peer_fanout=None,
+                is_root=False,
             )
 
     def test_root_rejects_wrong_length(self) -> None:
@@ -766,7 +794,12 @@ class TestBroadcastTargetTokens:
 
         with pytest.raises(RuntimeError, match="must equal k_this"):
             _broadcast_target_tokens(
-                [10, 20], k=4, k_this=2, target_group=None, is_root=True
+                [10, 20],
+                k=4,
+                k_this=2,
+                target_group=None,
+                target_peer_fanout=None,
+                is_root=True,
             )
 
 
@@ -829,7 +862,7 @@ class TestDrafterAbortRecovery:
         )
 
         # Should not raise; should not require any group machinery.
-        _broadcast_abort(k=4, target_group=None)
+        _broadcast_abort(k=4, target_group=None, target_peer_fanout=None)
 
     def test_sentinel_value_is_in_validator_range(self) -> None:
         # The sentinel must satisfy ``_validate_broadcast_values``
@@ -885,6 +918,7 @@ class TestDrafterAbortRecovery:
                 None,
                 k=k,
                 target_group=sentinel_group,  # pyright: ignore[reportArgumentType]
+                target_peer_fanout=None,
                 is_root=False,
             )
 
@@ -898,7 +932,10 @@ class TestDrafterAbortRecovery:
 
         broadcast_calls: list[tuple[int, object]] = []
 
-        def fake_abort(*, k: int, target_group: object) -> None:
+        def fake_abort(
+            *, k: int, target_group: object, target_peer_fanout: object
+        ) -> None:
+            del target_peer_fanout
             broadcast_calls.append((k, target_group))
 
         def fake_body(**kwargs: object):
@@ -944,7 +981,10 @@ class TestDrafterAbortRecovery:
 
         broadcast_calls: list[tuple[int, object]] = []
 
-        def fake_abort(*, k: int, target_group: object) -> None:
+        def fake_abort(
+            *, k: int, target_group: object, target_peer_fanout: object
+        ) -> None:
+            del target_peer_fanout
             broadcast_calls.append((k, target_group))
 
         def fake_body(**kwargs: object):
@@ -987,8 +1027,10 @@ class TestDrafterAbortRecovery:
         # avoids masking the root cause in the caller's traceback.
         from exo.worker.engines.mlx.generator import pipelined_drafter
 
-        def fake_abort(*, k: int, target_group: object) -> None:
-            del k, target_group
+        def fake_abort(
+            *, k: int, target_group: object, target_peer_fanout: object
+        ) -> None:
+            del k, target_group, target_peer_fanout
             raise RuntimeError("group is also dead")
 
         def fake_body(**kwargs: object):

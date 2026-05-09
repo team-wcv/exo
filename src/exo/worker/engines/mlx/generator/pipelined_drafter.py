@@ -168,7 +168,11 @@ from exo.worker.engines.mlx.generator.drafter_transport import (
     DraftFuture,
 )
 from exo.worker.engines.mlx.types import KVCacheType, Model
-from exo.worker.engines.mlx.utils_mlx import mx_broadcast_int_list
+from exo.worker.engines.mlx.utils_mlx import (
+    TargetPeerFanout,
+    mx_broadcast_int_list,
+    target_peer_broadcast_int_list,
+)
 
 # Length-prefix slot value reserved for the "drafter aborted" signal.
 # Picked from the int32 positive range so it survives
@@ -259,6 +263,7 @@ class PipelinedModelDrafter:
         transport: DrafterTransport | None,
         num_draft_tokens: int,
         target_group: mx.distributed.Group | None = None,
+        target_peer_fanout: TargetPeerFanout | None = None,
         is_target_root: bool = True,
     ) -> None:
         if num_draft_tokens < 1:
@@ -291,6 +296,7 @@ class PipelinedModelDrafter:
         self._transport = transport
         self._num_draft_tokens = num_draft_tokens
         self._target_group = target_group
+        self._target_peer_fanout = target_peer_fanout
         self._is_target_root = is_target_root
 
     @property
@@ -327,6 +333,7 @@ class PipelinedModelDrafter:
             num_draft_tokens=self._num_draft_tokens,
             prefill_step_size=prefill_step_size,
             target_group=self._target_group,
+            target_peer_fanout=self._target_peer_fanout,
             is_target_root=self._is_target_root,
         )
 
@@ -350,6 +357,7 @@ def _pipelined_stream_generate(
     num_draft_tokens: int,
     prefill_step_size: int,
     target_group: mx.distributed.Group | None = None,
+    target_peer_fanout: TargetPeerFanout | None = None,
     is_target_root: bool = True,
 ) -> Generator[GenerationResponse, None, None]:
     """Mirror of ``mlx_lm.stream_generate`` framing for the pipelined drafter.
@@ -380,6 +388,7 @@ def _pipelined_stream_generate(
         prefill_step_size=prefill_step_size,
         prompt_token_count=len(context_tokens),
         target_group=target_group,
+        target_peer_fanout=target_peer_fanout,
         is_target_root=is_target_root,
     )
 
@@ -442,11 +451,41 @@ def _pipelined_stream_generate(
     )
 
 
+def _broadcast_int_list(
+    payload: list[int] | None,
+    *,
+    length: int,
+    target_group: mx.distributed.Group | None,
+    target_peer_fanout: TargetPeerFanout | None,
+    is_root: bool,
+) -> list[int]:
+    """Pick the correct fixed-length int broadcast for the active wiring.
+
+    Multi-target asymmetric placements ride
+    :func:`target_peer_broadcast_int_list` (TCP fanout, immune to
+    JACCL int/float wire conflation). Every other path -- single-rank
+    targets, symmetric multi-rank without a drafter, test fakes that
+    bring up a ``mx.distributed.Group`` without populating a fanout
+    -- falls through to :func:`mx_broadcast_int_list`. The fallback
+    is correct in those cases because the JACCL bug only manifests
+    when the spec-decode int broadcasts interleave with the model's
+    TP ``all_sum`` collectives on the same group; without spec
+    decode (no drafter) or without a multi-rank target (no TP
+    collectives) the interleaving cannot happen.
+    """
+    if target_peer_fanout is not None:
+        return target_peer_broadcast_int_list(
+            payload, length, target_peer_fanout, is_root=is_root
+        )
+    return mx_broadcast_int_list(payload, length, target_group, is_root=is_root)
+
+
 def _broadcast_drafts(
     drafts: list[int] | None,
     *,
     k: int,
     target_group: mx.distributed.Group | None,
+    target_peer_fanout: TargetPeerFanout | None,
     is_root: bool,
 ) -> list[int]:
     """Rank-0 broadcast of a draft list, padded to ``k`` slots + length prefix.
@@ -462,7 +501,7 @@ def _broadcast_drafts(
     ``drafts`` on the root and is a programming error elsewhere (the
     consumer rank must always have a group to receive on).
     """
-    if target_group is None:
+    if target_group is None and target_peer_fanout is None:
         if not is_root or drafts is None:
             raise RuntimeError("non-root broadcast consumer requires target_group")
         return list(drafts)
@@ -475,9 +514,21 @@ def _broadcast_drafts(
                 "transport must clamp before broadcasting"
             )
         payload = [len(drafts)] + list(drafts) + [0] * (k - len(drafts))
-        broadcast = mx_broadcast_int_list(payload, k + 1, target_group, is_root=True)
+        broadcast = _broadcast_int_list(
+            payload,
+            length=k + 1,
+            target_group=target_group,
+            target_peer_fanout=target_peer_fanout,
+            is_root=True,
+        )
     else:
-        broadcast = mx_broadcast_int_list(None, k + 1, target_group, is_root=False)
+        broadcast = _broadcast_int_list(
+            None,
+            length=k + 1,
+            target_group=target_group,
+            target_peer_fanout=target_peer_fanout,
+            is_root=False,
+        )
     actual_len = broadcast[0]
     if actual_len == DRAFT_ABORT_SENTINEL:
         # Root has flagged a drafter-side failure (see
@@ -499,6 +550,7 @@ def _broadcast_abort(
     *,
     k: int,
     target_group: mx.distributed.Group | None,
+    target_peer_fanout: TargetPeerFanout | None,
 ) -> None:
     """Root-only: broadcast the abort sentinel on the draft channel.
 
@@ -512,10 +564,16 @@ def _broadcast_abort(
     to notify, so this is a no-op. The local rank still re-raises
     the underlying transport exception that triggered the abort.
     """
-    if target_group is None:
+    if target_group is None and target_peer_fanout is None:
         return
     payload = [DRAFT_ABORT_SENTINEL] + [0] * k
-    mx_broadcast_int_list(payload, k + 1, target_group, is_root=True)
+    _ = _broadcast_int_list(
+        payload,
+        length=k + 1,
+        target_group=target_group,
+        target_peer_fanout=target_peer_fanout,
+        is_root=True,
+    )
 
 
 def _broadcast_target_tokens(
@@ -524,6 +582,7 @@ def _broadcast_target_tokens(
     k: int,
     k_this: int,
     target_group: mx.distributed.Group | None,
+    target_peer_fanout: TargetPeerFanout | None,
     is_root: bool,
 ) -> list[int]:
     """Rank-0 broadcast of post-verify sampled tokens, slot count ``k + 1``.
@@ -545,7 +604,7 @@ def _broadcast_target_tokens(
     Single-rank short-circuit (``target_group is None``): identity on
     root; programming error on consumer (no broadcast peer).
     """
-    if target_group is None:
+    if target_group is None and target_peer_fanout is None:
         if not is_root or target_tokens is None:
             raise RuntimeError("non-root broadcast consumer requires target_group")
         if len(target_tokens) != k_this + 1:
@@ -565,9 +624,21 @@ def _broadcast_target_tokens(
                 "emits exactly that many tokens per round"
             )
         payload = list(target_tokens) + [0] * (k - k_this)
-        broadcast = mx_broadcast_int_list(payload, k + 1, target_group, is_root=True)
+        broadcast = _broadcast_int_list(
+            payload,
+            length=k + 1,
+            target_group=target_group,
+            target_peer_fanout=target_peer_fanout,
+            is_root=True,
+        )
     else:
-        broadcast = mx_broadcast_int_list(None, k + 1, target_group, is_root=False)
+        broadcast = _broadcast_int_list(
+            None,
+            length=k + 1,
+            target_group=target_group,
+            target_peer_fanout=target_peer_fanout,
+            is_root=False,
+        )
     return broadcast[: k_this + 1]
 
 
@@ -584,6 +655,7 @@ def _pipelined_speculative_step(
     prefill_step_size: int,
     prompt_token_count: int,
     target_group: mx.distributed.Group | None = None,
+    target_peer_fanout: TargetPeerFanout | None = None,
     is_target_root: bool = True,
 ) -> Generator[tuple[int, mx.array, bool], None, None]:
     """Public spec-step generator with drafter-failure recovery.
@@ -616,6 +688,7 @@ def _pipelined_speculative_step(
         prefill_step_size=prefill_step_size,
         prompt_token_count=prompt_token_count,
         target_group=target_group,
+        target_peer_fanout=target_peer_fanout,
         is_target_root=is_target_root,
     )
     try:
@@ -629,7 +702,11 @@ def _pipelined_speculative_step(
             # path. Suppression keeps the original ``OSError``
             # intact for the caller's traceback.
             with contextlib.suppress(Exception):
-                _broadcast_abort(k=num_draft_tokens, target_group=target_group)
+                _broadcast_abort(
+                    k=num_draft_tokens,
+                    target_group=target_group,
+                    target_peer_fanout=target_peer_fanout,
+                )
         raise
 
 
@@ -646,6 +723,7 @@ def _pipelined_speculative_step_body(
     prefill_step_size: int,
     prompt_token_count: int,
     target_group: mx.distributed.Group | None = None,
+    target_peer_fanout: TargetPeerFanout | None = None,
     is_target_root: bool = True,
 ) -> Generator[tuple[int, mx.array, bool], None, None]:
     """Cross-round speculative decoding loop using ``transport``.
@@ -717,7 +795,11 @@ def _pipelined_speculative_step_body(
     else:
         drafts_local = None
     drafts = _broadcast_drafts(
-        drafts_local, k=k, target_group=target_group, is_root=is_target_root
+        drafts_local,
+        k=k,
+        target_group=target_group,
+        target_peer_fanout=target_peer_fanout,
+        is_root=is_target_root,
     )
 
     speculative_future: DraftFuture | None = None
@@ -843,6 +925,7 @@ def _pipelined_speculative_step_body(
             k=k,
             k_this=k_this,
             target_group=target_group,
+            target_peer_fanout=target_peer_fanout,
             is_root=is_target_root,
         )
 
@@ -947,6 +1030,7 @@ def _pipelined_speculative_step_body(
             next_drafts_local,
             k=k,
             target_group=target_group,
+            target_peer_fanout=target_peer_fanout,
             is_root=is_target_root,
         )
 

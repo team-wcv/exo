@@ -63,6 +63,24 @@ class DrafterPlacement(FrozenModel):
                              drafter wire ops. Allocated at placement
                              time; the runner bootstrap binds that
                              specific port (failure is a hard error).
+        target_peer_socket_port: TCP port target rank 0 binds on for
+                             *inter-target-rank* spec-decode int
+                             broadcasts. Distinct from
+                             ``drafter_socket_port`` because the drafter
+                             dials in over a different IP than the
+                             other target ranks; sharing a port would
+                             collide. Empty for single-target instances
+                             (no peer to broadcast to).
+        target_peer_hosts_by_rank: For each non-zero target rank,
+                             the IP that rank uses to dial target rank
+                             0 over the inter-target socket wire.
+                             Resolved at placement time via
+                             :func:`find_ip_prioritised`; differs
+                             per peer because Thunderbolt /30 meshes
+                             expose a unique IP per node pair. Keys
+                             are device ranks (string-encoded for
+                             Pydantic dict-key serialisation), not
+                             node ids.
     """
 
     drafter_node_id: NodeId
@@ -71,6 +89,8 @@ class DrafterPlacement(FrozenModel):
     drafter_rank: int = Field(ge=0)
     drafter_socket_host: str
     drafter_socket_port: int = Field(ge=1, le=65535)
+    target_peer_socket_port: int = Field(ge=1, le=65535)
+    target_peer_hosts_by_rank: dict[int, str] = Field(default_factory=dict)
 
 
 class BaseInstance(TaggedModel):

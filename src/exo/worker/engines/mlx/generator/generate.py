@@ -799,6 +799,7 @@ def mlx_generate(
     drafter_min_output_tokens: int | None = None,
     asymmetric_drafter_rank: int | None = None,
     asymmetric_drafter_transport: object | None = None,
+    target_peer_fanout: object | None = None,
     precomputed_target_cache: KVCacheType | None = None,
 ) -> Generator[GenerationResponse]:
     """Generate tokens for ``task``.
@@ -1272,6 +1273,7 @@ def mlx_generate(
                     target_subgroup_size=target_subgroup_size,
                     pipelined_transport=session_transport,
                     target_group=group,
+                    target_peer_fanout=target_peer_fanout,
                     is_target_root=True,
                 )
             except BaseException:
@@ -1308,6 +1310,7 @@ def mlx_generate(
                 target_subgroup_size=target_subgroup_size,
                 pipelined_transport=None,
                 target_group=group,
+                target_peer_fanout=target_peer_fanout,
                 is_target_root=False,
             )
     else:

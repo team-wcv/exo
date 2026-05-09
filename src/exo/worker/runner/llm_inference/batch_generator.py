@@ -1,3 +1,4 @@
+import contextlib
 import itertools
 import os
 import time
@@ -201,6 +202,15 @@ class SequentialGenerator(Engine):
     # the actual ``DrafterTransport`` consumed by the spec loop. Closed
     # in :meth:`close` (sends ``OP_SHUTDOWN`` to the drafter rank).
     remote_drafter_transport: RemoteTransport | None = None
+    # Inter-target-rank TCP fanout for spec-decode int broadcasts.
+    # Allocated alongside the drafter wire on multi-target asymmetric
+    # placements (see :class:`TargetPeerFanout`); ``None`` for
+    # single-target / symmetric instances. The runner stores it so the
+    # spec-decode loop can sidestep ``mx.distributed.send`` / ``recv``
+    # for inter-target int broadcasts -- those collide with the
+    # model's TP ``all_sum`` collectives on the JACCL backend and
+    # silently corrupt the int wire.
+    target_peer_fanout: object | None = None
     check_for_cancel_every: int = 50
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
@@ -770,6 +780,7 @@ class SequentialGenerator(Engine):
             drafter_min_output_tokens=self.drafter_min_output_tokens,
             asymmetric_drafter_rank=self.drafter_rank_in_parent,
             asymmetric_drafter_transport=self.remote_drafter_transport,
+            target_peer_fanout=self.target_peer_fanout,
             precomputed_target_cache=precomputed_target_cache,
         )
 
@@ -787,6 +798,27 @@ class SequentialGenerator(Engine):
                     "Drafter rank shutdown failed; continuing close"
                 )
             self.remote_drafter_transport = None
+        # Close every TCP socket the target-peer fanout owns (one per
+        # peer on rank 0, single rank-zero socket on peers). Inline
+        # the socket import + isinstance check to keep this module's
+        # top-level imports thin. ``OSError`` here is benign -- the
+        # peer may already have closed (e.g. supervisor SIGKILL chain)
+        # and we just want to free the local FDs before the runner
+        # exits.
+        if self.target_peer_fanout is not None:
+            from exo.worker.engines.mlx.utils_mlx import TargetPeerFanout as _Fanout
+
+            if isinstance(self.target_peer_fanout, _Fanout):
+                import socket as _socket
+
+                for sock in self.target_peer_fanout.peer_sockets.values():
+                    if isinstance(sock, _socket.socket):
+                        with contextlib.suppress(OSError):
+                            sock.close()
+                if isinstance(self.target_peer_fanout.rank_zero_socket, _socket.socket):
+                    with contextlib.suppress(OSError):
+                        self.target_peer_fanout.rank_zero_socket.close()
+            self.target_peer_fanout = None
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:

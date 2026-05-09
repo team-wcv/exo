@@ -640,6 +640,52 @@ def _select_drafter_placement(
         )
         return None
     drafter_socket_port = random_ephemeral_port()
+    # Inter-target-peer wire: target rank 0 binds a separate ephemeral
+    # port for the spec-decode int-broadcast fanout (drafts in / sampled
+    # tokens out). Decoupled from the drafter port because both bind on
+    # rank 0 and a single port can only accept one connection class
+    # cleanly. Each non-zero target rank dials the IP rank 0 advertises
+    # *to that peer* -- different peers may reach rank 0 over different
+    # interfaces (e.g. a Thunderbolt /30 mesh exposes a unique IP per
+    # node pair). The map below resolves those per-peer IPs once at
+    # placement time so workers don't re-do the topology dance at
+    # bootstrap.
+    target_peer_socket_port = random_ephemeral_port()
+    target_peer_hosts_by_rank: dict[int, str] = {}
+    for peer_rank, peer_node_id in enumerate(selected_cycle.node_ids):
+        if peer_rank == 0:
+            continue
+        peer_view_of_rank_zero = find_ip_prioritised(
+            peer_node_id,
+            target_rank_zero,
+            topology,
+            node_network,
+            ring=True,
+        )
+        if peer_view_of_rank_zero is None:
+            # Same fail-loud rationale as the drafter IP: target rank 0
+            # is unreachable from a peer in topology, so the spec-decode
+            # int-broadcast wire cannot be brought up. Falling back to
+            # the legacy ``mx.distributed`` broadcast would re-introduce
+            # the JACCL int/float wire-conflation bug. Degrade to no
+            # drafter so the user still gets generation, just at
+            # standard (non-speculative) speed.
+            _emit_drafter_degraded(
+                on_drafter_placement_degraded,
+                command=command,
+                instance_id=instance_id,
+                target_node_ids=target_node_ids,
+                eligible_nodes=eligible_nodes,
+                reason=DrafterPlacementDegradationReason.NoReachablePathFromTargetRankZero,
+                fallback=fallback,
+                detail=(
+                    f"Target rank 0 ({target_rank_zero}) has no IP address "
+                    f"reachable from peer target rank {peer_rank} "
+                    f"(node {peer_node_id}) in topology"
+                ),
+            )
+            return None
+        target_peer_hosts_by_rank[peer_rank] = peer_view_of_rank_zero
     return DrafterPlacement(
         drafter_node_id=drafter_node_id,
         drafter_runner_id=drafter_runner_id,
@@ -647,6 +693,8 @@ def _select_drafter_placement(
         drafter_rank=drafter_rank,
         drafter_socket_host=drafter_socket_host,
         drafter_socket_port=drafter_socket_port,
+        target_peer_socket_port=target_peer_socket_port,
+        target_peer_hosts_by_rank=target_peer_hosts_by_rank,
     )
 
 

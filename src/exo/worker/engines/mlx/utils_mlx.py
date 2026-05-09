@@ -5,7 +5,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast, final
 
@@ -225,6 +225,11 @@ class MlxGroupSplit:
         drafter (``placement.drafter_rank``). Carried for telemetry
         and the few legacy call sites that branch on "is asymmetric";
         ``None`` for symmetric placement.
+      * ``target_peer_fanout`` -- inter-target-rank TCP fanout for
+        spec-decode int broadcasts (see :class:`TargetPeerFanout`).
+        ``None`` for single-target instances or symmetric placements
+        without a drafter (no spec-decode hot path; legacy
+        ``mx_broadcast_int_list`` is sufficient).
     """
 
     parent: mx.distributed.Group | None
@@ -238,9 +243,66 @@ class MlxGroupSplit:
     (:mod:`builder`) cast back to ``socket.socket`` before passing to
     :func:`make_remote_transport`."""
 
+    target_peer_fanout: "TargetPeerFanout | None" = None
+    """Inter-target-rank TCP fanout for spec-decode int broadcasts.
+
+    Allocated alongside the drafter socket on multi-target asymmetric
+    placements. ``None`` for single-target or symmetric instances.
+    Built once at bootstrap; the spec-decode loop reuses it for every
+    round."""
+
     @property
     def is_asymmetric(self) -> bool:
         return self.drafter_rank_in_parent is not None
+
+
+@final
+@dataclass(frozen=True)
+class TargetPeerFanout:
+    """Direct TCP int-broadcast wire between target rank 0 and its peers.
+
+    Replaces :func:`mx.distributed.send` / :func:`recv` on the
+    spec-decode hot path. JACCL on Apple Silicon conflates int32
+    broadcasts on the target group with the model's float32 TP
+    ``all_sum`` collectives; the former occasionally returns the
+    latter's logit memory reinterpreted as int32, surfacing as
+    out-of-vocab token ids (~``10^9``) deep in the SPM detokenizer.
+
+    The model's TP ``all_sum`` collectives stay on JACCL/RDMA -- they
+    carry multi-MB tensor reductions where vendor RDMA wins
+    decisively. Only the tiny (~24-byte) int32 broadcasts move to TCP,
+    where Thunderbolt with ``TCP_NODELAY`` adds <100µs per round
+    (negligible against a ~30ms verifier forward).
+
+    Topology:
+      * On target rank 0: ``peer_sockets`` holds one connection per
+        non-zero peer rank, indexed by peer rank.
+      * On a peer target rank (rank > 0): ``rank_zero_socket`` holds
+        the single connection back to rank 0.
+
+    Both shapes are produced by :func:`_setup_target_peer_fanout` at
+    instance bootstrap and are immutable for the runner's lifetime.
+    Reconnect-on-failure is intentionally NOT supported: a transport
+    failure on this wire is treated as a hard runner failure (same as
+    a TP all-reduce failure) and the supervisor rebuilds the instance.
+    """
+
+    rank: int
+    """Caller's target rank inside the parent group; matches
+    ``MlxGroupSplit.parent.rank()`` when ``parent`` is set."""
+
+    peer_sockets: dict[int, object] = field(default_factory=dict)
+    """Rank 0 only: ``{peer_rank: socket.socket}``. Empty on rank > 0."""
+
+    rank_zero_socket: object | None = None
+    """Rank > 0 only: connected socket back to rank 0. ``None`` on rank 0."""
+
+    expected_world_size: int = 1
+    """Target world size (every rank in the fanout sees the same value).
+
+    Stored explicitly so the broadcast helpers can sanity-check that
+    rank 0's ``peer_sockets`` cover all peers without re-deriving the
+    world size from a possibly-discarded group handle."""
 
 
 def initialize_mlx(bound_instance: BoundInstance) -> MlxGroupSplit:
@@ -289,11 +351,18 @@ def initialize_mlx(bound_instance: BoundInstance) -> MlxGroupSplit:
         placement=placement,
     )
 
+    target_peer_fanout = _maybe_setup_target_peer_fanout(
+        bound_instance=bound_instance,
+        target_world_size=target_world_size,
+        placement=placement,
+    )
+
     return MlxGroupSplit(
         parent=parent,
         target_subgroup=parent,
         drafter_rank_in_parent=drafter_rank_in_parent,
         drafter_socket=drafter_socket,
+        target_peer_fanout=target_peer_fanout,
     )
 
 
@@ -358,6 +427,126 @@ def _maybe_accept_drafter_socket(
         # connected for the instance lifetime); close it as soon as
         # accept returns to free the port.
         listener.close()
+
+
+def _maybe_setup_target_peer_fanout(
+    *,
+    bound_instance: BoundInstance,
+    target_world_size: int,
+    placement: object,
+) -> TargetPeerFanout | None:
+    """Bring up the inter-target-rank TCP int-broadcast wire.
+
+    Multi-target asymmetric placements need a TCP fanout between
+    target rank 0 and its peers because the JACCL backend conflates
+    the model's float32 TP ``all_sum`` with int32 broadcasts on the
+    same group (see :class:`TargetPeerFanout` docstring). Single-rank
+    targets and symmetric placements (no drafter) have no spec-decode
+    hot path, so they don't need this wire and the function returns
+    ``None``.
+
+    Bootstrap protocol:
+
+      * Target rank 0 binds 0.0.0.0:``placement.target_peer_socket_port``
+        and accepts ``target_world_size - 1`` incoming connections.
+      * Each non-zero target rank dials
+        ``placement.target_peer_hosts_by_rank[my_rank]:target_peer_socket_port``
+        with bounded retry (the listener may not be up yet on the
+        first attempt because ``accept`` and ``connect`` race during
+        bootstrap).
+
+    The drafter rank is NOT in this fanout: it has its own dedicated
+    wire to target rank 0 (see :func:`_maybe_accept_drafter_socket`).
+    Skipping the fanout for the drafter rank is the right call
+    because the drafter never broadcasts int frames to target peers
+    -- it only exchanges drafts/verify with rank 0.
+
+    Failure mode: a dial timeout / accept timeout raises
+    :class:`ConnectionError` or :class:`socket.timeout`, which
+    bubbles up to the runner and surfaces as a connect-task failure.
+    The cluster does not silently wedge.
+    """
+    from exo.shared.types.worker.instances import DrafterPlacement
+
+    if placement is None or not isinstance(placement, DrafterPlacement):
+        return None
+    if target_world_size <= 1:
+        return None
+    if bound_instance.is_drafter_rank:
+        return None
+
+    rank = bound_instance.parent_rank
+    expected_world_size = target_world_size
+
+    # Imported lazily to avoid pulling the socket module into module
+    # import for runners that never reach this code path.
+    from exo.worker.engines.mlx.generator.target_peer_socket import (
+        accept_target_peers,
+        bind_target_peer_listener,
+        dial_target_zero,
+    )
+
+    if rank == 0:
+        listener = bind_target_peer_listener(
+            "0.0.0.0",
+            placement.target_peer_socket_port,
+            backlog=expected_world_size - 1,
+        )
+        try:
+            logger.info(
+                f"target rank 0 listening for {expected_world_size - 1} "
+                f"target peers on 0.0.0.0:{placement.target_peer_socket_port}"
+            )
+            conns = accept_target_peers(
+                listener,
+                expected_peers=expected_world_size - 1,
+                timeout_seconds=180.0,
+            )
+            logger.info(
+                f"target rank 0 accepted {len(conns)} target-peer "
+                "connection(s)"
+            )
+        finally:
+            listener.close()
+        # The peer rank that wrote each connection is implicit (we
+        # accept in connection order, but peers can dial in any
+        # order). Spec-decode broadcasts don't need rank-indexed
+        # peers -- rank 0 sends the same payload to every peer per
+        # round -- so we store sockets in arbitrary stable order
+        # keyed by accept order. The spec-decode broadcast helper
+        # iterates ``peer_sockets.values()`` and ignores keys.
+        peer_sockets: dict[int, object] = {idx: c for idx, c in enumerate(conns)}
+        return TargetPeerFanout(
+            rank=0,
+            peer_sockets=peer_sockets,
+            rank_zero_socket=None,
+            expected_world_size=expected_world_size,
+        )
+
+    rank_zero_host = placement.target_peer_hosts_by_rank.get(rank)
+    if rank_zero_host is None:
+        raise RuntimeError(
+            f"target peer rank {rank} has no entry in "
+            f"DrafterPlacement.target_peer_hosts_by_rank "
+            f"({placement.target_peer_hosts_by_rank}); placement is "
+            "malformed"
+        )
+    logger.info(
+        f"target peer rank {rank} dialing target rank 0 at "
+        f"{rank_zero_host}:{placement.target_peer_socket_port}"
+    )
+    conn = dial_target_zero(
+        rank_zero_host,
+        placement.target_peer_socket_port,
+        total_timeout_seconds=180.0,
+    )
+    logger.info(f"target peer rank {rank} connected to target rank 0")
+    return TargetPeerFanout(
+        rank=rank,
+        peer_sockets={},
+        rank_zero_socket=conn,
+        expected_world_size=expected_world_size,
+    )
 
 
 EXO_DISABLE_DRAFTER_ENV = "EXO_DISABLE_DRAFTER"
@@ -1352,6 +1541,85 @@ def mx_broadcast_int_list(
             f"mx_broadcast_int_list PEER recvd {out} (expected len={length})"
         )
     return out
+
+
+def target_peer_broadcast_int_list(
+    values: list[int] | None,
+    length: int,
+    fanout: TargetPeerFanout,
+    *,
+    is_root: bool,
+) -> list[int]:
+    """Broadcast a fixed-length signed int list over the TCP fanout.
+
+    Drop-in replacement for :func:`mx_broadcast_int_list` on the
+    spec-decode hot path. Same shape contract (``length`` agreed by
+    every rank up front; root passes ``values``, peers pass
+    ``None``); the only difference is that this version rides direct
+    TCP sockets instead of ``mx.distributed.send`` / ``recv``,
+    sidestepping the JACCL int/float wire-conflation bug entirely.
+
+    Wire format (every frame): ``length`` little-endian signed int32
+    values, no header. The peer side knows ``length`` from the same
+    shape contract the caller agreed to.
+
+    Args:
+      values: On root, exactly ``length`` int32-range values to
+        broadcast. Ignored on peers.
+      length: Buffer size, agreed by all ranks. Must be ``>= 1``.
+      fanout: Pre-built fanout from :func:`_maybe_setup_target_peer_fanout`.
+        Carries the per-rank role (rank 0 vs peer) and the connected
+        sockets. Mismatched ``is_root`` vs ``fanout.rank`` is a caller
+        bug and raises :class:`ValueError`.
+      is_root: ``True`` on rank 0, ``False`` elsewhere. Asserted
+        against ``fanout.rank``.
+
+    Returns:
+      A list of ``length`` ints identical on every rank, equal to
+      root's ``values``.
+
+    Raises:
+      ValueError: caller-bug conditions (length, values shape,
+        is_root vs rank mismatch).
+      ConnectionError: a peer closed the socket mid-frame; surfaces
+        as a runner failure for the supervisor to rebuild.
+    """
+    import socket as _socket
+
+    from exo.worker.engines.mlx.generator.target_peer_socket import (
+        recv_int32_frame,
+        send_int32_frame,
+    )
+
+    if length < 1:
+        raise ValueError(
+            f"target_peer_broadcast_int_list length must be >= 1, got {length}"
+        )
+    if is_root != (fanout.rank == 0):
+        raise ValueError(
+            f"target_peer_broadcast_int_list is_root={is_root} disagrees "
+            f"with fanout.rank={fanout.rank}; exactly one rank in the "
+            "fanout must pass is_root=True"
+        )
+    if is_root:
+        if values is None or len(values) != length:
+            raise ValueError(
+                "target_peer_broadcast_int_list root rank requires values "
+                f"of length {length}, got "
+                f"{None if values is None else len(values)}"
+            )
+        for sock in fanout.peer_sockets.values():
+            assert isinstance(sock, _socket.socket)  # narrow object -> socket
+            send_int32_frame(sock, values)
+        return list(values)
+    sock = fanout.rank_zero_socket
+    if sock is None:
+        raise RuntimeError(
+            "target_peer_broadcast_int_list called on peer rank but "
+            "fanout.rank_zero_socket is None; bootstrap must populate it"
+        )
+    assert isinstance(sock, _socket.socket)
+    return recv_int32_frame(sock, length)
 
 
 def mx_all_sum_int_list(
