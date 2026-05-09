@@ -198,6 +198,28 @@ def _get_eos_ids(tokenizer: TokenizerWrapper) -> list[int]:
     return eos
 
 
+def _get_tokenizer_vocab_size(tokenizer: TokenizerWrapper) -> int | None:
+    """Return ``len(tokenizer.vocab)`` (or HF equivalent) when available.
+
+    Used by the spec-decode loop as an early sanity check on emitted
+    token ids: anything outside ``[0, vocab_size)`` cannot have come
+    from a clean broadcast (the sampler and drafter both produce ids
+    in that range), so it always points at a wire-level corruption
+    upstream. Returns ``None`` when the tokenizer doesn't expose a
+    vocab size (extremely defensive; mlx_lm tokenizers do).
+    """
+    inner: object = getattr(tokenizer, "_tokenizer", None)
+    if inner is None:
+        return None
+    vocab_size: object = getattr(inner, "vocab_size", None)
+    if isinstance(vocab_size, int) and vocab_size > 0:
+        return vocab_size
+    vocab: object = getattr(inner, "vocab", None)
+    if isinstance(vocab, dict) and vocab:
+        return max(cast("dict[object, int]", vocab).values()) + 1
+    return None
+
+
 def _process_logits_for_position(
     raw_logits: mx.array,
     prev_tokens: mx.array,
@@ -339,6 +361,12 @@ def _pipelined_stream_generate(
     detokenizer = tokenizer.detokenizer
     detokenizer.reset()  # type: ignore[reportUnknownMemberType]
     eos_ids = _get_eos_ids(tokenizer)
+    # Vocab bound for early surfacing of broadcast corruption.
+    # ``add_token`` would otherwise blow up deep inside the SPM
+    # detokenizer with ``IndexError: list index out of range`` and
+    # the operator has to dig through the mlx_lm internals to learn
+    # which token id was bogus.
+    vocab_size = _get_tokenizer_vocab_size(tokenizer)
 
     token_iter = _pipelined_speculative_step(
         prompt=prompt,
@@ -371,6 +399,15 @@ def _pipelined_stream_generate(
         if token in eos_ids:
             finish_reason = "stop"
             break
+        if vocab_size is not None and not 0 <= token < vocab_size:
+            raise RuntimeError(
+                f"pipelined drafter emitted token id {token} outside "
+                f"tokenizer vocab [0, {vocab_size}); "
+                "this is a wire-protocol bug in the spec-decode "
+                "broadcast path (cross-stream JACCL collision or "
+                "rank divergence). The runner will crash and the "
+                "supervisor will rebuild the instance."
+            )
         detokenizer.add_token(token)  # type: ignore[reportUnknownMemberType]
         if (n + 1) == max_tokens:
             finish_reason = "length"

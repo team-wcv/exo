@@ -1225,9 +1225,12 @@ def mlx_cleanup(
 def mx_any(bool_: bool, group: mx.distributed.Group | None) -> bool:
     if group is None:
         return bool_
-    num_true = mx.distributed.all_sum(
-        mx.array(bool_), group=group, stream=mx.default_stream(mx.Device(mx.cpu))
-    )
+    # Stream alignment: see :func:`mx_broadcast_int_list` for the full
+    # rationale. ``mx_any`` participates in the spec-decode hot path
+    # via ``agree_on_cancellations`` and runs on the same target group
+    # the model TP uses; staying on the default stream keeps JACCL's
+    # collective FIFO intact across CPU and Metal dispatches.
+    num_true = mx.distributed.all_sum(mx.array(bool_), group=group)
     mx.eval(num_true)
     return num_true.item() > 0
 
@@ -1235,11 +1238,9 @@ def mx_any(bool_: bool, group: mx.distributed.Group | None) -> bool:
 def mx_barrier(group: mx.distributed.Group | None):
     if group is None:
         return
-    mx.eval(
-        mx.distributed.all_sum(
-            mx.array(1.0), group=group, stream=mx.default_stream(mx.Device(mx.cpu))
-        )
-    )
+    # Same stream-alignment rationale as :func:`mx_any` /
+    # :func:`mx_broadcast_int_list`.
+    mx.eval(mx.distributed.all_sum(mx.array(1.0), group=group))
 
 
 # ``int32`` lower / upper bounds. Values broadcast through
@@ -1323,9 +1324,18 @@ def mx_broadcast_int_list(
     else:
         buffer = mx.zeros((length,), dtype=mx.int32)
 
-    summed = mx.distributed.all_sum(
-        buffer, group=group, stream=mx.default_stream(mx.Device(mx.cpu))
-    )
+    # Stream alignment: the model's TP all-reduces dispatch on the
+    # default (Metal) stream. If we issued this broadcast on the CPU
+    # stream, JACCL would observe two independent dispatch queues per
+    # rank and could pair a CPU collective on rank A with a Metal
+    # collective on rank B (cross-stream rendezvous), corrupting the
+    # buffers. Symptom in the wild: drafter spec-decode emitted
+    # token IDs > vocab_size which crashed the SPM detokenizer with
+    # ``IndexError: list index out of range`` on rank-1 within ~1
+    # round of decode start. Keeping every collective on the same
+    # stream as the model TP makes JACCL's matching FIFO across the
+    # whole hot path. ``stream=None`` means "default for ``buffer``".
+    summed = mx.distributed.all_sum(buffer, group=group)
     mx.eval(summed)
     return [int(v) for v in cast(list[int], summed.tolist())]
 
@@ -1377,9 +1387,10 @@ def mx_all_sum_int_list(
     if group is None:
         return list(values)
     buffer = mx.array(values, dtype=mx.int32)
-    summed = mx.distributed.all_sum(
-        buffer, group=group, stream=mx.default_stream(mx.Device(mx.cpu))
-    )
+    # Same stream-alignment rationale as :func:`mx_broadcast_int_list`:
+    # match the model's TP all-reduce stream so JACCL serialises every
+    # group collective into one FIFO per rank.
+    summed = mx.distributed.all_sum(buffer, group=group)
     mx.eval(summed)
     return [int(v) for v in cast(list[int], summed.tolist())]
 
