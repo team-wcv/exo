@@ -654,6 +654,19 @@ def _is_routable_jaccl_ipv4(ip_address: str) -> bool:
             return False
         if len(octet) > 1 and octet.startswith("0"):
             return False
+        # Codex P2 (PR #11 round-(N+8), placement.py): even after the
+        # ASCII-digit guard, ``int(octet)`` can still raise
+        # ``ValueError`` because CPython enforces a string-conversion
+        # digit limit (``sys.set_int_max_str_digits``, default 4300).
+        # A pathological ``node_network`` payload such as
+        # ``"9" * 4301 + ".1.1.1"`` would reach this line and abort
+        # the placement preflight instead of returning False. The
+        # contract for this helper is "never raise on malformed
+        # network payloads", so cap octet length at 3 (any IPv4 octet
+        # in the range 0..255 fits in three ASCII digits) before
+        # attempting conversion.
+        if len(octet) > 3:
+            return False
         value = int(octet)
         if value < 0 or value > 255:
             return False

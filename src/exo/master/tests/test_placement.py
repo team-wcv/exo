@@ -2019,6 +2019,37 @@ def test_is_routable_jaccl_ipv4_rejects_unicode_digit_octets() -> None:
         )
 
 
+def test_is_routable_jaccl_ipv4_rejects_oversized_octet_strings() -> None:
+    """Codex P2 (PR #11 round-(N+8), placement.py): ``int(octet)`` can
+    raise ``ValueError`` for very long numeric strings because CPython
+    enforces ``sys.set_int_max_str_digits`` (default 4300). Pre-fix the
+    function only checked ``isascii()``/``isdigit()`` before calling
+    ``int()``, so an input like ``"9" * 4301 + ".1.1.1"`` reached
+    ``int(octet)`` and aborted placement preflight rather than
+    returning False. The contract for this helper is "never raise on
+    malformed network payloads", so all oversized digit strings must
+    cleanly return False.
+    """
+    pathological_octet = "9" * 4301
+    cases = [
+        f"{pathological_octet}.1.1.1",
+        f"1.{pathological_octet}.1.1",
+        f"1.1.{pathological_octet}.1",
+        f"1.1.1.{pathological_octet}",
+        # Just over the IPv4 max-octet width (3 digits) -- still
+        # rejected before ``int()`` is reached, before any
+        # ``set_int_max_str_digits`` worry.
+        "1234.1.1.1",
+        "1.1.1.0001",
+    ]
+    for ip in cases:
+        # Must not raise (incl. ``ValueError`` from CPython's
+        # int-digit limit); must return False cleanly.
+        assert not _is_routable_jaccl_ipv4(ip), (
+            f"oversized-octet input {ip[:20]}... unexpectedly accepted"
+        )
+
+
 def test_jaccl_placement_allows_nodes_with_unknown_network_info(
     model_card: ModelCard,
 ) -> None:
