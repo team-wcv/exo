@@ -1014,6 +1014,81 @@ async def test_failed_target_top_level_call_still_skips_drafter_chain() -> None:
         )
 
 
+async def test_chained_drafter_does_not_recursively_chain_via_inner_path() -> None:
+    """Codex P2 (PR #18 round-(N+10), coordinator.py:347):
+    ``_start_download_inner`` calls ``_spawn_drafter_chain`` in three
+    completion arms (cached-on-disk, initial-progress complete,
+    actual download started). Pre-fix, the ``is_drafter_chain``
+    flag introduced at the outer ``_start_download`` boundary was
+    DROPPED at the inner-call boundary, so a drafter being downloaded
+    as a chain step would itself trigger ``_spawn_drafter_chain``
+    whenever its own card declared ``drafter_model_ids`` (custom
+    cards or accidentally self-referential cards). This test
+    constructs a drafter card whose own ``drafter_model_ids`` lists
+    a "second-level" drafter, runs the chain, and asserts that the
+    second-level drafter is never enqueued -- the chain stops at
+    one level deep.
+    """
+    second_level_id = ModelId("test-org/second-level-drafter")
+    drafter_card_with_subdrafter = ModelCard(
+        model_id=DRAFTER_ID,
+        storage_size=Memory.from_mb(50),
+        n_layers=12,
+        hidden_size=768,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        # Self-recursive trap: the drafter's card itself lists a
+        # nested drafter. Pre-fix this would recursively chain.
+        drafter_model_ids=[second_level_id],
+    )
+    second_level_card = ModelCard(
+        model_id=second_level_id,
+        storage_size=Memory.from_mb(20),
+        n_layers=4,
+        hidden_size=256,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+    )
+
+    target_shard = _make_shard(_make_target_card([DRAFTER_ID]))
+
+    async def fake_load(model_id: ModelId) -> ModelCard:
+        if model_id == DRAFTER_ID:
+            return drafter_card_with_subdrafter
+        if model_id == second_level_id:
+            return second_level_card
+        raise AssertionError(f"unexpected ModelCard.load for {model_id}")
+
+    with patch.object(ModelCard, "load", side_effect=fake_load):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            _coordinator,
+            cmd_send,
+            event_recv,
+        ):
+            await cmd_send.send(
+                ForwarderDownloadCommand(
+                    origin=SystemId("test"),
+                    command=StartDownload(
+                        target_node_id=NODE_ID, shard_metadata=target_shard
+                    ),
+                )
+            )
+            assert await _wait_for_completed(event_recv, TARGET_ID) is not None
+            assert await _wait_for_completed(event_recv, DRAFTER_ID) is not None
+            # Grace window so any rogue second-level chain has time
+            # to fire before we assert it didn't.
+            await asyncio.sleep(0.1)
+
+    assert second_level_id not in downloader.ensured, (
+        "chained drafters must NOT recursively re-chain their own "
+        "drafter_model_ids; the chain stops at one level deep so a "
+        "self-referential or custom-multi-level drafter card cannot "
+        "spawn nested background fetches. "
+        f"ensured={downloader.ensured!r}"
+    )
+
+
 async def test_starting_downloads_cleared_on_completion() -> None:
     """The ephemeral ``_starting_downloads`` lock must be released
     after ``_start_download`` finishes, so a legitimate restart

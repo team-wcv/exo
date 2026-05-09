@@ -344,11 +344,23 @@ class DownloadCoordinator:
             return
         self._starting_downloads.add(model_id)
         try:
-            await self._start_download_inner(shard)
+            await self._start_download_inner(shard, is_drafter_chain=is_drafter_chain)
         finally:
             self._starting_downloads.discard(model_id)
 
-    async def _start_download_inner(self, shard: ShardMetadata) -> None:
+    async def _start_download_inner(
+        self, shard: ShardMetadata, *, is_drafter_chain: bool = False
+    ) -> None:
+        # Codex P2 (PR #18 round-(N+10), coordinator.py:347): thread
+        # ``is_drafter_chain`` through ``_start_download_inner`` so the
+        # ``_spawn_drafter_chain`` calls below remain gated when the
+        # drafter is being downloaded as part of an already-active
+        # chain. Pre-fix the flag was dropped at the inner-call
+        # boundary, so a chained drafter that itself declares
+        # ``drafter_model_ids`` (custom or accidentally self-
+        # referential cards) would recursively re-chain another
+        # drafter download whenever its inner path completed,
+        # spawning unintended nested background fetches.
         model_id = shard.model_card.model_id
 
         # Check all model directories for pre-existing complete models
@@ -364,7 +376,8 @@ class DownloadCoordinator:
             await self.event_sender.send(
                 NodeDownloadProgress(download_progress=completed)
             )
-            self._spawn_drafter_chain(shard)
+            if not is_drafter_chain:
+                self._spawn_drafter_chain(shard)
             return
 
         # Emit pending status
@@ -400,7 +413,8 @@ class DownloadCoordinator:
             await self.event_sender.send(
                 NodeDownloadProgress(download_progress=completed)
             )
-            self._spawn_drafter_chain(shard)
+            if not is_drafter_chain:
+                self._spawn_drafter_chain(shard)
             return
 
         if self.offline:
@@ -419,7 +433,8 @@ class DownloadCoordinator:
 
         # Start actual download
         self._start_download_task(shard, initial_progress)
-        self._spawn_drafter_chain(shard)
+        if not is_drafter_chain:
+            self._spawn_drafter_chain(shard)
 
     def _spawn_drafter_chain(self, target_shard: ShardMetadata) -> None:
         """Background the drafter chain so command processing doesn't block.
