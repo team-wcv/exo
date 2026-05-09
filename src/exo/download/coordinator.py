@@ -78,6 +78,25 @@ class DownloadCoordinator:
     # children).
     _drafter_children: dict[ModelId, list[ModelId]] = field(default_factory=dict)
 
+    # Codex P2 (PR #18 round-(N+3), coordinator.py:224): per-model
+    # in-flight marker for ``_start_download``. Pre-fix, the function
+    # treated only ``DownloadOngoing``/``DownloadCompleted`` as
+    # in-flight, so concurrent chain coroutines could both observe
+    # ``DownloadPending`` (set during the early ``DownloadPending``
+    # emit) and fall through to ``_start_download_task``, racing
+    # ``ensure_shard()`` and producing a cancel/restart flap. The set
+    # also has to coexist with the post-cancel restart-after-cancel
+    # path: ``_cancel_download`` leaves ``download_status`` at
+    # ``DownloadPending`` after a user cancel, but the cancelled
+    # ``_start_download`` is no longer in ``_starting_downloads``,
+    # so a follow-up ``StartDownload`` correctly re-enters the
+    # download-launch flow. ``active_downloads`` cannot serve as the
+    # gate by itself: it's only populated late in
+    # ``_start_download_task``, after the ``DownloadPending`` emit
+    # and the ``get_shard_download_status_for_shard`` await window
+    # where the race occurs.
+    _starting_downloads: set[ModelId] = field(default_factory=set)
+
     def __post_init__(self) -> None:
         self.shard_downloader.on_progress(self._download_progress_callback)
 
@@ -206,14 +225,29 @@ class DownloadCoordinator:
         # intent. Pop the parent->children mapping (so we don't
         # double-cancel on a follow-up cancel of the same target) and
         # cascade the cancel.
+        #
+        # Codex P1 (PR #18 round-(N+3), coordinator.py:212): cascade
+        # MUST recurse unconditionally, NOT only for children already
+        # in ``active_downloads``. Children registered by
+        # ``_maybe_chain_drafter_download`` (via ``remember_drafter_link``)
+        # are tracked BEFORE ``await self._start_download(...)`` populates
+        # ``active_downloads``. Pre-fix, a cancel that arrived during
+        # that prep window skipped the child here -- the cascade saw
+        # nothing to cancel -- and the chain's own ``cancelled()``
+        # check upstream in the loop only fires *between* iterations,
+        # not for the drafter that's mid-``_start_download``. So the
+        # drafter download silently continued. The post-await re-check
+        # in ``_maybe_chain_drafter_download`` is the live safety net,
+        # but recursing unconditionally here keeps the cascade
+        # symmetric with future state extensions and ensures the
+        # cancel intent reaches every registered child.
         children = self._drafter_children.pop(model_id, [])
         for child_model_id in children:
-            if child_model_id in self.active_downloads:
-                logger.info(
-                    f"Cancelling chained drafter {child_model_id} alongside "
-                    f"target {model_id}"
-                )
-                await self._cancel_download(child_model_id)
+            logger.info(
+                f"Cascading cancel to chained drafter {child_model_id} "
+                f"alongside target {model_id}"
+            )
+            await self._cancel_download(child_model_id)
 
     async def _start_download(self, shard: ShardMetadata) -> None:
         model_id = shard.model_card.model_id
@@ -245,6 +279,37 @@ class DownloadCoordinator:
                     f"skipping drafter chain (drafter is useless without target)"
                 )
                 return
+
+        # Codex P2 (PR #18 round-(N+3), coordinator.py:224): per-model
+        # in-flight gate. We can't use ``download_status`` alone because
+        # ``DownloadPending`` is also the state that ``_cancel_download``
+        # leaves behind, so a follow-up ``StartDownload`` for the same
+        # drafter MUST still re-launch the download (restart-after-cancel
+        # is a supported flow). And we can't use ``active_downloads``
+        # alone because it's only populated late in
+        # ``_start_download_task``, AFTER the ``DownloadPending`` emit
+        # and the ``get_shard_download_status_for_shard`` await window
+        # where overlapping chain coroutines would otherwise both fall
+        # through and call ``ensure_shard()`` -- which then cancels
+        # itself and restarts in a flap. ``_starting_downloads`` is the
+        # ephemeral marker that bridges that window: present strictly
+        # while one ``_start_download`` is mid-launch for ``model_id``,
+        # cleared in ``finally`` so a real cancel/failure doesn't leave
+        # a stale lock.
+        if model_id in self._starting_downloads:
+            logger.debug(
+                f"Download for {model_id} already in launch flow; "
+                f"skipping duplicate start to avoid ensure_shard flap"
+            )
+            return
+        self._starting_downloads.add(model_id)
+        try:
+            await self._start_download_inner(shard)
+        finally:
+            self._starting_downloads.discard(model_id)
+
+    async def _start_download_inner(self, shard: ShardMetadata) -> None:
+        model_id = shard.model_card.model_id
 
         # Check all model directories for pre-existing complete models
         found_path = await to_thread.run_sync(
@@ -529,6 +594,28 @@ class DownloadCoordinator:
             remember_drafter_link(drafter_id)
             logger.info(f"Chaining drafter download {drafter_id} for {target_model_id}")
             await self._start_download(drafter_shard)
+
+            # Codex P1 (PR #18 round-(N+3), coordinator.py:212): close
+            # the cancel-cascade race window. The cascade in
+            # ``_cancel_download`` recurses into every registered child,
+            # but ``_cancel_download`` itself can only honor a cancel if
+            # the child has reached ``active_downloads``. If the parent
+            # is cancelled while we're awaiting ``_start_download``
+            # above, the cascade arrives BEFORE ``_start_download_task``
+            # has populated ``active_downloads`` -- the cascade no-ops
+            # for this child, then ``_start_download_task`` runs and
+            # the drafter download proceeds despite the user revoking
+            # the parent. Re-check ``cancelled()`` here and explicitly
+            # cancel the now-launched drafter so the user's intent
+            # propagates regardless of timing.
+            if cancelled():
+                logger.info(
+                    f"Drafter chain for {target_model_id} aborted after "
+                    f"starting {drafter_id}: target was cancelled mid-launch; "
+                    f"cancelling drafter to honor cascade."
+                )
+                await self._cancel_download(drafter_id)
+                return
 
     def _start_download_task(
         self, shard: ShardMetadata, initial_progress: RepoDownloadProgress

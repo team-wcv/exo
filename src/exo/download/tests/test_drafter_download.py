@@ -767,3 +767,152 @@ async def test_rechain_preserves_drafter_link_for_cancel_cascade() -> None:
             assert captured_list.count(DRAFTER_ID) == 1, (
                 "rechain must dedup drafter ids it already linked"
             )
+
+
+async def test_cancel_cascade_recurses_unconditionally_for_pending_children() -> None:
+    """Codex P1 (PR #18 round-(N+3), coordinator.py:212): the cancel
+    cascade pre-fix gated child recursion on ``active_downloads``
+    membership, so a child registered in ``_drafter_children`` but
+    not yet promoted into ``active_downloads`` (e.g., a chained
+    drafter mid-``_start_download``) was silently skipped. The
+    cascade now recurses into every registered child unconditionally
+    so the cancel intent reaches each one even before the launch
+    flow has populated ``active_downloads``.
+    """
+    drafter_card = _make_drafter_card()
+    drafter_shard = _make_shard(drafter_card)
+
+    downloader = _RecordingShardDownloader()
+    async with _running_coordinator(downloader) as (coordinator, _, _):
+        # Yield once so ``coordinator.run()``'s TaskGroup is entered
+        # before we exercise ``_cancel_download`` and the
+        # ``_running_coordinator`` finalizer asks for ``shutdown()``.
+        await asyncio.sleep(0)
+        coordinator._drafter_children[TARGET_ID] = [DRAFTER_ID]  # pyright: ignore[reportPrivateUsage]
+        # Note: DRAFTER_ID is intentionally NOT in
+        # ``active_downloads`` -- this models the race window where
+        # the chain has registered the link via ``remember_drafter_link``
+        # but ``_start_download`` hasn't yet populated
+        # ``active_downloads``. Status is set to ``DownloadPending`` so
+        # ``_cancel_download`` can no-op gracefully on the inner gate
+        # while still being CALLED on the child (the regression we're
+        # protecting against is the cascade SKIPPING the call entirely).
+
+        from exo.shared.types.worker.downloads import DownloadPending
+
+        coordinator.download_status[DRAFTER_ID] = DownloadPending(
+            shard_metadata=drafter_shard,
+            node_id=NODE_ID,
+            model_directory="/fake/drafter",
+        )
+
+        cancel_calls: list[ModelId] = []
+        original_cancel = coordinator._cancel_download  # pyright: ignore[reportPrivateUsage]
+
+        async def tracking_cancel(model_id: ModelId) -> None:
+            cancel_calls.append(model_id)
+            await original_cancel(model_id)
+
+        coordinator._cancel_download = tracking_cancel  # pyright: ignore[reportPrivateUsage]
+        try:
+            await coordinator._cancel_download(TARGET_ID)  # pyright: ignore[reportPrivateUsage]
+        finally:
+            coordinator._cancel_download = original_cancel  # pyright: ignore[reportPrivateUsage]
+
+        # Pre-fix: cascade would have skipped the child because
+        # ``DRAFTER_ID not in active_downloads``. Post-fix: the cascade
+        # MUST call ``_cancel_download(DRAFTER_ID)`` so the cancel
+        # intent reaches every registered drafter regardless of its
+        # current launch progress.
+        assert DRAFTER_ID in cancel_calls, (
+            "cascade must recurse into pending children, not gate on "
+            f"active_downloads; got cancel_calls={cancel_calls!r}"
+        )
+        # And the parent->children mapping must still be cleared.
+        assert TARGET_ID not in coordinator._drafter_children  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_concurrent_chain_does_not_double_start_pending_drafter() -> None:
+    """Codex P2 (PR #18 round-(N+3), coordinator.py:224): when two
+    overlapping chain coroutines both observe a drafter at
+    ``DownloadPending`` (e.g., chain A has set ``DownloadPending``
+    inside ``_start_download`` but hasn't yet reached
+    ``_start_download_task``), pre-fix both fell through and both
+    called ``_start_download_task``. ``ensure_shard()`` then cancels
+    the first call and restarts -- a flap. Post-fix, the second
+    ``_start_download`` for the same model short-circuits via the
+    ``_starting_downloads`` lock, so ``ensure_shard`` is invoked
+    exactly once.
+    """
+    target_shard = _make_shard(_make_target_card([DRAFTER_ID]))
+    drafter_card = _make_drafter_card()
+
+    async def fake_load(model_id: ModelId) -> ModelCard:
+        if model_id == DRAFTER_ID:
+            return drafter_card
+        raise AssertionError(f"unexpected ModelCard.load for {model_id}")
+
+    with patch.object(ModelCard, "load", side_effect=fake_load):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            _,
+            cmd_send,
+            event_recv,
+        ):
+            # Spawn two concurrent target StartDownload commands
+            # quickly so two chain coroutines run interleaved.
+            for _ in range(2):
+                await cmd_send.send(
+                    ForwarderDownloadCommand(
+                        origin=SystemId("test"),
+                        command=StartDownload(
+                            target_node_id=NODE_ID, shard_metadata=target_shard
+                        ),
+                    )
+                )
+
+            # Wait for both target completion events; allow the
+            # background drafter chains to settle.
+            assert await _wait_for_completed(event_recv, TARGET_ID) is not None
+            assert await _wait_for_completed(event_recv, DRAFTER_ID) is not None
+            await asyncio.sleep(0.1)
+
+    # Pre-fix: ``ensure_shard(DRAFTER_ID)`` could be invoked twice as
+    # the second chain's ``_start_download_task`` overrode the first.
+    # Post-fix: the ``_starting_downloads`` gate prevents the duplicate
+    # launch and ``ensure_shard`` is invoked exactly once for the
+    # drafter.
+    assert downloader.ensured.count(DRAFTER_ID) == 1, (
+        "concurrent chain runs must not double-start the same drafter; "
+        f"got ensured={downloader.ensured!r}"
+    )
+
+
+async def test_starting_downloads_cleared_on_completion() -> None:
+    """The ephemeral ``_starting_downloads`` lock must be released
+    after ``_start_download`` finishes, so a legitimate restart
+    (e.g., after the user cancels the drafter) is not gated by a
+    stale entry.
+    """
+    target_shard = _make_shard(_make_target_card([]))
+
+    downloader = _RecordingShardDownloader()
+    async with _running_coordinator(downloader) as (
+        coordinator,
+        cmd_send,
+        event_recv,
+    ):
+        await cmd_send.send(
+            ForwarderDownloadCommand(
+                origin=SystemId("test"),
+                command=StartDownload(
+                    target_node_id=NODE_ID, shard_metadata=target_shard
+                ),
+            )
+        )
+        assert await _wait_for_completed(event_recv, TARGET_ID) is not None
+
+    assert TARGET_ID not in coordinator._starting_downloads, (  # pyright: ignore[reportPrivateUsage]
+        "_starting_downloads must be cleared after _start_download "
+        "returns, otherwise restart-after-cancel is silently disabled"
+    )
