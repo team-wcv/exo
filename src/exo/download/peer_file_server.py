@@ -25,6 +25,7 @@ from typing import TypeAlias, cast
 
 import aiofiles
 import aiofiles.os as aios
+import anyio
 from aiohttp import web
 from loguru import logger
 
@@ -49,15 +50,57 @@ class PeerFileServer:
         self._runner: web.AppRunner | None = None
 
     async def run(self) -> None:
-        self._runner = web.AppRunner(self._app)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, self.host, self.port)
+        """Start the peer file server and keep the task alive until cancelled.
+
+        Codex P2 (PR #16 round-(N+10), peer_file_server.py:56): pre-fix
+        ``run()`` returned immediately after ``site.start()``, so the
+        task spawned by ``Node.run()`` (``tg.start_soon(self.peer_file_server.run)``)
+        completed on the first event-loop tick and the parent task
+        group considered the server "done". When the node was
+        cancelled, there was no live coroutine for the task group to
+        cancel, so the aiohttp listener kept its TCP socket open
+        until process exit. That manifested as
+        ``OSError: [Errno 48] address already in use`` whenever a
+        node was stopped/restarted in the same process (commonly in
+        tests, embedded runs, or systemd-style restart loops).
+
+        The fix keeps the coroutine alive via ``anyio.sleep_forever``
+        and runs ``self._runner.cleanup()`` in a shielded ``finally``
+        block on cancellation, so the listener is reliably released
+        before the task group considers the server torn down.
+        """
+        runner = web.AppRunner(self._app)
+        self._runner = runner
+        await runner.setup()
+        site = web.TCPSite(runner, self.host, self.port)
         await site.start()
         logger.info(f"PeerFileServer listening on {self.host}:{self.port}")
+        try:
+            await anyio.sleep_forever()
+        finally:
+            # Shield cleanup from the cancellation that woke us so
+            # ``aiohttp`` can drain in-flight responses and release
+            # the listening socket before this task is considered
+            # complete. Without the shield the cleanup itself is
+            # cancelled immediately, which leaves the socket bound
+            # and reproduces the original ``EADDRINUSE`` symptom.
+            with anyio.CancelScope(shield=True):
+                # Re-read self._runner so an external ``shutdown()``
+                # call (e.g. from a separate code path) doesn't drive
+                # cleanup twice. ``cast`` because the type-checker has
+                # narrowed ``self._runner`` to ``AppRunner`` from the
+                # assignment above; an external mutation could still
+                # have set it to ``None``.
+                live_runner = cast(web.AppRunner | None, self._runner)
+                if live_runner is not None:
+                    self._runner = None
+                    await live_runner.cleanup()
+                logger.info(f"PeerFileServer on {self.host}:{self.port} stopped")
 
     async def shutdown(self) -> None:
         if self._runner:
             await self._runner.cleanup()
+            self._runner = None
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
@@ -98,8 +141,7 @@ class PeerFileServer:
             new_partial_is_more_complete = (
                 not new_complete
                 and not existing_complete
-                and cast(int, entry["safe_bytes"])
-                > cast(int, existing["safe_bytes"])
+                and cast(int, entry["safe_bytes"]) > cast(int, existing["safe_bytes"])
             )
             if (new_complete and not existing_complete) or (
                 new_partial_is_more_complete

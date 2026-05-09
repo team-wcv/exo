@@ -2,6 +2,7 @@
 # pyright: reportPrivateUsage=false
 
 import json
+import socket
 from collections.abc import AsyncIterator, Generator, Iterable
 from pathlib import Path
 from typing import Callable, cast
@@ -9,6 +10,7 @@ from typing import Callable, cast
 import aiofiles
 import aiofiles.os as aios
 import aiohttp
+import anyio
 import pytest
 
 from exo.download.peer_download import download_file_from_peer, get_peer_file_status
@@ -374,9 +376,7 @@ class TestPeerFileServerMultipleDirectories:
         async with aiofiles.open(second / "test--model" / "weights.bin", "wb") as f:
             await f.write(canonical)
 
-        server = PeerFileServer(
-            host="127.0.0.1", port=0, models_dirs=[first, second]
-        )
+        server = PeerFileServer(host="127.0.0.1", port=0, models_dirs=[first, second])
         server._runner = web.AppRunner(server._app)
         await server._runner.setup()
         site = web.TCPSite(server._runner, "127.0.0.1", 0)
@@ -436,9 +436,7 @@ class TestPeerFileServerMultipleDirectories:
         async with aiofiles.open(second / "test--model" / "weights.bin", "wb") as f:
             await f.write(canonical)
 
-        server = PeerFileServer(
-            host="127.0.0.1", port=0, models_dirs=[first, second]
-        )
+        server = PeerFileServer(host="127.0.0.1", port=0, models_dirs=[first, second])
         server._runner = web.AppRunner(server._app)
         await server._runner.setup()
         site = web.TCPSite(server._runner, "127.0.0.1", 0)
@@ -1233,3 +1231,108 @@ class TestPeerDownloadIntegrityCheckRespectsOfflineMode:
             "peer-downloaded bytes against HF's authoritative hash; "
             f"got meta_calls={meta_calls!r}"
         )
+
+
+def _allocate_free_tcp_port() -> int:
+    """Bind ephemeral port 0 to grab a free TCP port; close before reuse.
+
+    Used by lifecycle tests that want to verify a specific port is
+    released after server teardown -- we cannot bind 0 in the server
+    itself because the test needs a stable port to assert on.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return cast(int, probe.getsockname()[1])
+
+
+class TestPeerFileServerLifecycle:
+    """Codex P2 (PR #16 round-(N+10), peer_file_server.py:56): the
+    coroutine returned by ``PeerFileServer.run()`` must stay alive
+    until cancelled, otherwise the parent task group considers the
+    server "done" the moment ``site.start()`` returns and never drives
+    cleanup -- the listening socket leaks until process exit, causing
+    ``EADDRINUSE`` on stop/restart in the same process (tests,
+    embedded runs, systemd-style restart loops).
+    """
+
+    async def test_run_blocks_until_cancelled(self, tmp_path: Path) -> None:
+        models_dir = tmp_path / "models"
+        await aios.makedirs(models_dir, exist_ok=True)
+        server = PeerFileServer(host="127.0.0.1", port=0, models_dirs=[models_dir])
+
+        run_completed = anyio.Event()
+
+        async def _run_and_signal() -> None:
+            try:
+                await server.run()
+            finally:
+                run_completed.set()
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_run_and_signal)
+            # Yield a few times so the server can boot.
+            for _ in range(5):
+                await anyio.sleep(0.01)
+            assert not run_completed.is_set(), (
+                "PeerFileServer.run must keep the coroutine alive after "
+                "site.start() so task-group cancellation can drive "
+                "teardown; pre-fix it returned immediately and the "
+                "listening socket leaked until process exit"
+            )
+            tg.cancel_scope.cancel()
+        assert run_completed.is_set()
+
+    async def test_listening_port_is_released_after_run_cancellation(
+        self, tmp_path: Path
+    ) -> None:
+        """End-to-end EADDRINUSE regression: pre-fix a stop/restart
+        in the same process raised ``OSError: [Errno 48] address
+        already in use`` because cleanup never ran. After the fix the
+        same port must be re-bindable immediately after cancellation.
+        """
+        models_dir = tmp_path / "models"
+        await aios.makedirs(models_dir, exist_ok=True)
+        port = _allocate_free_tcp_port()
+
+        server = PeerFileServer(host="127.0.0.1", port=port, models_dirs=[models_dir])
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(server.run)
+            for _ in range(10):
+                await anyio.sleep(0.02)
+                async with aiohttp.ClientSession() as s:
+                    try:
+                        async with s.get(
+                            f"http://127.0.0.1:{port}/health",
+                            timeout=aiohttp.ClientTimeout(total=0.5),
+                        ) as r:
+                            if r.status == 200:
+                                break
+                    except (aiohttp.ClientError, TimeoutError):
+                        continue
+            else:
+                raise AssertionError(
+                    "PeerFileServer never started listening on the "
+                    f"allocated port {port}"
+                )
+            tg.cancel_scope.cancel()
+
+        # Restart on the same port immediately. Pre-fix this raised
+        # EADDRINUSE because the prior listener was never closed.
+        server2 = PeerFileServer(host="127.0.0.1", port=port, models_dirs=[models_dir])
+        async with anyio.create_task_group() as tg2:
+            tg2.start_soon(server2.run)
+            await anyio.sleep(0.05)
+            async with (
+                aiohttp.ClientSession() as s,
+                s.get(
+                    f"http://127.0.0.1:{port}/health",
+                    timeout=aiohttp.ClientTimeout(total=2.0),
+                ) as r,
+            ):
+                assert r.status == 200, (
+                    "server2 must come up cleanly on the recycled "
+                    "port; pre-fix the prior server's socket "
+                    "leaked and this raised EADDRINUSE"
+                )
+            tg2.cancel_scope.cancel()
