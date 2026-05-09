@@ -410,6 +410,57 @@ class TestPeerDownloadClient:
         )
         assert result is None
 
+    async def test_oversized_stale_partial_is_discarded_and_retransferred(
+        self, peer_server: PeerFileServer, temp_models_dir: Path, tmp_path: Path
+    ) -> None:
+        """Codex P1 (PR #16 round 5): a stale ``.partial`` larger than
+        ``expected_size`` left over from a previous run must be
+        rejected, NOT silently renamed as the successful download.
+
+        Pre-fix the resume loop ran ``while n_read < expected_size``,
+        so an oversized partial skipped the loop entirely and the
+        final ``rename`` accepted bad bytes. In offline mode (where
+        hash verification is intentionally skipped) this would
+        permanently poison the model cache without any warning.
+        Post-fix the oversized partial is discarded and the file is
+        re-fetched from the peer.
+        """
+        model_dir = temp_models_dir / "test--model"
+        await aios.makedirs(model_dir, exist_ok=True)
+        canonical = b"the canonical model weights"
+        async with aiofiles.open(model_dir / "weights.bin", "wb") as f:
+            await f.write(canonical)
+
+        download_dir = tmp_path / "downloads" / "test--model"
+        await aios.makedirs(download_dir, exist_ok=True)
+        # Stale partial from a "previous run" -- bigger than the
+        # canonical file and full of junk bytes. Pre-fix, this would
+        # be the file that ended up renamed as ``weights.bin``.
+        stale_partial = download_dir / "weights.bin.partial"
+        stale_bytes = b"\xde\xad\xbe\xef" * (len(canonical) * 2)
+        async with aiofiles.open(stale_partial, "wb") as f:
+            await f.write(stale_bytes)
+        assert (await aios.stat(stale_partial)).st_size > len(canonical)
+
+        result = await download_file_from_peer(
+            "127.0.0.1",
+            peer_server.port,
+            "test--model",
+            "weights.bin",
+            download_dir,
+            len(canonical),
+        )
+
+        assert result is not None
+        assert result == download_dir / "weights.bin"
+        async with aiofiles.open(result, "rb") as f:
+            downloaded = await f.read()
+        assert downloaded == canonical, (
+            "stale oversized partial must NOT be accepted as the "
+            "downloaded file; the fix must redownload from the peer"
+        )
+        assert not stale_partial.exists()
+
     async def test_skip_already_complete(
         self, peer_server: PeerFileServer, temp_models_dir: Path, tmp_path: Path
     ) -> None:

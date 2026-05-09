@@ -42,9 +42,12 @@ async def get_peer_file_status(
     """
     url = f"http://{peer_host}:{peer_port}/status/{model_id_normalized}"
     try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=timeout)
-        ) as session, session.get(url) as r:
+        async with (
+            aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as session,
+            session.get(url) as r,
+        ):
             if r.status != 200:
                 return None
             data = cast(dict[str, object], await r.json())
@@ -109,9 +112,30 @@ async def download_file_from_peer(
     url = f"http://{peer_host}:{peer_port}/files/{model_id_normalized}/{file_path}"
     n_read = 0
 
-    # Resume from existing partial
+    # Resume from existing partial.
+    #
+    # Codex P1 (PR #16 round 5): a stale ``.partial`` left over from a
+    # previous run can be larger than ``expected_size`` (e.g. the peer
+    # was serving the wrong revision, the on-disk file was truncated
+    # to a different blob, or the user manually replaced it). In that
+    # case ``n_read >= expected_size`` skips the resume loop entirely
+    # and we'd then ``rename`` a too-large file as the "successful"
+    # result. With offline mode we explicitly skip hash verification,
+    # so the bad bytes would never get caught downstream and would
+    # poison the model cache. Fail fast: drop the stale partial and
+    # restart from zero on this peer.
     if await aios.path.exists(partial_path):
-        n_read = (await aios.stat(partial_path)).st_size
+        existing_size = (await aios.stat(partial_path)).st_size
+        if existing_size > expected_size:
+            logger.warning(
+                f"Discarding stale oversized peer partial for {file_path} "
+                f"({existing_size} > expected {expected_size}); "
+                "restarting download from zero"
+            )
+            await aios.remove(partial_path)
+            n_read = 0
+        else:
+            n_read = existing_size
 
     poll_count = 0
     chunk_size = 8 * 1024 * 1024  # 8MB, matching HF download
@@ -123,9 +147,12 @@ async def download_file_from_peer(
                 headers["Range"] = f"bytes={n_read}-"
 
             got_bytes = False
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=300, sock_read=60)
-            ) as session, session.get(url, headers=headers) as r:
+            async with (
+                aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=300, sock_read=60)
+                ) as session,
+                session.get(url, headers=headers) as r,
+            ):
                 if r.status == 416:
                     # Range not satisfiable - peer doesn't have more yet
                     pass
@@ -142,9 +169,7 @@ async def download_file_from_peer(
                             got_bytes = True
                             on_progress(n_read, expected_size, False)
                 elif r.status == 404:
-                    logger.debug(
-                        f"File {file_path} not found on peer {peer_host}"
-                    )
+                    logger.debug(f"File {file_path} not found on peer {peer_host}")
                     return None
                 else:
                     logger.warning(

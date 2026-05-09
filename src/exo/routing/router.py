@@ -24,7 +24,7 @@ from exo_pyo3_bindings import (
 from filelock import FileLock
 from loguru import logger
 
-from exo.shared.constants import EXO_NODE_ID_KEYPAIR
+from exo.shared.constants import EXO_LEGACY_NODE_ID_KEYPAIR, EXO_NODE_ID_KEYPAIR
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.pydantic_ext import FrozenModel
 from exo.utils.task_group import TaskGroup
@@ -293,18 +293,37 @@ class Router:
 
 def get_node_id_keypair(
     path: str | bytes | PathLike[str] | PathLike[bytes] = EXO_NODE_ID_KEYPAIR,
+    legacy_path: str | bytes | PathLike[str] | PathLike[bytes] | None = (
+        EXO_LEGACY_NODE_ID_KEYPAIR
+    ),
 ) -> Keypair:
     """
     Obtains the :class:`Keypair` associated with this node-ID.
     Obtain the :class:`PeerId` by from it.
-    """
 
-    def lock_path(path: str | bytes | PathLike[str] | PathLike[bytes]) -> Path:
-        return Path(str(path) + ".lock")
+    On first call after the upgrade, if the new ``path`` (config dir)
+    has no keypair yet but the legacy cache-dir ``legacy_path`` does,
+    the legacy file is moved to ``path`` so the node retains its
+    identity across the relocation. Migration is best-effort: if
+    moving fails (e.g. cross-device link errors on Linux when
+    ``XDG_*`` dirs span filesystems), the legacy bytes are copied
+    instead. Either way, the legacy file is removed once the new
+    location holds a valid keypair so subsequent calls do not need
+    to re-check.
+    """
+    resolved_path = Path(str(path))
+
+    def lock_path(p: str | bytes | PathLike[str] | PathLike[bytes]) -> Path:
+        return Path(str(p) + ".lock")
+
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if legacy_path is not None:
+        _migrate_legacy_node_id_keypair(resolved_path, Path(str(legacy_path)))
 
     # operate with cross-process lock to avoid race conditions
-    with FileLock(lock_path(path)):
-        with open(path, "a+b") as f:  # opens in append-mode => starts at EOF
+    with FileLock(lock_path(resolved_path)):
+        with open(resolved_path, "a+b") as f:  # opens in append-mode => starts at EOF
             # if non-zero EOF, then file exists => use to get node-ID
             if f.tell() != 0:
                 f.seek(0)  # go to start & read protobuf-encoded bytes
@@ -316,7 +335,52 @@ def get_node_id_keypair(
                     logger.warning(f"Encountered error when trying to get keypair: {e}")
 
         # if no valid credentials, create new ones and persist
-        with open(path, "w+b") as f:
+        with open(resolved_path, "w+b") as f:
             keypair = Keypair.generate()
             f.write(keypair.to_bytes())
             return keypair
+
+
+def _migrate_legacy_node_id_keypair(
+    new_path: Path,
+    legacy_path: Path,
+) -> None:
+    """One-shot migrator for the cache→config relocation of the
+    node-ID keypair (Codex P1 PR #16 round 5).
+
+    Idempotent and best-effort: only acts when ``new_path`` is
+    absent and ``legacy_path`` exists. Falls back to byte copy if
+    ``rename`` fails (cross-device, permissions, etc.). On any
+    exception we log and bail -- the caller will then generate a
+    fresh keypair, which is suboptimal but better than crashing
+    startup over identity-file housekeeping.
+    """
+    try:
+        if new_path.exists() or not legacy_path.exists():
+            return
+        # Ensure the destination directory exists for either the
+        # ``replace`` (which silently no-ops on missing parent on some
+        # platforms but raises ``ENOENT`` on others) or the byte-copy
+        # fallback. ``get_node_id_keypair`` already creates this dir
+        # for the same reason; doing it again here keeps the migrator
+        # safely callable from tests in isolation.
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            legacy_path.replace(new_path)
+        except OSError as rename_err:
+            logger.debug(
+                f"Cross-device rename of legacy keypair failed ({rename_err}); "
+                "falling back to byte copy."
+            )
+            new_path.write_bytes(legacy_path.read_bytes())
+            legacy_path.unlink(missing_ok=True)
+        logger.info(
+            f"Migrated node-ID keypair from legacy cache path {legacy_path} "
+            f"to persistent config path {new_path}."
+        )
+    except Exception as e:
+        logger.warning(
+            f"Failed to migrate legacy node-ID keypair from {legacy_path} "
+            f"to {new_path}: {e}. The node will generate a new identity; "
+            "manually copy the file if cluster membership matters."
+        )

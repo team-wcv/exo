@@ -69,8 +69,18 @@ DASHBOARD_DIR = (
 EXO_LOG_DIR = EXO_CACHE_HOME / "exo_log"
 EXO_LOG = EXO_LOG_DIR / "exo.log"
 
-# Identity (config)
-EXO_NODE_ID_KEYPAIR = EXO_CACHE_HOME / "node_id.keypair"
+# Identity (config -- persistent across cache eviction).
+#
+# Codex P1 (PR #16 round 5): keeping the node-ID keypair under
+# ``EXO_CACHE_HOME`` makes cluster identity vulnerable to normal
+# cache cleanup, which causes nodes to come up with a new peer ID
+# after a cache wipe and breaks the intended persistence of cluster
+# membership / mDNS routes. Identity material lives under
+# ``EXO_CONFIG_HOME`` instead. The legacy cache path is migrated
+# on first use by ``get_node_id_keypair`` to preserve existing
+# identity across the upgrade.
+EXO_NODE_ID_KEYPAIR = EXO_CONFIG_HOME / "node_id.keypair"
+EXO_LEGACY_NODE_ID_KEYPAIR = EXO_CACHE_HOME / "node_id.keypair"
 EXO_CONFIG_FILE = EXO_CONFIG_HOME / "config.toml"
 
 # libp2p topics for event forwarding
