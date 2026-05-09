@@ -118,6 +118,19 @@ class DownloadCoordinator:
     # where the race occurs.
     _starting_downloads: set[ModelId] = field(default_factory=set)
 
+    # ``_deleting_in_progress``: cycle-protection set for the
+    # delete cascade. ``_reconstruct_drafter_links_for_delete``
+    # rebuilds children from the model card on every call, so a
+    # self-referential card (``A.drafter_model_ids = [A]``) or a
+    # cycle (``A -> B -> A``) would otherwise drive the recursive
+    # ``_delete_download`` into infinite recursion until the
+    # interpreter's stack limit triggered. Add the current
+    # ``model_id`` on entry, remove on exit (in a ``finally`` to
+    # survive exceptions in ``delete_model``); the cascade loop
+    # skips children already in the set. (Codex P2, PR #18
+    # round-(N+13), coordinator.py:337).
+    _deleting_in_progress: set[ModelId] = field(default_factory=set)
+
     def __post_init__(self) -> None:
         self.shard_downloader.on_progress(self._download_progress_callback)
 
@@ -328,12 +341,25 @@ class DownloadCoordinator:
                 logger.debug(
                     f"Download for {model_id} already in progress or complete, skipping"
                 )
-                # Even if the target was already in flight, the user may have
-                # just upgraded exo onto a build that knows about its drafter.
-                # Make sure the drafter download is chained either way.
+                # Codex P2 (PR #18 round-(N+13), coordinator.py:337):
+                # only chain drafters here when the target is
+                # ``DownloadCompleted`` (target weights are already
+                # on disk and runnable). Pre-fix the branch also
+                # chained on ``DownloadOngoing``, so a re-issued
+                # ``StartDownload`` during an in-flight target
+                # download spawned drafters BEFORE the target's
+                # ``ensure_shard()`` had succeeded -- defeating the
+                # round-(N+12) success-gated path in
+                # ``_start_download_task``. The in-flight target's
+                # own ``download_wrapper`` will spawn the chain on
+                # the success arm, so duplicating the spawn here
+                # is both wasteful (re-enters the chain) and
+                # incorrect (chain runs before target success when
+                # target is still ``DownloadOngoing``).
+                #
                 # Drafter chain calls don't recurse into another chain
                 # spawn here -- they're already inside one.
-                if not is_drafter_chain:
+                if not is_drafter_chain and isinstance(status, DownloadCompleted):
                     self._spawn_drafter_chain(shard)
                 return
             if isinstance(status, DownloadFailed):
@@ -885,6 +911,32 @@ class DownloadCoordinator:
         return merged
 
     async def _delete_download(self, model_id: ModelId) -> None:
+        # Codex P2 (PR #18 round-(N+13), coordinator.py:337): cycle
+        # protection. ``_reconstruct_drafter_links_for_delete``
+        # rebuilds children from ``ModelCard.load`` on every call,
+        # so a self-referential card
+        # (``A.drafter_model_ids = [A]``) or a cycle
+        # (``A -> B -> A``) would otherwise drive the recursive
+        # cascade into infinite recursion until the interpreter's
+        # stack limit fired (and aborted the operator's delete
+        # mid-cascade rather than performing a safe no-op). When we
+        # detect we're already deleting this id earlier on the
+        # call stack, skip the recursive call -- the outer
+        # invocation will finish the on-disk delete.
+        if model_id in self._deleting_in_progress:
+            logger.debug(
+                f"Skipping recursive delete cascade for {model_id}: "
+                f"already in progress earlier on the call stack "
+                f"(self-referential or cyclical drafter card)"
+            )
+            return
+        self._deleting_in_progress.add(model_id)
+        try:
+            await self._delete_download_inner(model_id)
+        finally:
+            self._deleting_in_progress.discard(model_id)
+
+    async def _delete_download_inner(self, model_id: ModelId) -> None:
         # Protect read-only models from deletion
         if model_id in self.download_status:
             current = self.download_status[model_id]

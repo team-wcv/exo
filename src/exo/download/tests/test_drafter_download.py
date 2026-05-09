@@ -1598,6 +1598,243 @@ async def test_delete_cascade_rebuilds_drafter_links_after_restart() -> None:
     )
 
 
+async def test_reissue_during_ongoing_target_does_not_chain_drafters() -> (
+    None
+):
+    """Codex P2 (PR #18 round-(N+13), coordinator.py:337): the
+    ``_start_download`` fast-path branch chains drafters when a
+    re-issued ``StartDownload`` arrives for a target that's
+    already in the in-memory cache. Pre-fix the branch chained
+    even when the target was only ``DownloadOngoing``, so a
+    duplicate ``StartDownload`` during an in-flight target
+    download spawned drafters BEFORE the target's
+    ``ensure_shard()`` had succeeded. That bypassed the
+    round-(N+12) success-gated path in ``_start_download_task``
+    (which is what initiates the chain after the in-flight
+    target's ``ensure_shard()`` returns successfully).
+
+    Round-(N+13) restricts the fast-path chaining to
+    ``DownloadCompleted`` only -- if the target is still
+    ``DownloadOngoing``, the original in-flight task's
+    ``download_wrapper`` will spawn the chain on success, so
+    duplicating the spawn here would be both wasteful and
+    incorrect (chain runs before target success when target
+    transitions from ``DownloadOngoing`` to ``DownloadFailed``).
+    """
+    target_shard = _make_shard(_make_target_card([DRAFTER_ID]))
+
+    async def fail_load(_: ModelId) -> ModelCard:
+        raise AssertionError(
+            "ModelCard.load must not be called when a duplicate "
+            "StartDownload arrives for a target that is still "
+            "DownloadOngoing -- the original in-flight task's "
+            "download_wrapper handles the chain on success"
+        )
+
+    with patch.object(ModelCard, "load", side_effect=fail_load):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            cmd_send,
+            _event_recv,
+        ):
+            await asyncio.sleep(0.05)
+
+            # Pre-seed the target's status as DownloadOngoing.
+            ongoing_progress = DownloadProgressData(
+                downloaded=Memory.from_mb(100),
+                downloaded_this_session=Memory.from_mb(100),
+                total=Memory.from_mb(500),
+                completed_files=0,
+                total_files=1,
+                speed=0.0,
+                eta_ms=0,
+                files={},
+            )
+            coordinator.download_status[TARGET_ID] = DownloadOngoing(
+                shard_metadata=target_shard,
+                node_id=NODE_ID,
+                model_directory="/fake/target",
+                download_progress=ongoing_progress,
+            )
+
+            # Re-issue StartDownload for the in-flight target.
+            # Pre-fix the fast-path called ``_spawn_drafter_chain``
+            # which would have triggered ``ModelCard.load`` for the
+            # drafter (the test's ``fail_load`` would have raised).
+            await cmd_send.send(
+                ForwarderDownloadCommand(
+                    origin=SystemId("test"),
+                    command=StartDownload(
+                        target_node_id=NODE_ID, shard_metadata=target_shard
+                    ),
+                )
+            )
+            await asyncio.sleep(0.1)
+
+    assert downloader.ensured == [], (
+        "drafter chain must NOT fire when the duplicate StartDownload "
+        "arrives during an in-flight target download (DownloadOngoing). "
+        f"got ensured={downloader.ensured!r}"
+    )
+
+
+async def test_self_referential_drafter_card_does_not_recurse_on_delete() -> (
+    None
+):
+    """Codex P2 (PR #18 round-(N+13), coordinator.py:337): a model
+    card with a self-referential ``drafter_model_ids = [self]`` or
+    a cycle like ``A -> B -> A`` would drive the recursive delete
+    cascade into infinite recursion. Pre-fix
+    ``_reconstruct_drafter_links_for_delete`` rebuilds children
+    from ``ModelCard.load`` on every call, so the same id keeps
+    getting reintroduced and recursed into until the interpreter's
+    stack limit fires and aborts the operator's delete mid-cascade.
+
+    Round-(N+13) adds an ``_deleting_in_progress`` set guarded by
+    a wrapper. When the recursive call detects the id is already
+    being deleted earlier on the call stack, it skips the
+    recursion -- the outer invocation finishes the on-disk delete
+    cleanly.
+    """
+    self_referential_card = ModelCard(
+        model_id=TARGET_ID,
+        storage_size=Memory.from_mb(500),
+        n_layers=32,
+        hidden_size=2048,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        drafter_model_ids=[TARGET_ID],
+    )
+    target_shard = _make_shard(self_referential_card)
+
+    async def fake_load(model_id: ModelId) -> ModelCard:
+        if model_id == TARGET_ID:
+            return self_referential_card
+        raise AssertionError(f"unexpected ModelCard.load for {model_id}")
+
+    deleted_ids: list[ModelId] = []
+
+    with patch.object(ModelCard, "load", side_effect=fake_load):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            _cmd_send,
+            _event_recv,
+        ):
+            await asyncio.sleep(0.05)
+
+            target_completed = DownloadCompleted(
+                shard_metadata=target_shard,
+                node_id=NODE_ID,
+                total=target_shard.model_card.storage_size,
+                model_directory="/fake/target",
+            )
+            coordinator.download_status[TARGET_ID] = target_completed
+
+            async def fake_delete_model(model_id: ModelId) -> bool:
+                deleted_ids.append(model_id)
+                coordinator.download_status.pop(model_id, None)
+                return True
+
+            with patch(
+                "exo.download.coordinator.delete_model",
+                side_effect=fake_delete_model,
+            ):
+                # Pre-fix: this call recursed indefinitely until
+                # RecursionError. Post-fix: returns cleanly with
+                # one ``delete_model`` invocation for the target.
+                await coordinator._delete_download(TARGET_ID)  # pyright: ignore[reportPrivateUsage]
+
+    assert deleted_ids == [TARGET_ID], (
+        "self-referential drafter card must not loop the delete "
+        "cascade; ``delete_model`` must run exactly once for the "
+        f"target. got deleted_ids={deleted_ids!r}"
+    )
+
+
+async def test_cyclic_drafter_cards_do_not_recurse_on_delete() -> None:
+    """Codex P2 (PR #18 round-(N+13), coordinator.py:337): the
+    ``A -> B -> A`` cycle case. Pre-fix the recursion alternates
+    A and B forever; post-fix the inner ``_delete_download(A)``
+    call triggered by ``B``'s rebuild detects A already in
+    ``_deleting_in_progress`` and short-circuits, so the cascade
+    deletes both A and B exactly once each before unwinding.
+    """
+    target_a_id = ModelId("test-org/cycle-a")
+    target_b_id = ModelId("test-org/cycle-b")
+    card_a = ModelCard(
+        model_id=target_a_id,
+        storage_size=Memory.from_mb(500),
+        n_layers=32,
+        hidden_size=2048,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        drafter_model_ids=[target_b_id],
+    )
+    card_b = ModelCard(
+        model_id=target_b_id,
+        storage_size=Memory.from_mb(500),
+        n_layers=32,
+        hidden_size=2048,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        drafter_model_ids=[target_a_id],
+    )
+    shard_a = _make_shard(card_a)
+    shard_b = _make_shard(card_b)
+
+    async def fake_load(model_id: ModelId) -> ModelCard:
+        if model_id == target_a_id:
+            return card_a
+        if model_id == target_b_id:
+            return card_b
+        raise AssertionError(f"unexpected ModelCard.load for {model_id}")
+
+    deleted_ids: list[ModelId] = []
+
+    with patch.object(ModelCard, "load", side_effect=fake_load):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            _cmd_send,
+            _event_recv,
+        ):
+            await asyncio.sleep(0.05)
+
+            coordinator.download_status[target_a_id] = DownloadCompleted(
+                shard_metadata=shard_a,
+                node_id=NODE_ID,
+                total=card_a.storage_size,
+                model_directory="/fake/cycle-a",
+            )
+            coordinator.download_status[target_b_id] = DownloadCompleted(
+                shard_metadata=shard_b,
+                node_id=NODE_ID,
+                total=card_b.storage_size,
+                model_directory="/fake/cycle-b",
+            )
+
+            async def fake_delete_model(model_id: ModelId) -> bool:
+                deleted_ids.append(model_id)
+                coordinator.download_status.pop(model_id, None)
+                return True
+
+            with patch(
+                "exo.download.coordinator.delete_model",
+                side_effect=fake_delete_model,
+            ):
+                await coordinator._delete_download(target_a_id)  # pyright: ignore[reportPrivateUsage]
+
+    assert sorted(deleted_ids, key=str) == sorted(
+        [target_a_id, target_b_id], key=str
+    ), (
+        "cyclical drafter cards must drive each id through "
+        "``delete_model`` exactly once, not infinitely. "
+        f"got deleted_ids={deleted_ids!r}"
+    )
+
+
 async def test_delete_cascade_runs_when_drafter_status_cache_cold() -> None:
     """Codex P2 (PR #18 round-(N+13), coordinator.py:945): even
     after ``_reconstruct_drafter_links_for_delete`` correctly
