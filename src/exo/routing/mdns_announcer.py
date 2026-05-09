@@ -66,9 +66,7 @@ def main() -> None:
 
     sent_count = 0
     while True:
-        packet = _build_response_packet(
-            args.node_id, args.ip_address, args.libp2p_port
-        )
+        packet = _build_response_packet(args.node_id, args.ip_address, args.libp2p_port)
         errors: list[str] = []
         destinations: list[tuple[str, int]] = []
         if args.broadcast_address is not None:

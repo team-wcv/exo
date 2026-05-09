@@ -1,6 +1,6 @@
 import time
 from collections.abc import Generator
-from typing import Annotated, Any, Literal, get_args
+from typing import Annotated, Any, Final, Literal, get_args
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
@@ -16,6 +16,24 @@ from exo.utils.pydantic_ext import FrozenModel
 FinishReason = Literal[
     "stop", "length", "tool_calls", "content_filter", "function_call", "error"
 ]
+
+# Upper bound for the per-request ``num_draft_tokens`` override. The runner
+# allocates a fixed wire-protocol budget at warmup (``EXO_NUM_DRAFT_TOKENS``,
+# default in ``defaults.py``), and per-request K is clamped to that budget
+# inside ``generate.py``. The API-level cap exists only as a sanity guard
+# against obviously-pathological inputs (negative values are blocked by
+# ``ge=1``; values like ``10**9`` would still crash the runner subprocess
+# via an unhandled ``ValueError`` if they escaped the API boundary).
+#
+# Codex flagged (PR #20 round 2 P2) that an earlier ``= 32`` cap was a
+# regression for benchmarking and tuning flows: those flows sweep larger K
+# values when the operator has explicitly raised ``EXO_NUM_DRAFT_TOKENS``
+# (e.g. K=64 on a fat target / drafter pair) and previously the runner
+# would handle them. The cap is intentionally raised to a value far above
+# any realistic budget so it never gates legitimate sweeps; the runner's
+# internal clamp in ``generate.py`` against ``EXO_NUM_DRAFT_TOKENS``
+# remains the authoritative bound.
+MAX_NUM_DRAFT_TOKENS_PER_REQUEST: Final[int] = 1024
 
 
 class ErrorInfo(BaseModel):
@@ -199,12 +217,16 @@ class GenerationStats(BaseModel):
     # K used for speculative_generate_step (None when drafter didn't run).
     num_draft_tokens: int | None = None
     # Drafting strategy that actually ran for this request: "model" for
-    # external-drafter spec decoding, "ngram" for in-context suffix
-    # lookup, "none" for non-speculative. None when the engine doesn't
+    # external-drafter spec decoding, "pipelined" for the pipelined+
+    # remote drafter, "ngram" for in-context suffix lookup, "eagle" /
+    # "lookahead" reserved for the upcoming auxiliary-head + Jacobi
+    # drafters, "none" for non-speculative. None when the engine doesn't
     # surface drafting (e.g. image gen). Useful for telemetry dashboards
     # to attribute throughput wins to a specific strategy when running
     # mixed-mode A/B tests.
-    draft_mode: Literal["model", "ngram", "none"] | None = None
+    draft_mode: (
+        Literal["model", "pipelined", "ngram", "eagle", "lookahead", "none"] | None
+    ) = None
 
     @property
     def drafter_acceptance_fraction(self) -> float | None:
@@ -309,15 +331,31 @@ class ChatCompletionRequest(BaseModel):
     # ignore unknown fields and get the runner's defaults.
     #
     # ``use_drafter=False`` short-circuits to non-speculative; clients that
-    # want a finer-grained switch use ``draft_mode`` to pick between the
-    # external-drafter loop (``"model"``), in-context n-gram lookahead
-    # (``"ngram"``), or non-speculative (``"none"``). When both are set,
-    # the explicit ``draft_mode`` wins (matches ``TextGenerationTaskParams``
-    # resolution in ``resolve_draft_mode``); see
+    # want a finer-grained switch use ``draft_mode`` to pick a specific
+    # strategy. When both are set, the explicit ``draft_mode`` wins
+    # (matches ``TextGenerationTaskParams`` resolution in
+    # ``resolve_draft_mode``); see
     # ``src/exo/worker/engines/mlx/generator/drafter.py``.
     use_drafter: bool | None = None
-    num_draft_tokens: int | None = None
-    draft_mode: Literal["model", "ngram", "none"] | None = None
+    num_draft_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_NUM_DRAFT_TOKENS_PER_REQUEST,
+        description=(
+            "Per-request override for the number of speculative draft tokens "
+            "per round (K). Validated as a positive integer up to "
+            f"{MAX_NUM_DRAFT_TOKENS_PER_REQUEST} (a sanity guard against "
+            "pathological values). The runner clamps K to its actual "
+            "wire-protocol budget (``EXO_NUM_DRAFT_TOKENS``) internally, so "
+            "benchmarking flows that sweep large K values are not gated by "
+            "this bound."
+        ),
+    )
+    # Per-request draft-strategy override. ``"model"`` uses the external
+    # drafter, ``"pipelined"`` uses the pipelined+remote drafter, ``"ngram"``
+    # uses CPU n-gram tables, ``"none"`` disables speculation. ``None`` defers
+    # to the model card / runner default. Mirrors ``draft_mode`` on the task.
+    draft_mode: Literal["model", "pipelined", "ngram", "none"] | None = None
 
 
 class BenchChatCompletionRequest(ChatCompletionRequest):

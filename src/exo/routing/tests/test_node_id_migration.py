@@ -499,9 +499,7 @@ def test_legacy_migration_serialized_across_process_scopes(
     scoped_a = base_path.parent / "node_id.52416.keypair"
     scoped_b = base_path.parent / "node_id.52417.keypair"
     matches = sum(
-        1
-        for p in (scoped_a, scoped_b)
-        if p.exists() and p.read_bytes() == legacy_bytes
+        1 for p in (scoped_a, scoped_b) if p.exists() and p.read_bytes() == legacy_bytes
     )
     assert matches == 1, (
         f"exactly one scope must have adopted the legacy bytes; "

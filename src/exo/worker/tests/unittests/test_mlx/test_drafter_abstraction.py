@@ -14,17 +14,87 @@ from exo.worker.engines.mlx.generator.drafter import (
     ALL_DRAFT_MODES,
     EXO_DRAFT_MODE_ENV,
     DraftMode,
+    EagleDrafter,
+    LookaheadDrafter,
     NgramDrafter,
     NoSpecDrafter,
     make_drafter,
     parse_draft_mode,
+    resolve_asymmetric_draft_mode,
     resolve_draft_mode,
 )
 
 
 def test_all_draft_modes_match_literal() -> None:
     """``ALL_DRAFT_MODES`` must be the runtime mirror of the ``DraftMode`` Literal."""
-    assert ALL_DRAFT_MODES == ("model", "ngram", "none")
+    assert ALL_DRAFT_MODES == (
+        "model",
+        "pipelined",
+        "ngram",
+        "eagle",
+        "lookahead",
+        "none",
+    )
+
+
+def test_eagle_drafter_scaffold_raises_on_stream() -> None:
+    """``EagleDrafter`` is a scaffolding stub; ``stream`` must fail loudly.
+
+    The factory dispatch + ``Drafter`` protocol shape are the durable
+    contract here; the actual auxiliary-head loop is intentionally not
+    implemented yet. A future PR fills this in.
+    """
+    drafter = make_drafter(
+        mode="eagle",
+        num_draft_tokens=3,
+        draft_model=None,
+        draft_cache=None,
+    )
+    assert isinstance(drafter, EagleDrafter)
+    assert drafter.mode == "eagle"
+    assert drafter.num_draft_tokens == 3
+    with pytest.raises(NotImplementedError, match="EagleDrafter is a scaffolding"):
+        # ``stream`` is a generator function; ``next()`` triggers the body.
+        next(
+            drafter.stream(
+                model=object(),  # type: ignore[arg-type]
+                tokenizer=object(),  # type: ignore[arg-type]
+                prompt=object(),  # type: ignore[arg-type]
+                context_tokens=[],
+                prompt_cache=[],
+                max_tokens=1,
+                sampler=lambda x: x,
+                logits_processors=[],
+            )
+        )
+
+
+def test_lookahead_drafter_scaffold_raises_on_stream() -> None:
+    """``LookaheadDrafter`` is a scaffolding stub; ``stream`` must fail loudly."""
+    drafter = make_drafter(
+        mode="lookahead",
+        num_draft_tokens=3,
+        draft_model=None,
+        draft_cache=None,
+    )
+    assert isinstance(drafter, LookaheadDrafter)
+    assert drafter.mode == "lookahead"
+    assert drafter.num_draft_tokens == 3
+    assert drafter.window_size == 5
+    assert drafter.ngram_size == 3
+    with pytest.raises(NotImplementedError, match="LookaheadDrafter is a scaffolding"):
+        next(
+            drafter.stream(
+                model=object(),  # type: ignore[arg-type]
+                tokenizer=object(),  # type: ignore[arg-type]
+                prompt=object(),  # type: ignore[arg-type]
+                context_tokens=[],
+                prompt_cache=[],
+                max_tokens=1,
+                sampler=lambda x: x,
+                logits_processors=[],
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -35,6 +105,8 @@ def test_all_draft_modes_match_literal() -> None:
         ("model", "none", "model"),
         ("MODEL", "none", "model"),
         ("  ngram  ", "none", "ngram"),
+        ("pipelined", "none", "pipelined"),
+        ("PIPELINED", "model", "pipelined"),
         ("none", "model", "none"),
         ("garbage", "model", "model"),
         ("garbage", "none", "none"),
@@ -128,6 +200,36 @@ class TestResolveDraftMode:
             == "none"
         )
 
+    def test_pipelined_mode_without_drafter_demotes_to_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Same misconfiguration safety net as ``"model"``: requesting
+        # ``"pipelined"`` without a loaded drafter must fall back to
+        # ``"none"`` rather than hard-failing or producing a no-op
+        # drafter that silently degrades throughput.
+        monkeypatch.delenv(EXO_DRAFT_MODE_ENV, raising=False)
+        assert (
+            resolve_draft_mode(
+                has_drafter_model=False,
+                request_use_drafter=None,
+                request_draft_mode="pipelined",
+            )
+            == "none"
+        )
+
+    def test_pipelined_mode_with_drafter_loaded_passes_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(EXO_DRAFT_MODE_ENV, raising=False)
+        assert (
+            resolve_draft_mode(
+                has_drafter_model=True,
+                request_use_drafter=None,
+                request_draft_mode="pipelined",
+            )
+            == "pipelined"
+        )
+
     def test_explicit_none_with_drafter_loaded(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -205,6 +307,282 @@ class TestResolveDraftMode:
             request_draft_mode="ngram",
         )
         assert result == "ngram"
+
+
+class TestResolveAsymmetricDraftMode:
+    """Codex P1 (PR #20 round-(N+1), generate.py:949): per-request
+    overrides must win over the asymmetric placement's implicit
+    pipelined default. Pre-fix the asymmetric branch in
+    ``mlx_generate`` clobbered ``draft_mode`` to ``"pipelined"``
+    unconditionally, ignoring callers who explicitly opted out via
+    ``draft_mode="none"`` (benchmark baseline, short-output skip)
+    or chose ngram for mixed traffic.
+    """
+
+    def test_default_returns_pipelined_for_asymmetric_placement(self) -> None:
+        # No override: an asymmetric placement defaults to the
+        # remote-drafter pipeline (the whole point of the topology).
+        assert (
+            resolve_asymmetric_draft_mode(
+                has_asymmetric_drafter=True,
+                request_use_drafter=None,
+                request_draft_mode=None,
+            )
+            == "pipelined"
+        )
+
+    def test_use_drafter_false_overrides_to_none(self) -> None:
+        assert (
+            resolve_asymmetric_draft_mode(
+                has_asymmetric_drafter=True,
+                request_use_drafter=False,
+                request_draft_mode=None,
+            )
+            == "none"
+        )
+
+    def test_explicit_request_draft_mode_none_overrides_to_none(self) -> None:
+        # The bug we are guarding against: pre-fix this returned
+        # "pipelined", silently engaging spec decoding for a caller
+        # who explicitly opted out via draft_mode="none".
+        assert (
+            resolve_asymmetric_draft_mode(
+                has_asymmetric_drafter=True,
+                request_use_drafter=None,
+                request_draft_mode="none",
+            )
+            == "none"
+        )
+
+    def test_explicit_request_draft_mode_ngram_overrides_to_ngram(self) -> None:
+        # Mixed-traffic A/B test: caller wants in-process suffix
+        # lookup on this request even though the placement has a
+        # remote drafter wired up.
+        assert (
+            resolve_asymmetric_draft_mode(
+                has_asymmetric_drafter=True,
+                request_use_drafter=None,
+                request_draft_mode="ngram",
+            )
+            == "ngram"
+        )
+
+    def test_explicit_pipelined_request_passes_through(self) -> None:
+        assert (
+            resolve_asymmetric_draft_mode(
+                has_asymmetric_drafter=True,
+                request_use_drafter=None,
+                request_draft_mode="pipelined",
+            )
+            == "pipelined"
+        )
+
+    def test_no_asymmetric_placement_returns_none(self) -> None:
+        # Defensive: the helper signals "asymmetric branch did not
+        # apply" via "none". Callers fall back to ``resolve_draft_mode``
+        # for the non-asymmetric resolution path; we don't repeat
+        # that logic here.
+        assert (
+            resolve_asymmetric_draft_mode(
+                has_asymmetric_drafter=False,
+                request_use_drafter=True,
+                request_draft_mode="pipelined",
+            )
+            == "none"
+        )
+
+    def test_use_drafter_false_wins_over_explicit_pipelined_request(self) -> None:
+        # The opt-out shortcut beats the explicit mode override.
+        # This matches the precedence in ``resolve_draft_mode``.
+        assert (
+            resolve_asymmetric_draft_mode(
+                has_asymmetric_drafter=True,
+                request_use_drafter=False,
+                request_draft_mode="pipelined",
+            )
+            == "none"
+        )
+
+    def test_explicit_model_request_demotes_to_pipelined_under_asymmetric(
+        self,
+    ) -> None:
+        # Codex P1 (PR #20 round-(N+6), drafter.py:253). In an
+        # asymmetric placement target ranks intentionally never load
+        # a local ``draft_model``, so a request with
+        # ``draft_mode="model"`` would otherwise crash with
+        # ``ValueError`` deep in :class:`ModelDrafter`'s constructor.
+        # Demote to ``"pipelined"`` so the user's intent (model
+        # drafting, as opposed to n-gram or none) is preserved
+        # through the wire transport that talks to the peer rank
+        # holding the actual drafter weights.
+        assert (
+            resolve_asymmetric_draft_mode(
+                has_asymmetric_drafter=True,
+                request_use_drafter=None,
+                request_draft_mode="model",
+            )
+            == "pipelined"
+        )
+
+    def test_use_drafter_false_wins_over_explicit_model_request(self) -> None:
+        # Even with the new model->pipelined demotion, the opt-out
+        # shortcut still wins: a caller explicitly asking to skip
+        # spec decoding must not be silently re-enabled.
+        assert (
+            resolve_asymmetric_draft_mode(
+                has_asymmetric_drafter=True,
+                request_use_drafter=False,
+                request_draft_mode="model",
+            )
+            == "none"
+        )
+
+    def test_explicit_model_request_when_no_asymmetric_returns_none(self) -> None:
+        # Defensive: the demotion only fires under
+        # ``has_asymmetric_drafter=True``. When asymmetric isn't set
+        # up at all the caller falls back to ``resolve_draft_mode``,
+        # so this helper signals "asymmetric branch did not apply"
+        # via ``"none"`` regardless of the requested mode.
+        assert (
+            resolve_asymmetric_draft_mode(
+                has_asymmetric_drafter=False,
+                request_use_drafter=None,
+                request_draft_mode="model",
+            )
+            == "none"
+        )
+
+
+class TestUnimplementedDraftModesAreDowngraded:
+    """Codex P1 (PR #20 round-(N+10), drafter.py:157): ``"eagle"`` and
+    ``"lookahead"`` are scaffolding-only modes -- their drafter
+    ``stream()`` implementations raise ``NotImplementedError``.
+    Allowing them through ``parse_draft_mode`` /
+    ``resolve_draft_mode`` / ``resolve_asymmetric_draft_mode`` would
+    take the runner out of service when an operator set
+    ``EXO_DRAFT_MODE=eagle`` or a client sent ``draft_mode="eagle"``.
+    Until executable implementations land, downgrade with a warning
+    so the runner stays serving (n-gram or no-spec) instead of
+    failing every request.
+    """
+
+    def test_parse_draft_mode_downgrades_eagle_to_default(self) -> None:
+        assert parse_draft_mode("eagle", default="model") == "model"
+        assert parse_draft_mode("EAGLE", default="none") == "none"
+
+    def test_parse_draft_mode_downgrades_lookahead_to_default(self) -> None:
+        assert parse_draft_mode("lookahead", default="model") == "model"
+        assert parse_draft_mode("Lookahead", default="none") == "none"
+
+    def test_resolve_draft_mode_downgrades_request_eagle_with_loaded_drafter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(EXO_DRAFT_MODE_ENV, raising=False)
+        # An explicit per-request ``draft_mode="eagle"`` arrives via
+        # ``TaskParams`` and bypasses ``parse_draft_mode``, so the
+        # resolver must apply its own downgrade. With a drafter
+        # loaded the safest fallback is ``"model"`` (the user clearly
+        # intended a "real model" drafter, just not the scaffolding
+        # one).
+        assert (
+            resolve_draft_mode(
+                has_drafter_model=True,
+                request_use_drafter=None,
+                request_draft_mode="eagle",
+            )
+            == "model"
+        )
+
+    def test_resolve_draft_mode_downgrades_request_lookahead_without_drafter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(EXO_DRAFT_MODE_ENV, raising=False)
+        # No drafter loaded -> the request-level downgrade chooses
+        # ``"none"`` so the request still runs (as plain decoding).
+        assert (
+            resolve_draft_mode(
+                has_drafter_model=False,
+                request_use_drafter=None,
+                request_draft_mode="lookahead",
+            )
+            == "none"
+        )
+
+    def test_resolve_asymmetric_draft_mode_downgrades_eagle_to_pipelined(
+        self,
+    ) -> None:
+        # On an asymmetric placement the analog of "model drafter"
+        # is "pipelined drafter via remote transport"; downgrading to
+        # ``"pipelined"`` preserves the user's intent (use real
+        # weights) while keeping the request runnable.
+        assert (
+            resolve_asymmetric_draft_mode(
+                has_asymmetric_drafter=True,
+                request_use_drafter=None,
+                request_draft_mode="eagle",
+            )
+            == "pipelined"
+        )
+
+    def test_resolve_asymmetric_draft_mode_downgrades_lookahead_to_pipelined(
+        self,
+    ) -> None:
+        assert (
+            resolve_asymmetric_draft_mode(
+                has_asymmetric_drafter=True,
+                request_use_drafter=None,
+                request_draft_mode="lookahead",
+            )
+            == "pipelined"
+        )
+
+    def test_explicit_request_mode_wins_over_use_drafter_shortcut(
+        self,
+    ) -> None:
+        # ``request_draft_mode`` is checked before ``use_drafter`` in
+        # the precedence chain, so an explicit unimplemented-mode
+        # request still gets the downgrade rather than the
+        # use_drafter=False shortcut. This matches the existing
+        # ``test_explicit_request_mode_wins_over_use_drafter`` for
+        # implemented modes (``"ngram"``).
+        assert (
+            resolve_draft_mode(
+                has_drafter_model=True,
+                request_use_drafter=False,
+                request_draft_mode="eagle",
+            )
+            == "model"
+        )
+
+    def test_use_drafter_false_alone_is_unaffected_by_unimplemented_handling(
+        self,
+    ) -> None:
+        # When ``request_draft_mode`` is None, the opt-out shortcut
+        # still wins; the unimplemented-mode handler only fires when
+        # an unimplemented mode is actually requested.
+        assert (
+            resolve_draft_mode(
+                has_drafter_model=True,
+                request_use_drafter=False,
+                request_draft_mode=None,
+            )
+            == "none"
+        )
+
+    def test_use_drafter_false_wins_over_unimplemented_under_asymmetric(
+        self,
+    ) -> None:
+        # Asymmetric resolver checks ``use_drafter is False`` BEFORE
+        # ``request_draft_mode``, so the opt-out shortcut still wins
+        # even if the request specifies an unimplemented mode.
+        assert (
+            resolve_asymmetric_draft_mode(
+                has_asymmetric_drafter=True,
+                request_use_drafter=False,
+                request_draft_mode="eagle",
+            )
+            == "none"
+        )
 
 
 class TestNgramDrafterPropose:

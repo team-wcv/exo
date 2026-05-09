@@ -7,6 +7,7 @@ from loguru import logger
 
 from exo.master.placement import (
     add_instance_to_placements,
+    auto_place_prefill_siblings,
     cancel_unnecessary_downloads,
     delete_instance,
     get_transition_events,
@@ -38,6 +39,7 @@ from exo.shared.types.common import CommandId, NodeId, SessionId, SystemId
 from exo.shared.types.events import (
     CustomModelCardAdded,
     CustomModelCardDeleted,
+    DrafterPlacementDegraded,
     Event,
     GlobalForwarderEvent,
     IndexedEvent,
@@ -55,7 +57,7 @@ from exo.shared.types.events import (
     TracesCollected,
     TracesMerged,
 )
-from exo.shared.types.instance_link import InstanceLink
+from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
 from exo.shared.types.state import State
 from exo.shared.types.tasks import (
     ImageEdits as ImageEditsTask,
@@ -385,6 +387,9 @@ class Master:
                                 )
                             generated_events.extend(transition_events)
                         case PlaceInstance():
+                            drafter_degradation_events: list[
+                                DrafterPlacementDegraded
+                            ] = []
                             placement = place_instance(
                                 command,
                                 self.state.topology,
@@ -393,11 +398,60 @@ class Master:
                                 self.state.node_network,
                                 download_status=self.state.downloads,
                                 node_rdma_ctl=self.state.node_rdma_ctl,
+                                on_drafter_placement_degraded=drafter_degradation_events.append,
                             )
+
+                            # Auto-place prefill-only siblings on operator-
+                            # designated nodes, then link them to each newly-
+                            # created decode instance. The link tells
+                            # ``_prefill_endpoint_for`` to spread incoming
+                            # requests' prefill traffic across the linked
+                            # nodes, which is the only architecturally
+                            # honest way to keep slot N's TTFT independent
+                            # of slot 0's prefill: dispatch them to
+                            # different GPUs in the cluster instead of
+                            # serialising on the target's single forward.
+                            if command.model_card.prefill_eligible_nodes:
+                                new_decode_ids = [
+                                    iid
+                                    for iid in placement
+                                    if iid not in self.state.instances
+                                ]
+                                for decode_id in new_decode_ids:
+                                    decode_inst = placement[decode_id]
+                                    (
+                                        new_prefill_instances,
+                                        new_prefill_ids,
+                                    ) = auto_place_prefill_siblings(
+                                        decode_instance_id=decode_id,
+                                        decode_instance=decode_inst,
+                                        model_card=command.model_card,
+                                        topology=self.state.topology,
+                                        current_instances=placement,
+                                        node_memory=self.state.node_memory,
+                                        node_network=self.state.node_network,
+                                        download_status=self.state.downloads,
+                                    )
+                                    placement = {
+                                        **placement,
+                                        **new_prefill_instances,
+                                    }
+                                    if new_prefill_ids:
+                                        generated_events.append(
+                                            InstanceLinkCreated(
+                                                link=InstanceLink(
+                                                    link_id=InstanceLinkId(),
+                                                    prefill_instances=new_prefill_ids,
+                                                    decode_instances=[decode_id],
+                                                )
+                                            )
+                                        )
+
                             transition_events = get_transition_events(
                                 self.state.instances, placement, self.state.tasks
                             )
                             generated_events.extend(transition_events)
+                            generated_events.extend(drafter_degradation_events)
                         case CreateInstance():
                             placement = add_instance_to_placements(
                                 command,

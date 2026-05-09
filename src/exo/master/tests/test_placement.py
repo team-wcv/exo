@@ -625,6 +625,7 @@ def test_tensor_rdma_backend_connectivity_matrix(
             ip_part = coordinator.split(":")[0]
             assert len(ip_part.split(".")) == 4
 
+
 def test_qwen3_5_tensor_auto_upgrade_requires_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

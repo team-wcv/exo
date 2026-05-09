@@ -15,6 +15,7 @@ from anyio import (
 from loguru import logger
 
 from exo.shared.types.chunks import ErrorChunk
+from exo.shared.types.common import ModelId
 from exo.shared.types.events import (
     ChunkGenerated,
     Event,
@@ -37,6 +38,7 @@ from exo.shared.types.worker.runners import (
     RunnerFailed,
     RunnerIdle,
     RunnerLoading,
+    RunnerReady,
     RunnerRunning,
     RunnerShuttingDown,
     RunnerStatus,
@@ -53,7 +55,12 @@ DECODE_TIMEOUT_SECONDS = 5
 
 @dataclass(eq=False)
 class RunnerSupervisor:
-    shard_metadata: ShardMetadata
+    # ``None`` when ``bound_instance.is_drafter_rank`` is true: the drafter
+    # rank has no shard (it serves the full drafter model, not a slice of
+    # the target). Use the ``model_id`` property instead of reaching
+    # through ``shard_metadata.model_card`` so the same access pattern
+    # works for target and drafter runners.
+    shard_metadata: ShardMetadata | None
     bound_instance: BoundInstance
     runner_process: mp.Process
     initialize_timeout: float
@@ -96,7 +103,12 @@ class RunnerSupervisor:
             daemon=True,
         )
 
-        shard_metadata = bound_instance.bound_shard
+        # Drafter ranks have no shard (they own the full drafter model);
+        # only target ranks slice the model into shards. Use ``model_id``
+        # for logging so both code paths share the same surface.
+        shard_metadata = (
+            None if bound_instance.is_drafter_rank else bound_instance.bound_shard
+        )
 
         self = cls(
             bound_instance=bound_instance,
@@ -109,19 +121,39 @@ class RunnerSupervisor:
             _event_sender=event_sender,
         )
         logger.info(
-            "Created runner supervisor "
-            f"{self._runner_context()} model_id={self.shard_metadata.model_card.model_id}"
+            f"Created runner supervisor {self._runner_context()} "
+            f"model_id={self.model_id}"
         )
 
         return self
+
+    @property
+    def model_id(self) -> ModelId:
+        """Model loaded by the supervised runner.
+
+        For target ranks this is the sharded model ID from
+        ``shard_metadata``; for drafter ranks it is the drafter model
+        ID from ``DrafterPlacement``. The two callers that previously
+        reached through ``shard_metadata.model_card.model_id`` only
+        needed the model id for logging / error chunks, both of which
+        also make sense for the drafter rank.
+        """
+        if self.shard_metadata is not None:
+            return self.shard_metadata.model_card.model_id
+        placement = self.bound_instance.instance.drafter_placement
+        assert placement is not None, (
+            "supervisor with no shard_metadata must be on a drafter rank "
+            "but its instance has no DrafterPlacement; this should have "
+            "been validated by BoundInstance"
+        )
+        return placement.drafter_model_id
 
     async def run(self):
         self.runner_process.start()
         self._started_at = current_time()
         logger.info(
-            "Runner process started "
-            f"{self._runner_context()} pid={self.runner_process.pid} "
-            f"model_id={self.shard_metadata.model_card.model_id}"
+            f"Runner process started {self._runner_context()} "
+            f"pid={self.runner_process.pid} model_id={self.model_id}"
         )
         try:
             async with self._tg as tg:
@@ -129,8 +161,8 @@ class RunnerSupervisor:
                 tg.start_soon(self._forward_events)
         finally:
             logger.info(
-                "Runner supervisor shutting down "
-                f"{self._runner_context()} pid={self.runner_process.pid} "
+                f"Runner supervisor shutting down {self._runner_context()} "
+                f"model_id={self.model_id} pid={self.runner_process.pid} "
                 f"rss_mb={self._runner_rss_mb()}"
             )
             if not self._cancel_watch_runner.cancel_called:
@@ -229,7 +261,41 @@ class RunnerSupervisor:
             self.in_progress.pop(task.task_id, None)
             logger.warning(f"Task {task} dropped, runner closed communication.")
             return
+        # Generation tasks (Text/Image/Edits) on a warmed-up runner do not need
+        # the per-task ack-wait gate: the runner state machine accepts them
+        # in any order while ``RunnerReady``/``RunnerRunning``, and waiting
+        # for ack here serialises worker->runner dispatch one task at a time.
+        # This caps batched-prefill (in ``SequentialGenerator``) at B=2 even
+        # when the bench fires conc=4: slot #3 only ships after the runner
+        # acks slot #2, which only happens after batched_prefill completes.
+        # Lifecycle tasks (LoadModel, StartWarmup, ConnectToGroup, Shutdown,
+        # CancelTask) keep the gate so state transitions stay ordered.
+        is_generation_task = isinstance(
+            task, (TextGeneration, ImageGeneration, ImageEdits)
+        )
+        runner_is_warm = isinstance(self.status, (RunnerReady, RunnerRunning))
+        if is_generation_task and runner_is_warm:
+            return
         await event.wait()
+
+    def mark_task_dropped_locally(self, task_id: TaskId) -> None:
+        """Record that ``task_id`` was handled locally without dispatch.
+
+        Used by the worker when a task reaches this node but the
+        runner cannot accept it (currently: a generation task arriving
+        at a drafter rank, which only services lifecycle tasks). The
+        planner uses ``completed | in_progress`` to decide whether to
+        re-select a task on the next 100ms tick (see ``plan.py``); if
+        we just return without recording anything, the same task gets
+        re-selected on every tick until the target finishes,
+        re-emitting ``TaskCreated`` events and re-running this drop
+        path. Adding the id to ``completed`` short-circuits future
+        re-selection without falsely advertising completion to the
+        master -- the global completion still flows from the target
+        runner's ``TaskStatusUpdated`` event.
+        """
+        self.in_progress.pop(task_id, None)
+        self.completed.add(task_id)
 
     async def cancel_task(self, task_id: TaskId):
         if task_id in self.completed:
@@ -339,7 +405,7 @@ class RunnerSupervisor:
                         ChunkGenerated(
                             command_id=task.command_id,
                             chunk=ErrorChunk(
-                                model=self.shard_metadata.model_card.model_id,
+                                model=self.model_id,
                                 error_message=(
                                     "Runner shutdown before completing command "
                                     f"({cause})"

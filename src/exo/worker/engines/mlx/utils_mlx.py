@@ -1,3 +1,5 @@
+import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -5,8 +7,9 @@ import sys
 import tempfile
 import time
 from collections.abc import Generator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast, final
 
 if TYPE_CHECKING:
     from exo.worker.engines.mlx.vision import VisionProcessor
@@ -44,7 +47,7 @@ from pydantic import RootModel
 from exo.download.download_utils import build_model_path, resolve_existing_model
 from exo.shared.types.common import Host
 from exo.shared.types.memory import Memory
-from exo.shared.types.tasks import TaskId, TextGeneration
+from exo.shared.types.tasks import TextGeneration
 from exo.shared.types.text_generation import ChatTemplateValue, TextGenerationTaskParams
 from exo.shared.types.worker.instances import (
     BoundInstance,
@@ -104,13 +107,31 @@ class HostList(RootModel[list[str]]):
         return cls(root=[str(host) for host in hosts])
 
 
+def _bound_rank(bound_instance: BoundInstance) -> int:
+    """Rank of this runner inside the parent ``mx.distributed`` group.
+
+    Target ranks read this from their bound shard metadata; the drafter
+    rank reads it from :class:`DrafterPlacement` since the drafter has
+    no target shard.
+    """
+    if bound_instance.is_drafter_rank:
+        placement = bound_instance.instance.drafter_placement
+        assert placement is not None  # type narrowed by is_drafter_rank
+        return placement.drafter_rank
+    return bound_instance.bound_shard.device_rank
+
+
 def mlx_distributed_init(
     bound_instance: BoundInstance,
 ) -> mx.distributed.Group:
+    """Initialize MLX distributed for this rank's parent group.
+
+    The parent group spans every rank declared by the instance: target
+    ranks plus, for asymmetric placement, the trailing drafter rank.
+    Target ranks split off into a subgroup at runtime via
+    :func:`initialize_mlx`; this helper just brings up the parent.
     """
-    Initialize MLX distributed.
-    """
-    rank = bound_instance.bound_shard.device_rank
+    rank = _bound_rank(bound_instance)
     logger.info(f"Starting initialization for rank {rank}")
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -179,17 +200,186 @@ def mlx_distributed_init(
         return group
 
 
-def initialize_mlx(
-    bound_instance: BoundInstance,
-) -> mx.distributed.Group:
+@final
+@dataclass(frozen=True)
+class MlxGroupSplit:
+    """Target-side view of an instance's distributed wiring.
+
+    Pre-v3 the asymmetric drafter rank was a member of the parent
+    ``mx.distributed`` group, and this struct carried the parent + a
+    target-only subgroup. Under the v3+ wire the drafter is NOT in any
+    ``mx.distributed.Group`` -- target ranks form their own group of
+    size ``target_world_size`` and the drafter dials a TCP socket. The
+    struct now carries:
+
+      * ``parent`` / ``target_subgroup`` -- aliases for the same target
+        group (``parent is target_subgroup`` always under v3). Both
+        fields are retained so existing callers (builder.py, image
+        builder, generate.py) keep working without rev. ``None`` when
+        the target world size is 1 (the well-known "single rank, no
+        collectives needed" signal that
+        :func:`load_mlx_items`, :func:`mx_barrier`, :func:`mx_any`
+        already short-circuit on).
+      * ``drafter_socket`` -- the connected TCP socket between target
+        rank 0 and the drafter rank. Set ONLY on target rank 0 of an
+        asymmetric placement; ``None`` for any other rank.
+      * ``drafter_rank_in_parent`` -- advisory placement index of the
+        drafter (``placement.drafter_rank``). Carried for telemetry
+        and the few legacy call sites that branch on "is asymmetric";
+        ``None`` for symmetric placement.
+    """
+
+    parent: mx.distributed.Group | None
+    target_subgroup: mx.distributed.Group | None
+    drafter_rank_in_parent: int | None
+    drafter_socket: object | None = None
+    """Connected ``socket.socket`` from target rank 0 to the drafter.
+
+    Typed as ``object`` to keep the dataclass importable from modules
+    that don't import ``socket`` directly. Runtime callers
+    (:mod:`builder`) cast back to ``socket.socket`` before passing to
+    :func:`make_remote_transport`."""
+
+    @property
+    def is_asymmetric(self) -> bool:
+        return self.drafter_rank_in_parent is not None
+
+
+def initialize_mlx(bound_instance: BoundInstance) -> MlxGroupSplit:
+    """Bring up the target ``mx.distributed`` group + (rank 0) drafter socket.
+
+    Target ranks: initialise an ``mx.distributed.Group`` of size
+    ``parent_group_size`` (which under v3+ equals the number of target
+    shards -- the drafter is NOT a member of this group). Single-target
+    instances (``parent_group_size == 1``) short-circuit and return a
+    split with ``parent / target_subgroup = None``.
+
+    Target rank 0 of an asymmetric placement additionally binds a TCP
+    listener on ``DrafterPlacement.drafter_socket_port`` and accepts
+    the drafter's incoming connection. The connected socket flows
+    through :class:`MlxGroupSplit.drafter_socket` to the builder, which
+    hands it to :func:`make_remote_transport`.
+
+    The drafter rank does NOT call this function; its bootstrap
+    (:class:`DrafterRunner._handle_connect`) dials the socket directly
+    without touching ``mx.distributed`` at all.
+    """
+    assert not bound_instance.is_drafter_rank, (
+        "initialize_mlx should not be called on a drafter rank under "
+        "the v3+ asymmetric wire; DrafterRunner._handle_connect dials "
+        "the drafter socket directly without joining mx.distributed."
+    )
     # should we unseed it?
     # TODO: pass in seed from params
     mx.random.seed(42)
 
-    assert len(bound_instance.instance.shard_assignments.node_to_runner) > 1, (
-        "Tried to initialize mlx for a single node instance"
+    target_world_size = bound_instance.instance.parent_group_size
+    placement = bound_instance.instance.drafter_placement
+
+    # Single-target instance: no mx.distributed group needed (other
+    # ranks short-circuit on the ``group is None`` signal). Drafter
+    # wire still exists for asymmetric placement.
+    parent: mx.distributed.Group | None = (
+        None if target_world_size <= 1 else mlx_distributed_init(bound_instance)
     )
-    return mlx_distributed_init(bound_instance)
+
+    drafter_rank_in_parent = placement.drafter_rank if placement is not None else None
+
+    drafter_socket = _maybe_accept_drafter_socket(
+        bound_instance=bound_instance,
+        target_world_size=target_world_size,
+        placement=placement,
+    )
+
+    return MlxGroupSplit(
+        parent=parent,
+        target_subgroup=parent,
+        drafter_rank_in_parent=drafter_rank_in_parent,
+        drafter_socket=drafter_socket,
+    )
+
+
+def _maybe_accept_drafter_socket(
+    *,
+    bound_instance: BoundInstance,
+    target_world_size: int,
+    placement: object,
+) -> object | None:
+    """Bind + accept the drafter dial on target rank 0; otherwise return ``None``.
+
+    Only target rank 0 of an asymmetric placement owns the drafter
+    wire. Other target ranks (rank >= 1) and symmetric placements
+    return ``None``. The caller embeds the result in
+    :class:`MlxGroupSplit.drafter_socket`.
+
+    The accept call is sequential after :func:`mlx_distributed_init`
+    in the parent function. The drafter's :func:`dial_target` retries
+    with backoff for up to two minutes, which comfortably covers the
+    target group's bootstrap latency. If accept times out (drafter
+    unreachable / crashed), this raises :class:`socket.timeout`; the
+    runner surface bubbles it up as a connect-task failure so the
+    cluster doesn't sit silently wedged.
+    """
+    from exo.shared.types.worker.instances import DrafterPlacement
+
+    if placement is None:
+        return None
+    if not isinstance(placement, DrafterPlacement):
+        raise TypeError(
+            f"drafter_placement must be DrafterPlacement, got {type(placement)!r}"
+        )
+    # Target rank 0 binds; other target ranks no-op. Symmetric placements
+    # land in the ``placement is None`` branch above.
+    if bound_instance.parent_rank != 0:
+        return None
+    del target_world_size  # not needed once we know we're rank 0
+    # Imported lazily to avoid pulling the socket transport into module
+    # import unless this code path is exercised.
+    from exo.worker.engines.mlx.generator.drafter_socket import (
+        accept_drafter,
+        bind_target_listener,
+    )
+
+    # Bind to all interfaces so the drafter can dial whichever address
+    # ``DrafterPlacement.drafter_socket_host`` resolves to (LAN,
+    # Thunderbolt-bridge, Tailscale, etc.). The placement-time IP only
+    # serves as the address the drafter dials; target rank 0 doesn't
+    # need to advertise a specific bind address.
+    #
+    # Codex P2 (PR #20 round-(N+9), drafter_socket.py:106): pre-fix the
+    # listener was hard-coded to ``AF_INET``/``0.0.0.0``, so an IPv6
+    # advertised host (Tailscale ULA, link-local IPv6, IPv6-only LAN)
+    # could never accept the drafter's dial. Pick the wildcard whose
+    # family matches the advertised host: ``::`` for IPv6 (with
+    # IPV6_V6ONLY=0 inside ``bind_target_listener`` so IPv4-mapped
+    # connects still land), ``0.0.0.0`` for IPv4 or unparseable
+    # hostnames.
+    advertised = placement.drafter_socket_host
+    try:
+        parsed = ipaddress.ip_address(advertised)
+        bind_host = "::" if isinstance(parsed, ipaddress.IPv6Address) else "0.0.0.0"
+    except ValueError:
+        # ``find_ip_prioritised`` should always return an IP literal,
+        # but defensively handle a hostname by binding to the IPv6
+        # wildcard (dual-stack via IPV6_V6ONLY=0). If IPv6 is not
+        # available on the host, ``bind_target_listener`` will raise
+        # and the failure is loud rather than silent.
+        bind_host = "::"
+    listener = bind_target_listener(bind_host, placement.drafter_socket_port)
+    try:
+        logger.info(
+            f"target rank 0 listening for drafter on "
+            f"{bind_host}:{placement.drafter_socket_port} "
+            f"(advertised {placement.drafter_socket_host})"
+        )
+        conn = accept_drafter(listener, timeout_seconds=180.0)
+        logger.info("target rank 0 accepted drafter connection")
+        return conn
+    finally:
+        # Listener is single-shot (drafter dials once and stays
+        # connected for the instance lifetime); close it as soon as
+        # accept returns to free the port.
+        listener.close()
 
 
 EXO_DISABLE_DRAFTER_ENV = "EXO_DISABLE_DRAFTER"
@@ -218,9 +408,7 @@ def _drafter_preference() -> str:
     return raw
 
 
-def _select_drafter_id(
-    candidates: list[ModelId], preference: str
-) -> ModelId | None:
+def _select_drafter_id(candidates: list[ModelId], preference: str) -> ModelId | None:
     """Pick a drafter id from a card's preference-ordered list.
 
     The card lists drafters in `[fastest, ..., highest_acceptance]` order. We
@@ -333,10 +521,13 @@ def load_mlx_items(
     # Pre-include drafter size in the wired-memory limit so the OS doesn't
     # page out drafter weights between requests. We have to make this decision
     # *before* loading the target because `set_wired_limit_for_model` configures
-    # the limit once.
+    # the limit once. Skip the bump for asymmetric placements: the drafter
+    # weights live on a different node so they don't draw from this rank's
+    # wired pool.
     combined_size = target_size
     if (
         group is None
+        and bound_instance.instance.drafter_placement is None
         and not _drafter_disabled_by_env()
         and target_card.drafter_model_ids
     ):
@@ -375,9 +566,26 @@ def load_mlx_items(
         logger.info(f"Time taken to load model: {(end_time - start_time):.2f}s")
         tokenizer = get_tokenizer(model_path, bound_instance.bound_shard)
 
-        drafter_pair = _maybe_load_drafter(target_card)
-        if drafter_pair is not None:
-            drafter_id, drafter_model = drafter_pair
+        # Skip the local in-process drafter when an asymmetric drafter
+        # rank exists for this instance: ``DrafterPlacement`` means the
+        # drafter is a separate ``DrafterRunner`` reachable via
+        # ``RemoteTransport`` over the parent group, and loading a
+        # second copy locally would just duplicate the weights and
+        # confuse the spec-decode loop.
+        if bound_instance.instance.drafter_placement is None:
+            drafter_pair = _maybe_load_drafter(target_card)
+            if drafter_pair is not None:
+                drafter_id, drafter_model = drafter_pair
+        else:
+            # Codex P2 (PR #20 round-(N+10), utils_mlx.py:578):
+            # single-rank asymmetric target also has a remote drafter
+            # but pre-fix this branch never surfaced the drafter id,
+            # so ``GenerationStats.drafter_model_id`` stayed ``None``
+            # and dashboards / telemetry gated on a non-null id
+            # silently dropped attribution for every such request.
+            # Mirror the multi-rank branch below: copy the placement's
+            # drafter id even when no local weights are loaded.
+            drafter_id = bound_instance.instance.drafter_placement.drafter_model_id
 
     else:
         logger.info("Starting distributed init")
@@ -390,6 +598,18 @@ def load_mlx_items(
         logger.info(
             f"Time taken to shard and load model: {(end_time - start_time):.2f}s"
         )
+
+        # Asymmetric multi-rank placement: the drafter weights live on
+        # a separate ``DrafterRunner``, so this rank doesn't load them
+        # locally (no ``drafter_model``). The model id, however, is
+        # known from the placement and is the only piece downstream
+        # telemetry needs to surface "this request used the X drafter".
+        # Without this, ``GenerationStats.drafter_model_id`` stays
+        # ``None`` for every multi-target asymmetric request even
+        # though the drafter is materially serving traffic.
+        drafter_placement = bound_instance.instance.drafter_placement
+        if drafter_placement is not None:
+            drafter_id = drafter_placement.drafter_model_id
 
     mx.clear_cache()
 
@@ -1058,6 +1278,114 @@ def mx_barrier(group: mx.distributed.Group | None):
     )
 
 
+# ``int32`` lower / upper bounds. Values broadcast through
+# :func:`mx_broadcast_int_list` must be non-negative (the wire protocol
+# uses unsigned token IDs and length prefixes) AND fit in int32 with
+# room for the all-sum to land back in range. Since exactly one rank
+# contributes the values and the rest contribute zero, the sum is the
+# root's values per element regardless of group size, so the per-element
+# bound is plain int32 max. We tighten to ``2**31 - 1`` (positive int32
+# max) and reject negatives explicitly so a caller passing a Python
+# ``-1`` doesn't silently wrap into a 4-billion-ish "valid" int32.
+_MX_BROADCAST_MAX_VALUE: Final[int] = (1 << 31) - 1
+
+
+def mx_broadcast_int_list(
+    values: list[int] | None,
+    length: int,
+    group: mx.distributed.Group | None,
+    *,
+    is_root: bool,
+) -> list[int]:
+    """Broadcast a fixed-length int list from one rank to all peers.
+
+    Implementation: all-sum of an ``int32`` buffer where non-root ranks
+    contribute zeros. Reuses MLX's well-exercised ``all_sum`` collective
+    (the same one the model's TP forward depends on every step), so the
+    primitive's reliability is bounded by JACCL's ``all_sum`` rather than
+    its problematic ``all_gather`` (see :func:`mx_all_gather_tasks`).
+
+    The fixed-length contract means the caller pads to ``length`` on
+    root and both ranks agree on ``length`` ahead of time. This avoids
+    a count-then-payload two-collective handshake that would double the
+    wire round-trips on the spec-decode hot path.
+
+    Args:
+      values: On root, a list of exactly ``length`` ints to broadcast.
+        Each value must be in ``[0, 2**31 - 1]``. Negative values are
+        rejected explicitly so a stray ``-1`` doesn't silently wrap to
+        ``0xFFFFFFFF`` and corrupt the broadcast. Ignored on non-root.
+      length: Buffer size, agreed by all ranks. Must be ``>= 1``.
+      group: Distributed group; ``None`` is a single-rank short-circuit
+        that simply returns ``values`` (root-only).
+      is_root: ``True`` on the rank holding the source values; ``False``
+        elsewhere. Exactly one rank in ``group`` must pass ``True``.
+
+    Returns:
+      A list of ``length`` ints identical on every rank in ``group``,
+      equal to root's ``values``.
+
+    Raises:
+      ValueError: ``length`` is non-positive, the root's ``values`` are
+        ``None`` or wrong length, or any root value is out of int32
+        range. These are caller bugs, not runtime conditions.
+    """
+    if length < 1:
+        raise ValueError(f"mx_broadcast_int_list length must be >= 1, got {length}")
+
+    if group is None:
+        if not is_root:
+            raise ValueError(
+                "mx_broadcast_int_list: single-rank short-circuit requires "
+                "is_root=True (only the root has source values)"
+            )
+        if values is None or len(values) != length:
+            raise ValueError(
+                "mx_broadcast_int_list: single-rank call requires "
+                f"values of length {length}, got "
+                f"{None if values is None else len(values)}"
+            )
+        _validate_broadcast_values(values)
+        return list(values)
+
+    if is_root:
+        if values is None or len(values) != length:
+            raise ValueError(
+                "mx_broadcast_int_list root rank requires values of "
+                f"length {length}, got {None if values is None else len(values)}"
+            )
+        _validate_broadcast_values(values)
+        buffer = mx.array(values, dtype=mx.int32)
+    else:
+        buffer = mx.zeros((length,), dtype=mx.int32)
+
+    summed = mx.distributed.all_sum(
+        buffer, group=group, stream=mx.default_stream(mx.Device(mx.cpu))
+    )
+    mx.eval(summed)
+    return [int(v) for v in cast(list[int], summed.tolist())]
+
+
+def _validate_broadcast_values(values: list[int]) -> None:
+    """Range-check root-side broadcast values.
+
+    Centralised so both the single-rank short-circuit and the multi-
+    rank all-sum path enforce identical contracts. Linear scan; for
+    ``length`` values this is microseconds and runs once per round on
+    the spec-decode hot path -- amortised free against an MLX
+    collective.
+    """
+    for index, value in enumerate(values):
+        if value < 0 or value > _MX_BROADCAST_MAX_VALUE:
+            raise ValueError(
+                f"mx_broadcast_int_list values must be in "
+                f"[0, {_MX_BROADCAST_MAX_VALUE}]; "
+                f"index {index} = {value} is out of range "
+                f"(negatives wrap silently in int32 all-sum; values "
+                f">= 2**31 overflow)"
+            )
+
+
 def _parse_kimi_tool_calls(text: str):
     import regex as re
 
@@ -1097,50 +1425,142 @@ def mx_all_gather_tasks(
     tasks: list[TextGeneration],
     group: mx.distributed.Group | None,
 ) -> tuple[list[TextGeneration], list[TextGeneration]]:
-    def encode_task_id(task_id: TaskId) -> list[int]:
-        utf8_task_id = task_id.encode()
-        return [
-            int.from_bytes(utf8_task_id[i : i + 1]) for i in range(len(utf8_task_id))
-        ]
+    """Cross-rank task agreement that tolerates partial arrival.
 
-    def decode_task_id(encoded_task_id: list[int]) -> TaskId:
-        return TaskId(
-            bytes.decode(b"".join((x).to_bytes(length=1) for x in encoded_task_id))
+    Returns ``(agreed, different)`` where ``agreed`` is the subset of
+    ``tasks`` that *every* rank in ``group`` has, and ``different`` is
+    the subset only some ranks have. The caller (``agree_on_tasks``)
+    enqueues ``agreed`` immediately and retains ``different`` for the
+    next tick, so benign pubsub timing skew (rank 0 has ``[A, B]``
+    while rank 1 still only has ``[A]``) converges naturally without
+    aborting decode.
+
+    Codex P1 (PR #20 round-(N+2), utils_mlx.py:1451): the previous
+    drift-detector hash-equality check raised ``RuntimeError`` on any
+    cross-rank divergence, which turned that benign timing skew into
+    a runner-killing failure. The fix below restores the original
+    intersection semantics while still avoiding JACCL's unreliable
+    ``all_gather`` primitive.
+    """
+    # Single-rank short-circuit. ``mx.distributed.all_gather(group=None)``
+    # delegates to the MLX *default* group, which on an asymmetric runner
+    # is the parent (target+drafter) group. The drafter rank is busy in
+    # ``drafter_serve_loop`` doing its own ``recv`` on that same default
+    # group, so an unguarded all-gather here cross-talks with the
+    # drafter's wire protocol and corrupts the next command frame the
+    # drafter decodes (manifesting as ``num_forwards must be >= 1, got
+    # 0``). When ``group is None`` we are by construction the only
+    # participating rank, so every task is trivially "agreed".
+    if group is None:
+        return list(tasks), []
+
+    # JACCL's ``all_gather`` is unreliable for small task-agreement
+    # buffers on Apple Silicon: it sporadically reads peer slots back
+    # as float32 bit patterns rather than the int32 we wrote (observed:
+    # count gather returning ``[1, 1068875521]`` -> 0x3FB80001 / a
+    # float32 representation), which forced a 144 GB padded-buffer
+    # allocation and crashed the runner with ``[metal::malloc]
+    # Attempting to allocate ...``. We therefore build the intersection
+    # over the well-exercised ``all_sum`` primitive instead, in three
+    # collectives:
+    #
+    #   1. Root broadcasts the count of its tasks (1 int32).
+    #   2. Root broadcasts the hash pair (2 int32 per task) of its
+    #      sorted task IDs. 62 bits per task is well below the
+    #      birthday-collision threshold for any practical queue size.
+    #   3. Every rank contributes a presence bitmap (1 int32 per
+    #      root-task: 1 if rank has that hash, 0 otherwise) via
+    #      ``all_sum``. A slot whose sum equals ``group.size()`` is in
+    #      the universally-present intersection.
+    #
+    # When root has zero tasks (a perfectly normal cold-start state),
+    # the second/third collectives are skipped and every non-root rank's
+    # local tasks fall through to ``different`` for retry next tick.
+    sorted_tasks = sorted(tasks, key=lambda t: t.task_id)
+    is_root = group.rank() == 0
+
+    root_count = mx_broadcast_int_list(
+        [len(sorted_tasks)] if is_root else None,
+        length=1,
+        group=group,
+        is_root=is_root,
+    )[0]
+
+    if root_count == 0:
+        # Root has nothing to agree on. Every local task on a non-root
+        # rank stays in ``different`` for the next tick.
+        return [], sorted_tasks
+
+    pairs_per_task = 2
+    hash_buffer_length = root_count * pairs_per_task
+
+    if is_root:
+        root_pairs: list[int] = []
+        for task in sorted_tasks:
+            high, low = _task_id_hash_pair(task.task_id)
+            root_pairs.append(high)
+            root_pairs.append(low)
+    else:
+        root_pairs = []  # ignored; non-root passes None below
+
+    root_hashes_flat = mx_broadcast_int_list(
+        root_pairs if is_root else None,
+        length=hash_buffer_length,
+        group=group,
+        is_root=is_root,
+    )
+
+    local_pair_set: set[tuple[int, int]] = {
+        _task_id_hash_pair(task.task_id) for task in sorted_tasks
+    }
+    presence: list[int] = []
+    root_pair_seq: list[tuple[int, int]] = []
+    for index in range(root_count):
+        pair = (
+            root_hashes_flat[index * pairs_per_task],
+            root_hashes_flat[index * pairs_per_task + 1],
         )
+        root_pair_seq.append(pair)
+        presence.append(1 if pair in local_pair_set else 0)
 
-    uuid_byte_length = 36
-
-    n_tasks = len(tasks)
-    all_counts = cast(
-        list[int],
-        mx.distributed.all_gather(mx.array([n_tasks]), group=group).tolist(),
+    presence_buffer = mx.array(presence, dtype=mx.int32)
+    counts_array = mx.distributed.all_sum(
+        presence_buffer,
+        group=group,
+        stream=mx.default_stream(mx.Device(mx.cpu)),
     )
-    max_tasks = max(all_counts)
-    world_size: int = 1 if group is None else group.size()
+    mx.eval(counts_array)
+    counts: list[int] = [int(value) for value in cast(list[int], counts_array.tolist())]
+    group_size = group.size()
+    agreed_pair_set: set[tuple[int, int]] = {
+        root_pair_seq[index]
+        for index, count in enumerate(counts)
+        if count == group_size
+    }
 
-    if max_tasks == 0:
-        return [], []
-
-    padded = [encode_task_id(task.task_id) for task in tasks] + [
-        [0] * uuid_byte_length
-    ] * (max_tasks - n_tasks)
-
-    assert all(len(encoded_task_id) == uuid_byte_length for encoded_task_id in padded)
-
-    gathered = cast(
-        list[list[list[int]]],
-        mx.distributed.all_gather(mx.array(padded), group=group)
-        .reshape(world_size, max_tasks, -1)
-        .tolist(),
-    )
-    all_task_ids: list[list[TaskId]] = [
-        [decode_task_id(encoded_task_id) for encoded_task_id in rank_tasks[:count]]
-        for rank_tasks, count in zip(gathered, all_counts, strict=True)
-    ]
-
-    agreed_ids = set[TaskId].intersection(*(set(tids) for tids in all_task_ids))
-
-    local_tasks = {task.task_id: task for task in tasks}
-    agreed = [local_tasks[tid] for tid in sorted(agreed_ids)]
-    different = [task for task in tasks if task.task_id not in agreed_ids]
+    agreed: list[TextGeneration] = []
+    different: list[TextGeneration] = []
+    for task in sorted_tasks:
+        if _task_id_hash_pair(task.task_id) in agreed_pair_set:
+            agreed.append(task)
+        else:
+            different.append(task)
     return agreed, different
+
+
+def _task_id_hash_pair(task_id: str) -> tuple[int, int]:
+    """Stable 62-bit (high, low) hash pair for a task ID.
+
+    Two 31-bit halves so the broadcast buffer can carry both without
+    crossing :func:`mx_broadcast_int_list`'s ``[0, 2**31 - 1]`` value
+    range (which the int32 ``all_sum`` requires to avoid wrap-around).
+    Birthday-collision threshold is around ``2**31 ~= 2 billion``
+    distinct task IDs -- well above any practical scheduler queue.
+    BLAKE2b is deterministic across processes and seed-free, so two
+    runner subprocesses always derive the same digest from the same
+    task ID without bypassing Python's salted ``hash()``.
+    """
+    digest = hashlib.blake2b(task_id.encode("utf-8"), digest_size=8).digest()
+    high = int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+    low = int.from_bytes(digest[4:], "big") & 0x7FFFFFFF
+    return high, low

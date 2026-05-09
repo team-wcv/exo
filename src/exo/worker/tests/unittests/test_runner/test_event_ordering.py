@@ -124,8 +124,17 @@ class MockLoadOutput:
 
 @pytest.fixture
 def patch_out_mlx(monkeypatch: pytest.MonkeyPatch):
-    # initialize_mlx returns a mock group
-    monkeypatch.setattr(mlx_builder, "initialize_mlx", make_nothin(MockGroup()))
+    # initialize_mlx returns an MlxGroupSplit; for symmetric placement the
+    # target subgroup is the same object as the parent.
+    from exo.worker.engines.mlx.utils_mlx import MlxGroupSplit
+
+    mock_group = MockGroup()
+    mock_split = MlxGroupSplit(
+        parent=mock_group,  # pyright: ignore[reportArgumentType]
+        target_subgroup=mock_group,  # pyright: ignore[reportArgumentType]
+        drafter_rank_in_parent=None,
+    )
+    monkeypatch.setattr(mlx_builder, "initialize_mlx", make_nothin(mock_split))
 
     def lmi_gen():
         yield MockLoadOutput(1, 1)

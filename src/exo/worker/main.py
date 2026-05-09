@@ -41,6 +41,7 @@ from exo.shared.types.tasks import (
     CreateRunner,
     DownloadModel,
     ImageEdits,
+    ImageGeneration,
     LoadModel,
     Shutdown,
     Task,
@@ -50,7 +51,7 @@ from exo.shared.types.tasks import (
 from exo.shared.types.text_generation import Base64Image, Base64ImageHash
 from exo.shared.types.topology import Connection, SocketConnection
 from exo.shared.types.worker.downloads import DownloadCompleted
-from exo.shared.types.worker.instances import InstanceId
+from exo.shared.types.worker.instances import DrafterPlacement, InstanceId
 from exo.shared.types.worker.runners import RunnerId
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.info_gatherer.info_gatherer import GatheredInfo, InfoGatherer
@@ -59,6 +60,43 @@ from exo.utils.keyed_backoff import KeyedBackoff
 from exo.utils.task_group import TaskGroup
 from exo.worker.plan import plan
 from exo.worker.runner.supervisor import RunnerSupervisor
+
+
+def _should_drop_generation_task_at_drafter(
+    *,
+    task: Task,
+    runner_id: RunnerId,
+    drafter_placement: DrafterPlacement | None,
+    node_id: NodeId,
+) -> bool:
+    """Return whether a task should be silently dropped because it
+    would otherwise be dispatched to a drafter runner that can't
+    handle it.
+
+    Generation tasks (``TextGeneration``, ``ImageGeneration``,
+    ``ImageEdits``) must never reach the drafter rank.
+    :class:`DrafterRunner` only accepts lifecycle tasks
+    (``ConnectToGroup``, ``LoadModel``, ``StartWarmup``,
+    ``Shutdown``) and raises ``ValueError`` for anything else, which
+    marks the runner failed and cascades into instance shutdown
+    during asymmetric serving. The asymmetric drafter produces draft
+    tokens via the spec-decode socket wire, driven by the target's
+    verify loop -- it does not participate in ``Task``-driven
+    user-facing generation.
+
+    Returns True iff:
+    - ``drafter_placement`` is set (asymmetric placement),
+    - ``node_id`` is the drafter node,
+    - ``runner_id`` resolves to the drafter runner, AND
+    - the task is a generation task.
+    """
+    if drafter_placement is None:
+        return False
+    if drafter_placement.drafter_node_id != node_id:
+        return False
+    if runner_id != drafter_placement.drafter_runner_id:
+        return False
+    return isinstance(task, (TextGeneration, ImageGeneration, ImageEdits))
 
 
 class Worker:
@@ -397,10 +435,36 @@ class Worker:
             logger.warning("Timed out waiting for Worker shutdown")
 
     async def _start_runner_task(self, task: Task):
-        if (instance := self.state.instances.get(task.instance_id)) is not None:
-            await self.runners[
-                instance.shard_assignments.node_to_runner[self.node_id]
-            ].start_task(task)
+        if (instance := self.state.instances.get(task.instance_id)) is None:
+            return
+        # ``all_node_to_runner`` resolves both target and drafter ranks
+        # for asymmetric placement; ``node_to_runner`` alone misses the
+        # drafter rank because it lives on ``instance.drafter_placement``,
+        # not on ``shard_assignments``.
+        runner_id = instance.all_node_to_runner[self.node_id]
+        if _should_drop_generation_task_at_drafter(
+            task=task,
+            runner_id=runner_id,
+            drafter_placement=instance.drafter_placement,
+            node_id=self.node_id,
+        ):
+            logger.debug(
+                f"Dropping {task.__class__.__name__} task "
+                f"{task.task_id} on drafter node {self.node_id} "
+                f"(instance {task.instance_id}); drafter runner only "
+                f"accepts lifecycle tasks."
+            )
+            # Record the drop in the runner's local completion set so
+            # the planner does not re-select the same task on every
+            # 100ms tick. Otherwise the worker keeps re-emitting
+            # ``TaskCreated`` events and re-running this drop path
+            # for the lifetime of the request, which is pure
+            # control-plane churn under streaming or long-running
+            # generations. The target runner remains the authority
+            # for the *global* task lifecycle (Codex P2, PR #20).
+            self.runners[runner_id].mark_task_dropped_locally(task.task_id)
+            return
+        await self.runners[runner_id].start_task(task)
 
     def _create_supervisor(self, task: CreateRunner) -> RunnerSupervisor:
         """Creates and stores a new AssignedRunner with initial downloading status."""

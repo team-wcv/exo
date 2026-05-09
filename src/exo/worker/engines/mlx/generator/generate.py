@@ -7,6 +7,7 @@ from typing import Any, Callable, Generator, cast, get_args
 
 import mlx.core as mx
 from mlx_lm.generate import (
+    PromptProcessingBatch,
     maybe_quantize_kv_cache,
     stream_generate,
 )
@@ -59,9 +60,8 @@ from exo.worker.engines.mlx.constants import (
 from exo.worker.engines.mlx.generator.drafter import (
     Drafter,
     DraftMode,
-    ModelDrafter,
-    NgramDrafter,
-    NoSpecDrafter,
+    make_drafter,
+    resolve_asymmetric_draft_mode,
     resolve_draft_mode,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
@@ -70,6 +70,7 @@ from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
     fix_unmatched_think_end_tokens,
     mx_barrier,
+    mx_broadcast_int_list,
     system_prompt_token_count,
 )
 from exo.worker.engines.mlx.vision import (
@@ -86,6 +87,57 @@ REMOTE_PREFILL_MIN_TOKENS = 1000
 generation_stream = mx.new_stream(mx.default_device())
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
+
+
+def _broadcast_clamped_num_draft_tokens(
+    *,
+    effective_num_draft_tokens: int,
+    group: mx.distributed.Group,
+) -> int:
+    """Make every target rank in a multi-target asymmetric placement
+    agree on ``num_draft_tokens`` by broadcasting rank 0's
+    (potentially-clamped) value over ``group``.
+
+    Only rank 0 of the target subgroup holds the
+    ``DrafterTransport`` (the socket to the drafter rank), so only
+    rank 0 can call ``clamp_num_draft_tokens_to_transport``. Pre-fix
+    non-root target ranks used the unclamped
+    ``effective_num_draft_tokens`` to size their
+    ``PipelinedModelDrafter`` buffers, so a per-request override
+    above the transport budget would have desynchronized the
+    spec-decode collectives in ``_broadcast_drafts`` /
+    ``_broadcast_target_tokens`` (Codex P1 on PR #20 round 3).
+
+    The broadcast is a one-shot length-1 int collective. It rides
+    the same ``mx.distributed.Group`` the spec-decode rounds use,
+    not the ``target_peer_fanout`` socket, so it does not interact
+    with the JACCL int/float wire-conflation issue the fanout
+    works around -- correctness only depends on every target rank
+    agreeing on a positive int slot count, which
+    ``mx_broadcast_int_list`` already enforces.
+
+    Returns the K every rank should use for the rest of this
+    request. Rank 0's return value is identical to the input; non-
+    root ranks' return value is the rank-0-clamped value.
+    """
+    is_root_in_target_group = group.rank() == 0
+    broadcast = mx_broadcast_int_list(
+        [int(effective_num_draft_tokens)] if is_root_in_target_group else None,
+        length=1,
+        group=group,
+        is_root=is_root_in_target_group,
+    )
+    consensus_k = broadcast[0]
+    if consensus_k != effective_num_draft_tokens:
+        # On rank 0 this is unreachable (we just sent the value);
+        # on non-root ranks this is the expected path whenever
+        # the per-request override was clamped at the root.
+        logger.info(
+            f"non-root target rank adopting clamped "
+            f"num_draft_tokens={consensus_k} from rank 0 "
+            f"(local pre-broadcast={effective_num_draft_tokens})"
+        )
+    return consensus_k
 
 
 @contextlib.contextmanager
@@ -405,6 +457,164 @@ def prefill(
     return tokens_per_sec, num_tokens, snapshots[:-1] if snapshots else []
 
 
+class BatchedPrefillUnsupportedError(Exception):
+    """Raised when ``batched_prefill`` cannot run for the requested batch.
+
+    The caller is expected to recover by falling back to per-slot
+    :func:`prefill`. Reasons include cache types that do not implement
+    ``merge``/``extract`` (e.g. ``DeepseekV4Cache``), pipeline-parallel
+    targets where collective semantics differ, or any prompt being too
+    short to leave a decode-seed token after slicing.
+    """
+
+
+def batched_prefill(
+    *,
+    model: Model,
+    prompt_tokens_list: list[mx.array],
+    caches_list: list[KVCacheType],
+    on_progress: Callable[[int, int], None] | None = None,
+    prefill_step_size: int = 4096,
+) -> tuple[float, int]:
+    """Run K prefills in a single batched forward pass.
+
+    Wraps :class:`mlx_lm.generate.PromptProcessingBatch`. After return, each cache in
+    ``caches_list`` is filled in-place to offset ``len(prompt_tokens_list[i]) - 1``
+    so the decode loop can seed from the last prompt token (matching the
+    exact-prefix-hit shape ``mlx_generate`` already handles via
+    ``kv_prefix_cache.get_kv_cache``).
+
+    The K prompts are right-padded to the longest length; per-cache
+    ``prepare(lengths=, right_padding=)`` + ``finalize()`` remove the
+    padding from the cache state. Total wall-clock cost is roughly the
+    cost of one prefill at the longest prompt's length, amortising weight
+    loads across the batch — which is the whole point on a single GPU
+    where matmul throughput is otherwise weight-bandwidth-bound for the
+    sequential per-slot path.
+
+    Args:
+        model: target model. Must produce caches whose layers support
+            ``merge``/``extract`` (e.g. ``KVCache`` + ``RotatingKVCache`` for
+            Gemma-4; ``DeepseekV4Cache`` is not supported and raises
+            :class:`BatchedPrefillUnsupportedError`).
+        prompt_tokens_list: per-slot full prompt tokens. Each prompt is
+            sliced to ``prompt[:-1]`` internally so the decode seed
+            (``prompt[-1]``) is left out of the cache.
+        caches_list: per-slot fresh caches (offset 0). Mutated in place;
+            on return each cache's layers point at the extracted
+            per-sequence state from the batched forward.
+        on_progress: aggregate ``(processed_max_seq, total_max_seq)``
+            callback fired once per ``prefill_step_size`` chunk. The
+            ``processed`` count is the per-slot maximum (longest prompt's
+            chunk count) so progress monotonically increases even when
+            slots have unequal lengths.
+        prefill_step_size: chunk size for the prefill loop.
+
+    Returns:
+        ``(aggregate_tps, total_tokens)``: sum of per-slot tokens divided
+        by batched wall-clock time, useful for telemetry / bench output.
+
+    Raises:
+        BatchedPrefillUnsupportedError: cache layers do not implement
+            ``merge``/``extract`` (caller should fall back to per-slot
+            :func:`prefill`).
+        ValueError: ``len(prompt_tokens_list) != len(caches_list)`` or any
+            prompt has fewer than 2 tokens (need at least 1 prefill +
+            1 seed token).
+    """
+    if len(prompt_tokens_list) != len(caches_list):
+        raise ValueError(
+            f"prompt_tokens_list ({len(prompt_tokens_list)}) and caches_list "
+            f"({len(caches_list)}) must have the same length"
+        )
+    if not prompt_tokens_list:
+        return 0.0, 0
+    if any(int(p.size) < 2 for p in prompt_tokens_list):
+        raise ValueError(
+            "batched_prefill requires every prompt to have length >= 2 "
+            "(1 token to prefill + 1 token for the decode seed)"
+        )
+
+    # Slice off the decode seed so the post-prefill cache offset lands at
+    # ``len(prompt) - 1`` per slot — same invariant ``mlx_generate``'s
+    # exact-prefix-hit branch produces.
+    prefill_tokens: list[list[int]] = [
+        [int(t) for t in cast(list[int], p[:-1].tolist())] for p in prompt_tokens_list
+    ]
+    total_tokens = sum(len(p) for p in prefill_tokens)
+    if total_tokens == 0:
+        return 0.0, 0
+
+    batch_size = len(prefill_tokens)
+    uids = list(range(batch_size))
+
+    start_time = time.perf_counter()
+
+    try:
+        batch: object = PromptProcessingBatch(
+            model=model,
+            uids=uids,
+            caches=[list(c) for c in caches_list],
+            prefill_step_size=prefill_step_size,
+        )
+    except ValueError as e:
+        # ``_merge_caches`` raises ``ValueError`` for cache types without
+        # a ``merge`` method. Surface as a typed unsupported error so the
+        # caller can fall back cleanly.
+        raise BatchedPrefillUnsupportedError(
+            f"cache layer does not support batching: {e}"
+        ) from e
+
+    logger.debug(
+        f"Batched prefill: {batch_size} slots, "
+        f"lengths={[len(p) for p in prefill_tokens]}, total={total_tokens}"
+    )
+    try:
+        # ``PromptProcessingBatch.prompt`` does the right-padding +
+        # chunked forward internally; one call processes all K
+        # sequences in lock-step.
+        batch.prompt(prefill_tokens)  # type: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
+    except Exception as e:
+        # Convert mlx-internal failures (e.g. shape mismatches between
+        # ``prepare(right_padding=...)`` and the model's attention
+        # implementation) into the typed unsupported error so the
+        # caller falls back to per-slot prefill instead of taking the
+        # whole runner down.
+        raise BatchedPrefillUnsupportedError(
+            f"PromptProcessingBatch.prompt() raised during batched prefill: {e!r}"
+        ) from e
+
+    if on_progress is not None:
+        max_len = max(len(p) for p in prefill_tokens)
+        on_progress(max_len, max_len)
+
+    # Re-extract per-sequence caches and update the original cache lists
+    # in place. Each ``extract_cache(idx)`` produces fresh per-layer
+    # cache objects of the original (non-batched) type with the
+    # post-prefill state for sequence ``idx``; we overwrite the
+    # caller-supplied list contents so any references the caller still
+    # holds (e.g. the SequentialGenerator's per-slot ``caches`` ref)
+    # see the new state.
+    for idx, original_cache in enumerate(caches_list):
+        extracted = cast(list[object], batch.extract_cache(idx))
+        if len(extracted) != len(original_cache):
+            raise BatchedPrefillUnsupportedError(
+                f"extract_cache({idx}) returned {len(extracted)} layers, "
+                f"original cache has {len(original_cache)}"
+            )
+        for i, layer in enumerate(extracted):
+            original_cache[i] = layer  # type: ignore[index]
+
+    elapsed = time.perf_counter() - start_time
+    aggregate_tps = total_tokens / elapsed if elapsed > 0 else 0.0
+    logger.debug(
+        f"Batched prefill complete: {batch_size} slots, "
+        f"{total_tokens} tokens in {elapsed:.2f}s "
+        f"({aggregate_tps:.1f} tok/s aggregate)"
+    )
+    return aggregate_tps, total_tokens
+
+
 def resolve_speculative_decoding(
     draft_model: Model | None,
     group: mx.distributed.Group | None,
@@ -588,6 +798,13 @@ def ban_token_ids(token_ids: list[int]) -> Callable[[mx.array, mx.array], mx.arr
             logits[..., tid] = -1e9
         return logits
 
+    # Marks the processor as not dependent on the running token history,
+    # so the speculative-decoding verify loop can apply it once to a
+    # batched ``(K+1, vocab)`` logits tensor and sample all positions
+    # in a single host-device sync. Stateful processors (e.g. repetition
+    # penalty) leave this attribute unset and force the per-position
+    # path.
+    proc.position_independent = True  # type: ignore[reportAttributeAccessIssue]
     return proc
 
 
@@ -682,7 +899,28 @@ def mlx_generate(
     drafter_model_id: ModelId | None = None,
     num_draft_tokens: int | None = None,
     drafter_min_output_tokens: int | None = None,
+    asymmetric_drafter_rank: int | None = None,
+    asymmetric_drafter_transport: object | None = None,
+    precomputed_target_cache: KVCacheType | None = None,
 ) -> Generator[GenerationResponse]:
+    """Generate tokens for ``task``.
+
+    The ``precomputed_target_cache`` argument is the seam used by
+    :class:`SequentialGenerator._start_batch` to inject a target-side cache
+    that has already been prefilled (typically via :func:`batched_prefill`
+    across multiple in-flight requests on a single GPU). When supplied:
+
+    * the prefix-cache lookup is bypassed entirely (we don't pollute the
+      shared ``KVPrefixCache`` with per-request entries — V1 trade-off);
+    * the local :func:`prefill` call is a no-op (its prompt slice is
+      length 0);
+    * cache offset is assumed to be ``len(all_prompt_tokens) - 1`` so the
+      decode loop seeds from the last prompt token (identical shape to
+      the existing ``is_exact_hit`` path of ``KVPrefixCache.get_kv_cache``).
+
+    Eligibility is enforced by the caller — see
+    :meth:`SequentialGenerator._batch_eligible_for_prefill`.
+    """
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
     # TODO: Randomise task seed and set in taskparams, instead of hard coding as 42.
@@ -735,20 +973,29 @@ def mlx_generate(
         else num_draft_tokens
     ) or 0
     max_tokens = task.max_output_tokens or MAX_TOKENS
-    if group is not None:
-        draft_mode: DraftMode = "none"
+    has_asymmetric_drafter = asymmetric_drafter_rank is not None
+    if has_asymmetric_drafter:
+        draft_mode: DraftMode = resolve_asymmetric_draft_mode(
+            has_asymmetric_drafter=True,
+            request_use_drafter=request_use_drafter,
+            request_draft_mode=request_draft_mode,
+        )
+    elif group is not None:
+        draft_mode = "none"
     else:
         draft_mode = resolve_draft_mode(
             has_drafter_model=draft_model is not None,
             request_use_drafter=request_use_drafter,
             request_draft_mode=request_draft_mode,
         )
-    # Item 8: short-output skip applies only to the model-drafter path
-    # where the drafter prefill cost dominates. N-gram drafting has no
-    # prefill (microsecond suffix-match per round) so the threshold is
-    # irrelevant; baseline non-spec wouldn't be cheaper anyway.
+    asymmetric_drafter_requested = has_asymmetric_drafter and draft_mode == "pipelined"
+    # Item 8: short-output skip applies to drafter-model paths
+    # (``"model"`` and ``"pipelined"``) where the drafter prefill cost
+    # dominates. N-gram drafting has no prefill (microsecond suffix-
+    # match per round) so the threshold is irrelevant; baseline non-
+    # spec wouldn't be cheaper anyway.
     if (
-        draft_mode == "model"
+        draft_mode in ("model", "pipelined")
         and drafter_min_output_tokens is not None
         and max_tokens <= drafter_min_output_tokens
     ):
@@ -777,21 +1024,87 @@ def mlx_generate(
             f"under greedy decoding"
         )
         draft_mode = "none"
-    effective_draft_model = draft_model if draft_mode == "model" else None
-    # Reused below: only the model-drafter path needs paired drafter caches.
-    # The variable name is preserved for readability with the existing cache
-    # bookkeeping code immediately below.
-    spec_active = draft_mode == "model" and effective_draft_model is not None
+    asymmetric_drafter_active = (
+        asymmetric_drafter_requested and draft_mode == "pipelined"
+    )
+    asymmetric_drafter_is_root = (
+        asymmetric_drafter_active and asymmetric_drafter_transport is not None
+    )
+    effective_draft_model = (
+        draft_model if draft_mode in ("model", "pipelined") else None
+    )
+    # Reused below: drafter-model paths need paired drafter caches; the
+    # ngram and none paths don't. The variable name is preserved for
+    # readability with the existing cache bookkeeping code below.
+    spec_active = (
+        draft_mode in ("model", "pipelined") and effective_draft_model is not None
+    )
     if effective_num_draft_tokens < 1:
         # Defaulted to 0 above when the runner didn't pre-resolve K and the
         # request didn't override either. Clamp to 1 so n-gram and model
         # drafters don't crash on zero-K proposals.
         effective_num_draft_tokens = 1
 
+    if asymmetric_drafter_is_root and asymmetric_drafter_transport is not None:
+        # Only the root has access to the transport's clamp; we then
+        # propagate the clamped K to every non-root target rank below
+        # so all ranks agree on the wire-format slot count
+        # (``k + 1``) used by ``_broadcast_drafts`` /
+        # ``_broadcast_target_tokens``. Pre-fix non-root target ranks
+        # used the unclamped ``effective_num_draft_tokens`` to size
+        # their PipelinedModelDrafter, so a per-request override
+        # above the transport budget would have desynchronized the
+        # spec-decode collectives (Codex P1, PR #20 round 3).
+        #
+        # The clamp helper now accepts ``HasNumDraftTokens``, so it
+        # works on both :class:`DrafterTransport` (in-process path:
+        # the transport itself is the session) and
+        # :class:`RemoteTransport` (production asymmetric path: the
+        # session factory). Pre-fix the call site only invoked the
+        # clamp for ``DrafterTransport``, so production
+        # ``RemoteTransport`` placements silently skipped the clamp
+        # and oversized per-request K landed in ``forward(...)``,
+        # raising ``ValueError`` and killing the request (Codex P1,
+        # PR #20 round 5, generate.py:1025).
+        from exo.worker.engines.mlx.generator.drafter_transport import (
+            HasNumDraftTokens,
+            clamp_num_draft_tokens_to_transport,
+        )
+
+        if isinstance(asymmetric_drafter_transport, HasNumDraftTokens):
+            clamped_k, was_clamped = clamp_num_draft_tokens_to_transport(
+                effective_num_draft_tokens, asymmetric_drafter_transport
+            )
+            if was_clamped:
+                logger.warning(
+                    f"clamping num_draft_tokens={effective_num_draft_tokens} "
+                    f"to transport max={clamped_k} "
+                    f"(request_num_draft_tokens={request_num_draft_tokens}); "
+                    f"raise EXO_NUM_DRAFT_TOKENS at runner startup to widen "
+                    f"the wire-protocol budget"
+                )
+            effective_num_draft_tokens = clamped_k
+
+    if asymmetric_drafter_active and group is not None and group.size() > 1:
+        effective_num_draft_tokens = _broadcast_clamped_num_draft_tokens(
+            effective_num_draft_tokens=effective_num_draft_tokens,
+            group=group,
+        )
+
     prefix_hit_length = 0
     matched_index: int | None = None
     is_exact_hit = False
-    if kv_prefix_cache is None:
+    if precomputed_target_cache is not None:
+        # External batched-prefill path: caller supplies a cache already
+        # filled to ``len(all_prompt_tokens) - 1`` and we leave a single
+        # decode-seed token in ``prompt_tokens``. ``prefill()`` below
+        # short-circuits because the slice ``prompt_tokens[:-1]`` is
+        # empty; the prefix-cache update path is also skipped because
+        # ``matched_index`` stays None and ``is_exact_hit`` stays False.
+        caches = precomputed_target_cache
+        prompt_tokens = all_prompt_tokens[-1:]
+        prefix_hit_length = int(all_prompt_tokens.size) - 1
+    elif kv_prefix_cache is None:
         caches = make_kv_cache(model=model)
         prompt_tokens = all_prompt_tokens
     else:
@@ -1027,22 +1340,115 @@ def mlx_generate(
     logger.info("Starting decode")
     mx_barrier(group)
 
-    # Dispatch to the selected drafting strategy. ``ModelDrafter``
-    # delegates to ``mlx_lm.stream_generate(draft_model=...)`` (the
-    # well-tested upstream spec loop); ``NgramDrafter`` runs an in-house
-    # spec loop that proposes drafts via in-context suffix lookup;
-    # ``NoSpecDrafter`` is a thin pass-through to ``mlx_lm.stream_generate``.
+    # Dispatch to the selected drafting strategy via ``make_drafter``.
+    # The factory routes:
+    #   * ``"model"``    -> mlx_lm.speculative_generate_step (well-tested upstream)
+    #   * ``"pipelined"`` -> custom spec loop with cross-round speculation
+    #                       behind a ``DrafterTransport`` (in-process or remote)
+    #   * ``"ngram"``    -> in-house n-gram suffix-match spec loop
+    #   * ``"none"``     -> plain ``mlx_lm.stream_generate``
+    # Per-task session for the asymmetric remote drafter (if active).
+    # Opened in the ``if`` branch below; closed in the ``finally`` at
+    # the end of the function so a fault, cancellation, or normal
+    # completion all funnel through ``session.shutdown()`` and free
+    # the drafter rank's per-session KV cache. Without this, every
+    # completed request would leak ~50-100 MB of KV cache on the
+    # drafter rank until the runner shuts down.
     drafter: Drafter
-    if spec_active and effective_draft_model is not None:
-        drafter = ModelDrafter(
-            draft_model=effective_draft_model,
-            draft_cache=drafter_caches,
-            num_draft_tokens=effective_num_draft_tokens,
+    asymmetric_session: object | None = None
+    if asymmetric_drafter_active:
+        assert asymmetric_drafter_rank is not None
+        target_subgroup_size = group.size() if group is not None else 1
+        from exo.worker.engines.mlx.generator.drafter_transport import (
+            DrafterTransport as _DrafterTransport,
         )
-    elif draft_mode == "ngram":
-        drafter = NgramDrafter(num_draft_tokens=effective_num_draft_tokens)
+        from exo.worker.engines.mlx.generator.remote_drafter import (
+            RemoteTransport as _RemoteTransport,
+        )
+
+        if asymmetric_drafter_is_root:
+            # Target root rank: open a per-request session on the
+            # ``RemoteTransport`` wire so concurrent target requests
+            # don't interleave OP_FORWARD frames on the same socket.
+            # Test fakes pass a bare ``DrafterTransport``; in that
+            # singular-task path we use it directly.
+            if isinstance(asymmetric_drafter_transport, _RemoteTransport):
+                asymmetric_session = asymmetric_drafter_transport.open_session()
+                session_transport: object = asymmetric_session
+            elif isinstance(asymmetric_drafter_transport, _DrafterTransport):
+                session_transport = asymmetric_drafter_transport
+            else:
+                raise TypeError(
+                    "asymmetric_drafter_transport must be a RemoteTransport "
+                    "(production asymmetric placement) or a DrafterTransport "
+                    "(test fakes); "
+                    f"got {type(asymmetric_drafter_transport).__name__}"
+                )
+            # Sync this request's drafter cache against the prompt before
+            # constructing the drafter wrapper. The session sends OP_PREFILL
+            # with prompt[:-2] (matching ``_spec_drafter_prefill``'s
+            # invariant: align the drafter's offset to ``len(prompt) - 2``
+            # so the spec loop's first OP_FORWARD seeds from prompt[-2]).
+            prefill_prompt: list[int] = [
+                int(t) for t in cast(list[int], all_prompt_tokens[:-2].tolist())
+            ]
+            try:
+                cast(_DrafterTransport, session_transport).reset_and_prefill(
+                    prefill_prompt
+                )
+                drafter = make_drafter(
+                    mode=draft_mode,
+                    num_draft_tokens=effective_num_draft_tokens,
+                    draft_model=None,
+                    draft_cache=None,
+                    target_subgroup_size=target_subgroup_size,
+                    pipelined_transport=session_transport,
+                    target_group=group,
+                    is_target_root=True,
+                )
+            except BaseException:
+                # ``make_drafter`` or ``reset_and_prefill`` raised;
+                # release the freshly-allocated session so the drafter
+                # rank doesn't hold its KV cache forever.
+                try:
+                    if asymmetric_session is not None:
+                        cast(_DrafterTransport, asymmetric_session).shutdown()
+                except Exception:
+                    logger.opt(exception=True).warning(
+                        "asymmetric drafter session shutdown raised "
+                        "during error recovery; ignoring"
+                    )
+                asymmetric_session = None
+                raise
+        else:
+            # Non-root target rank in a multi-target placement: no
+            # socket, no session, no drafter prefill (the drafter rank
+            # only knows about the root's session). The consumer
+            # drafter receives drafts each round via a rank-0
+            # broadcast on ``group``; the broadcast is the only
+            # cross-rank wire this rank needs.
+            assert group is not None and target_subgroup_size > 1, (
+                "asymmetric_drafter non-root rank requires a target "
+                "subgroup of size > 1 (V1 single-target placements "
+                "only have rank 0; this branch should not be reached)"
+            )
+            drafter = make_drafter(
+                mode=draft_mode,
+                num_draft_tokens=effective_num_draft_tokens,
+                draft_model=None,
+                draft_cache=None,
+                target_subgroup_size=target_subgroup_size,
+                pipelined_transport=None,
+                target_group=group,
+                is_target_root=False,
+            )
     else:
-        drafter = NoSpecDrafter()
+        drafter = make_drafter(
+            mode=draft_mode,
+            num_draft_tokens=effective_num_draft_tokens,
+            draft_model=effective_draft_model if spec_active else None,
+            draft_cache=drafter_caches if spec_active else None,
+        )
 
     # ``decode_prompt`` is the prefill-tail (last two tokens of the
     # prompt). The cache is already aligned to ``all_prompt_tokens[:-2]``
@@ -1067,130 +1473,160 @@ def mlx_generate(
     else:
         full_context_tokens = []
 
-    for completion_tokens, out in enumerate(
-        drafter.stream(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=decode_prompt,
-            context_tokens=full_context_tokens,
-            prompt_cache=caches,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            logits_processors=logits_processors,
-            prefill_step_size=1,
-        ),
-        start=1,
-    ):
-        generated_text_parts.append(out.text)
-        accumulated_text += out.text
-        if getattr(out, "from_draft", False):
-            from_draft_count += 1
+    try:
+        for completion_tokens, out in enumerate(
+            drafter.stream(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=decode_prompt,
+                context_tokens=full_context_tokens,
+                prompt_cache=caches,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                prefill_step_size=1,
+            ),
+            start=1,
+        ):
+            generated_text_parts.append(out.text)
+            accumulated_text += out.text
+            if getattr(out, "from_draft", False):
+                from_draft_count += 1
 
-        # Check for stop sequences
-        text = out.text
-        finish_reason: FinishReason | None = cast(
-            FinishReason | None, out.finish_reason
-        )
-        stop_matched = False
-
-        if stop_sequences:
-            for stop_seq in stop_sequences:
-                if stop_seq in accumulated_text:
-                    # Trim text to just before the stop sequence
-                    stop_index = accumulated_text.find(stop_seq)
-                    text_before_stop = accumulated_text[:stop_index]
-                    chunk_start = len(accumulated_text) - len(out.text)
-                    text = text_before_stop[chunk_start:]
-                    finish_reason = "stop"
-                    stop_matched = True
-                    break
-
-        is_done = finish_reason is not None
-
-        stats: GenerationStats | None = None
-        if is_done:
-            # Drafter telemetry: only stamp the id when speculation actually
-            # ran for this request. `effective_draft_model is not None` is
-            # the source of truth -- short-skip and distributed paths zero
-            # it out, so we don't spuriously surface a drafter that didn't
-            # contribute.
-            telemetry_drafter_id: str | None = None
-            telemetry_k: int | None = None
-            if drafter.mode == "model" and effective_draft_model is not None:
-                telemetry_k = effective_num_draft_tokens
-                if drafter_model_id is not None:
-                    telemetry_drafter_id = str(drafter_model_id)
-            elif drafter.mode == "ngram":
-                telemetry_k = effective_num_draft_tokens
-
-            stats = GenerationStats(
-                prompt_tps=float(prefill_tps or out.prompt_tps),
-                generation_tps=float(out.generation_tps),
-                prompt_tokens=int(prefill_tokens + out.prompt_tokens),
-                generation_tokens=int(out.generation_tokens),
-                peak_memory_usage=Memory.from_gb(out.peak_memory),
-                drafter_model_id=telemetry_drafter_id,
-                accepted_draft_tokens=from_draft_count,
-                num_draft_tokens=telemetry_k,
-                draft_mode=drafter.mode,
+            # Check for stop sequences
+            text = out.text
+            finish_reason: FinishReason | None = cast(
+                FinishReason | None, out.finish_reason
             )
-            if not stop_matched and out.finish_reason not in get_args(FinishReason):
-                logger.warning(
-                    f"Model generated unexpected finish_reason: {out.finish_reason}"
+            stop_matched = False
+
+            if stop_sequences:
+                for stop_seq in stop_sequences:
+                    if stop_seq in accumulated_text:
+                        # Trim text to just before the stop sequence
+                        stop_index = accumulated_text.find(stop_seq)
+                        text_before_stop = accumulated_text[:stop_index]
+                        chunk_start = len(accumulated_text) - len(out.text)
+                        text = text_before_stop[chunk_start:]
+                        finish_reason = "stop"
+                        stop_matched = True
+                        break
+
+            is_done = finish_reason is not None
+
+            stats: GenerationStats | None = None
+            if is_done:
+                # Drafter telemetry: stamp the id whenever speculation
+                # actually ran for this request. The asymmetric
+                # ``"pipelined"`` path has no in-process draft model
+                # (the weights live on the drafter rank), so guarding
+                # solely on ``effective_draft_model is not None`` would
+                # spuriously zero out telemetry for the very topology
+                # the drafter buys us the most. We instead trust
+                # ``drafter.mode`` together with the asymmetric flag,
+                # which is set iff the placement actually wired a
+                # drafter rank into this instance.
+                telemetry_drafter_id: str | None = None
+                telemetry_k: int | None = None
+                if (
+                    drafter.mode == "model" and effective_draft_model is not None
+                ) or drafter.mode == "pipelined":
+                    telemetry_k = effective_num_draft_tokens
+                    if drafter_model_id is not None:
+                        telemetry_drafter_id = str(drafter_model_id)
+                elif drafter.mode == "ngram":
+                    telemetry_k = effective_num_draft_tokens
+
+                stats = GenerationStats(
+                    prompt_tps=float(prefill_tps or out.prompt_tps),
+                    generation_tps=float(out.generation_tps),
+                    prompt_tokens=int(prefill_tokens + out.prompt_tokens),
+                    generation_tokens=int(out.generation_tokens),
+                    peak_memory_usage=Memory.from_gb(out.peak_memory),
+                    drafter_model_id=telemetry_drafter_id,
+                    accepted_draft_tokens=from_draft_count,
+                    num_draft_tokens=telemetry_k,
+                    draft_mode=drafter.mode,
+                )
+                if not stop_matched and out.finish_reason not in get_args(FinishReason):
+                    logger.warning(
+                        f"Model generated unexpected finish_reason: {out.finish_reason}"
+                    )
+
+                total_prompt_tokens = len(all_prompt_tokens)
+                usage = Usage(
+                    prompt_tokens=total_prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_prompt_tokens + completion_tokens,
+                    prompt_tokens_details=PromptTokensDetails(
+                        cached_tokens=prefix_hit_length
+                    ),
+                    completion_tokens_details=CompletionTokensDetails(
+                        reasoning_tokens=0
+                    ),
                 )
 
-            total_prompt_tokens = len(all_prompt_tokens)
-            usage = Usage(
-                prompt_tokens=total_prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_prompt_tokens + completion_tokens,
-                prompt_tokens_details=PromptTokensDetails(
-                    cached_tokens=prefix_hit_length
-                ),
-                completion_tokens_details=CompletionTokensDetails(reasoning_tokens=0),
+            # Extract logprobs from the full vocabulary logprobs array
+            logprob: float | None = None
+            top_logprobs: list[TopLogprobItem] | None = None
+            if task.logprobs:
+                with mx.stream(generation_stream):
+                    logprob, top_logprobs = extract_top_logprobs(
+                        logprobs=out.logprobs,
+                        tokenizer=tokenizer,
+                        top_logprobs=task.top_logprobs or DEFAULT_TOP_LOGPROBS,
+                        selected_token=out.token,
+                    )
+
+            if is_done:
+                # Log generation stats
+                generation_elapsed = time.perf_counter() - generation_start_time
+                generated_tokens = len(generated_text_parts)
+                generation_tps = (
+                    generated_tokens / generation_elapsed
+                    if generation_elapsed > 0
+                    else 0.0
+                )
+                logger.debug(
+                    f"Generation complete: prefill {prompt_tokens} tokens @ "
+                    f"{prefill_tps:.1f} tok/s, generated {generated_tokens} tokens @ "
+                    f"{generation_tps:.1f} tok/s"
+                )
+            if on_generation_token is not None:
+                on_generation_token()
+
+            yield GenerationResponse(
+                text=text,
+                token=out.token,
+                logprob=logprob,
+                top_logprobs=top_logprobs,
+                finish_reason=finish_reason,
+                stats=stats,
+                usage=usage,
             )
 
-        # Extract logprobs from the full vocabulary logprobs array
-        logprob: float | None = None
-        top_logprobs: list[TopLogprobItem] | None = None
-        if task.logprobs:
-            with mx.stream(generation_stream):
-                logprob, top_logprobs = extract_top_logprobs(
-                    logprobs=out.logprobs,
-                    tokenizer=tokenizer,
-                    top_logprobs=task.top_logprobs or DEFAULT_TOP_LOGPROBS,
-                    selected_token=out.token,
+            if is_done:
+                mx_barrier(group)
+                break
+
+            # Limit accumulated_text to what's needed for stop sequence detection
+            if max_stop_len > 0 and len(accumulated_text) > max_stop_len:
+                accumulated_text = accumulated_text[-max_stop_len:]
+    finally:
+        # Free the per-request drafter-rank KV cache. ``shutdown`` is
+        # idempotent on ``_SessionHandle``; the ``try / except`` is
+        # belt-and-suspenders for the rare case where the wire is
+        # already torn down (e.g. runner shutdown raced this call).
+        if asymmetric_session is not None:
+            try:
+                from exo.worker.engines.mlx.generator.drafter_transport import (
+                    DrafterTransport as _DrafterTransport,
                 )
 
-        if is_done:
-            # Log generation stats
-            generation_elapsed = time.perf_counter() - generation_start_time
-            generated_tokens = len(generated_text_parts)
-            generation_tps = (
-                generated_tokens / generation_elapsed if generation_elapsed > 0 else 0.0
-            )
-            logger.debug(
-                f"Generation complete: prefill {prompt_tokens} tokens @ "
-                f"{prefill_tps:.1f} tok/s, generated {generated_tokens} tokens @ "
-                f"{generation_tps:.1f} tok/s"
-            )
-        if on_generation_token is not None:
-            on_generation_token()
-
-        yield GenerationResponse(
-            text=text,
-            token=out.token,
-            logprob=logprob,
-            top_logprobs=top_logprobs,
-            finish_reason=finish_reason,
-            stats=stats,
-            usage=usage,
-        )
-
-        if is_done:
-            mx_barrier(group)
-            break
-
-        # Limit accumulated_text to what's needed for stop sequence detection
-        if max_stop_len > 0 and len(accumulated_text) > max_stop_len:
-            accumulated_text = accumulated_text[-max_stop_len:]
+                cast(_DrafterTransport, asymmetric_session).shutdown()
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "asymmetric drafter session shutdown raised; the "
+                    "drafter rank will free its session cache on its "
+                    "next OP_SHUTDOWN"
+                )
