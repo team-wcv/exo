@@ -373,16 +373,49 @@ class SequentialGenerator(Engine):
                 del self._active_tasks[task_id]
 
             except Exception as e:
-                # Send error chunk to the client and mark the task finished,
-                # but DO NOT re-raise. Re-raising here propagates through
-                # ``handle_generation_tasks`` and triggers ``RunnerFailed``
-                # on the supervisor, which currently leaves a respawned
-                # target rank stuck in ``RunnerIdle`` because its drafter
-                # peer is still ``RunnerRunning`` (see
-                # ``_init_distributed_backend``). A single malformed
-                # request must never permanently brick a multi-rank
-                # instance, and with ``max_concurrent_tasks > 1`` it must
-                # not affect the *other* in-flight tasks either.
+                # ALWAYS log first. Without this, an exception silently
+                # swallowed on a non-root target rank presents to the
+                # operator as "rank 1 returned ready in 0.4 s with no
+                # tokens"; the actual error -- which may be a master
+                # divergence, an MLX collective desync, or a bad model
+                # weights load -- is invisible. Logging is unconditional
+                # because the multi-rank re-raise path below also relies
+                # on it (the supervisor records the message but not the
+                # traceback).
+                logger.opt(exception=True).error(
+                    "generator.step raised; "
+                    f"task_id={task_id} "
+                    f"command_id={task.command_id} "
+                    f"device_rank={self.device_rank} "
+                    f"group_size={self.group.size() if self.group is not None else 1} "
+                    f"exc={type(e).__name__}: {e}"
+                )
+
+                # Multi-rank targets MUST re-raise. Any exception here
+                # (whether a request-level bug or a system-level MLX
+                # error) means this rank exited the generator without
+                # participating in the verify-forward TP collective the
+                # peer rank is now waiting on. Swallowing leaves the
+                # peer hung indefinitely; raising hands control to
+                # ``handle_generation_tasks`` -> supervisor ->
+                # ``RunnerFailed``. The peer's ``_kill_runner`` rule
+                # then tears down its own runner via the
+                # ``RunnerFailed``-on-peer trigger (see
+                # ``worker/plan.py``), the master rebuilds the instance
+                # via ``CreateRunner``, and the next request sees a
+                # fresh group. Total recovery is bounded by the
+                # supervisor escalation chain (~25 s), not "manual
+                # operator restart".
+                #
+                # Single-rank runners keep the legacy swallow path: a
+                # malformed request shouldn't crash the (only) runner
+                # and break unrelated concurrent tasks sharing the
+                # process.
+                if self.group is not None and self.group.size() > 1:
+                    self._send_error(task, e)
+                    del self._active_tasks[task_id]
+                    raise
+
                 self._send_error(task, e)
                 del self._active_tasks[task_id]
                 output.append((task_id, FinishedResponse()))

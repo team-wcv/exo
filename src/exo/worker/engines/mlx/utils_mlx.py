@@ -1385,80 +1385,164 @@ def _parse_kimi_tool_calls(text: str):
         return [_parse_single_tool(text)]
 
 
+# Maximum number of tasks the agreement protocol can carry per round.
+# Sized to ``EXO_MAX_CONCURRENT_REQUESTS`` (default 8) plus headroom for
+# transient ``_maybe_queue`` build-up; tasks beyond this slot count get
+# deferred to the next agreement round, never lost. Matches the sizing
+# the supervisor already enforces via ``max_concurrent_tasks`` at the
+# generator layer, so steady-state oversubscription is not a real
+# concern.
+_MX_AGREE_MAX_TASKS: Final[int] = 16
+# UUID4 string length (``len("01234567-...-...-...-............") == 36``).
+# The agreement protocol broadcasts task IDs as fixed-width ASCII so
+# every rank can decode the same canonical payload. Hashes are not
+# enough on their own because root needs to specify *which* tasks are
+# in the agreed set without leaving the consumer guessing on collision.
+_MX_TASK_ID_BYTES: Final[int] = 36
+# Buffer layout: ``[count, task_id_bytes_0, task_id_bytes_1, ...]`` where
+# each task_id slot is ``_MX_TASK_ID_BYTES`` ints (one ASCII char per
+# int32 slot). A char fits trivially in int32, and using one slot per
+# char avoids endian / packing concerns at the cost of ~4x bandwidth --
+# acceptable since this only runs at admit boundaries, not per-token.
+_MX_AGREE_BUFFER_LEN: Final[int] = 1 + _MX_AGREE_MAX_TASKS * _MX_TASK_ID_BYTES
+
+
 def mx_all_gather_tasks(
     tasks: list[TextGeneration],
     group: mx.distributed.Group | None,
 ) -> tuple[list[TextGeneration], list[TextGeneration]]:
-    # Single-rank short-circuit. ``mx.distributed.all_gather(group=None)``
-    # delegates to the MLX *default* group, which on an asymmetric runner
-    # is the parent (target+drafter) group. The drafter rank is busy in
-    # ``drafter_serve_loop`` doing its own ``recv`` on that same default
-    # group, so an unguarded all-gather here cross-talks with the
-    # drafter's wire protocol and corrupts the next command frame the
-    # drafter decodes (manifesting as ``num_forwards must be >= 1, got
-    # 0``). When ``group is None`` we are by construction the only
-    # participating rank, so every task is trivially "agreed".
+    """Root-authoritative task agreement across target ranks.
+
+    Returns ``(agreed, leftover)`` where:
+
+      * ``agreed``: tasks every rank should admit this round, in the
+        canonical order set by the root rank. On root this is simply
+        the root-side ``tasks``; on non-root it is the subset of root's
+        broadcast that this rank also has locally (any root-side task
+        not yet visible here is silently dropped from this round and
+        will surface again next round once libp2p delivers it).
+      * ``leftover``: local tasks that didn't make it into ``agreed``.
+        For root this is always empty (root's view is canonical); for
+        non-root these are tasks the root hasn't seen yet, kept in the
+        caller's ``_maybe_queue`` for the next agreement cycle.
+
+    Why authoritative rather than intersection-based:
+      The previous design used ``mx.distributed.all_gather`` to compute
+      the per-rank intersection. JACCL's ``all_gather`` was unreliable
+      on Apple Silicon for the small int32 buffers used here (peer
+      slots returned as float32 bit patterns), which forced a strict
+      drift-detection assertion on top of an ``all_sum`` hash. That
+      detector worked correctly but fired in steady state because the
+      master legitimately pushes tasks to ranks at slightly different
+      times (libp2p delivery races). Authoritative agreement rides on
+      the well-exercised ``all_sum`` primitive (via
+      :func:`mx_broadcast_int_list`) and tolerates the delivery race
+      naturally: rank N waits on its local task to be delivered before
+      it's eligible for admission, but never desyncs from the
+      collective.
+
+    Why ``group is None`` short-circuits without touching MLX:
+      ``mx.distributed.all_gather(group=None)`` delegates to MLX's
+      default group, which on an asymmetric runner is the parent
+      (target+drafter) group. The drafter rank is busy in
+      ``drafter_serve_loop`` doing its own ``recv`` on that same
+      default group, so an unguarded all-gather here cross-talks with
+      the drafter's wire protocol. When ``group is None`` we are by
+      construction the only participating rank, so every task is
+      trivially "agreed".
+    """
     if group is None:
         return list(tasks), []
 
-    # JACCL's ``all_gather`` is unreliable for the small task-agreement
-    # buffers we used to ship through here on Apple Silicon: the gather
-    # sporadically reads peer slots back as float32 bit patterns rather
-    # than the int32 we wrote (observed: count gather returning
-    # ``[1, 1068875521]`` -> 0x3FB80001 / a float32 representation), which
-    # forced a 144 GB padded-buffer allocation and crashed the runner with
-    # ``[metal::malloc] Attempting to allocate ...``.
-    #
-    # The agreement protocol is *defensive*: in practice the master pushes
-    # the same task list to every target rank via the worker plan, so each
-    # rank's local view already matches its peers. Rather than re-running
-    # the unreliable all-gather, we run a one-collective drift detector
-    # over the well-tested ``all_sum`` primitive: each rank computes a
-    # 31-bit hash of its task list, root broadcasts its hash via
-    # :func:`mx_broadcast_int_list`, every other rank compares against
-    # its own. A mismatch signals master divergence and raises locally
-    # (which propagates to the runner's main loop and surfaces in
-    # ``handle_generation_tasks`` rather than corrupting later TP
-    # forwards on stale state).
-    local_hash = _hash_task_list(tasks)
     is_root = group.rank() == 0
-    expected_hash = mx_broadcast_int_list(
-        [local_hash] if is_root else None,
-        length=1,
-        group=group,
-        is_root=is_root,
-    )[0]
-    if expected_hash != local_hash:
-        raise RuntimeError(
-            "mx_all_gather_tasks: target ranks disagree on the task list "
-            f"(rank {group.rank()} hash={local_hash}, root hash={expected_hash}); "
-            "the master should be pushing identical plans to every target "
-            "rank -- this is a master/event-sourcing bug, not a runtime "
-            "condition. Refusing to silently desync the next TP forward."
+
+    # Build the canonical payload on root: ``[count, id_0_chars,
+    # id_1_chars, ...]``. UUIDs are pure ASCII so ``ord()`` lands
+    # cleanly in our int32 broadcast slots; the ``_validate_broadcast_values``
+    # guard in :func:`mx_broadcast_int_list` would catch any unexpected
+    # high-bit chars.
+    if is_root:
+        admitted = tasks[:_MX_AGREE_MAX_TASKS]
+        payload: list[int] = [len(admitted)]
+        for task in admitted:
+            payload.extend(_encode_task_id(task.task_id))
+        # Pad remaining slots (no-task slots stay all-zero so the
+        # decoder's null check terminates cleanly).
+        payload.extend([0] * (_MX_AGREE_BUFFER_LEN - len(payload)))
+        broadcast = mx_broadcast_int_list(
+            payload, _MX_AGREE_BUFFER_LEN, group, is_root=True
         )
-    return list(tasks), []
+    else:
+        broadcast = mx_broadcast_int_list(
+            None, _MX_AGREE_BUFFER_LEN, group, is_root=False
+        )
+
+    count = broadcast[0]
+    if count < 0 or count > _MX_AGREE_MAX_TASKS:
+        # Programming error: root encoded a count outside the agreed
+        # bounds. This is a hard failure -- the buffer is corrupt and
+        # we cannot decode the rest of the payload safely.
+        raise RuntimeError(
+            f"mx_all_gather_tasks: broadcast count {count} outside "
+            f"[0, {_MX_AGREE_MAX_TASKS}]; broadcast buffer corrupt "
+            "(JACCL all_sum returned non-int32 data?)"
+        )
+
+    canonical_ids: list[str] = []
+    for i in range(count):
+        start = 1 + i * _MX_TASK_ID_BYTES
+        end = start + _MX_TASK_ID_BYTES
+        canonical_ids.append(_decode_task_id(broadcast[start:end]))
+
+    if is_root:
+        return list(tasks[: len(canonical_ids)]), []
+
+    # Non-root: keep canonical order, drop entries we don't have yet,
+    # and stash unrecognised local tasks for the next round.
+    local_by_id: dict[str, TextGeneration] = {t.task_id: t for t in tasks}
+    agreed: list[TextGeneration] = []
+    for tid in canonical_ids:
+        task = local_by_id.pop(tid, None)
+        if task is not None:
+            agreed.append(task)
+    leftover = list(local_by_id.values())
+    return agreed, leftover
 
 
-def _hash_task_list(tasks: list[TextGeneration]) -> int:
-    """Stable 31-bit hash of a task list for cross-rank drift detection.
+def _encode_task_id(task_id: str) -> list[int]:
+    """ASCII-encode ``task_id`` into ``_MX_TASK_ID_BYTES`` int32 slots.
 
-    31-bit because :func:`mx_broadcast_int_list` rejects values >=
-    ``2**31`` (the int32 broadcast buffer would otherwise wrap on
-    all-sum). Hashing the task IDs is sufficient because the master
-    schedules tasks by ID -- two ranks with the same ID set + ordering
-    are by construction working on the same plan; the rest of the task
-    payload is content-addressed off that ID.
+    Right-pads with zeros if ``task_id`` is shorter than the slot
+    count; raises if it's longer or contains non-ASCII (UUIDs are pure
+    ASCII by construction, so any rejection here points at upstream
+    bugs).
     """
-    # FNV-1a-style polynomial hash with an explicit per-byte mix so
-    # transpositions are caught (a plain byte-sum over task IDs
-    # collides on permutations). Deterministic across runner
-    # subprocesses because we bypass Python's salted ``hash()``;
-    # folded to 31 bits because :func:`mx_broadcast_int_list` rejects
-    # negatives and values >= ``2**31``.
-    h = 0
-    for task in tasks:
-        for byte in task.task_id.encode("utf-8"):
-            h = ((h * 1000003) ^ byte) & 0x7FFFFFFF
-        # Separator byte so [a, b] and [ab] hash distinctly.
-        h = ((h * 1000003) ^ 0x1F) & 0x7FFFFFFF
-    return h
+    encoded = task_id.encode("ascii")
+    if len(encoded) > _MX_TASK_ID_BYTES:
+        raise ValueError(
+            f"task_id {task_id!r} exceeds {_MX_TASK_ID_BYTES} bytes; "
+            "agreement buffer slot is sized for UUID4 strings only"
+        )
+    out = [int(b) for b in encoded]
+    out.extend([0] * (_MX_TASK_ID_BYTES - len(out)))
+    return out
+
+
+def _decode_task_id(slots: list[int]) -> str:
+    """Inverse of :func:`_encode_task_id`: int32 slots -> ASCII string.
+
+    Stops at the first zero byte (the encode pad), so the result is
+    bounded by ``_MX_TASK_ID_BYTES``. Any non-ASCII byte is rejected
+    locally rather than silently coerced; the broadcast contract
+    requires ASCII-only IDs.
+    """
+    chars: list[str] = []
+    for value in slots:
+        if value == 0:
+            break
+        if value < 0 or value > 127:
+            raise ValueError(
+                f"task_id slot {value} outside ASCII range; broadcast payload corrupt"
+            )
+        chars.append(chr(value))
+    return "".join(chars)
