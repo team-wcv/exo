@@ -34,7 +34,7 @@ def exo_shard_downloader(
         max_parallel_downloads, offline=offline
     )
     if peer_download_enabled:
-        inner = PeerAwareShardDownloader(inner)
+        inner = PeerAwareShardDownloader(inner, offline=offline)
     return SingletonShardDownloader(inner)
 
 

@@ -2,9 +2,9 @@
 # pyright: reportPrivateUsage=false
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Generator, Iterable
 from pathlib import Path
-from typing import cast
+from typing import Callable, cast
 
 import aiofiles
 import aiofiles.os as aios
@@ -402,3 +402,212 @@ class TestPeerAwareShardDownloader:
         assert downloader._pop_available_peers(shard) == [peer_a]
         assert downloader._pop_available_peers(shard) == [peer_b]
         assert downloader._pop_available_peers(shard) == []
+
+
+class TestPeerSelectionRespectsOfflineAndIgnorePatterns:
+    """Codex P1s on PR #16 round 2: peer selection must mirror
+    ``download_shard``'s logic exactly (``ignore_patterns`` for
+    ``original/*`` / ``metal/*``) and must propagate the coordinator's
+    offline mode into ``fetch_file_list_with_cache`` so a cold offline
+    node can still complete a peer download without reaching out to
+    HuggingFace for the initial file list.
+    """
+
+    def test_offline_flag_defaults_to_false(self) -> None:
+        downloader = PeerAwareShardDownloader(NoopShardDownloader())
+        assert downloader._offline is False
+
+    def test_offline_flag_propagates(self) -> None:
+        downloader = PeerAwareShardDownloader(
+            NoopShardDownloader(), offline=True
+        )
+        assert downloader._offline is True
+
+    async def test_try_peer_download_passes_offline_to_fetch_file_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``_try_peer_download`` must thread ``self._offline`` into
+        ``fetch_file_list_with_cache`` instead of always passing
+        ``skip_internet=False``. We capture the kwargs by patching
+        the import binding inside ``peer_shard_downloader``.
+        """
+        from exo.download import peer_shard_downloader as psd
+        from exo.download.peer_download import PeerFileInfo
+        from exo.shared.types.worker.downloads import FileListEntry
+
+        captured: dict[str, object] = {}
+
+        async def fake_fetch(
+            *args: object, **kwargs: object
+        ) -> list[FileListEntry]:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            # Empty list -> no required files -> ``failed`` short-
+            # circuit -> we get out cleanly with the call kwargs
+            # captured.
+            return []
+
+        async def fake_peer_status(
+            peer_host: str,
+            peer_port: int,
+            model_id_normalized: str,
+            timeout: float = 5.0,
+        ) -> list[PeerFileInfo] | None:
+            return [
+                PeerFileInfo(
+                    path="model-00001-of-00002.safetensors",
+                    size=10,
+                    complete=True,
+                    safe_bytes=10,
+                )
+            ]
+
+        async def fake_resolve_dir(model_id: ModelId) -> Path:
+            return Path("/tmp/fake-model")
+
+        async def fake_resolve_allow(shard: ShardMetadata) -> list[str]:
+            return ["*.safetensors"]
+
+        monkeypatch.setattr(psd, "fetch_file_list_with_cache", fake_fetch)
+        monkeypatch.setattr(psd, "get_peer_file_status", fake_peer_status)
+        monkeypatch.setattr(psd, "resolve_model_dir", fake_resolve_dir)
+        monkeypatch.setattr(psd, "resolve_allow_patterns", fake_resolve_allow)
+
+        downloader = PeerAwareShardDownloader(
+            NoopShardDownloader(), offline=True
+        )
+        shard = _make_shard(ModelId("test-org/model-a"))
+
+        result = await downloader._try_peer_download(
+            shard,
+            peer_ip="10.0.0.1",
+            peer_port=52415,
+            model_id_normalized="test-org/model-a",
+        )
+        # Empty file list short-circuits to ``failed`` path and returns
+        # None, but that's beside the point -- we just need the kwargs.
+        assert result is None
+        assert captured["kwargs"] == {
+            "recursive": True,
+            "skip_internet": True,
+        }, (
+            "skip_internet must reflect downloader.offline (got "
+            f"{captured['kwargs']!r})"
+        )
+
+    async def test_try_peer_download_filters_ignore_patterns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Files under ``original/*`` and ``metal/*`` are excluded by
+        ``download_shard``; the peer path must skip them too. Pre-fix
+        the peer path filtered only ``allow_patterns``, leaving these
+        in the required-files list. The peer doesn't have them
+        locally (HF never downloads them), the strict
+        ``peer_info missing => fail`` check fired, and every download
+        fell back to HuggingFace.
+        """
+        from exo.download import peer_shard_downloader as psd
+        from exo.download.peer_download import PeerFileInfo
+        from exo.shared.types.worker.downloads import FileListEntry
+
+        served = [
+            FileListEntry(
+                type="file",
+                path="model-00001-of-00002.safetensors",
+                size=100,
+            ),
+            FileListEntry(type="file", path="config.json", size=10),
+            # These two should NOT show up on the peer's required-files
+            # list once the fix lands. Pre-fix they did, the peer didn't
+            # have them, and the whole transfer fell back to HF.
+            FileListEntry(
+                type="file", path="original/consolidated.00.pth", size=999
+            ),
+            FileListEntry(type="file", path="metal/dist.bin", size=999),
+        ]
+
+        async def fake_fetch(
+            *_args: object, **_kwargs: object
+        ) -> list[FileListEntry]:
+            return served
+
+        # The peer reports ONLY the canonical files, exactly the shape
+        # production peers are in (HF never downloaded ``original/*`` or
+        # ``metal/*`` for them either).
+        peer_paths = ("model-00001-of-00002.safetensors", "config.json")
+
+        async def fake_peer_status(
+            peer_host: str,
+            peer_port: int,
+            model_id_normalized: str,
+            timeout: float = 5.0,
+        ) -> list[PeerFileInfo] | None:
+            return [
+                PeerFileInfo(
+                    path=p, size=100, complete=True, safe_bytes=100
+                )
+                for p in peer_paths
+            ]
+
+        async def fake_resolve_dir(model_id: ModelId) -> Path:
+            return Path("/tmp/fake-model")
+
+        async def fake_resolve_allow(shard: ShardMetadata) -> list[str]:
+            # Match the production allow set permissively; the legacy
+            # bug was that ``allow_patterns`` admitted ``original/*`` /
+            # ``metal/*`` whenever the repo allow-list was loose.
+            return ["*"]
+
+        async def fake_download(
+            peer_ip: str,
+            peer_port: int,
+            model_id_normalized: str,
+            file_path: str,
+            target_dir: Path,
+            expected_size: int,
+            on_progress: object = None,
+        ) -> Path | None:
+            return None
+
+        captured_kwargs: list[object] = []
+        real_filter = psd.filter_repo_objects
+
+        def recording_filter(
+            items: Iterable[FileListEntry],
+            *,
+            allow_patterns: list[str] | str | None = None,
+            ignore_patterns: list[str] | str | None = None,
+            key: Callable[[FileListEntry], str] | None = None,
+        ) -> Generator[FileListEntry, None, None]:
+            captured_kwargs.append(ignore_patterns)
+            yield from real_filter(
+                items,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                key=key,
+            )
+
+        monkeypatch.setattr(psd, "fetch_file_list_with_cache", fake_fetch)
+        monkeypatch.setattr(psd, "get_peer_file_status", fake_peer_status)
+        monkeypatch.setattr(psd, "resolve_model_dir", fake_resolve_dir)
+        monkeypatch.setattr(psd, "resolve_allow_patterns", fake_resolve_allow)
+        monkeypatch.setattr(psd, "download_file_from_peer", fake_download)
+        monkeypatch.setattr(psd, "filter_repo_objects", recording_filter)
+
+        downloader = PeerAwareShardDownloader(NoopShardDownloader())
+        shard = _make_shard(ModelId("test-org/model-a"))
+
+        await downloader._try_peer_download(
+            shard,
+            peer_ip="10.0.0.1",
+            peer_port=52415,
+            model_id_normalized="test-org/model-a",
+        )
+
+        assert captured_kwargs == [["original/*", "metal/*"]], (
+            "peer download must apply the same ``ignore_patterns`` set "
+            "as ``download_shard`` (download_utils.py:983) so peers "
+            "that don't have ``original/*`` / ``metal/*`` aren't "
+            "incorrectly judged incomplete; got "
+            f"{captured_kwargs!r}"
+        )

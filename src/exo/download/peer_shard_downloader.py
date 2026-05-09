@@ -61,8 +61,17 @@ class PeerAwareShardDownloader(ShardDownloader):
     no peer has it or the transfer fails.
     """
 
-    def __init__(self, inner: ShardDownloader) -> None:
+    def __init__(self, inner: ShardDownloader, offline: bool = False) -> None:
         self._inner = inner
+        # ``offline`` mirrors ``ResumableShardDownloader.offline`` and is
+        # forwarded to ``fetch_file_list_with_cache`` so that a node
+        # configured for offline operation never reaches out to
+        # HuggingFace before attempting a peer download. Pre-fix the
+        # peer path hard-coded ``skip_internet=False`` and would raise
+        # on cold/offline nodes that lacked a cached file list, ending
+        # the peer attempt before it could even start. Codex flagged
+        # this as a P1 (PR #16 round 2).
+        self._offline = offline
         self._progress_callbacks: list[
             Callable[[ShardMetadata, RepoDownloadProgress], Awaitable[None]]
         ] = []
@@ -153,15 +162,33 @@ class PeerAwareShardDownloader(ShardDownloader):
                 shard.model_card.model_id,
                 revision,
                 recursive=True,
-                skip_internet=False,
+                # Honor the coordinator's offline setting so a cold
+                # offline node can still satisfy a peer download from
+                # the LAN without reaching out to HuggingFace for the
+                # initial file-list fetch (Codex P1, PR #16 round 2).
+                skip_internet=self._offline,
             )
         except Exception:
             return None
 
         allow_patterns = await resolve_allow_patterns(shard)
+        # Mirror ``download_shard``'s selection logic exactly: it filters
+        # by ``allow_patterns`` AND ``ignore_patterns`` before deciding
+        # which files to fetch. Pre-fix the peer path applied
+        # ``allow_patterns`` only and missed the ignore set, so for any
+        # repo containing ``original/*`` or ``metal/*`` (e.g. Llama 3.x
+        # repos) the peer would not have those files locally, and the
+        # later strict ``peer_info`` missing => fail check would abort
+        # the whole peer transfer and force a HuggingFace fallback for
+        # every download (Codex P1, PR #16 round 2). Keep this list in
+        # sync with ``download_shard`` (download_utils.py:983).
+        ignore_patterns = ["original/*", "metal/*"]
         filtered_file_list: list[FileListEntry] = list(
             filter_repo_objects(
-                file_list, allow_patterns=allow_patterns, key=lambda x: x.path
+                file_list,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                key=lambda x: x.path,
             )
         )
 
