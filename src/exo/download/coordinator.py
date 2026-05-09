@@ -305,6 +305,23 @@ class DownloadCoordinator:
                 f"{drafter_ids} for {target_shard.model_card.model_id}"
             )
             return
+        if self.offline:
+            # Offline mode: ``ModelCard.load`` falls through to
+            # ``fetch_from_hf`` whenever the drafter card isn't already
+            # in ``_card_cache``, which is an outbound HuggingFace
+            # request. Drafter downloads are silent best-effort, so the
+            # subsequent ``DownloadFailed`` would have been swallowed
+            # anyway, but the HF call itself can stall command
+            # processing for the full client timeout (the upstream
+            # offline guard at ``_start_download`` line 263 only fires
+            # *after* this path has already issued the network call).
+            # Skip drafter chaining outright in offline mode -- if the
+            # operator wants a drafter, they need to ship it locally.
+            logger.debug(
+                f"Offline mode: skipping drafter card resolution "
+                f"{drafter_ids} for {target_shard.model_card.model_id}"
+            )
+            return
 
         for drafter_id in drafter_ids:
             if drafter_id in self.download_status:

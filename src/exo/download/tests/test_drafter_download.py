@@ -173,6 +173,8 @@ async def _wait_for_completed(
 @contextlib.asynccontextmanager
 async def _running_coordinator(
     downloader: _RecordingShardDownloader,
+    *,
+    offline: bool = False,
 ) -> AsyncIterator[
     tuple[
         DownloadCoordinator,
@@ -188,6 +190,7 @@ async def _running_coordinator(
         shard_downloader=downloader,
         download_command_receiver=cmd_recv,
         event_sender=event_send,
+        offline=offline,
     )
     coordinator_task = asyncio.create_task(coordinator.run())
     try:
@@ -301,3 +304,47 @@ async def test_drafter_chain_swallows_card_load_error() -> None:
             await asyncio.sleep(0.05)
 
     assert downloader.ensured == [TARGET_ID]
+
+
+async def test_drafter_chain_skipped_in_offline_mode() -> None:
+    """Offline-mode coordinators must NOT call ``ModelCard.load`` for
+    declared drafters even when the target download itself is locally
+    complete.
+
+    ``ModelCard.load`` falls through to ``ModelCard.fetch_from_hf``
+    whenever the drafter card isn't already in ``_card_cache``. Under
+    ``EXO_OFFLINE=true`` that's an outbound HuggingFace request that
+    can stall command processing for the full client timeout before
+    the eventual ``DownloadFailed`` is swallowed by the silent
+    best-effort drafter chain. The fix short-circuits
+    ``_maybe_chain_drafter_download`` when ``self.offline`` is True
+    so no card resolution is attempted.
+
+    Test calls ``_maybe_chain_drafter_download`` directly so the
+    assertion is precise: ``ModelCard.load`` is the network entry
+    point, and the test fails immediately if the offline guard
+    regresses to letting it fire.
+    """
+    target_shard = _make_shard(_make_target_card([DRAFTER_ID]))
+
+    async def fail_load(_: ModelId) -> ModelCard:
+        raise AssertionError(
+            "ModelCard.load must not be called in offline mode "
+            "(would trigger a HuggingFace fetch)"
+        )
+
+    with patch.object(ModelCard, "load", side_effect=fail_load):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader, offline=True) as (
+            coordinator,
+            _,
+            _,
+        ):
+            await coordinator._maybe_chain_drafter_download(  # pyright: ignore[reportPrivateUsage]
+                target_shard
+            )
+            await asyncio.sleep(0.05)
+
+    # No drafter download was ever queued because the chain
+    # short-circuited before ``ModelCard.load``.
+    assert downloader.ensured == []
