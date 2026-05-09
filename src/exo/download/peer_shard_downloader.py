@@ -15,14 +15,17 @@ from collections import defaultdict, deque
 from collections.abc import Awaitable, Coroutine
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable, Literal
 
+import aiofiles.os as aios
 from loguru import logger
 
 from exo.download.download_utils import (
     RepoDownloadProgress,
+    calc_hash,
     calculate_repo_progress,
     fetch_file_list_with_cache,
+    file_meta,
     is_image_model,
     resolve_allow_patterns,
     resolve_model_dir,
@@ -223,7 +226,70 @@ class PeerAwareShardDownloader(ShardDownloader):
                     expected_size,
                     on_progress=on_file_progress,
                 )
-                return result is not None
+                if result is None:
+                    return False
+                # Codex flagged (P2, PR #16 round 2) that peer downloads
+                # were marked successful as soon as ``n_read ==
+                # expected_size``, with no content-integrity check. A
+                # peer serving wrong bytes with the right length
+                # (stale/corrupt/malicious) would otherwise be
+                # silently accepted as model data, causing
+                # hard-to-diagnose inference failures.
+                #
+                # Validate against HuggingFace's authoritative hash:
+                # we already need internet for ``fetch_file_list_with_cache``
+                # (line 149), so the extra ``file_meta()`` HEAD is
+                # cheap. Trusting a hash advertised by the peer would
+                # leave us vulnerable to a malicious peer that lies
+                # about both bytes and hash; HF is the canonical
+                # source.
+                #
+                # On mismatch the partial-or-renamed file is removed
+                # so the caller's HF fallback (``self._inner.ensure_shard``)
+                # starts from a clean slate.
+                try:
+                    _expected_size, expected_etag = await file_meta(
+                        shard.model_card.model_id, revision, file_path
+                    )
+                except Exception as exc:
+                    # If we can't reach HF for metadata, the file
+                    # might still be valid -- but we can't prove it.
+                    # Fall back to HF download where the same call
+                    # would have happened anyway.
+                    logger.warning(
+                        f"Peer download integrity-check failed: could not "
+                        f"fetch HF metadata for {file_path}: {exc}; "
+                        f"discarding peer-downloaded copy"
+                    )
+                    try:
+                        await aios.remove(result)
+                    except Exception as cleanup_exc:
+                        logger.debug(
+                            f"Could not remove unverified peer download "
+                            f"{result}: {cleanup_exc}"
+                        )
+                    return False
+
+                hash_type: Literal["sha1", "sha256"] = (
+                    "sha256" if len(expected_etag) == 64 else "sha1"
+                )
+                final_hash = await calc_hash(result, hash_type=hash_type)
+                if final_hash != expected_etag:
+                    logger.warning(
+                        f"Peer-downloaded {file_path} from {peer_ip} has "
+                        f"hash {final_hash} but HF authoritative hash is "
+                        f"{expected_etag} ({hash_type}); discarding and "
+                        f"falling back to HF"
+                    )
+                    try:
+                        await aios.remove(result)
+                    except Exception as exc:
+                        logger.error(
+                            f"Failed to remove corrupt peer download "
+                            f"{result}: {exc}"
+                        )
+                    return False
+                return True
 
         # Initialize progress for all files
         for f in filtered_file_list:

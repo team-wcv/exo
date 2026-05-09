@@ -597,7 +597,23 @@ def make_kv_cache(
         caches: list[
             KVCache | RotatingKVCache | QuantizedKVCache | ArraysCache | CacheList
         ] = list(model.make_cache())  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]
-        if KV_CACHE_BITS is not None:
+        # Apply the same single-node safeguard used in the
+        # ``make_cache``-less branch below: ``QuantizedKVCache``
+        # cannot be combined with the single-node ``BatchGenerator``
+        # path because mlx-lm calls ``_merge_caches`` on every step
+        # and ``QuantizedKVCache`` doesn't implement ``merge``. Models
+        # with ``make_cache()`` (e.g. Gemma3 with mixed attention
+        # layers) used to skip this guard and would crash at runtime
+        # with::
+        #
+        #     <class 'mlx_lm.models.cache.QuantizedKVCache'> does not
+        #     yet support batching with history
+        #
+        # Pipeline-parallel deployments use a different generation
+        # path that does support quantized caches, so we honor
+        # ``EXO_KV_CACHE_BITS`` only when the model has PP layer
+        # wrappers installed.
+        if KV_CACHE_BITS is not None and _model_is_pipeline_parallel(model):
             # Honor KV_CACHE_BITS even when the model provides its own
             # make_cache(). Replace plain KVCache entries with
             # QuantizedKVCache; leave ArraysCache (DeltaNet/SSM) and other
@@ -617,7 +633,14 @@ def make_kv_cache(
                 f"for {quantized}/{len(caches)} layers"
             )
         else:
-            logger.info("Using MLX LM's make cache")
+            if KV_CACHE_BITS is not None:
+                logger.info(
+                    f"EXO_KV_CACHE_BITS={KV_CACHE_BITS} ignored in single-node mode "
+                    f"(QuantizedKVCache has no merge() support, "
+                    f"required by BatchGenerator); using model.make_cache() unmodified"
+                )
+            else:
+                logger.info("Using MLX LM's make cache")
             # Increase KVCache step size to reduce Metal allocator
             # fragmentation. Default step=256 causes a mx.concatenate
             # expansion every prefill chunk; a larger step lets the cache
