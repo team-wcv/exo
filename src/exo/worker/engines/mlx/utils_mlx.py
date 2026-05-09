@@ -1246,6 +1246,10 @@ def mx_barrier(group: mx.distributed.Group | None):
 # max) and reject negatives explicitly so a caller passing a Python
 # ``-1`` doesn't silently wrap into a 4-billion-ish "valid" int32.
 _MX_BROADCAST_MAX_VALUE: Final[int] = (1 << 31) - 1
+# Toggle to dump every broadcast call's send/recv buffers. Set via
+# ``EXO_PROBE_BROADCAST=1`` for ad-hoc diagnostics; leave off in
+# steady state because the per-token logging spam quickly dominates.
+_BROADCAST_PROBE: Final[bool] = bool(os.environ.get("EXO_PROBE_BROADCAST"))
 
 
 def mx_broadcast_int_list(
@@ -1329,21 +1333,25 @@ def mx_broadcast_int_list(
             )
         _validate_broadcast_values(values)
         send_buffer = mx.array(values, dtype=mx.int32)
-        # Send to every peer in turn. Sequential sends keep the wire
-        # ordering deterministic across rank pairs, which matters
-        # when the same send/recv primitive is used for the
-        # follow-up ``target_tokens`` broadcast in the same spec
-        # round: peers must receive drafts before tokens.
         for dst in range(1, group_size):
             sent = mx.distributed.send(send_buffer, dst=dst, group=group)
             mx.eval(sent)
+        if _BROADCAST_PROBE:
+            logger.warning(
+                f"mx_broadcast_int_list ROOT sent {values} (len={length})"
+            )
         return list(values)
 
     received = mx.distributed.recv(
         shape=(length,), dtype=mx.int32, src=0, group=group
     )
     mx.eval(received)
-    return [int(v) for v in cast(list[int], received.tolist())]
+    out = [int(v) for v in cast(list[int], received.tolist())]
+    if _BROADCAST_PROBE:
+        logger.warning(
+            f"mx_broadcast_int_list PEER recvd {out} (expected len={length})"
+        )
+    return out
 
 
 def mx_all_sum_int_list(
