@@ -154,6 +154,14 @@ a bug, please flag it.
 from __future__ import annotations
 
 import contextlib
+
+# Side-channel file logger for diagnostics. The runner subprocess on
+# some hosts (smbpt observed during gemma-4 bring-up) does not flush
+# its loguru output anywhere we can read; this fallback writes plain
+# timestamped lines to ``/tmp/spec_diag_<pid>.log`` so we always have
+# something to grep, regardless of how loguru / stdout are wired.
+import os as _diag_os
+import sys as _diag_sys
 import time
 from typing import Callable, Final, Generator, Sequence, cast, final
 
@@ -174,6 +182,23 @@ from exo.worker.engines.mlx.utils_mlx import (
     target_peer_broadcast_int_list,
 )
 from exo.worker.runner.bootstrap import logger as _diag_logger
+
+
+def _spec_diag(message: str) -> None:
+    """Log to loguru AND a per-pid side-channel file. Best effort."""
+    _diag_logger.info(message)
+    try:
+        path = f"/tmp/spec_diag_{_diag_os.getpid()}.log"
+        with open(path, "a", encoding="utf-8") as fh:
+            _ = fh.write(f"{time.time():.6f} {message}\n")
+    except OSError:
+        # Filesystem unavailable; fall back to stderr so something
+        # still surfaces.
+        try:
+            _ = _diag_sys.stderr.write(f"[spec-diag fallback] {message}\n")
+            _diag_sys.stderr.flush()
+        except OSError:
+            pass
 
 # Length-prefix slot value reserved for the "drafter aborted" signal.
 # Picked from the int32 positive range so it survives
@@ -773,8 +798,8 @@ def _pipelined_speculative_step_body(
         if target_group is not None
         else (0 if is_target_root else -1)
     )
-    _diag_logger.info(
-        f"[spec-diag] rank {_diag_rank}: spec body entered "
+    _spec_diag(
+        f"rank {_diag_rank}: spec body entered "
         f"(prompt size={int(prompt.size)}, k={k}, root={is_target_root})"
     )
 
@@ -790,8 +815,8 @@ def _pipelined_speculative_step_body(
         mx.eval([c.state for c in prompt_cache])  # type: ignore[reportArgumentType]
         y = y[n_to_process:]
         mx.clear_cache()
-        _diag_logger.info(
-            f"[spec-diag] rank {_diag_rank}: spec-body prefill iter "
+        _spec_diag(
+            f"rank {_diag_rank}: spec-body prefill iter "
             f"{_diag_prefill_iters} done in "
             f"{(time.perf_counter() - _diag_prefill_t0) * 1000:.1f}ms "
             f"(remaining y.size={int(y.size)})"
@@ -800,8 +825,8 @@ def _pipelined_speculative_step_body(
 
     _diag_seed_t0 = time.perf_counter()
     seed = int(y.item())
-    _diag_logger.info(
-        f"[spec-diag] rank {_diag_rank}: seed materialized in "
+    _spec_diag(
+        f"rank {_diag_rank}: seed materialized in "
         f"{(time.perf_counter() - _diag_seed_t0) * 1000:.1f}ms (seed={seed})"
     )
     # ``prev_tokens`` carries the running token sequence (prompt +
@@ -816,22 +841,22 @@ def _pipelined_speculative_step_body(
     # ranks we skip that and just receive the broadcast.
     if transport is not None:
         _diag_fwd_t0 = time.perf_counter()
-        _diag_logger.info(
-            f"[spec-diag] rank {_diag_rank}: round 0 about to call "
+        _spec_diag(
+            f"rank {_diag_rank}: round 0 about to call "
             f"transport.forward([seed], k={k})"
         )
         drafts_future = transport.forward([seed], k)
         drafts_local: list[int] | None = drafts_future.result()
-        _diag_logger.info(
-            f"[spec-diag] rank {_diag_rank}: round 0 transport.forward "
+        _spec_diag(
+            f"rank {_diag_rank}: round 0 transport.forward "
             f"returned in {(time.perf_counter() - _diag_fwd_t0) * 1000:.1f}ms "
             f"(drafts_local len={len(drafts_local) if drafts_local else 0})"
         )
     else:
         drafts_local = None
     _diag_bcast_t0 = time.perf_counter()
-    _diag_logger.info(
-        f"[spec-diag] rank {_diag_rank}: round 0 about to call "
+    _spec_diag(
+        f"rank {_diag_rank}: round 0 about to call "
         f"_broadcast_drafts (root={is_target_root})"
     )
     drafts = _broadcast_drafts(
@@ -841,14 +866,15 @@ def _pipelined_speculative_step_body(
         target_peer_fanout=target_peer_fanout,
         is_root=is_target_root,
     )
-    _diag_logger.info(
-        f"[spec-diag] rank {_diag_rank}: round 0 _broadcast_drafts done "
+    _spec_diag(
+        f"rank {_diag_rank}: round 0 _broadcast_drafts done "
         f"in {(time.perf_counter() - _diag_bcast_t0) * 1000:.1f}ms "
         f"(drafts len={len(drafts)})"
     )
 
     speculative_future: DraftFuture | None = None
     ntoks = 0
+    _diag_round = 0
 
     while ntoks < max_tokens:
         budget = max_tokens - ntoks
@@ -856,6 +882,11 @@ def _pipelined_speculative_step_body(
         if k_this < 1:
             break
         drafts = drafts[:k_this]
+        _diag_round += 1
+        _spec_diag(
+            f"rank {_diag_rank}: round {_diag_round} top "
+            f"(ntoks={ntoks}, k_this={k_this})"
+        )
 
         # ----- Cross-round speculation: dispatch in parallel with verify -----
         # Speculate only when:
@@ -885,7 +916,17 @@ def _pipelined_speculative_step_body(
         seed_arr = mx.array([seed], dtype=mx.uint32)
         draft_arr = mx.array(drafts, dtype=mx.uint32)
         verify_input = mx.concatenate([seed_arr, draft_arr])
+        _diag_verify_t0 = time.perf_counter()
+        _spec_diag(
+            f"rank {_diag_rank}: round {_diag_round} about to call "
+            f"model(verify_input[None]) (verify_len={k_this + 1})"
+        )
         logits = model(verify_input[None], cache=prompt_cache)
+        _spec_diag(
+            f"rank {_diag_rank}: round {_diag_round} model(verify) "
+            f"dispatched in {(time.perf_counter() - _diag_verify_t0) * 1000:.1f}ms "
+            f"(NOT yet eval'd, MLX is lazy)"
+        )
         # logits shape: (1, k_this + 1, vocab)
 
         target_logprobs: list[mx.array]
@@ -921,12 +962,31 @@ def _pipelined_speculative_step_body(
             )
             target_logprobs = [batched_logprobs[i] for i in range(k_this + 1)]
             if is_target_root:
+                _diag_sample_t0 = time.perf_counter()
+                _spec_diag(
+                    f"rank {_diag_rank}: round {_diag_round} root: about to "
+                    f"call sampler(batched_logprobs)"
+                )
                 sampled_batch = sampler(batched_logprobs)
+                _spec_diag(
+                    f"rank {_diag_rank}: round {_diag_round} root: about to "
+                    f"mx.eval(sampled_batch) (this forces verify forward + "
+                    f"all_sum to actually run)"
+                )
                 mx.eval(sampled_batch)
+                _spec_diag(
+                    f"rank {_diag_rank}: round {_diag_round} root: "
+                    f"mx.eval(sampled_batch) done in "
+                    f"{(time.perf_counter() - _diag_sample_t0) * 1000:.1f}ms"
+                )
                 target_tokens = [int(t) for t in sampled_batch.tolist()]  # type: ignore[reportUnknownArgumentType]
             else:
                 # Filled by broadcast below; skip the sampler entirely.
                 target_tokens = []
+                _spec_diag(
+                    f"rank {_diag_rank}: round {_diag_round} non-root: "
+                    f"skipped sampler, awaiting broadcast"
+                )
         else:
             # Stateful path: logits processors (e.g. repetition penalty)
             # depend on ``running_prev`` which only resolves between
@@ -965,6 +1025,11 @@ def _pipelined_speculative_step_body(
         # accept/reject decisions are bit-identical. Single-rank
         # placements (``target_group is None``) short-circuit to
         # identity, so this is free for the non-multi-target paths.
+        _diag_tbcast_t0 = time.perf_counter()
+        _spec_diag(
+            f"rank {_diag_rank}: round {_diag_round} about to call "
+            f"_broadcast_target_tokens (root={is_target_root})"
+        )
         target_tokens = _broadcast_target_tokens(
             target_tokens if is_target_root else None,
             k=k,
@@ -972,6 +1037,11 @@ def _pipelined_speculative_step_body(
             target_group=target_group,
             target_peer_fanout=target_peer_fanout,
             is_root=is_target_root,
+        )
+        _spec_diag(
+            f"rank {_diag_rank}: round {_diag_round} _broadcast_target_tokens "
+            f"done in {(time.perf_counter() - _diag_tbcast_t0) * 1000:.1f}ms "
+            f"(target_tokens len={len(target_tokens)})"
         )
 
         # ----- Greedy accept loop -----
@@ -1071,12 +1141,22 @@ def _pipelined_speculative_step_body(
         else:
             next_drafts_local = None
 
+        _diag_nbcast_t0 = time.perf_counter()
+        _spec_diag(
+            f"rank {_diag_rank}: round {_diag_round} about to call "
+            f"_broadcast_drafts (next, accepted={num_accepted}/{k_this})"
+        )
         next_drafts = _broadcast_drafts(
             next_drafts_local,
             k=k,
             target_group=target_group,
             target_peer_fanout=target_peer_fanout,
             is_root=is_target_root,
+        )
+        _spec_diag(
+            f"rank {_diag_rank}: round {_diag_round} _broadcast_drafts (next) "
+            f"done in {(time.perf_counter() - _diag_nbcast_t0) * 1000:.1f}ms "
+            f"(next_drafts len={len(next_drafts)})"
         )
 
         seed = next_seed
