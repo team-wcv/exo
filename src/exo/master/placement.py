@@ -545,7 +545,7 @@ def _node_has_or_lacks_known_jaccl_path(
     return "known_no_path"
 
 
-_THUNDERBOLT_CANDIDATE_INTERFACE_NAME = re.compile(r"^en\d+$")
+_THUNDERBOLT_CANDIDATE_INTERFACE_NAME = re.compile(r"^(en|bridge)\d+$")
 
 
 def _is_plausible_thunderbolt_candidate(
@@ -557,11 +557,16 @@ def _is_plausible_thunderbolt_candidate(
     The heuristic limits the permissive ``unknown``-typing fallback to
     interfaces that *could* legitimately be a Thunderbolt bridge:
 
-    * the interface name matches ``en\\d+`` -- the canonical Apple
-      ``ifconfig`` naming for physical/bridged ethernet-style adapters
-      (Wi-Fi is ``en0`` / ``en1``, Thunderbolt bridges sit on
-      ``en2`` / ``en3`` / ``en4`` on every cluster machine we ship),
-      AND
+    * the interface name matches ``en\\d+`` (canonical Apple
+      ``ifconfig`` naming for physical/bridged ethernet-style
+      adapters; Wi-Fi is ``en0``/``en1``, Thunderbolt bridges sit on
+      ``en2``/``en3``/``en4`` on every cluster machine we ship), OR
+      ``bridge\\d+`` (the Thunderbolt Bridge service device --
+      ``info_gatherer`` explicitly models the macOS Thunderbolt
+      Bridge as ``bridge0``, which does NOT appear in
+      ``networksetup -listallhardwareports`` and therefore typically
+      lands in ``NetworkInterfaceInfo`` with
+      ``interface_type='unknown'``); AND
     * the interface advertises a routable IPv4 (filters out loopback,
       link-local, and unset addresses via
       :func:`_is_routable_jaccl_ipv4`).
@@ -572,6 +577,19 @@ def _is_plausible_thunderbolt_candidate(
     loopback (``lo*``) all fail the name check, so a Wi-Fi-only node
     that happens to have a Tailscale ``utun3`` link with a routable
     ``100.x`` IPv4 no longer slips through the JACCL preflight.
+
+    Codex P2 (PR #11 round-(N+13), placement.py:578): the regex was
+    initially scoped to ``en\\d+`` only. ``info_gatherer`` explicitly
+    models the macOS Thunderbolt Bridge as ``bridge0`` and that
+    device does not appear in ``networksetup
+    -listallhardwareports``, so on a node where the actual JACCL
+    path runs over the bridge service rather than a member ``en*``
+    leaf, the bridge interface lands here with
+    ``interface_type='unknown'`` and the round-(N+13) narrowing
+    rejected it -- causing false-negative JACCL preflight failures
+    on the very partial-typing scenario this fallback is meant to
+    tolerate. Round-(N+14) accepts ``bridge\\d+`` as a candidate
+    name in addition to ``en\\d+``.
     """
     if not _THUNDERBOLT_CANDIDATE_INTERFACE_NAME.match(interface.name):
         return False

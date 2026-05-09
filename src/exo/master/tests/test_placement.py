@@ -2476,6 +2476,124 @@ def test_jaccl_placement_allows_nodes_with_partial_interface_typing(
     )
 
 
+def test_jaccl_placement_allows_bridge0_thunderbolt_with_unknown_typing(
+    model_card: ModelCard,
+) -> None:
+    """Codex P2 (PR #11 round-(N+13), placement.py:578): the
+    round-(N+13) narrowing of the unknown-typing fallback to
+    ``en\\d+`` was too restrictive. ``info_gatherer`` explicitly
+    models the macOS Thunderbolt Bridge as ``bridge0`` (see
+    ``utils.info_gatherer.info_gatherer._extract_bridge_services``).
+    That device does NOT appear in ``networksetup
+    -listallhardwareports``, so it lands here with
+    ``interface_type='unknown'`` and a routable IPv4 -- the exact
+    scenario this fallback is meant to tolerate. Pre-(N+14) the
+    ``en\\d+`` regex rejected ``bridge0``, regressing real
+    Thunderbolt-Bridge deployments to the ``bb rdma repair`` error
+    even when the bridge was correctly carrying the JACCL path.
+
+    Round-(N+14) widens the candidate regex to ``^(en|bridge)\\d+$``
+    so a node whose only proper-typed candidate is Wi-Fi but ALSO
+    has an unclassified ``bridge0`` with a routable IPv4 still
+    resolves to ``unknown`` (permissive) rather than
+    ``known_no_path`` (rejected). The legitimate rejection paths
+    are still covered by
+    ``test_jaccl_placement_rejects_nodes_with_only_vpn_tunnel_unknown_typing``
+    and
+    ``test_jaccl_placement_rejects_nodes_with_only_loopback_unknown_typing``.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_socket_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_socket_connection(1))
+    )
+
+    node_network = {
+        node_a: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.50",
+                    interface_type="wifi",
+                ),
+                # Thunderbolt Bridge service device: ``info_gatherer``
+                # models this as ``bridge0`` and it does not appear in
+                # ``networksetup -listallhardwareports`` so it lands
+                # here as ``"unknown"`` with the routable IPv4 the
+                # JACCL path actually uses.
+                NetworkInterfaceInfo(
+                    name="bridge0",
+                    ip_address="192.168.10.10",
+                    interface_type="unknown",
+                ),
+            ]
+        ),
+        node_b: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.51",
+                    interface_type="wifi",
+                ),
+                NetworkInterfaceInfo(
+                    name="bridge0",
+                    ip_address="192.168.10.11",
+                    interface_type="unknown",
+                ),
+            ]
+        ),
+    }
+
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
+        node_network,
+    )
+
+    assert len(placements) == 1
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxJacclInstance), (
+        "MlxJaccl placement must succeed when the only TB-bridge "
+        "candidate is named ``bridge0`` (the canonical macOS "
+        "Thunderbolt Bridge device); the round-(N+13) ``en\\d+`` "
+        "regex was too narrow and regressed real ``bridge0`` "
+        "deployments to ``known_no_path``. Round-(N+14) accepts "
+        "``bridge\\d+`` as well."
+    )
+
+
 def test_jaccl_placement_rejects_nodes_with_only_vpn_tunnel_unknown_typing(
     model_card: ModelCard,
 ) -> None:
