@@ -1343,6 +1343,112 @@ class TestPeerDownloadZeroByteFiles:
         assert (await aios.stat(gitattributes)).st_size == 0
         assert (await aios.stat(empty_shim)).st_size == 0
 
+    async def test_unknown_size_file_aborts_peer_transfer_for_hf_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Codex P1 (PR #16 round-(N+11), peer_shard_downloader.py:354):
+        ``FileListEntry(size=None)`` is NOT a zero-byte marker -- the
+        upstream ``fetch_file_list_with_cache`` returns ``size=None``
+        for files discovered via the safetensors index whose size
+        wasn't in the HF API response (real weight shards). Pre-fix
+        the round-(N+10) materialize-as-empty path treated those as
+        empty markers and reported peer transfer success on a
+        corrupted snapshot.
+
+        Post-fix, ``size is None`` aborts the peer transfer (returns
+        None) so the HF fallback gets a real download path. We
+        construct a file list with a real safetensor (size=10) and
+        an unknown-size weight shard (size=None) and assert the
+        peer transfer returns None *without* materializing the
+        unknown-size entry as an empty file.
+        """
+        from exo.download import peer_shard_downloader as psd
+        from exo.download.peer_download import PeerFileInfo
+        from exo.shared.types.worker.downloads import FileListEntry
+
+        served = [
+            FileListEntry(type="file", path="model.safetensors", size=10),
+            # Unknown size: real weight shard from safetensors index.
+            FileListEntry(
+                type="file", path="model-00002-of-00003.safetensors", size=None
+            ),
+        ]
+
+        async def fake_fetch(*_args: object, **_kwargs: object) -> list[FileListEntry]:
+            return served
+
+        async def fake_peer_status(
+            peer_host: str,  # noqa: ARG001
+            peer_port: int,  # noqa: ARG001
+            model_id_normalized: str,  # noqa: ARG001
+            timeout: float = 5.0,  # noqa: ARG001
+        ) -> list[PeerFileInfo] | None:
+            return [
+                PeerFileInfo(
+                    path="model.safetensors", size=10, complete=True, safe_bytes=10
+                ),
+                PeerFileInfo(
+                    path="model-00002-of-00003.safetensors",
+                    size=999,
+                    complete=True,
+                    safe_bytes=999,
+                ),
+            ]
+
+        async def fake_resolve_dir(_model_id: ModelId) -> Path:
+            return tmp_path
+
+        async def fake_resolve_allow(_shard: ShardMetadata) -> list[str]:
+            return ["*"]
+
+        download_called = anyio.Event()
+
+        async def fake_download(
+            peer_ip: str,  # noqa: ARG001
+            peer_port: int,  # noqa: ARG001
+            model_id_normalized: str,  # noqa: ARG001
+            file_path: str,  # noqa: ARG001
+            target_dir: Path,  # noqa: ARG001
+            expected_size: int,  # noqa: ARG001
+            on_progress: object = None,  # noqa: ARG001
+        ) -> Path | None:
+            download_called.set()
+            return None
+
+        monkeypatch.setattr(psd, "fetch_file_list_with_cache", fake_fetch)
+        monkeypatch.setattr(psd, "get_peer_file_status", fake_peer_status)
+        monkeypatch.setattr(psd, "resolve_model_dir", fake_resolve_dir)
+        monkeypatch.setattr(psd, "resolve_allow_patterns", fake_resolve_allow)
+        monkeypatch.setattr(psd, "download_file_from_peer", fake_download)
+
+        downloader = PeerAwareShardDownloader(NoopShardDownloader(), offline=True)
+        shard = _make_shard(ModelId("test-org/model-a"))
+
+        result = await downloader._try_peer_download(
+            shard,
+            peer_ip="10.0.0.1",
+            peer_port=52415,
+            model_id_normalized="test-org/model-a",
+        )
+        assert result is None, (
+            "peer transfer must abort (return None) when the file list "
+            "contains a size=None entry; HF fallback then takes over to "
+            "ensure the unknown-size weight is properly downloaded. "
+            "Pre-fix the size=None entry was lumped with size=0 markers "
+            "and materialized as empty, producing corrupted snapshots."
+        )
+        # The unknown-size file must NOT have been created as empty
+        # by the marker-materialization path.
+        unknown_path = tmp_path / "model-00002-of-00003.safetensors"
+        assert not await aios.path.exists(unknown_path), (
+            "size=None entries must NOT be materialized as empty marker "
+            "files -- they're real weights of unknown size, not markers"
+        )
+        assert not download_called.is_set(), (
+            "peer transfer should abort BEFORE issuing any download "
+            "call when a size=None entry is encountered"
+        )
+
     async def test_zero_byte_files_not_created_when_canonical_transfer_fails(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

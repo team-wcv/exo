@@ -359,10 +359,46 @@ class PeerAwareShardDownloader(ShardDownloader):
         # those marker files (model loaders, processors that probe
         # for ``chat_template.json``, etc.) would then fail in ways
         # that don't point back at the peer step.
+        #
+        # Codex P1 (PR #16 round-(N+11), peer_shard_downloader.py:354):
+        # ``size is None`` is *not* the same as ``size == 0``.
+        # ``fetch_file_list_with_cache`` returns ``FileListEntry(size=None)``
+        # for files discovered via the safetensors index (e.g. weight
+        # shards whose size is not in the HF API response). Pre-fix
+        # the previous round lumped ``None`` together with literal
+        # zero and materialized those weight files as empty,
+        # producing a "DownloadCompleted" snapshot with corrupted /
+        # incomplete weights that failed only at load/inference
+        # time. Split the cases: ``== 0`` is materialized as an
+        # empty marker; ``is None`` aborts the peer transfer and
+        # forces the HF fallback so the file gets a real download
+        # path.
+        #
+        # Pre-pass: detect bail-out conditions before constructing any
+        # ``download_one`` coroutines so we don't leak un-awaited
+        # coroutines on the unknown-size or missing-peer-info paths.
+        for f in filtered_file_list:
+            if f.size is None:
+                logger.info(
+                    f"Peer transfer for {model_id_normalized} aborted: "
+                    f"unknown-size entry {f.path!r} (size=None) cannot "
+                    f"be safely transferred over peer; falling back to HF"
+                )
+                return None
+            if f.size == 0:
+                continue
+            peer_info = peer_file_map.get(f.path)
+            if not peer_info or peer_info.safe_bytes <= 0:
+                # Real-size file the peer doesn't have => abort transfer.
+                return None
+
         zero_byte_files: list[str] = []
         tasks: list[Coroutine[Any, Any, bool]] = []
         for f in filtered_file_list:
-            if f.size is None or f.size == 0:
+            if f.size is None:
+                # Pre-pass already bailed; safety net for type-narrowing.
+                return None
+            if f.size == 0:
                 # Defer the local touch until after we know the rest
                 # of the peer transfer succeeded; a partial peer
                 # transfer should not leave behind orphan empty
