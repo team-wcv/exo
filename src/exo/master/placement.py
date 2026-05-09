@@ -558,14 +558,24 @@ def _node_has_or_lacks_known_jaccl_path(
 #   permissive fallback from firing on a Wi-Fi-only node whose
 #   primary ``en0`` happened to land in ``"unknown"`` typing
 #   (e.g. due to a transient ``networksetup`` parse failure).
-# * ``bridge0`` -- the canonical macOS Thunderbolt Bridge service
-#   device (``info_gatherer`` explicitly looks it up by this name).
-#   Higher bridge indices (``bridge100``, ``bridge101`` from
-#   Parallels Desktop; ``bridge2``+ from VirtualBox) are virtualised
-#   networking stacks, NOT Thunderbolt, so admitting them would
-#   reintroduce the same false-positive class as ``utun*``/``wg*``.
+# * ``bridge0`` ... ``bridge99`` -- ``bridge0`` is the canonical
+#   macOS Thunderbolt Bridge service device, but
+#   :func:`exo.utils.info_gatherer.info_gatherer._get_bridge_services`
+#   and :func:`_find_thunderbolt_bridge` enumerate **arbitrary**
+#   ``bridge\\d+`` devices and intersect their member set with the
+#   Thunderbolt hardware-port device list -- a user with multiple
+#   bridges (or a system that already had ``bridge0`` claimed by
+#   another service) can have a real Thunderbolt Bridge exposed as
+#   ``bridge1``/``bridge2``/etc. Codex P1 (PR #11 round-(N+15),
+#   placement.py:567) called out that hard-coding ``bridge0`` here
+#   rejects those legitimate configurations. We accept
+#   ``bridge[0-9]{1,2}`` (i.e. ``bridge0``..``bridge99``); macOS
+#   Internet Sharing reserves ``bridge100``+ for NAT/Parallels/
+#   VirtualBox VM stacks (see ``man 8 bridge``), so excluding the
+#   3-digit range still keeps VM-stack bridges out of the
+#   permissive fallback.
 _THUNDERBOLT_CANDIDATE_INTERFACE_NAME = re.compile(
-    r"^(en[2-9]|en[1-9]\d+|bridge0)$"
+    r"^(en[2-9]|en[1-9]\d+|bridge[0-9]{1,2})$"
 )
 
 
@@ -585,11 +595,12 @@ def _is_plausible_thunderbolt_candidate(
     Tunnel/VPN adapters (``utun*``, ``tun*``, ``tap*``, ``wg*``,
     ``gif*``, ``stf*``, ``ipsec*``), Apple Wireless Direct Link
     (``awdl*`` / ``llw*``), packet-capture (``pktap*``), loopback
-    (``lo*``), VM-stack bridges (``bridge100``, ``bridge2``+), and
-    the Wi-Fi/primary leaves (``en0``, ``en1``) all fail the name
-    check, so a Wi-Fi-only node that happens to have a Tailscale
-    ``utun3`` link or a Parallels ``bridge100`` with a routable
-    IPv4 no longer slips through the JACCL preflight.
+    (``lo*``), Internet-Sharing/VM-stack bridges
+    (``bridge100``, ``bridge101``, ...), and the Wi-Fi/primary
+    leaves (``en0``, ``en1``) all fail the name check, so a
+    Wi-Fi-only node that happens to have a Tailscale ``utun3``
+    link or a Parallels ``bridge100`` with a routable IPv4 no
+    longer slips through the JACCL preflight.
 
     Codex history:
 
@@ -606,12 +617,22 @@ def _is_plausible_thunderbolt_candidate(
     (Wi-Fi/primary), so the Wi-Fi-only-on-VPN attack surface
     re-opened with VM-stack bridges as the new bypass vector.
 
-    Round-(N+15) (this commit) narrows to the exact set:
-    ``en[2-9]`` / ``en[1-9]\\d+`` (excludes ``en0``/``en1``,
-    matches the ``maybe_ethernet`` reclassification convention in
-    :func:`exo.utils.info_gatherer.system_info._get_interface_types_from_networksetup`)
-    and ``bridge0`` only (the canonical macOS Thunderbolt Bridge
-    service device; higher bridge indices are VM stacks).
+    Round-(N+15) narrowed to ``^(en[2-9]|en[1-9]\\d+|bridge0)$``
+    (excludes ``en0``/``en1`` and rejects every non-``bridge0``
+    bridge). Codex flagged (P1, PR #11 round-(N+15),
+    placement.py:567) that the gatherer's
+    :func:`exo.utils.info_gatherer.info_gatherer._find_thunderbolt_bridge`
+    operates on **arbitrary** ``bridgeX`` devices -- a user with
+    multiple bridge services (or one whose ``bridge0`` is already
+    claimed by another stack) can have a real Thunderbolt Bridge
+    exposed as ``bridge1``/``bridge2``/etc., so hard-coding
+    ``bridge0`` rejected legitimate TB-only configurations.
+
+    Round-(N+16) (this commit) widens the bridge half to
+    ``bridge[0-9]{1,2}`` (i.e. ``bridge0``..``bridge99``) so the
+    real-Thunderbolt indices below the macOS Internet-Sharing
+    reservation (``bridge100``+) are accepted, while the VM-stack
+    bridges in the 3-digit range remain excluded.
     """
     if not _THUNDERBOLT_CANDIDATE_INTERFACE_NAME.match(interface.name):
         return False

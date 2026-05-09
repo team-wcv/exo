@@ -2594,6 +2594,125 @@ def test_jaccl_placement_allows_bridge0_thunderbolt_with_unknown_typing(
     )
 
 
+def test_jaccl_placement_allows_non_zero_bridge_index_thunderbolt(
+    model_card: ModelCard,
+) -> None:
+    """Codex P1 (PR #11 round-(N+15), placement.py:567): the
+    round-(N+15) hard-coded ``bridge0`` was too narrow. The
+    info_gatherer's
+    :func:`exo.utils.info_gatherer.info_gatherer._get_bridge_services`
+    and :func:`_find_thunderbolt_bridge` enumerate **arbitrary**
+    ``bridgeX`` devices and intersect their member set with the
+    Thunderbolt hardware-port device list. A user with multiple
+    bridges -- e.g. an existing ``bridge0`` already claimed by
+    another service, or a manually-configured second bridge for
+    a multi-host TB cable -- can have a real Thunderbolt Bridge
+    exposed as ``bridge1``/``bridge2``/etc. Hard-coding
+    ``bridge0`` rejected those configurations with the
+    ``bb rdma repair`` error even though a perfectly valid TB
+    peer path was available.
+
+    Round-(N+16) widens the bridge half of
+    :data:`_THUNDERBOLT_CANDIDATE_INTERFACE_NAME` to
+    ``bridge[0-9]{1,2}`` (i.e. ``bridge0``..``bridge99``). macOS
+    Internet Sharing reserves ``bridge100``+ for NAT/Parallels/
+    VirtualBox VM stacks (see ``man 8 bridge``), so this still
+    rejects VM-stack bridges (covered by
+    ``test_jaccl_placement_rejects_nodes_with_vm_stack_bridges_and_primary_en``)
+    while admitting legitimate TB indices below 100.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_socket_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_socket_connection(1))
+    )
+
+    # Both nodes expose their Thunderbolt Bridge as ``bridge1``
+    # (because ``bridge0`` is already claimed elsewhere on each
+    # host). The bridge service device does not appear in
+    # ``networksetup -listallhardwareports`` so it lands here as
+    # ``"unknown"`` with a routable IPv4 -- exactly the scenario
+    # the permissive fallback is meant to tolerate.
+    node_network = {
+        node_a: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.50",
+                    interface_type="wifi",
+                ),
+                NetworkInterfaceInfo(
+                    name="bridge1",
+                    ip_address="192.168.10.10",
+                    interface_type="unknown",
+                ),
+            ]
+        ),
+        node_b: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.51",
+                    interface_type="wifi",
+                ),
+                NetworkInterfaceInfo(
+                    name="bridge2",
+                    ip_address="192.168.10.11",
+                    interface_type="unknown",
+                ),
+            ]
+        ),
+    }
+
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
+        node_network,
+    )
+
+    assert len(placements) == 1
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxJacclInstance), (
+        "MlxJaccl placement must succeed when the only TB-bridge "
+        "candidates are named ``bridge1``/``bridge2``; the "
+        "info_gatherer enumerates arbitrary ``bridgeX`` devices and "
+        "matches them by Thunderbolt-member intersection, so any "
+        "low-index bridge is a legitimate TB candidate."
+    )
+
+
 def test_jaccl_placement_rejects_nodes_with_vm_stack_bridges_and_primary_en(
     model_card: ModelCard,
 ) -> None:
