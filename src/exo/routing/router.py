@@ -326,6 +326,12 @@ def get_node_id_keypair(
     migration is performed INSIDE the file lock so two concurrent
     processes can't both pass the existence check and then race
     each other into divergent in-memory vs. on-disk identities.
+    Codex P1 (PR #16 round-(N+13), router.py:359): when callers
+    pass distinct ``process_scope`` values, the per-scope lock
+    above does NOT serialize legacy adoption across scopes, so a
+    second lock keyed on the (unscoped) legacy path is acquired
+    before invoking the migrator -- otherwise the cross-device
+    byte-copy fallback can produce duplicate ``NodeId``s.
     """
     base_path = Path(str(path))
     resolved_path = (
@@ -356,7 +362,31 @@ def get_node_id_keypair(
     # on-disk file but divergent in-memory identities.
     with FileLock(lock_path(resolved_path)):
         if resolved_legacy is not None:
-            _migrate_legacy_node_id_keypair(resolved_path, resolved_legacy)
+            # Codex P1 (PR #16 round-(N+13), router.py:359):
+            # serialize legacy adoption across ALL ``process_scope``
+            # values. The outer ``resolved_path`` lock is per-scope,
+            # so two same-host processes with different scopes
+            # acquire DIFFERENT lock files and can each enter
+            # ``_migrate_legacy_node_id_keypair`` concurrently. In
+            # the cross-device fallback path -- where ``replace()``
+            # raises ``OSError`` and the migrator falls back to a
+            # ``read_bytes`` + ``write_bytes`` + ``unlink``
+            # sequence -- both processes can read the same legacy
+            # keypair before either unlinks it, then each writes
+            # those bytes into its own scoped file. Result: two
+            # nodes claiming the same ``NodeId`` despite distinct
+            # scopes, breaking routing's unique-identity and
+            # election's tiebreaker invariants. A lock keyed on the
+            # legacy path (which is intentionally NOT scope-suffixed
+            # because it pre-dates scoping) serializes migration so
+            # exactly one scope wins legacy adoption and any
+            # concurrent peers observe the file already gone and
+            # generate fresh keypairs -- the documented "first
+            # process boots wins" semantic. Released immediately
+            # after migration so unrelated keypair I/O on other
+            # scopes isn't blocked on identity housekeeping.
+            with FileLock(lock_path(resolved_legacy)):
+                _migrate_legacy_node_id_keypair(resolved_path, resolved_legacy)
 
         with open(resolved_path, "a+b") as f:  # opens in append-mode => starts at EOF
             # if non-zero EOF, then file exists => use to get node-ID

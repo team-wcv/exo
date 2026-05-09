@@ -388,6 +388,128 @@ class TestNodeIdKeypairScope:
         )
 
 
+def test_legacy_migration_serialized_across_process_scopes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P1 (PR #16 round-(N+13), router.py:359): legacy
+    adoption MUST be serialized across all ``process_scope`` values,
+    even when the per-scope ``resolved_path`` lock differs and the
+    cross-device byte-copy fallback path is taken inside
+    ``_migrate_legacy_node_id_keypair``.
+
+    Pre-fix this test produces two identical scoped keypairs (both
+    matching the legacy bytes), simulating two same-host processes
+    racing legacy adoption: each acquires its own per-scope lock,
+    both fall through to the byte-copy branch, both read the same
+    legacy bytes, and both end up writing those bytes to their own
+    scoped file -- duplicate ``NodeId`` despite distinct scopes.
+
+    Post-fix the migrator is wrapped in a second FileLock keyed on
+    the legacy path. The first scope wins adoption and unlinks the
+    legacy file; the second scope's migrator no-ops on the absent
+    legacy and generates a fresh keypair, so the two scopes diverge
+    as required by the per-process isolation invariant.
+
+    We simulate the cross-device fallback by monkey-patching
+    ``Path.replace`` to raise ``OSError`` (the same trigger that
+    fires on Linux when ``XDG_*`` dirs span filesystems). The
+    serialization invariant is asserted by also blocking the byte
+    copy with a ``threading.Event`` so two threads must contend on
+    the legacy lock; only one thread should observe the legacy
+    file present at copy time.
+    """
+    import threading
+
+    import exo.routing.router as router_mod
+
+    legacy_path = tmp_path / "cache" / "node_id.keypair"
+    base_path = tmp_path / "config" / "node_id.keypair"
+    legacy_path.parent.mkdir(parents=True)
+    base_path.parent.mkdir(parents=True)
+
+    legacy_bytes = Keypair.generate().to_bytes()
+    legacy_path.write_bytes(legacy_bytes)
+
+    # Force the cross-device fallback so the migrator goes through
+    # the read_bytes/write_bytes/unlink sequence (the path Codex
+    # flagged as racy).
+    real_replace = Path.replace
+
+    def _force_cross_device(self: Path, target: object) -> object:  # noqa: ANN001
+        if Path(self) == legacy_path:
+            raise OSError("simulated cross-device link error")
+        return real_replace(self, target)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(Path, "replace", _force_cross_device)
+
+    # Pause inside the byte-copy branch so two threads pile up on
+    # the legacy lock while one thread holds it. Without the legacy
+    # lock both threads would observe the legacy file present at
+    # this point and both would proceed to write_bytes/unlink.
+    in_copy = threading.Event()
+    release_copy = threading.Event()
+    real_write_bytes = Path.write_bytes
+
+    def _slow_write_bytes(self: Path, data: bytes) -> int:
+        if self.parent == base_path.parent:
+            in_copy.set()
+            release_copy.wait(timeout=5.0)
+        return real_write_bytes(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", _slow_write_bytes)
+
+    keypairs: dict[int, Keypair] = {}
+
+    def _run(scope: int) -> None:
+        keypairs[scope] = router_mod.get_node_id_keypair(
+            path=base_path, legacy_path=legacy_path, process_scope=scope
+        )
+
+    thread_a = threading.Thread(target=_run, args=(52416,), daemon=True)
+    thread_b = threading.Thread(target=_run, args=(52417,), daemon=True)
+    thread_a.start()
+    in_copy.wait(timeout=5.0)
+    # While thread_a is paused inside the byte copy holding the
+    # legacy lock, thread_b should be blocked on the legacy lock --
+    # NOT racing through its own byte copy of the same legacy file.
+    thread_b.start()
+    # Give thread_b a moment to attempt acquiring the legacy lock
+    # so we can assert it did not slip through.
+    thread_b.join(timeout=0.2)
+    assert thread_b.is_alive(), (
+        "second scope must be blocked on the legacy lock while the "
+        "first scope is mid-copy; if this fails, both scopes will "
+        "duplicate the legacy NodeId via the byte-copy race"
+    )
+    release_copy.set()
+    thread_a.join(timeout=5.0)
+    thread_b.join(timeout=5.0)
+    assert not thread_a.is_alive() and not thread_b.is_alive()
+
+    scope_a_bytes = keypairs[52416].to_bytes()
+    scope_b_bytes = keypairs[52417].to_bytes()
+    assert scope_a_bytes != scope_b_bytes, (
+        "concurrent legacy adoption across distinct process_scope "
+        "values must NOT produce duplicate keypairs; the legacy "
+        "lock should let exactly one scope adopt the legacy bytes "
+        "while the other generates a fresh identity"
+    )
+    # Exactly one scoped file should match the legacy bytes (the
+    # winner of adoption); the other was generated fresh.
+    scoped_a = base_path.parent / "node_id.52416.keypair"
+    scoped_b = base_path.parent / "node_id.52417.keypair"
+    matches = sum(
+        1
+        for p in (scoped_a, scoped_b)
+        if p.exists() and p.read_bytes() == legacy_bytes
+    )
+    assert matches == 1, (
+        f"exactly one scope must have adopted the legacy bytes; "
+        f"matches={matches} indicates the cross-device race fired"
+    )
+    assert not legacy_path.exists(), "legacy file must be unlinked after adoption"
+
+
 def test_legacy_migration_adopts_into_scoped_path(tmp_path: Path) -> None:
     """When a process passes a scope and a legacy unscoped keypair
     exists, the legacy bytes must be adopted into the scoped path.
