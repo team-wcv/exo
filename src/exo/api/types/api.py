@@ -188,6 +188,58 @@ class GenerationStats(BaseModel):
     generation_tokens: int
     peak_memory_usage: Memory
     prefix_cache_hit: Literal["none", "partial", "exact"] = "none"
+    # Speculative-decoding telemetry. ``drafter_model_id`` is set whenever
+    # speculative decoding actually ran for this request (drafter loaded *and*
+    # not short-circuited by the short-skip threshold). ``accepted_draft_tokens``
+    # counts ``stream_generate`` outputs with ``from_draft=True``: those are
+    # tokens the drafter proposed *and* the target accepted. The user-facing
+    # speedup is approximately ``accepted_draft_tokens / generation_tokens``.
+    drafter_model_id: str | None = None
+    accepted_draft_tokens: int = 0
+    # K used for speculative_generate_step (None when drafter didn't run).
+    num_draft_tokens: int | None = None
+    # Drafting strategy that actually ran for this request: "model" for
+    # external-drafter spec decoding, "ngram" for in-context suffix
+    # lookup, "none" for non-speculative. None when the engine doesn't
+    # surface drafting (e.g. image gen). Useful for telemetry dashboards
+    # to attribute throughput wins to a specific strategy when running
+    # mixed-mode A/B tests.
+    draft_mode: Literal["model", "ngram", "none"] | None = None
+
+    @property
+    def drafter_acceptance_fraction(self) -> float | None:
+        """Fraction of *generated* tokens that came from the drafter.
+
+        ``None`` when no drafter ran for the request. This is a slight
+        misnomer relative to the speculative-decoding literature -- the true
+        acceptance rate would divide by the drafter's proposal count, which
+        ``stream_generate`` doesn't surface -- but it is the metric that
+        directly maps to wall-clock speedup, so it's what we display.
+
+        Codex P2 (PR #19 round-(N+1)): n-gram speculation
+        (``draft_mode="ngram"``) intentionally runs without a drafter
+        model id because it's an in-process suffix-lookup over the
+        prompt + partial generation rather than a separate model.
+        Pre-fix this property returned ``None`` for every n-gram run
+        (because ``drafter_model_id is None``), which misreported
+        valid speculative runs as non-speculative in telemetry and
+        broke acceptance metrics for n-gram A/B tests. Trust
+        ``draft_mode`` as the canonical "did a drafter run?" signal:
+        accept any non-``"none"`` mode, and fall back to the legacy
+        ``drafter_model_id`` heuristic for streams that don't yet
+        carry ``draft_mode`` (older recorded benches, partial
+        responses).
+        """
+        if self.generation_tokens == 0:
+            return None
+        if self.draft_mode is None:
+            # Older payload: only model-mode telemetry was
+            # recorded historically.
+            if self.drafter_model_id is None:
+                return None
+        elif self.draft_mode == "none":
+            return None
+        return self.accepted_draft_tokens / self.generation_tokens
 
 
 class ImageGenerationStats(BaseModel):
@@ -252,6 +304,20 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
     user: str | None = None
+    # Speculative-decoding per-request overrides (item 9). These are exo
+    # extensions to the OpenAI Chat Completions schema -- standard clients
+    # ignore unknown fields and get the runner's defaults.
+    #
+    # ``use_drafter=False`` short-circuits to non-speculative; clients that
+    # want a finer-grained switch use ``draft_mode`` to pick between the
+    # external-drafter loop (``"model"``), in-context n-gram lookahead
+    # (``"ngram"``), or non-speculative (``"none"``). When both are set,
+    # the explicit ``draft_mode`` wins (matches ``TextGenerationTaskParams``
+    # resolution in ``resolve_draft_mode``); see
+    # ``src/exo/worker/engines/mlx/generator/drafter.py``.
+    use_drafter: bool | None = None
+    num_draft_tokens: int | None = None
+    draft_mode: Literal["model", "ngram", "none"] | None = None
 
 
 class BenchChatCompletionRequest(ChatCompletionRequest):

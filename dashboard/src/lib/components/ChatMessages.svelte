@@ -298,6 +298,42 @@
                   <span class="text-exo-light-gray/50">tok/s</span>{/if}
               </span>
             {/if}
+            {#if message.drafterStats}
+              <!--
+                Codex P3 (PR #19 round-(N+9), ChatMessages.svelte:304):
+                pre-fix the tooltip blindly formatted any missing
+                ``modelId`` as ``n-gram (...)`` so a model-mode run
+                with a partial/legacy payload (``buildDrafterStats``
+                explicitly accepts those) showed up as
+                ``n-gram (model)``, mislabeling the drafter strategy.
+                Switch on ``draftMode`` so the fallback is accurate
+                whether the run is n-gram, model (with an unknown
+                drafter id), pipelined, or anything else.
+              -->
+              <span
+                class="text-xs text-exo-light-gray/80 font-mono ml-2"
+                title={`Drafter: ${
+                  message.drafterStats.modelId ??
+                  (message.drafterStats.draftMode === "ngram"
+                    ? "n-gram"
+                    : message.drafterStats.draftMode === "model"
+                      ? "model (unknown id)"
+                      : `(${message.drafterStats.draftMode})`)
+                }\nAccepted: ${message.drafterStats.acceptedDraftTokens}/${message.drafterStats.generationTokens}${message.drafterStats.numDraftTokens !== null ? `\nK=${message.drafterStats.numDraftTokens}` : ""}`}
+              >
+                <span class="text-exo-light-gray/50"
+                  >SPEC{message.drafterStats.draftMode === "ngram"
+                    ? "·NGRAM"
+                    : ""}</span
+                >
+                {(message.drafterStats.acceptanceFraction * 100).toFixed(
+                  0,
+                )}%{#if message.drafterStats.numDraftTokens !== null}<span
+                    class="text-exo-light-gray/30 mx-1">•</span
+                  ><span class="text-exo-light-gray/50">K=</span>{message
+                    .drafterStats.numDraftTokens}{/if}
+              </span>
+            {/if}
           </div>
         {:else}
           <!-- User message header -->

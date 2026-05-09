@@ -3,13 +3,14 @@ import functools
 import math
 import time
 import uuid
-from typing import Callable, Generator, cast, get_args
+from typing import Any, Callable, Generator, cast, get_args
 
 import mlx.core as mx
 from mlx_lm.generate import (
     maybe_quantize_kv_cache,
     stream_generate,
 )
+from mlx_lm.models.cache import trim_prompt_cache as mlx_trim_prompt_cache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
@@ -54,6 +55,14 @@ from exo.worker.engines.mlx.constants import (
     KV_BITS,
     KV_GROUP_SIZE,
     MAX_TOKENS,
+)
+from exo.worker.engines.mlx.generator.drafter import (
+    Drafter,
+    DraftMode,
+    ModelDrafter,
+    NgramDrafter,
+    NoSpecDrafter,
+    resolve_draft_mode,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.types import KVCacheType, Model
@@ -396,22 +405,125 @@ def prefill(
     return tokens_per_sec, num_tokens, snapshots[:-1] if snapshots else []
 
 
+def resolve_speculative_decoding(
+    draft_model: Model | None,
+    group: mx.distributed.Group | None,
+    max_tokens: int,
+    num_draft_tokens: int | None,
+    drafter_min_output_tokens: int | None,
+) -> tuple[Model | None, dict[str, object]]:
+    """Decide whether to actually use speculative decoding for this request.
+
+    Pure helper so we can unit-test the policy without spinning up MLX. Returns
+    ``(effective_draft_model, spec_kwargs)`` for forwarding to
+    ``stream_generate``.
+
+    Policy:
+    - Distributed runs: drafter is dropped (mlx_lm does not pipe the drafter
+      through the multi-device path yet).
+    - Single-device + drafter + ``max_tokens <= drafter_min_output_tokens``:
+      drafter is dropped (item 8 -- short outputs don't amortise the prefill
+      cost).
+    - Single-device + drafter active: forward ``num_draft_tokens`` (item 1)
+      via kwargs so ``speculative_generate_step`` honors it.
+    """
+    if group is not None or draft_model is None:
+        return None, {}
+
+    if (
+        drafter_min_output_tokens is not None
+        and max_tokens <= drafter_min_output_tokens
+    ):
+        logger.debug(
+            f"Short generation (max_tokens={max_tokens} <= "
+            f"{drafter_min_output_tokens}); skipping drafter for this request."
+        )
+        return None, {}
+
+    spec_kwargs: dict[str, object] = {}
+    if num_draft_tokens is not None:
+        spec_kwargs["num_draft_tokens"] = num_draft_tokens
+    return draft_model, spec_kwargs
+
+
+def _spec_drafter_prefill(
+    drafter: Model,
+    drafter_cache: KVCacheType,
+    tokens: mx.array,
+    step: int = 4096,
+) -> None:
+    """Advance ``drafter_cache`` by running ``drafter`` on ``tokens``.
+
+    Used on the speculative-decoding path to bring the drafter cache to the
+    same offset as the target cache before stream_generate's
+    ``speculative_generate_step._prefill`` ingests the final two prompt
+    tokens. Without this, the drafter cache would be empty (or stuck at a
+    prefix-cache hit boundary) while the target cache is at ``prompt - 2``,
+    desyncing mlx_lm's spec bookkeeping.
+    """
+    if tokens.size == 0:
+        return
+    y = tokens
+    while y.size > 0:
+        n = min(step, y.size)
+        drafter(y[:n][None], cache=drafter_cache)
+        mx.eval([c.state for c in drafter_cache])  # type: ignore[reportArgumentType]
+        y = y[n:]
+
+
 def warmup_inference(
     model: Model,
     tokenizer: TokenizerWrapper,
     group: mx.distributed.Group | None,
     model_id: ModelId,
+    draft_model: Model | None = None,
+    num_draft_tokens: int | None = None,
+    drafter_min_output_tokens: int | None = None,
 ) -> int:
+    """Run a throwaway generation to JIT-compile kernels and prime caches.
+
+    When ``draft_model`` is supplied (single-device only), the drafter
+    participates in the warmup so the *first real request* doesn't pay a
+    cold-cache penalty on the drafter's first speculative step. This is
+    item 3 from the drafter tuning plan.
+
+    ``num_draft_tokens`` is the runner's effective K and ``drafter_min_output_tokens``
+    is the runner's short-skip threshold. Codex flagged (P2, PR #19 round-(N+10),
+    generate.py:525) that omitting these forwards meant the warmup `mlx_generate`
+    call dropped to the implicit fallback K=1 and never exercised the
+    short-skip gate. Because mlx_lm's speculative_generate_step builds
+    a verify-graph keyed on K, the first real request at K>1 paid the
+    JIT/graph setup cost the warmup was supposed to absorb. Threading
+    K through here ensures the warmed verify-graph matches production
+    decoding shape; warmup max_tokens is also boosted above the
+    short-skip threshold so the drafter actually fires (the threshold
+    demotes the warmup itself to draft_mode='none' otherwise).
+    """
     logger.info(f"warming up inference for instance: {model_id}")
 
     content = InputMessageContent(
         "Prompt to warm up the inference engine. Repeat this."
     )
 
+    # Codex P2 (PR #19 round-(N+10)): the warmup must request at least
+    # one token *more* than the short-skip threshold so the drafter
+    # actually engages during warmup. ``mlx_generate`` demotes
+    # draft_mode -> 'none' for any request whose ``max_output_tokens``
+    # is at or below ``drafter_min_output_tokens``, so a too-low
+    # warmup token budget would silently bypass the very kernels we
+    # just plumbed K into. Use a generous floor either way (we only
+    # care about JIT compile cost; the actual decoded text is thrown
+    # away by the caller).
+    warmup_max_output_tokens = 50
+    if drafter_min_output_tokens is not None:
+        warmup_max_output_tokens = max(
+            warmup_max_output_tokens, drafter_min_output_tokens + 1
+        )
+
     warmup_task_params = TextGenerationTaskParams(
         model=model_id,
         input=[InputMessage(role="user", content=content)],
-        max_output_tokens=50,
+        max_output_tokens=warmup_max_output_tokens,
         temperature=0.0,
     )
 
@@ -424,7 +536,10 @@ def warmup_inference(
 
     mx_barrier(group)
 
-    logger.info("Generating warmup tokens")
+    logger.info(
+        "Generating warmup tokens"
+        + (" (with drafter)" if draft_model is not None else "")
+    )
 
     t = time.monotonic()
 
@@ -435,6 +550,9 @@ def warmup_inference(
         prompt=warmup_prompt,
         kv_prefix_cache=None,
         group=group,
+        draft_model=draft_model,
+        num_draft_tokens=num_draft_tokens,
+        drafter_min_output_tokens=drafter_min_output_tokens,
     ):
         tokens_generated += 1
 
@@ -529,6 +647,25 @@ def extract_top_logprobs(
     return selected_logprob, top_logprob_items
 
 
+def _request_is_greedy_sampling(task: TextGenerationTaskParams) -> bool:
+    """Return ``True`` iff the request samples deterministically.
+
+    Codex P1 (PR #19 round-(N+4)): the n-gram speculative loop's
+    ``target == draft`` accept rule is only distribution-correct
+    under greedy decoding (``argmax`` sampling). The MLX
+    ``make_sampler`` returns ``argmax`` whenever ``temp == 0.0``;
+    other params (``top_p``, ``top_k``, ``min_p``) only affect the
+    distribution when temperature > 0, so the temperature gate is
+    sufficient to identify "deterministic / argmax-equivalent"
+    sampling.
+
+    A request that omits temperature (``task.temperature is None``)
+    inherits the runner default of 0.7 (see ``make_sampler`` call
+    site), which is non-greedy.
+    """
+    return task.temperature == 0.0
+
+
 def mlx_generate(
     model: Model,
     tokenizer: TokenizerWrapper,
@@ -541,6 +678,10 @@ def mlx_generate(
     on_generation_token: Callable[[], None] | None = None,
     vision_processor: VisionProcessor | None = None,
     draft_model: Model | None = None,
+    drafter_kv_prefix_cache: KVPrefixCache | None = None,
+    drafter_model_id: ModelId | None = None,
+    num_draft_tokens: int | None = None,
+    drafter_min_output_tokens: int | None = None,
 ) -> Generator[GenerationResponse]:
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
@@ -578,7 +719,75 @@ def mlx_generate(
     if is_bench and not task.use_prefix_cache:
         kv_prefix_cache = None
 
-    # Use prefix cache if available, otherwise create fresh cache
+    # Resolve drafting strategy up-front so cache setup below can branch on
+    # the *effective* mode rather than the unfiltered ``draft_model``.
+    # Precedence: per-request ``draft_mode`` > per-request ``use_drafter`` >
+    # ``EXO_DRAFT_MODE`` env var > implicit default (``model`` if a drafter
+    # is loaded, else ``none``). Distributed runs always degrade to
+    # ``none`` because mlx_lm does not yet route either model-drafter or
+    # n-gram drafting through the pipeline-parallel path.
+    request_use_drafter = task.use_drafter
+    request_num_draft_tokens = task.num_draft_tokens
+    request_draft_mode = task.draft_mode
+    effective_num_draft_tokens = (
+        request_num_draft_tokens
+        if request_num_draft_tokens is not None
+        else num_draft_tokens
+    ) or 0
+    max_tokens = task.max_output_tokens or MAX_TOKENS
+    if group is not None:
+        draft_mode: DraftMode = "none"
+    else:
+        draft_mode = resolve_draft_mode(
+            has_drafter_model=draft_model is not None,
+            request_use_drafter=request_use_drafter,
+            request_draft_mode=request_draft_mode,
+        )
+    # Item 8: short-output skip applies only to the model-drafter path
+    # where the drafter prefill cost dominates. N-gram drafting has no
+    # prefill (microsecond suffix-match per round) so the threshold is
+    # irrelevant; baseline non-spec wouldn't be cheaper anyway.
+    if (
+        draft_mode == "model"
+        and drafter_min_output_tokens is not None
+        and max_tokens <= drafter_min_output_tokens
+    ):
+        logger.info(
+            f"draft_mode demoted to 'none' for short request "
+            f"(max_tokens={max_tokens} <= {drafter_min_output_tokens})"
+        )
+        draft_mode = "none"
+    # Codex P1 (PR #19 round-(N+4), drafter.py:692): the n-gram
+    # speculative loop accepts drafts via exact token equality and
+    # emits the target token at first mismatch. That rule is only
+    # distribution-correct under greedy decoding (temperature == 0):
+    # for stochastic sampling, accepting/rejecting on equality changes
+    # the model's output distribution because we never apply the
+    # rejection-sampling correction (``min(1, p_target / p_draft)``)
+    # that proper speculative sampling requires. Demote ``"ngram"`` to
+    # ``"none"`` whenever the request would sample non-greedily so
+    # users don't silently lose reproducibility/quality. Model-mode
+    # drafting goes through ``mlx_lm.speculative_generate_step`` which
+    # already implements rejection sampling, so it stays unchanged.
+    if draft_mode == "ngram" and not _request_is_greedy_sampling(task):
+        logger.info(
+            f"draft_mode demoted from 'ngram' to 'none' for non-greedy "
+            f"sampling (temperature={task.temperature!r}); "
+            f"n-gram drafting only preserves the output distribution "
+            f"under greedy decoding"
+        )
+        draft_mode = "none"
+    effective_draft_model = draft_model if draft_mode == "model" else None
+    # Reused below: only the model-drafter path needs paired drafter caches.
+    # The variable name is preserved for readability with the existing cache
+    # bookkeeping code immediately below.
+    spec_active = draft_mode == "model" and effective_draft_model is not None
+    if effective_num_draft_tokens < 1:
+        # Defaulted to 0 above when the runner didn't pre-resolve K and the
+        # request didn't override either. Clamp to 1 so n-gram and model
+        # drafters don't crash on zero-K proposals.
+        effective_num_draft_tokens = 1
+
     prefix_hit_length = 0
     matched_index: int | None = None
     is_exact_hit = False
@@ -588,7 +797,9 @@ def mlx_generate(
     else:
         caches, prompt_tokens, matched_index, is_exact_hit = (
             kv_prefix_cache.get_kv_cache(
-                model, all_prompt_tokens, media_regions=media_regions
+                model,
+                all_prompt_tokens,
+                media_regions=media_regions,
             )
         )
         prefix_hit_length = len(all_prompt_tokens) - len(prompt_tokens)
@@ -596,6 +807,49 @@ def mlx_generate(
             logger.info(
                 f"KV cache hit: {prefix_hit_length}/{len(all_prompt_tokens)} tokens cached ({100 * prefix_hit_length / len(all_prompt_tokens):.1f}%)"
             )
+
+    # Drafter cache lookup. We mirror the target's prefix-cache contract on
+    # the drafter so multi-turn workloads don't pay the drafter's prefill
+    # cost on every request (item 6). The aligned_hit logic below ensures
+    # both caches start the spec loop at the same offset; mismatched
+    # offsets would corrupt mlx_lm's spec_step bookkeeping.
+    drafter_caches: KVCacheType = []
+    drafter_matched_index: int | None = None
+    if spec_active and effective_draft_model is not None:
+        if drafter_kv_prefix_cache is None:
+            drafter_caches = make_kv_cache(model=effective_draft_model)
+            drafter_remaining = all_prompt_tokens
+        else:
+            (
+                drafter_caches,
+                drafter_remaining,
+                drafter_matched_index,
+                _,
+            ) = drafter_kv_prefix_cache.get_kv_cache(
+                effective_draft_model,
+                all_prompt_tokens,
+                media_regions=media_regions,
+            )
+        target_hit = prefix_hit_length
+        drafter_hit = len(all_prompt_tokens) - len(drafter_remaining)
+        aligned_hit = min(target_hit, drafter_hit)
+        # Trim whichever cache overshoots so both start at ``aligned_hit``.
+        if target_hit > aligned_hit:
+            mlx_trim_prompt_cache(cast(list[object], caches), target_hit - aligned_hit)  # type: ignore[reportArgumentType]
+            prompt_tokens = all_prompt_tokens[aligned_hit:]
+            prefix_hit_length = aligned_hit
+            if matched_index is not None and aligned_hit < target_hit:
+                # Trimming below the prior match invalidates the
+                # update-in-place path; treat as a fresh add.
+                matched_index = None
+                is_exact_hit = False
+        if drafter_hit > aligned_hit:
+            mlx_trim_prompt_cache(
+                cast("list[Any]", drafter_caches),
+                drafter_hit - aligned_hit,
+            )
+            if drafter_matched_index is not None and aligned_hit < drafter_hit:
+                drafter_matched_index = None
 
     logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
         make_logits_processors(
@@ -641,6 +895,7 @@ def mlx_generate(
     use_remote = (
         len(prompt_tokens) > REMOTE_PREFILL_MIN_TOKENS
         and task.prefill_endpoint is not None
+        and not spec_active
     )
     remote_prefilled = False
     prefill_tps = 0.0
@@ -674,6 +929,21 @@ def mlx_generate(
                 on_prefill_progress,
                 distributed_prompt_progress_callback,
             )
+        # On the spec path we mirror exo's prefill on the drafter so its
+        # cache reaches the same offset as the target's (prompt - 2 after
+        # the trim(2) inside exo.prefill). mlx_lm's
+        # speculative_generate_step._prefill then advances both caches by
+        # 1 (decode_prompt size = 2 -> processes 1 token), arriving at
+        # prompt - 1 with ``y = decode_prompt[-1:]`` -- the canonical
+        # entry state for the spec loop.
+        if spec_active and effective_draft_model is not None:
+            drafter_prefill_tokens = prompt_tokens[:-2]
+            if drafter_prefill_tokens.size > 0:
+                _spec_drafter_prefill(
+                    effective_draft_model,
+                    drafter_caches,
+                    drafter_prefill_tokens,
+                )
     cache_snapshots: list[CacheSnapshot] | None = ssm_snapshots_list or None
 
     if kv_prefix_cache is not None and matched_index is not None and is_exact_hit:
@@ -707,41 +977,114 @@ def mlx_generate(
                 prefill_tps=prefill_tps,
             )
 
-    # stream_generate starts from the last token
-    last_token = prompt_tokens[-2:]
+    # Drafter prefix cache update (item 6). Snapshot the drafter cache
+    # *before* stream_generate starts mutating it so subsequent requests
+    # can resume from this prompt boundary instead of replaying the
+    # drafter prefill.
+    if (
+        spec_active
+        and drafter_kv_prefix_cache is not None
+        and effective_draft_model is not None
+    ):
+        if (
+            drafter_matched_index is not None
+            and prefix_hit_length >= min_prefix_hit_length
+        ):
+            drafter_kv_prefix_cache.update_kv_cache(
+                drafter_matched_index,
+                all_prompt_tokens,
+                drafter_caches,
+                None,
+                restore_pos=prefix_hit_length,
+                media_regions=media_regions,
+                prefill_tps=prefill_tps,
+            )
+        else:
+            drafter_kv_prefix_cache.add_kv_cache(
+                all_prompt_tokens,
+                drafter_caches,
+                None,
+                media_regions=media_regions,
+                prefill_tps=prefill_tps,
+            )
+
+    # stream_generate starts from the last 2 tokens; caches already cover
+    # prompt[:-2] via exo's prefill + c.trim(2). The non-spec and spec paths
+    # share the same entry state -- spec just additionally has the drafter
+    # cache pre-aligned to the same offset (see drafter prefill above).
+    decode_prompt = prompt_tokens[-2:]
 
     max_tokens = task.max_output_tokens or MAX_TOKENS
     accumulated_text = ""
     generated_text_parts: list[str] = []
     generation_start_time = time.perf_counter()
     usage: Usage | None = None
+    # Speculative decoding telemetry (item 4). `from_draft_count` is the
+    # number of tokens stream_generate flagged as drafter-accepted; we report
+    # it on the final GenerationStats so dashboards / clients can A/B
+    # configurations on real traffic.
+    from_draft_count = 0
     logger.info("Starting decode")
     mx_barrier(group)
 
-    # Speculative decoding via mlx_lm: only enabled in the single-device path
-    # (group is None). Distributed speculative is not yet plumbed; passing a
-    # draft_model alongside a non-trivial group would be a no-op, so we drop
-    # it explicitly to make the caller contract clear.
-    effective_draft_model = draft_model if group is None else None
+    # Dispatch to the selected drafting strategy. ``ModelDrafter``
+    # delegates to ``mlx_lm.stream_generate(draft_model=...)`` (the
+    # well-tested upstream spec loop); ``NgramDrafter`` runs an in-house
+    # spec loop that proposes drafts via in-context suffix lookup;
+    # ``NoSpecDrafter`` is a thin pass-through to ``mlx_lm.stream_generate``.
+    drafter: Drafter
+    if spec_active and effective_draft_model is not None:
+        drafter = ModelDrafter(
+            draft_model=effective_draft_model,
+            draft_cache=drafter_caches,
+            num_draft_tokens=effective_num_draft_tokens,
+        )
+    elif draft_mode == "ngram":
+        drafter = NgramDrafter(num_draft_tokens=effective_num_draft_tokens)
+    else:
+        drafter = NoSpecDrafter()
+
+    # ``decode_prompt`` is the prefill-tail (last two tokens of the
+    # prompt). The cache is already aligned to ``all_prompt_tokens[:-2]``
+    # via ``exo.prefill`` + ``trim(2)``; mlx_lm's internal ``_prefill``
+    # advances by one more token, then the spec loop seeds from the
+    # last. ``full_context_tokens`` is the full prompt so the n-gram
+    # drafter can match against the entire history (including
+    # prefix-cached portions); other drafters ignore it.
+    #
+    # Codex P2 (PR #19 round-(N+7), generate.py): only the n-gram
+    # drafter consumes ``context_tokens``; ``ModelDrafter`` and
+    # ``NoSpecDrafter`` ``del context_tokens`` immediately. Pre-fix
+    # we paid the O(N) Python-side ``mx.array.tolist()`` +
+    # ``int(...)`` conversion on every request, including
+    # non-spec runs and prefix-cache-hit requests where decode work
+    # is otherwise small. Build the list only when n-gram drafting
+    # is actually selected; pass an empty sequence otherwise.
+    if draft_mode == "ngram":
+        full_context_tokens: list[int] = [
+            int(t) for t in cast(list[int], all_prompt_tokens.tolist())
+        ]
+    else:
+        full_context_tokens = []
 
     for completion_tokens, out in enumerate(
-        stream_generate(
+        drafter.stream(
             model=model,
             tokenizer=tokenizer,
-            prompt=last_token,
+            prompt=decode_prompt,
+            context_tokens=full_context_tokens,
+            prompt_cache=caches,
             max_tokens=max_tokens,
             sampler=sampler,
             logits_processors=logits_processors,
-            prompt_cache=caches,
             prefill_step_size=1,
-            kv_group_size=KV_GROUP_SIZE,
-            kv_bits=KV_BITS,
-            draft_model=effective_draft_model,
         ),
         start=1,
     ):
         generated_text_parts.append(out.text)
         accumulated_text += out.text
+        if getattr(out, "from_draft", False):
+            from_draft_count += 1
 
         # Check for stop sequences
         text = out.text
@@ -766,12 +1109,30 @@ def mlx_generate(
 
         stats: GenerationStats | None = None
         if is_done:
+            # Drafter telemetry: only stamp the id when speculation actually
+            # ran for this request. `effective_draft_model is not None` is
+            # the source of truth -- short-skip and distributed paths zero
+            # it out, so we don't spuriously surface a drafter that didn't
+            # contribute.
+            telemetry_drafter_id: str | None = None
+            telemetry_k: int | None = None
+            if drafter.mode == "model" and effective_draft_model is not None:
+                telemetry_k = effective_num_draft_tokens
+                if drafter_model_id is not None:
+                    telemetry_drafter_id = str(drafter_model_id)
+            elif drafter.mode == "ngram":
+                telemetry_k = effective_num_draft_tokens
+
             stats = GenerationStats(
                 prompt_tps=float(prefill_tps or out.prompt_tps),
                 generation_tps=float(out.generation_tps),
                 prompt_tokens=int(prefill_tokens + out.prompt_tokens),
                 generation_tokens=int(out.generation_tokens),
                 peak_memory_usage=Memory.from_gb(out.peak_memory),
+                drafter_model_id=telemetry_drafter_id,
+                accepted_draft_tokens=from_draft_count,
+                num_draft_tokens=telemetry_k,
+                draft_mode=drafter.mode,
             )
             if not stop_matched and out.finish_reason not in get_args(FinishReason):
                 logger.warning(
