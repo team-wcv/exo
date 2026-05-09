@@ -439,6 +439,36 @@ class PeerAwareShardDownloader(ShardDownloader):
                     f"falling back to HF for full snapshot integrity"
                 )
                 return None
+            # Codex P2 (PR #16 round-(N+13), peer_shard_downloader.py:407):
+            # ``download_one`` -> ``on_file_progress`` is the only
+            # writer of the per-file ``status="complete"`` marker;
+            # the zero-byte branch never invokes it (there are no
+            # bytes to stream), so the file_progress entry seeded
+            # at line 338 stays at ``status="not_started"``. The
+            # final ``calculate_repo_progress`` call below then
+            # rolls those up into a non-``complete`` overall status,
+            # which means ``_download_progress_callback`` does NOT
+            # publish ``DownloadCompleted`` -- the model gets stuck
+            # in ``DownloadOngoing`` until the periodic
+            # reconciliation loop in ``DownloadCoordinator`` notices
+            # the on-disk snapshot and force-updates the status.
+            # Mirror the regular file completion path by overwriting
+            # the seeded entry with a fully-complete one once the
+            # marker is on disk. ``RepoFileDownloadProgress`` is
+            # frozen, so we replace the dict slot rather than
+            # mutating the existing instance.
+            file_progress[marker_path] = RepoFileDownloadProgress(
+                repo_id=str(shard.model_card.model_id),
+                repo_revision=revision,
+                file_path=marker_path,
+                downloaded=Memory.from_bytes(0),
+                downloaded_this_session=Memory.from_bytes(0),
+                total=Memory.from_bytes(0),
+                speed=0,
+                eta=timedelta(0),
+                status="complete",
+                start_time=all_start_time,
+            )
 
         # Emit final progress
         final_progress = calculate_repo_progress(

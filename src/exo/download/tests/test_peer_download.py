@@ -1343,6 +1343,135 @@ class TestPeerDownloadZeroByteFiles:
         assert (await aios.stat(gitattributes)).st_size == 0
         assert (await aios.stat(empty_shim)).st_size == 0
 
+    async def test_zero_byte_files_marked_complete_in_progress_map(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Codex P2 (PR #16 round-(N+13), peer_shard_downloader.py:407):
+        zero-byte files must be marked ``status="complete"`` in the
+        progress map AFTER materialization, otherwise the final
+        ``calculate_repo_progress`` call rolls them up as
+        ``status="not_started"`` and the overall repo status stays
+        non-complete -- so ``_download_progress_callback`` does not
+        publish ``DownloadCompleted`` immediately and the model is
+        stuck in ``DownloadOngoing`` until reconciliation runs.
+
+        We exercise the same fixture as the materialization test,
+        but capture the *final* progress callback emission (the one
+        the coordinator turns into ``DownloadCompleted``) and
+        assert its ``status`` is ``"complete"`` and that every
+        per-file entry is also ``"complete"``.
+        """
+        from exo.download import peer_shard_downloader as psd
+        from exo.download.download_utils import RepoDownloadProgress
+        from exo.download.peer_download import PeerFileInfo
+        from exo.shared.types.worker.downloads import FileListEntry
+
+        served = [
+            FileListEntry(type="file", path="model.safetensors", size=10),
+            FileListEntry(type="file", path=".gitattributes", size=0),
+            FileListEntry(type="file", path="empty/__init__.py", size=0),
+        ]
+
+        async def fake_fetch(*_args: object, **_kwargs: object) -> list[FileListEntry]:
+            return served
+
+        async def fake_peer_status(
+            peer_host: str,  # noqa: ARG001
+            peer_port: int,  # noqa: ARG001
+            model_id_normalized: str,  # noqa: ARG001
+            timeout: float = 5.0,  # noqa: ARG001
+        ) -> list[PeerFileInfo] | None:
+            return [
+                PeerFileInfo(
+                    path="model.safetensors", size=10, complete=True, safe_bytes=10
+                )
+            ]
+
+        async def fake_resolve_dir(_model_id: ModelId) -> Path:
+            return tmp_path
+
+        async def fake_resolve_allow(_shard: ShardMetadata) -> list[str]:
+            return ["*"]
+
+        target_path = tmp_path / "model.safetensors"
+
+        async def fake_download(
+            peer_ip: str,  # noqa: ARG001
+            peer_port: int,  # noqa: ARG001
+            model_id_normalized: str,  # noqa: ARG001
+            file_path: str,  # noqa: ARG001
+            target_dir: Path,  # noqa: ARG001
+            expected_size: int,
+            on_progress: Callable[[int, int, bool], None] = lambda _a, _b, _c: None,
+        ) -> Path | None:
+            async with aiofiles.open(target_path, "wb") as f:
+                await f.write(b"0123456789")
+            # Match the production peer_download contract: emit the
+            # final rename-completed progress callback so the
+            # canonical-file's per-file progress entry transitions
+            # to ``status="complete"`` like it would in production.
+            on_progress(expected_size, expected_size, True)
+            return target_path
+
+        monkeypatch.setattr(psd, "fetch_file_list_with_cache", fake_fetch)
+        monkeypatch.setattr(psd, "get_peer_file_status", fake_peer_status)
+        monkeypatch.setattr(psd, "resolve_model_dir", fake_resolve_dir)
+        monkeypatch.setattr(psd, "resolve_allow_patterns", fake_resolve_allow)
+        monkeypatch.setattr(psd, "download_file_from_peer", fake_download)
+
+        downloader = PeerAwareShardDownloader(NoopShardDownloader(), offline=True)
+        shard = _make_shard(ModelId("test-org/model-a"))
+
+        # Capture the final progress emitted by the peer downloader
+        # so we can assert its rolled-up status.
+        captured: list[RepoDownloadProgress] = []
+
+        async def capture_progress(
+            _shard: ShardMetadata, progress: RepoDownloadProgress
+        ) -> None:
+            captured.append(progress)
+
+        downloader._progress_callbacks.append(capture_progress)
+
+        result = await downloader._try_peer_download(
+            shard,
+            peer_ip="10.0.0.1",
+            peer_port=52415,
+            model_id_normalized="test-org/model-a",
+        )
+        assert result is not None
+        assert captured, (
+            "peer downloader must emit at least one progress event "
+            "(the rolled-up final status); pre-fix the test never "
+            "got past this because the canonical file's per-byte "
+            "callback also triggers an emit"
+        )
+        final = captured[-1]
+        assert final.status == "complete", (
+            "rolled-up final repo progress must be ``complete`` once "
+            "every file (including zero-byte markers) is on disk; "
+            "pre-(N+13)-fix the zero-byte entries stayed at "
+            "``not_started`` so the rollup was non-complete and "
+            "DownloadCompleted was never published. "
+            f"final.status={final.status!r} "
+            f"per_file={[(p, e.status) for p, e in final.file_progress.items()]}"
+        )
+        for marker in (".gitattributes", "empty/__init__.py"):
+            entry = final.file_progress.get(marker)
+            assert entry is not None, (
+                f"file_progress must contain entry for {marker!r}; "
+                "pre-fix the seeded ``not_started`` entry was never "
+                "updated, so this assert succeeded but on the wrong "
+                "status -- this version of the assert covers both "
+                "regressions (entry presence and final status)"
+            )
+            assert entry.status == "complete", (
+                f"zero-byte marker {marker!r} must be marked complete "
+                f"in the progress map after materialization; "
+                f"pre-fix status was {entry.status!r} which causes "
+                f"calculate_repo_progress to roll up to non-complete"
+            )
+
     async def test_unknown_size_file_aborts_peer_transfer_for_hf_fallback(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
