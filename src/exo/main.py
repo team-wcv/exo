@@ -48,6 +48,7 @@ class Node:
     offline: bool
     _api_port: int
     _libp2p_port: int
+    _peer_download_port: int
     peer_file_server: PeerFileServer | None = None
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
 
@@ -99,15 +100,23 @@ class Node:
                 command_sender=router.sender(topics.COMMANDS),
                 download_command_sender=router.sender(topics.DOWNLOAD_COMMANDS),
                 api_port=args.api_port,
+                # Each node now binds its own peer-download listener on
+                # ``--peer-download-port`` (default ``EXO_PEER_DOWNLOAD_PORT``).
+                # The Worker uses this same value when discovering peers,
+                # so all nodes in a cluster MUST agree on it (typically
+                # via the shared ``EXO_PEER_DOWNLOAD_PORT`` env var).
+                # Pre-fix this was a single import-time module constant,
+                # making same-host multi-node setups impossible (Codex
+                # P2, PR #16 round 3).
+                peer_download_port=args.peer_download_port,
             )
         else:
             worker = None
 
-        # Create peer file server and download coordinator
         if peer_download_enabled:
             peer_file_server = PeerFileServer(
                 host="0.0.0.0",
-                port=EXO_PEER_DOWNLOAD_PORT,
+                port=args.peer_download_port,
                 models_dir=EXO_DEFAULT_MODELS_DIR,
             )
 
@@ -163,6 +172,7 @@ class Node:
             args.offline,
             args.api_port,
             args.libp2p_port,
+            args.peer_download_port,
             peer_file_server,
         )
         logger_set_context(
@@ -303,6 +313,7 @@ class Node:
                                 topics.DOWNLOAD_COMMANDS
                             ),
                             api_port=self._api_port,
+                            peer_download_port=self._peer_download_port,
                         )
                         self._tg.start_soon(self.worker.run)
                     if self.api:
@@ -416,9 +427,7 @@ def _darwin_en0_broadcast_address(ip_address: str) -> str | None:
         return None
 
 
-async def _darwin_mdns_broadcast_announcer(
-    node_id: NodeId, libp2p_port: int
-) -> None:
+async def _darwin_mdns_broadcast_announcer(node_id: NodeId, libp2p_port: int) -> None:
     ip_address = _darwin_en0_ip_address()
     if not ip_address:
         logger.debug("Darwin mDNS broadcast announcer disabled: no en0 IPv4 address")
@@ -545,6 +554,17 @@ class Args(FrozenModel):
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
     bootstrap_peers: list[str] = []
     libp2p_port: int
+    # Per-process listener port for peer-to-peer model file serving.
+    # Defaults to ``EXO_PEER_DOWNLOAD_PORT`` so existing single-node-per-
+    # host deployments keep working unchanged. Operators running
+    # multiple nodes on the same host MUST set this to a distinct value
+    # for each process; the cluster-wide convention is that every node
+    # exposes the same port, since peer discovery currently uses each
+    # node's local value as the assumed remote endpoint (see
+    # ``Worker._peer_download_port``). A future state-sync change can
+    # advertise per-node ports across the cluster -- tracked as a
+    # follow-up to Codex P2 (PR #16 round 3).
+    peer_download_port: PositiveInt = EXO_PEER_DOWNLOAD_PORT
     trust_remote_code: bool = False
 
     @classmethod
@@ -628,6 +648,22 @@ class Args(FrozenModel):
             default=0,
             dest="libp2p_port",
             help="Fixed TCP port for libp2p to listen on (0 = OS-assigned).",
+        )
+        parser.add_argument(
+            "--peer-download-port",
+            type=int,
+            default=EXO_PEER_DOWNLOAD_PORT,
+            dest="peer_download_port",
+            help=(
+                "TCP port for peer-to-peer model file serving (default: "
+                "EXO_PEER_DOWNLOAD_PORT, currently 52416). Required to "
+                "differ between processes when running multiple nodes "
+                "on the same host; otherwise the second node's "
+                "PeerFileServer hits 'address already in use'. All "
+                "nodes in a cluster must use the same value (peer "
+                "discovery uses the local port as the assumed remote "
+                "port)."
+            ),
         )
         fast_synch_group = parser.add_mutually_exclusive_group()
         fast_synch_group.add_argument(

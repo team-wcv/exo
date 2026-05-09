@@ -71,9 +71,10 @@ class TestPeerFileServer:
         """Health endpoint should return ok."""
         import aiohttp
 
-        async with aiohttp.ClientSession() as session, session.get(
-            f"http://127.0.0.1:{peer_server.port}/health"
-        ) as r:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(f"http://127.0.0.1:{peer_server.port}/health") as r,
+        ):
             assert r.status == 200
             data = cast(dict[str, object], await r.json())
             assert data["status"] == "ok"
@@ -97,9 +98,7 @@ class TestPeerFileServer:
         async with aiofiles.open(model_dir / "config.json", "wb") as f:
             await f.write(b'{"test": true}')
 
-        files = await get_peer_file_status(
-            "127.0.0.1", peer_server.port, "test--model"
-        )
+        files = await get_peer_file_status("127.0.0.1", peer_server.port, "test--model")
         assert files is not None
         assert len(files) == 1
         assert files[0].path == "config.json"
@@ -124,9 +123,7 @@ class TestPeerFileServer:
         ) as f:
             await f.write(json.dumps(meta))
 
-        files = await get_peer_file_status(
-            "127.0.0.1", peer_server.port, "test--model"
-        )
+        files = await get_peer_file_status("127.0.0.1", peer_server.port, "test--model")
         assert files is not None
         assert len(files) == 1
         assert files[0].path == "weights.safetensors"
@@ -151,9 +148,7 @@ class TestPeerFileServer:
         ) as f:
             await f.write(json.dumps({"safe_bytes": 512, "total": 2048}))
 
-        files = await get_peer_file_status(
-            "127.0.0.1", peer_server.port, "test--model"
-        )
+        files = await get_peer_file_status("127.0.0.1", peer_server.port, "test--model")
         assert files is not None
         by_path = {file.path: file for file in files}
         assert by_path["snapshots/abc123/config.json"].complete is True
@@ -173,9 +168,12 @@ class TestPeerFileServer:
 
         import aiohttp
 
-        async with aiohttp.ClientSession() as session, session.get(
-            f"http://127.0.0.1:{peer_server.port}/files/test--model/config.json"
-        ) as r:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(
+                f"http://127.0.0.1:{peer_server.port}/files/test--model/config.json"
+            ) as r,
+        ):
             assert r.status == 200
             assert r.headers["X-Exo-Complete"] == "true"
             body = await r.read()
@@ -195,10 +193,13 @@ class TestPeerFileServer:
 
         import aiohttp
 
-        async with aiohttp.ClientSession() as session, session.get(
-            f"http://127.0.0.1:{peer_server.port}/files/test--model/"
-            "snapshots/abc123/config.json"
-        ) as r:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(
+                f"http://127.0.0.1:{peer_server.port}/files/test--model/"
+                "snapshots/abc123/config.json"
+            ) as r,
+        ):
             assert r.status == 200
             body = await r.read()
             assert body == content
@@ -216,10 +217,13 @@ class TestPeerFileServer:
 
         import aiohttp
 
-        async with aiohttp.ClientSession() as session, session.get(
-            f"http://127.0.0.1:{peer_server.port}/files/test--model/"
-            "%2E%2E/outside.txt"
-        ) as r:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(
+                f"http://127.0.0.1:{peer_server.port}/files/test--model/"
+                "%2E%2E/outside.txt"
+            ) as r,
+        ):
             assert r.status == 404
             assert await r.text() != "outside"
 
@@ -236,10 +240,13 @@ class TestPeerFileServer:
 
         import aiohttp
 
-        async with aiohttp.ClientSession() as session, session.get(
-            f"http://127.0.0.1:{peer_server.port}/files/test--model/weights.bin",
-            headers={"Range": "bytes=8-"},
-        ) as r:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(
+                f"http://127.0.0.1:{peer_server.port}/files/test--model/weights.bin",
+                headers={"Range": "bytes=8-"},
+            ) as r,
+        ):
             assert r.status == 206
             body = await r.read()
             assert body == b"89abcdef"
@@ -248,9 +255,12 @@ class TestPeerFileServer:
         """Should return 404 for missing files."""
         import aiohttp
 
-        async with aiohttp.ClientSession() as session, session.get(
-            f"http://127.0.0.1:{peer_server.port}/files/test--model/missing.bin"
-        ) as r:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(
+                f"http://127.0.0.1:{peer_server.port}/files/test--model/missing.bin"
+            ) as r,
+        ):
             assert r.status == 404
 
 
@@ -418,9 +428,7 @@ class TestPeerSelectionRespectsOfflineAndIgnorePatterns:
         assert downloader._offline is False
 
     def test_offline_flag_propagates(self) -> None:
-        downloader = PeerAwareShardDownloader(
-            NoopShardDownloader(), offline=True
-        )
+        downloader = PeerAwareShardDownloader(NoopShardDownloader(), offline=True)
         assert downloader._offline is True
 
     async def test_try_peer_download_passes_offline_to_fetch_file_list(
@@ -437,9 +445,7 @@ class TestPeerSelectionRespectsOfflineAndIgnorePatterns:
 
         captured: dict[str, object] = {}
 
-        async def fake_fetch(
-            *args: object, **kwargs: object
-        ) -> list[FileListEntry]:
+        async def fake_fetch(*args: object, **kwargs: object) -> list[FileListEntry]:
             captured["args"] = args
             captured["kwargs"] = kwargs
             # Empty list -> no required files -> ``failed`` short-
@@ -473,9 +479,7 @@ class TestPeerSelectionRespectsOfflineAndIgnorePatterns:
         monkeypatch.setattr(psd, "resolve_model_dir", fake_resolve_dir)
         monkeypatch.setattr(psd, "resolve_allow_patterns", fake_resolve_allow)
 
-        downloader = PeerAwareShardDownloader(
-            NoopShardDownloader(), offline=True
-        )
+        downloader = PeerAwareShardDownloader(NoopShardDownloader(), offline=True)
         shard = _make_shard(ModelId("test-org/model-a"))
 
         result = await downloader._try_peer_download(
@@ -490,10 +494,7 @@ class TestPeerSelectionRespectsOfflineAndIgnorePatterns:
         assert captured["kwargs"] == {
             "recursive": True,
             "skip_internet": True,
-        }, (
-            "skip_internet must reflect downloader.offline (got "
-            f"{captured['kwargs']!r})"
-        )
+        }, f"skip_internet must reflect downloader.offline (got {captured['kwargs']!r})"
 
     async def test_try_peer_download_filters_ignore_patterns(
         self, monkeypatch: pytest.MonkeyPatch
@@ -520,15 +521,11 @@ class TestPeerSelectionRespectsOfflineAndIgnorePatterns:
             # These two should NOT show up on the peer's required-files
             # list once the fix lands. Pre-fix they did, the peer didn't
             # have them, and the whole transfer fell back to HF.
-            FileListEntry(
-                type="file", path="original/consolidated.00.pth", size=999
-            ),
+            FileListEntry(type="file", path="original/consolidated.00.pth", size=999),
             FileListEntry(type="file", path="metal/dist.bin", size=999),
         ]
 
-        async def fake_fetch(
-            *_args: object, **_kwargs: object
-        ) -> list[FileListEntry]:
+        async def fake_fetch(*_args: object, **_kwargs: object) -> list[FileListEntry]:
             return served
 
         # The peer reports ONLY the canonical files, exactly the shape
@@ -543,9 +540,7 @@ class TestPeerSelectionRespectsOfflineAndIgnorePatterns:
             timeout: float = 5.0,
         ) -> list[PeerFileInfo] | None:
             return [
-                PeerFileInfo(
-                    path=p, size=100, complete=True, safe_bytes=100
-                )
+                PeerFileInfo(path=p, size=100, complete=True, safe_bytes=100)
                 for p in peer_paths
             ]
 
@@ -610,4 +605,184 @@ class TestPeerSelectionRespectsOfflineAndIgnorePatterns:
             "that don't have ``original/*`` / ``metal/*`` aren't "
             "incorrectly judged incomplete; got "
             f"{captured_kwargs!r}"
+        )
+
+
+class TestPeerDownloadIntegrityCheckRespectsOfflineMode:
+    """Codex P1 on PR #16 round 3: ``_try_peer_download`` was calling
+    ``file_meta(...)`` against HuggingFace for every file, even when the
+    coordinator was started with ``--offline`` / ``EXO_OFFLINE=true``.
+    Any failure to reach HF (the entire point of offline mode) was
+    treated as an integrity-check failure, the peer-fetched bytes were
+    deleted, and the cold node was left with no path to complete model
+    sync. The fix: when the downloader is in offline mode, trust the
+    LAN peer's bytes and skip the HF metadata call entirely.
+    """
+
+    async def test_offline_mode_skips_file_meta_and_keeps_peer_bytes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from exo.download import peer_shard_downloader as psd
+        from exo.download.peer_download import PeerFileInfo
+        from exo.shared.types.worker.downloads import FileListEntry
+
+        async def fake_fetch(*_args: object, **_kwargs: object) -> list[FileListEntry]:
+            return [
+                FileListEntry(
+                    type="file",
+                    path="model.safetensors",
+                    size=10,
+                ),
+            ]
+
+        async def fake_peer_status(
+            peer_host: str,
+            peer_port: int,
+            model_id_normalized: str,
+            timeout: float = 5.0,
+        ) -> list[PeerFileInfo] | None:
+            return [
+                PeerFileInfo(
+                    path="model.safetensors",
+                    size=10,
+                    complete=True,
+                    safe_bytes=10,
+                )
+            ]
+
+        async def fake_resolve_dir(model_id: ModelId) -> Path:
+            return tmp_path
+
+        async def fake_resolve_allow(shard: ShardMetadata) -> list[str]:
+            return ["*"]
+
+        target_path = tmp_path / "model.safetensors"
+
+        async def fake_download(
+            peer_ip: str,
+            peer_port: int,
+            model_id_normalized: str,
+            file_path: str,
+            target_dir: Path,
+            expected_size: int,
+            on_progress: object = None,
+        ) -> Path | None:
+            async with aiofiles.open(target_path, "wb") as f:
+                await f.write(b"0123456789")
+            return target_path
+
+        async def file_meta_should_not_be_called(
+            *_args: object, **_kwargs: object
+        ) -> tuple[int, str]:
+            raise AssertionError(
+                "file_meta must not be called in offline mode -- the "
+                "operator opted into trusting LAN peers"
+            )
+
+        monkeypatch.setattr(psd, "fetch_file_list_with_cache", fake_fetch)
+        monkeypatch.setattr(psd, "get_peer_file_status", fake_peer_status)
+        monkeypatch.setattr(psd, "resolve_model_dir", fake_resolve_dir)
+        monkeypatch.setattr(psd, "resolve_allow_patterns", fake_resolve_allow)
+        monkeypatch.setattr(psd, "download_file_from_peer", fake_download)
+        monkeypatch.setattr(psd, "file_meta", file_meta_should_not_be_called)
+
+        downloader = PeerAwareShardDownloader(NoopShardDownloader(), offline=True)
+        shard = _make_shard(ModelId("test-org/model-a"))
+
+        result = await downloader._try_peer_download(
+            shard,
+            peer_ip="10.0.0.1",
+            peer_port=52415,
+            model_id_normalized="test-org/model-a",
+        )
+        assert result is not None, (
+            "offline peer download must succeed without consulting HF; "
+            "got None which means the integrity check fired and the "
+            "peer bytes were discarded"
+        )
+        assert await aios.path.exists(target_path), (
+            "peer-downloaded file must be retained when offline mode "
+            "skips the HF integrity check"
+        )
+
+    async def test_online_mode_still_calls_file_meta(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from exo.download import peer_shard_downloader as psd
+        from exo.download.peer_download import PeerFileInfo
+        from exo.shared.types.worker.downloads import FileListEntry
+
+        async def fake_fetch(*_args: object, **_kwargs: object) -> list[FileListEntry]:
+            return [
+                FileListEntry(
+                    type="file",
+                    path="model.safetensors",
+                    size=10,
+                ),
+            ]
+
+        async def fake_peer_status(
+            peer_host: str,
+            peer_port: int,
+            model_id_normalized: str,
+            timeout: float = 5.0,
+        ) -> list[PeerFileInfo] | None:
+            return [
+                PeerFileInfo(
+                    path="model.safetensors",
+                    size=10,
+                    complete=True,
+                    safe_bytes=10,
+                )
+            ]
+
+        async def fake_resolve_dir(model_id: ModelId) -> Path:
+            return tmp_path
+
+        async def fake_resolve_allow(shard: ShardMetadata) -> list[str]:
+            return ["*"]
+
+        target_path = tmp_path / "model.safetensors"
+
+        async def fake_download(
+            peer_ip: str,
+            peer_port: int,
+            model_id_normalized: str,
+            file_path: str,
+            target_dir: Path,
+            expected_size: int,
+            on_progress: object = None,
+        ) -> Path | None:
+            async with aiofiles.open(target_path, "wb") as f:
+                await f.write(b"0123456789")
+            return target_path
+
+        meta_calls: list[tuple[object, ...]] = []
+
+        async def recording_meta(*args: object, **_kwargs: object) -> tuple[int, str]:
+            meta_calls.append(args)
+            # Return mismatched etag -> downloader will discard.
+            return (10, "deadbeef" * 5)
+
+        monkeypatch.setattr(psd, "fetch_file_list_with_cache", fake_fetch)
+        monkeypatch.setattr(psd, "get_peer_file_status", fake_peer_status)
+        monkeypatch.setattr(psd, "resolve_model_dir", fake_resolve_dir)
+        monkeypatch.setattr(psd, "resolve_allow_patterns", fake_resolve_allow)
+        monkeypatch.setattr(psd, "download_file_from_peer", fake_download)
+        monkeypatch.setattr(psd, "file_meta", recording_meta)
+
+        downloader = PeerAwareShardDownloader(NoopShardDownloader(), offline=False)
+        shard = _make_shard(ModelId("test-org/model-a"))
+
+        await downloader._try_peer_download(
+            shard,
+            peer_ip="10.0.0.1",
+            peer_port=52415,
+            model_id_normalized="test-org/model-a",
+        )
+
+        assert len(meta_calls) == 1, (
+            "online mode must continue calling file_meta to validate "
+            "peer-downloaded bytes against HF's authoritative hash; "
+            f"got meta_calls={meta_calls!r}"
         )

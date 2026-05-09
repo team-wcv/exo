@@ -10,7 +10,7 @@ from exo.api.types import ImageEditsTaskParams
 from exo.download.download_utils import is_read_only_model_dir, resolve_existing_model
 from exo.download.peer_state import discover_peers_for_model
 from exo.shared.apply import apply
-from exo.shared.constants import EXO_MAX_INSTANCE_RETRIES, EXO_PEER_DOWNLOAD_PORT
+from exo.shared.constants import EXO_MAX_INSTANCE_RETRIES
 from exo.shared.models.model_cards import ModelId, add_to_card_cache, delete_custom_card
 from exo.shared.types.chunks import InputImageChunk
 from exo.shared.types.commands import (
@@ -73,6 +73,7 @@ class Worker:
         command_sender: Sender[ForwarderCommand],
         download_command_sender: Sender[ForwarderDownloadCommand],
         api_port: int,
+        peer_download_port: int,
     ):
         self.node_id: NodeId = node_id
         self.event_receiver = event_receiver
@@ -80,6 +81,14 @@ class Worker:
         self.command_sender = command_sender
         self.download_command_sender = download_command_sender
         self.api_port = api_port
+        # Codex P2 (PR #16 round 3): the peer-download listener port is
+        # now per-process configurable instead of a module-level
+        # constant. Use the local value when computing
+        # ``discover_peers_for_model`` results because peers in the
+        # current architecture all bind the same port (cluster-wide
+        # convention enforced via ``EXO_PEER_DOWNLOAD_PORT`` /
+        # ``--peer-download-port``).
+        self._peer_download_port = peer_download_port
 
         self.state: State = State()
         self.runners: dict[RunnerId, RunnerSupervisor] = {}
@@ -265,12 +274,11 @@ class Worker:
                             )
                         )
                     else:
-                        # Discover peers that already have this model
                         peers = discover_peers_for_model(
                             self.node_id,
                             self.state,
                             shard.model_card.model_id.normalize(),
-                            EXO_PEER_DOWNLOAD_PORT,
+                            self._peer_download_port,
                         )
                         await self.download_command_sender.send(
                             ForwarderDownloadCommand(

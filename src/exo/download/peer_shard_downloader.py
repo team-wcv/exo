@@ -76,9 +76,9 @@ class PeerAwareShardDownloader(ShardDownloader):
             Callable[[ShardMetadata, RepoDownloadProgress], Awaitable[None]]
         ] = []
         # Peers are set per-download by the coordinator before calling ensure_shard.
-        self._peers_by_shard: defaultdict[
-            ShardPeerKey, deque[list[PeerEndpoint]]
-        ] = defaultdict(deque)
+        self._peers_by_shard: defaultdict[ShardPeerKey, deque[list[PeerEndpoint]]] = (
+            defaultdict(deque)
+        )
 
     def set_available_peers(
         self, shard: ShardMetadata, peers: list[PeerEndpoint]
@@ -108,7 +108,9 @@ class PeerAwareShardDownloader(ShardDownloader):
         peers = self._pop_available_peers(shard)
 
         if not peers:
-            logger.debug(f"No peers available for {model_id}, downloading from HuggingFace")
+            logger.debug(
+                f"No peers available for {model_id}, downloading from HuggingFace"
+            )
             return await self._inner.ensure_shard(shard, config_only=False)
 
         # Try each peer (already sorted by priority: RDMA first, completed first)
@@ -121,16 +123,16 @@ class PeerAwareShardDownloader(ShardDownloader):
                 shard, peer.ip, peer.port, normalized
             )
             if result is not None:
-                logger.info(
-                    f"Successfully downloaded {model_id} from peer {peer.ip}"
-                )
+                logger.info(f"Successfully downloaded {model_id} from peer {peer.ip}")
                 return result
             logger.info(
                 f"Peer download from {peer.ip} failed, trying next peer or HuggingFace"
             )
 
         # All peers failed, fall back to HuggingFace
-        logger.info(f"All peer downloads failed for {model_id}, falling back to HuggingFace")
+        logger.info(
+            f"All peer downloads failed for {model_id}, falling back to HuggingFace"
+        )
         return await self._inner.ensure_shard(shard, config_only=False)
 
     async def _try_peer_download(
@@ -145,9 +147,7 @@ class PeerAwareShardDownloader(ShardDownloader):
         Returns the model directory path on success, None on failure.
         """
         # First, check what the peer has
-        peer_files = await get_peer_file_status(
-            peer_ip, peer_port, model_id_normalized
-        )
+        peer_files = await get_peer_file_status(peer_ip, peer_port, model_id_normalized)
         if not peer_files:
             return None
 
@@ -255,6 +255,21 @@ class PeerAwareShardDownloader(ShardDownloader):
                 )
                 if result is None:
                     return False
+                # Offline / air-gapped deployments have explicitly opted
+                # out of contacting HuggingFace. Codex flagged (P1, PR
+                # #16 round 3) that calling ``file_meta`` here silently
+                # broke peer transfers in offline mode: any exception
+                # (e.g. DNS failure, blocked egress) was treated as
+                # integrity-check failure and the peer copy was
+                # deleted, leaving the cold node with no path to
+                # complete model sync. When the operator runs with
+                # ``--offline``/``EXO_OFFLINE=true`` we trust the LAN
+                # peer's bytes (size already enforced by
+                # ``download_file_from_peer``) and skip the HF
+                # canonical-hash check entirely.
+                if self._offline:
+                    return True
+
                 # Codex flagged (P2, PR #16 round 2) that peer downloads
                 # were marked successful as soon as ``n_read ==
                 # expected_size``, with no content-integrity check. A
@@ -265,7 +280,7 @@ class PeerAwareShardDownloader(ShardDownloader):
                 #
                 # Validate against HuggingFace's authoritative hash:
                 # we already need internet for ``fetch_file_list_with_cache``
-                # (line 149), so the extra ``file_meta()`` HEAD is
+                # in online mode, so the extra ``file_meta()`` HEAD is
                 # cheap. Trusting a hash advertised by the peer would
                 # leave us vulnerable to a malicious peer that lies
                 # about both bytes and hash; HF is the canonical
@@ -312,8 +327,7 @@ class PeerAwareShardDownloader(ShardDownloader):
                         await aios.remove(result)
                     except Exception as exc:
                         logger.error(
-                            f"Failed to remove corrupt peer download "
-                            f"{result}: {exc}"
+                            f"Failed to remove corrupt peer download {result}: {exc}"
                         )
                     return False
                 return True
@@ -363,9 +377,7 @@ class PeerAwareShardDownloader(ShardDownloader):
         for cb in self._progress_callbacks:
             await cb(shard, final_progress)
 
-        gguf = next(
-            (f for f in filtered_file_list if f.path.endswith(".gguf")), None
-        )
+        gguf = next((f for f in filtered_file_list if f.path.endswith(".gguf")), None)
         return (target_dir / gguf.path) if gguf else target_dir
 
     async def get_shard_download_status(
