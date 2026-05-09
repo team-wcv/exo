@@ -210,6 +210,7 @@ def _spec_diag(message: str) -> None:
         except OSError:
             pass
 
+
 # Length-prefix slot value reserved for the "drafter aborted" signal.
 # Picked from the int32 positive range so it survives
 # ``_validate_broadcast_values`` (well above any legitimate ``K``,
@@ -334,6 +335,16 @@ class PipelinedModelDrafter:
         self._target_group = target_group
         self._target_peer_fanout = target_peer_fanout
         self._is_target_root = is_target_root
+        # Per-request spec-decode telemetry. Mutated in place by the
+        # spec body each round; read by ``mlx_generate`` after streaming
+        # completes to populate ``GenerationStats``. Single-request
+        # lifecycle (a fresh drafter is built per request in
+        # ``mlx_generate``), so no thread-safety concerns.
+        self._metrics: dict[str, int] = {
+            "proposed_draft_tokens": 0,
+            "accepted_draft_tokens": 0,
+            "spec_decode_rounds": 0,
+        }
 
     @property
     def mode(self) -> DraftMode:
@@ -342,6 +353,18 @@ class PipelinedModelDrafter:
     @property
     def num_draft_tokens(self) -> int:
         return self._num_draft_tokens
+
+    def metrics(self) -> dict[str, int]:
+        """Snapshot of accumulated spec-decode metrics for this request.
+
+        Keys: ``proposed_draft_tokens`` (total drafts proposed across all
+        rounds), ``accepted_draft_tokens`` (drafts the target accepted),
+        ``spec_decode_rounds`` (rounds executed). Acceptance rate is
+        ``accepted / proposed`` when ``proposed > 0``. Counters reset on
+        each new request via the per-request drafter construction in
+        ``mlx_generate``; mutate in lockstep with the spec loop.
+        """
+        return dict(self._metrics)
 
     def stream(
         self,
@@ -371,6 +394,7 @@ class PipelinedModelDrafter:
             target_group=self._target_group,
             target_peer_fanout=self._target_peer_fanout,
             is_target_root=self._is_target_root,
+            metrics=self._metrics,
         )
 
     def shutdown(self) -> None:
@@ -395,6 +419,7 @@ def _pipelined_stream_generate(
     target_group: mx.distributed.Group | None = None,
     target_peer_fanout: TargetPeerFanout | None = None,
     is_target_root: bool = True,
+    metrics: dict[str, int] | None = None,
 ) -> Generator[GenerationResponse, None, None]:
     """Mirror of ``mlx_lm.stream_generate`` framing for the pipelined drafter.
 
@@ -426,6 +451,7 @@ def _pipelined_stream_generate(
         target_group=target_group,
         target_peer_fanout=target_peer_fanout,
         is_target_root=is_target_root,
+        metrics=metrics,
     )
 
     prompt_size = len(context_tokens)
@@ -693,6 +719,7 @@ def _pipelined_speculative_step(
     target_group: mx.distributed.Group | None = None,
     target_peer_fanout: TargetPeerFanout | None = None,
     is_target_root: bool = True,
+    metrics: dict[str, int] | None = None,
 ) -> Generator[tuple[int, mx.array, bool], None, None]:
     """Public spec-step generator with drafter-failure recovery.
 
@@ -726,6 +753,7 @@ def _pipelined_speculative_step(
         target_group=target_group,
         target_peer_fanout=target_peer_fanout,
         is_target_root=is_target_root,
+        metrics=metrics,
     )
     try:
         yield from inner
@@ -761,6 +789,7 @@ def _pipelined_speculative_step_body(
     target_group: mx.distributed.Group | None = None,
     target_peer_fanout: TargetPeerFanout | None = None,
     is_target_root: bool = True,
+    metrics: dict[str, int] | None = None,
 ) -> Generator[tuple[int, mx.array, bool], None, None]:
     """Cross-round speculative decoding loop using ``transport``.
 
@@ -852,8 +881,7 @@ def _pipelined_speculative_step_body(
     if transport is not None:
         _diag_fwd_t0 = time.perf_counter()
         _spec_diag(
-            f"rank {_diag_rank}: round 0 about to call "
-            f"transport.forward([seed], k={k})"
+            f"rank {_diag_rank}: round 0 about to call transport.forward([seed], k={k})"
         )
         drafts_future = transport.forward([seed], k)
         drafts_local: list[int] | None = drafts_future.result()
@@ -1072,6 +1100,17 @@ def _pipelined_speculative_step_body(
                 num_accepted += 1
             else:
                 break
+
+        # Per-round telemetry: ``k_this`` drafts proposed,
+        # ``num_accepted`` accepted by the greedy verifier. The bonus
+        # token (target's correction or full-accept tail) is *not* a
+        # draft, so it doesn't count against acceptance rate. Mutates
+        # the caller's dict in place; ``metrics is None`` for the
+        # synthetic single-rank tests that bypass the drafter wrapper.
+        if metrics is not None:
+            metrics["proposed_draft_tokens"] += k_this
+            metrics["accepted_draft_tokens"] += num_accepted
+            metrics["spec_decode_rounds"] += 1
 
         # ----- Emit accepted drafts + correction/bonus -----
         emit_count = num_accepted + 1

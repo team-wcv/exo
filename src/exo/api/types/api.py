@@ -180,16 +180,6 @@ class ChatCompletionChoice(BaseModel):
     finish_reason: FinishReason | None = None
 
 
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: Literal["chat.completion"] = "chat.completion"
-    created: int
-    model: str
-    choices: list[ChatCompletionChoice | StreamingChoiceResponse]
-    usage: Usage | None = None
-    service_tier: str | None = None
-
-
 class GenerationStats(BaseModel):
     prompt_tps: float
     generation_tps: float
@@ -205,6 +195,21 @@ class GenerationStats(BaseModel):
     # speedup is approximately ``accepted_draft_tokens / generation_tokens``.
     drafter_model_id: str | None = None
     accepted_draft_tokens: int = 0
+    # Total drafts the drafter proposed across all spec-decode rounds.
+    # ``0`` means either the drafter didn't run or the drafter implementation
+    # doesn't surface proposal counts (currently only the pipelined drafter
+    # does). The classical per-position acceptance rate is
+    # ``accepted_draft_tokens / proposed_draft_tokens``; ``0`` here makes
+    # that property return ``None`` rather than divide-by-zero. ``mlx_lm``'s
+    # built-in ``stream_generate(draft_model=...)`` does not expose proposal
+    # counts at all, so external-model-drafter requests will leave this at 0
+    # while still populating ``accepted_draft_tokens``.
+    proposed_draft_tokens: int = 0
+    # Number of speculative-decoding rounds that actually ran. Each round
+    # proposes ``num_draft_tokens`` drafts (truncated near max_tokens).
+    # Useful for computing per-round latency in dashboards. ``0`` when the
+    # drafter didn't run or doesn't surface round counts.
+    spec_decode_rounds: int = 0
     # K used for speculative_generate_step (None when drafter didn't run).
     num_draft_tokens: int | None = None
     # Drafting strategy that actually ran for this request: "model" for
@@ -223,15 +228,47 @@ class GenerationStats(BaseModel):
     def drafter_acceptance_fraction(self) -> float | None:
         """Fraction of *generated* tokens that came from the drafter.
 
-        ``None`` when no drafter ran for the request. This is a slight
-        misnomer relative to the speculative-decoding literature -- the true
-        acceptance rate would divide by the drafter's proposal count, which
-        ``stream_generate`` doesn't surface -- but it is the metric that
-        directly maps to wall-clock speedup, so it's what we display.
+        Maps directly to wall-clock speedup. ``None`` when no drafter ran.
+        Always populated when speculative decoding runs (every drafter
+        tracks ``from_draft`` per emitted token).
         """
         if self.drafter_model_id is None or self.generation_tokens == 0:
             return None
         return self.accepted_draft_tokens / self.generation_tokens
+
+    @property
+    def drafter_acceptance_rate(self) -> float | None:
+        """Classical acceptance rate: accepted / proposed (per-position).
+
+        ``None`` when the drafter didn't run *or* when it doesn't track
+        proposal counts (e.g. external-model drafter via mlx_lm). The
+        pipelined drafter tracks this. Differs from
+        :attr:`drafter_acceptance_fraction`: this divides by total drafts
+        proposed (the standard literature metric for drafter quality);
+        ``drafter_acceptance_fraction`` divides by total emitted tokens
+        (the metric for end-to-end speedup).
+        """
+        if self.drafter_model_id is None or self.proposed_draft_tokens == 0:
+            return None
+        return self.accepted_draft_tokens / self.proposed_draft_tokens
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int
+    model: str
+    choices: list[ChatCompletionChoice | StreamingChoiceResponse]
+    usage: Usage | None = None
+    service_tier: str | None = None
+    # Non-OpenAI extension: full generation stats for the request,
+    # including spec-decode telemetry (drafter id, mode, K, accepted /
+    # proposed draft tokens, spec rounds, peak memory, prefill TPS).
+    # Standard OpenAI clients ignore unknown fields; exo's own benches
+    # and dashboards read this for drafter-effectiveness reporting.
+    # ``None`` for endpoints that don't run a generation pipeline (e.g.
+    # tool-call-only completions).
+    generation_stats: GenerationStats | None = None
 
 
 class ImageGenerationStats(BaseModel):

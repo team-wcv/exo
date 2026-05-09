@@ -486,8 +486,7 @@ def batched_prefill(
     # ``len(prompt) - 1`` per slot — same invariant ``mlx_generate``'s
     # exact-prefix-hit branch produces.
     prefill_tokens: list[list[int]] = [
-        [int(t) for t in cast(list[int], p[:-1].tolist())]
-        for p in prompt_tokens_list
+        [int(t) for t in cast(list[int], p[:-1].tolist())] for p in prompt_tokens_list
     ]
     total_tokens = sum(len(p) for p in prefill_tokens)
     if total_tokens == 0:
@@ -1417,6 +1416,24 @@ def mlx_generate(
                 elif drafter.mode == "ngram":
                     telemetry_k = effective_num_draft_tokens
 
+                # Pull per-round counters from the drafter when it
+                # surfaces them. Only the pipelined drafter does today;
+                # ``getattr(..., None)`` keeps this future-proof for
+                # drafter implementations that grow a ``metrics()``
+                # method later. ``mlx_lm``'s built-in spec loop doesn't
+                # expose proposal counts, so the ``"model"`` mode
+                # surfaces only ``accepted_draft_tokens`` (from the
+                # ``from_draft`` flag on each yielded token).
+                drafter_metrics_fn = cast(
+                    "Callable[[], dict[str, int]] | None",
+                    getattr(drafter, "metrics", None),
+                )
+                drafter_metrics: dict[str, int] = (
+                    drafter_metrics_fn() if drafter_metrics_fn is not None else {}
+                )
+                proposed = int(drafter_metrics.get("proposed_draft_tokens", 0))
+                spec_rounds = int(drafter_metrics.get("spec_decode_rounds", 0))
+
                 stats = GenerationStats(
                     prompt_tps=float(prefill_tps or out.prompt_tps),
                     generation_tps=float(out.generation_tps),
@@ -1425,6 +1442,8 @@ def mlx_generate(
                     peak_memory_usage=Memory.from_gb(out.peak_memory),
                     drafter_model_id=telemetry_drafter_id,
                     accepted_draft_tokens=from_draft_count,
+                    proposed_draft_tokens=proposed,
+                    spec_decode_rounds=spec_rounds,
                     num_draft_tokens=telemetry_k,
                     draft_mode=drafter.mode,
                 )
@@ -1433,6 +1452,18 @@ def mlx_generate(
                         f"Model generated unexpected finish_reason: {out.finish_reason}"
                     )
 
+                # OpenAI-compatible surface for spec-decode telemetry.
+                # ``accepted_prediction_tokens`` is OpenAI's term for
+                # tokens supplied by a Predicted Output that ended up in
+                # the completion -- semantically equivalent to our
+                # ``accepted_draft_tokens``. ``rejected_prediction_tokens``
+                # is the count of predicted tokens that didn't make it,
+                # i.e. drafts that the verifier rejected. We can only
+                # populate this when the drafter surfaces a proposal
+                # count; otherwise leave it at 0 rather than guess.
+                rejected_prediction_tokens = (
+                    max(0, proposed - from_draft_count) if proposed > 0 else 0
+                )
                 total_prompt_tokens = len(all_prompt_tokens)
                 usage = Usage(
                     prompt_tokens=total_prompt_tokens,
@@ -1442,7 +1473,9 @@ def mlx_generate(
                         cached_tokens=prefix_hit_length
                     ),
                     completion_tokens_details=CompletionTokensDetails(
-                        reasoning_tokens=0
+                        reasoning_tokens=0,
+                        accepted_prediction_tokens=from_draft_count,
+                        rejected_prediction_tokens=rejected_prediction_tokens,
                     ),
                 )
 
@@ -1459,7 +1492,13 @@ def mlx_generate(
                     )
 
             if is_done:
-                # Log generation stats
+                # Per-request generation summary. INFO level because it's
+                # one line per completed request -- bounded volume, and
+                # the operator absolutely needs visibility into drafter
+                # effectiveness without flipping ``-vv``. When the
+                # drafter ran, surface acceptance fraction + per-position
+                # acceptance rate (when proposal count is available) +
+                # rounds + K.
                 generation_elapsed = time.perf_counter() - generation_start_time
                 generated_tokens = len(generated_text_parts)
                 generation_tps = (
@@ -1467,11 +1506,29 @@ def mlx_generate(
                     if generation_elapsed > 0
                     else 0.0
                 )
-                logger.debug(
+                base_msg = (
                     f"Generation complete: prefill {prompt_tokens} tokens @ "
-                    f"{prefill_tps:.1f} tok/s, generated {generated_tokens} tokens @ "
-                    f"{generation_tps:.1f} tok/s"
+                    f"{prefill_tps:.1f} tok/s, generated {generated_tokens} "
+                    f"tokens @ {generation_tps:.1f} tok/s"
                 )
+                if stats is not None and stats.drafter_model_id is not None:
+                    fraction = stats.drafter_acceptance_fraction
+                    rate = stats.drafter_acceptance_rate
+                    fraction_str = f"{fraction:.1%}" if fraction is not None else "n/a"
+                    rate_str = f"{rate:.1%}" if rate is not None else "n/a"
+                    drafter_msg = (
+                        f", drafter={stats.draft_mode}/"
+                        f"{stats.drafter_model_id} "
+                        f"K={stats.num_draft_tokens} "
+                        f"rounds={stats.spec_decode_rounds} "
+                        f"accepted={stats.accepted_draft_tokens}/"
+                        f"{stats.proposed_draft_tokens or 'n/a'} "
+                        f"(rate={rate_str}, "
+                        f"fraction_of_emitted={fraction_str})"
+                    )
+                else:
+                    drafter_msg = ""
+                logger.info(base_msg + drafter_msg)
             if on_generation_token is not None:
                 on_generation_token()
 
