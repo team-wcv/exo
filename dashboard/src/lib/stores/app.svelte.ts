@@ -292,6 +292,50 @@ export interface PrefillProgress {
   startedAt: number;
 }
 
+export interface DrafterStats {
+  // ``modelId`` is null for n-gram speculation (no external drafter
+  // model -- the suffix lookup runs in-process against the prompt and
+  // the partial generation). The mode field below disambiguates the
+  // "no drafter" case from "drafter with no metadata yet".
+  modelId: string | null;
+  draftMode: "model" | "ngram";
+  acceptedDraftTokens: number;
+  generationTokens: number;
+  numDraftTokens: number | null;
+  acceptanceFraction: number; // accepted / generation_tokens
+}
+
+interface RawGenerationStats {
+  generation_tps: number;
+  generation_tokens?: number;
+  drafter_model_id?: string | null;
+  accepted_draft_tokens?: number;
+  num_draft_tokens?: number | null;
+  draft_mode?: "model" | "ngram" | "none" | null;
+}
+
+// Build a DrafterStats record from the API's generation_stats payload, or
+// return null if the request didn't speculate. We accept stats whenever the
+// server reports either an explicit drafter model id (model speculation) or
+// a draft_mode of "ngram" (in-process suffix lookup, which has no model id).
+function buildDrafterStats(stats: RawGenerationStats): DrafterStats | null {
+  if (!stats.generation_tokens || stats.generation_tokens <= 0) return null;
+  const isNgram = stats.draft_mode === "ngram";
+  const isModel =
+    stats.draft_mode === "model" ||
+    (stats.draft_mode == null && stats.drafter_model_id != null);
+  if (!isNgram && !isModel) return null;
+  const accepted = stats.accepted_draft_tokens ?? 0;
+  return {
+    modelId: stats.drafter_model_id ?? null,
+    draftMode: isNgram ? "ngram" : "model",
+    acceptedDraftTokens: accepted,
+    generationTokens: stats.generation_tokens,
+    numDraftTokens: stats.num_draft_tokens ?? null,
+    acceptanceFraction: accepted / stats.generation_tokens,
+  };
+}
+
 export interface Message {
   id: string;
   role: "user" | "assistant" | "system";
@@ -301,6 +345,7 @@ export interface Message {
   attachments?: MessageAttachment[];
   ttftMs?: number; // Time to first token in ms (for assistant messages)
   tps?: number; // Tokens per second (for assistant messages)
+  drafterStats?: DrafterStats; // Speculative-decoding telemetry for this turn
   requestType?: "chat" | "image-generation" | "image-editing";
   sourceImageDataUrl?: string; // For image editing regeneration
   tokens?: TokenData[];
@@ -538,6 +583,7 @@ class AppStore {
   // Performance metrics
   ttftMs = $state<number | null>(null); // Time to first token in ms
   tps = $state<number | null>(null); // Tokens per second
+  drafterStats = $state<DrafterStats | null>(null);
   totalTokens = $state<number>(0); // Total tokens in current response
   prefillProgress = $state<PrefillProgress | null>(null);
 
@@ -1676,6 +1722,7 @@ class AppStore {
     this.currentResponse = prefixText;
     this.ttftMs = null;
     this.tps = null;
+    this.drafterStats = null;
     this.totalTokens = tokensToKeep.length;
 
     try {
@@ -1831,9 +1878,13 @@ class AppStore {
         },
         {
           generation_stats: (data) => {
-            const stats = data as { generation_tps: number };
+            const stats = data as RawGenerationStats;
             if (stats.generation_tps > 0) {
               this.tps = stats.generation_tps;
+            }
+            const drafterStats = buildDrafterStats(stats);
+            if (drafterStats !== null) {
+              this.drafterStats = drafterStats;
             }
           },
         },
@@ -1852,6 +1903,7 @@ class AppStore {
           m.tokens = [...collectedTokens];
           if (this.ttftMs !== null) m.ttftMs = this.ttftMs;
           if (this.tps !== null) m.tps = this.tps;
+          if (this.drafterStats !== null) m.drafterStats = this.drafterStats;
         });
         this.syncActiveMessagesIfNeeded(targetConversationId);
         this.persistConversation(targetConversationId);
@@ -2044,9 +2096,13 @@ class AppStore {
         },
         {
           generation_stats: (data) => {
-            const stats = data as { generation_tps: number };
+            const stats = data as RawGenerationStats;
             if (stats.generation_tps > 0) {
               this.tps = stats.generation_tps;
+            }
+            const drafterStats = buildDrafterStats(stats);
+            if (drafterStats !== null) {
+              this.drafterStats = drafterStats;
             }
           },
         },
@@ -2103,6 +2159,7 @@ class AppStore {
     // Clear stats when model changes
     this.ttftMs = null;
     this.tps = null;
+    this.drafterStats = null;
   }
 
   /**
@@ -2305,6 +2362,7 @@ class AppStore {
     this.currentResponse = "";
     this.ttftMs = null;
     this.tps = null;
+    this.drafterStats = null;
     this.totalTokens = 0;
 
     // Build attachments from files
@@ -2655,11 +2713,15 @@ class AppStore {
             };
           },
           generation_stats: (data) => {
-            const stats = data as { generation_tps: number };
+            const stats = data as RawGenerationStats;
 
             if (stats.generation_tps > 0) {
               this.tps = stats.generation_tps;
               serverTpsReceived = true;
+            }
+            const drafterStats = buildDrafterStats(stats);
+            if (drafterStats !== null) {
+              this.drafterStats = drafterStats;
             }
           },
         },
@@ -2694,6 +2756,9 @@ class AppStore {
             }
             if (this.tps !== null) {
               msg.tps = this.tps;
+            }
+            if (this.drafterStats !== null) {
+              msg.drafterStats = this.drafterStats;
             }
           },
         );
@@ -3260,6 +3325,7 @@ class AppStore {
     // Clear performance stats
     this.ttftMs = null;
     this.tps = null;
+    this.drafterStats = null;
   }
 
   /**

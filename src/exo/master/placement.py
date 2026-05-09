@@ -354,19 +354,35 @@ def place_instance(
         instance_meta = InstanceMeta.MlxRing
         sharding = Sharding.Pipeline
 
-    # Two independent post-selection adjustments. They land in this
+    # Three independent post-selection adjustments. They land in this
     # order so the JACCL preflight fails fast (raising a node-specific
     # error message) before we go through the work of computing the
-    # singleton total-memory expansion. The two checks are mutually
-    # exclusive in practice -- the JACCL preflight only fires when
-    # ``instance_meta == MlxJaccl`` (multi-node) and the
-    # ``allow_single_node_total_memory`` expansion only fires for
-    # singleton cycles, which were already downgraded to ``MlxRing``
-    # by the block above -- but we keep both unconditional so the
-    # invariant is encoded in the code itself rather than in a
-    # comment about ordering.
+    # singleton total-memory expansion or the drafter-multi-node warning.
+    # The first two checks are mutually exclusive in practice -- the JACCL
+    # preflight only fires when ``instance_meta == MlxJaccl`` (multi-node)
+    # and the ``allow_single_node_total_memory`` expansion only fires for
+    # singleton cycles, which were already downgraded to ``MlxRing`` by
+    # the block above -- but we keep both unconditional so the invariant
+    # is encoded in the code itself rather than in a comment about
+    # ordering. The drafter-multi-node warning (item 10) is purely an
+    # operator hint emitted when a drafter-aware model card ends up on
+    # more than one node, since speculative decoding is single-device
+    # only in mlx_lm and the drafter would otherwise be silently dropped.
     if instance_meta == InstanceMeta.MlxJaccl:
         _validate_jaccl_thunderbolt_ipv4_paths(selected_cycle, node_network)
+
+    if (
+        len(selected_cycle) > 1
+        and command.model_card.drafter_model_ids
+    ):
+        logger.warning(
+            f"Model {command.model_card.model_id} declares drafters "
+            f"{list(command.model_card.drafter_model_ids)} but is being "
+            f"placed across {len(selected_cycle)} nodes. Speculative "
+            "decoding is single-device only and will be disabled for this "
+            "instance. To get the drafter speedup, place a smaller quant "
+            "(e.g. 4-bit) on the largest single node instead."
+        )
 
     placement_node_memory = (
         _node_memory_with_total_capacity(selected_cycle, node_memory)

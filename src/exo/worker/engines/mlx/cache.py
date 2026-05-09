@@ -358,7 +358,12 @@ class KVPrefixCache:
                 best_index, best_length = i, length
 
         if best_index is None:
-            return make_kv_cache(model), prompt_tokens, None, False
+            return (
+                make_kv_cache(model),
+                prompt_tokens,
+                None,
+                False,
+            )
 
         # For exact match: trim to max_length-1 so remaining has the last token
         # For partial match: trim to best_length, remaining has suffix to prefill
@@ -374,7 +379,12 @@ class KVPrefixCache:
 
         # No usable snapshot — need fresh cache
         if restore_snap is None and has_ssm:
-            return make_kv_cache(model), prompt_tokens, None, False
+            return (
+                make_kv_cache(model),
+                prompt_tokens,
+                None,
+                False,
+            )
 
         prompt_cache = deepcopy(self.caches[best_index])
         tokens_to_trim = cached_length - restore_pos
@@ -589,8 +599,20 @@ def _model_is_pipeline_parallel(model: Model) -> bool:
 
 
 def make_kv_cache(
-    model: Model, max_kv_size: int | None = None, keep: int = 0
+    model: Model,
+    max_kv_size: int | None = None,
+    keep: int = 0,
 ) -> KVCacheType:
+    """Build a KV cache for ``model``.
+
+    Honors the model's own ``make_cache()`` factory when available so each
+    architecture gets the cache layout it was designed for (e.g. Gemma 4
+    returns a mix of ``RotatingKVCache`` for sliding-window layers and
+    ``KVCache`` for global-attention layers). This is exactly what
+    ``mlx_lm.speculative_generate_step`` expects when ``draft_model`` is
+    supplied -- it slices the supplied ``prompt_cache`` into target/drafter
+    halves of native shape and uses each model's own attention masks.
+    """
     assert hasattr(model, "layers")
 
     if hasattr(model, "make_cache"):
@@ -618,6 +640,14 @@ def make_kv_cache(
             # make_cache(). Replace plain KVCache entries with
             # QuantizedKVCache; leave ArraysCache (DeltaNet/SSM) and other
             # cache types alone since they don't support quantization.
+            # The step=16384 here is internal to the QuantizedKVCache we
+            # are constructing (avoids mx.concatenate growth churn on the
+            # newly-allocated quantized buffer); we deliberately do NOT
+            # mutate ``step`` on plain KVCache instances returned by
+            # ``model.make_cache()`` -- that path now flows through to
+            # ``mlx_lm`` untouched so ``speculative_generate_step``
+            # receives caches whose allocation policy matches what each
+            # architecture's ``make_cache()`` declared.
             quantized = 0
             for i, c in enumerate(caches):
                 if isinstance(c, KVCache):
@@ -641,13 +671,6 @@ def make_kv_cache(
                 )
             else:
                 logger.info("Using MLX LM's make cache")
-            # Increase KVCache step size to reduce Metal allocator
-            # fragmentation. Default step=256 causes a mx.concatenate
-            # expansion every prefill chunk; a larger step lets the cache
-            # pre-allocate and write in-place for most of the prefill.
-            for c in caches:
-                if isinstance(c, KVCache):
-                    c.step = 16384
         return caches
 
     if max_kv_size is None:
