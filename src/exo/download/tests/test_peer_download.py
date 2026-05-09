@@ -1233,6 +1233,192 @@ class TestPeerDownloadIntegrityCheckRespectsOfflineMode:
         )
 
 
+class TestPeerDownloadZeroByteFiles:
+    """Codex P2 (PR #16 round-(N+10), peer_shard_downloader.py:354):
+    The peer transfer path skipped every file whose declared size was
+    0 (e.g. ``.gitattributes`` markers, empty ``__init__.py`` shims),
+    so DownloadCompleted was published with an incomplete local
+    snapshot. Loaders that probe for those marker files at runtime
+    (chat-template adapters, processor configs that expect an empty
+    sentinel) then failed in ways that didn't point back at the peer
+    step. The fix materializes the zero-byte files locally after the
+    rest of the peer transfer succeeds.
+    """
+
+    async def test_zero_byte_marker_files_materialized_after_peer_transfer(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A repo containing canonical bytes plus an empty marker file
+        must end the peer transfer with BOTH on disk -- the marker is
+        a zero-byte file that pre-fix was silently dropped.
+        """
+        from exo.download import peer_shard_downloader as psd
+        from exo.download.peer_download import PeerFileInfo
+        from exo.shared.types.worker.downloads import FileListEntry
+
+        served = [
+            FileListEntry(type="file", path="model.safetensors", size=10),
+            # Zero-byte sentinel; pre-fix the peer path silently
+            # skipped this and the local snapshot was incomplete.
+            FileListEntry(type="file", path=".gitattributes", size=0),
+            # Empty shim that loaders sometimes probe for.
+            FileListEntry(type="file", path="empty/__init__.py", size=0),
+        ]
+
+        async def fake_fetch(*_args: object, **_kwargs: object) -> list[FileListEntry]:
+            return served
+
+        async def fake_peer_status(
+            peer_host: str,  # noqa: ARG001
+            peer_port: int,  # noqa: ARG001
+            model_id_normalized: str,  # noqa: ARG001
+            timeout: float = 5.0,  # noqa: ARG001
+        ) -> list[PeerFileInfo] | None:
+            # The peer reports only the canonical bytes (mirrors
+            # production peers; HF-shard listings do not include
+            # zero-byte markers either).
+            return [
+                PeerFileInfo(
+                    path="model.safetensors", size=10, complete=True, safe_bytes=10
+                )
+            ]
+
+        async def fake_resolve_dir(_model_id: ModelId) -> Path:
+            return tmp_path
+
+        async def fake_resolve_allow(_shard: ShardMetadata) -> list[str]:
+            return ["*"]
+
+        target_path = tmp_path / "model.safetensors"
+
+        async def fake_download(
+            peer_ip: str,  # noqa: ARG001
+            peer_port: int,  # noqa: ARG001
+            model_id_normalized: str,  # noqa: ARG001
+            file_path: str,  # noqa: ARG001
+            target_dir: Path,  # noqa: ARG001
+            expected_size: int,  # noqa: ARG001
+            on_progress: object = None,  # noqa: ARG001
+        ) -> Path | None:
+            async with aiofiles.open(target_path, "wb") as f:
+                await f.write(b"0123456789")
+            return target_path
+
+        monkeypatch.setattr(psd, "fetch_file_list_with_cache", fake_fetch)
+        monkeypatch.setattr(psd, "get_peer_file_status", fake_peer_status)
+        monkeypatch.setattr(psd, "resolve_model_dir", fake_resolve_dir)
+        monkeypatch.setattr(psd, "resolve_allow_patterns", fake_resolve_allow)
+        monkeypatch.setattr(psd, "download_file_from_peer", fake_download)
+
+        downloader = PeerAwareShardDownloader(NoopShardDownloader(), offline=True)
+        shard = _make_shard(ModelId("test-org/model-a"))
+
+        result = await downloader._try_peer_download(
+            shard,
+            peer_ip="10.0.0.1",
+            peer_port=52415,
+            model_id_normalized="test-org/model-a",
+        )
+        assert result is not None, (
+            "peer transfer must succeed when the only missing 'files' "
+            "are zero-byte markers; pre-fix the path returned success "
+            "without materializing them, so subsequent loads broke"
+        )
+        assert await aios.path.exists(target_path), (
+            "the canonical safetensor must still be present"
+        )
+        # The crux of the regression test: zero-byte markers MUST be on disk.
+        gitattributes = tmp_path / ".gitattributes"
+        empty_shim = tmp_path / "empty" / "__init__.py"
+        assert await aios.path.exists(gitattributes), (
+            "zero-byte ``.gitattributes`` marker must be materialized on "
+            "disk after peer transfer; pre-fix it was silently skipped "
+            "and DownloadCompleted reported success on an incomplete dir"
+        )
+        assert await aios.path.exists(empty_shim), (
+            "zero-byte ``empty/__init__.py`` shim must exist after peer "
+            "transfer (parent dir must also be created)"
+        )
+        # Both must literally be empty.
+        assert (await aios.stat(gitattributes)).st_size == 0
+        assert (await aios.stat(empty_shim)).st_size == 0
+
+    async def test_zero_byte_files_not_created_when_canonical_transfer_fails(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """If the non-empty file transfer fails, the zero-byte markers
+        must NOT be created. Otherwise the local model dir would
+        contain orphan empty files masquerading as a partial download
+        and the HF fallback might skip them.
+        """
+        from exo.download import peer_shard_downloader as psd
+        from exo.download.peer_download import PeerFileInfo
+        from exo.shared.types.worker.downloads import FileListEntry
+
+        served = [
+            FileListEntry(type="file", path="model.safetensors", size=10),
+            FileListEntry(type="file", path=".gitattributes", size=0),
+        ]
+
+        async def fake_fetch(*_args: object, **_kwargs: object) -> list[FileListEntry]:
+            return served
+
+        async def fake_peer_status(
+            peer_host: str,  # noqa: ARG001
+            peer_port: int,  # noqa: ARG001
+            model_id_normalized: str,  # noqa: ARG001
+            timeout: float = 5.0,  # noqa: ARG001
+        ) -> list[PeerFileInfo] | None:
+            return [
+                PeerFileInfo(
+                    path="model.safetensors", size=10, complete=True, safe_bytes=10
+                )
+            ]
+
+        async def fake_resolve_dir(_model_id: ModelId) -> Path:
+            return tmp_path
+
+        async def fake_resolve_allow(_shard: ShardMetadata) -> list[str]:
+            return ["*"]
+
+        async def failing_download(
+            peer_ip: str,  # noqa: ARG001
+            peer_port: int,  # noqa: ARG001
+            model_id_normalized: str,  # noqa: ARG001
+            file_path: str,  # noqa: ARG001
+            target_dir: Path,  # noqa: ARG001
+            expected_size: int,  # noqa: ARG001
+            on_progress: object = None,  # noqa: ARG001
+        ) -> Path | None:
+            return None
+
+        monkeypatch.setattr(psd, "fetch_file_list_with_cache", fake_fetch)
+        monkeypatch.setattr(psd, "get_peer_file_status", fake_peer_status)
+        monkeypatch.setattr(psd, "resolve_model_dir", fake_resolve_dir)
+        monkeypatch.setattr(psd, "resolve_allow_patterns", fake_resolve_allow)
+        monkeypatch.setattr(psd, "download_file_from_peer", failing_download)
+
+        downloader = PeerAwareShardDownloader(NoopShardDownloader(), offline=True)
+        shard = _make_shard(ModelId("test-org/model-a"))
+
+        result = await downloader._try_peer_download(
+            shard,
+            peer_ip="10.0.0.1",
+            peer_port=52415,
+            model_id_normalized="test-org/model-a",
+        )
+        assert result is None, (
+            "peer transfer must report failure when the non-empty "
+            "canonical bytes never landed; the HF fallback then runs"
+        )
+        gitattributes = tmp_path / ".gitattributes"
+        assert not await aios.path.exists(gitattributes), (
+            "zero-byte markers must NOT be created if the canonical "
+            "transfer failed -- otherwise the partial dir confuses the "
+            "HF fallback's already-downloaded probe"
+        )
+
+
 def _allocate_free_tcp_port() -> int:
     """Bind ephemeral port 0 to grab a free TCP port; close before reuse.
 

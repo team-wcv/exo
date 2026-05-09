@@ -17,6 +17,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Literal
 
+import aiofiles
 import aiofiles.os as aios
 from loguru import logger
 
@@ -347,10 +348,26 @@ class PeerAwareShardDownloader(ShardDownloader):
                 start_time=all_start_time,
             )
 
-        # Download all files in parallel
+        # Codex P2 (PR #16 round-(N+10), peer_shard_downloader.py:354):
+        # zero-byte files (e.g. ``.gitattributes`` markers, empty
+        # ``__init__.py`` shims) MUST still be materialized so the
+        # local snapshot mirrors the filtered file list HF would
+        # have produced. Pre-fix the peer path silently skipped any
+        # file with ``size in (None, 0)`` and reported success, so
+        # ``DownloadCompleted`` was published with an incomplete
+        # local model directory -- subsequent loads that touched
+        # those marker files (model loaders, processors that probe
+        # for ``chat_template.json``, etc.) would then fail in ways
+        # that don't point back at the peer step.
+        zero_byte_files: list[str] = []
         tasks: list[Coroutine[Any, Any, bool]] = []
         for f in filtered_file_list:
             if f.size is None or f.size == 0:
+                # Defer the local touch until after we know the rest
+                # of the peer transfer succeeded; a partial peer
+                # transfer should not leave behind orphan empty
+                # marker files that masquerade as a complete download.
+                zero_byte_files.append(f.path)
                 continue
             peer_info = peer_file_map.get(f.path)
             if peer_info and peer_info.safe_bytes > 0:
@@ -365,6 +382,27 @@ class PeerAwareShardDownloader(ShardDownloader):
         results = await asyncio.gather(*tasks, return_exceptions=True)
         if any(isinstance(r, Exception) or r is False for r in results):
             return None
+
+        for marker_path in zero_byte_files:
+            full_path = target_dir / marker_path
+            try:
+                await aios.makedirs(full_path.parent, exist_ok=True)
+                # ``aios.path.exists`` first to avoid an unnecessary
+                # touch (and the corresponding mtime bump) when
+                # resume-from-partial finds the marker already on
+                # disk. ``aios.open`` in append mode is the safest
+                # way to materialize the empty file without
+                # truncating an already-present marker.
+                if not await aios.path.exists(full_path):
+                    async with aiofiles.open(full_path, mode="a"):
+                        pass
+            except Exception as exc:
+                logger.warning(
+                    f"Could not materialize zero-byte marker file "
+                    f"{full_path} after peer transfer: {exc}; "
+                    f"falling back to HF for full snapshot integrity"
+                )
+                return None
 
         # Emit final progress
         final_progress = calculate_repo_progress(
