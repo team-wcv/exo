@@ -939,15 +939,31 @@ class DownloadCoordinator:
                 # Last reference: clean up the empty parent set so
                 # the drafter is genuinely orphaned for this delete.
                 self._drafter_parents.pop(child_model_id, None)
-            if (
-                child_model_id in self.active_downloads
-                or child_model_id in self.download_status
-            ):
-                logger.info(
-                    f"Deleting chained drafter {child_model_id} alongside "
-                    f"target {model_id} (last referencing target)"
-                )
-                await self._delete_download(child_model_id)
+            # Codex P2 (PR #18 round-(N+13), coordinator.py:945):
+            # cascade unconditionally when we reach this point.
+            # ``_reconstruct_drafter_links_for_delete`` already
+            # populated ``children`` from the target's
+            # ``drafter_model_ids``, so the rediscovered IDs are
+            # *expected to exist on disk* even when neither
+            # ``active_downloads`` nor ``download_status`` knows
+            # about them yet (the typical post-restart window
+            # before ``_emit_existing_download_progress`` has
+            # hydrated). Pre-fix the cascade silently skipped a
+            # rediscovered drafter in that window, leaving its
+            # weights orphaned on disk -- the very regression the
+            # rebuild path was meant to repair.
+            # ``_delete_download`` itself is idempotent for missing
+            # state: ``delete_model`` reports "not found on disk"
+            # via ``deleted == False`` rather than raising, the
+            # read-only guard is keyed on ``download_status`` so a
+            # cold cache simply skips it, and the post-delete
+            # status emit short-circuits when ``download_status``
+            # is empty.
+            logger.info(
+                f"Deleting chained drafter {child_model_id} alongside "
+                f"target {model_id} (last referencing target)"
+            )
+            await self._delete_download(child_model_id)
 
         # Delete from disk
         logger.info(f"Deleting model files for {model_id}")

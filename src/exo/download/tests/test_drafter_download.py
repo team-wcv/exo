@@ -1598,6 +1598,92 @@ async def test_delete_cascade_rebuilds_drafter_links_after_restart() -> None:
     )
 
 
+async def test_delete_cascade_runs_when_drafter_status_cache_cold() -> None:
+    """Codex P2 (PR #18 round-(N+13), coordinator.py:945): even
+    after ``_reconstruct_drafter_links_for_delete`` correctly
+    rediscovers the drafter IDs from the target card, the cascade
+    was previously gated on ``child_model_id in self.active_downloads
+    or child_model_id in self.download_status``. After a restart,
+    if a ``DeleteDownload`` arrives BEFORE
+    ``_emit_existing_download_progress`` has hydrated
+    ``download_status`` from the on-disk shard listing, the
+    rediscovered drafter is still absent from the in-memory cache
+    and the gate silently skipped the cascade -- leaving the
+    drafter weights on disk.
+
+    Post-fix the cascade runs unconditionally for every
+    rediscovered child (``_delete_download`` itself is idempotent
+    for missing in-memory state: ``delete_model`` reports "not
+    found on disk" via ``deleted == False`` rather than raising).
+    This test pins that behaviour by populating ``download_status``
+    only for the target -- the drafter exists on disk but is NOT
+    in the in-memory cache yet. Pre-fix the cascade would have
+    skipped the drafter; post-fix it deletes both.
+    """
+    target_shard = _make_shard(_make_target_card([DRAFTER_ID]))
+    drafter_card = _make_drafter_card()
+    target_card = _make_target_card([DRAFTER_ID])
+
+    async def fake_load(model_id: ModelId) -> ModelCard:
+        if model_id == TARGET_ID:
+            return target_card
+        if model_id == DRAFTER_ID:
+            return drafter_card
+        raise AssertionError(f"unexpected ModelCard.load for {model_id}")
+
+    deleted_ids: list[ModelId] = []
+
+    with patch.object(ModelCard, "load", side_effect=fake_load):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            _cmd_send,
+            _event_recv,
+        ):
+            await asyncio.sleep(0.05)
+
+            target_completed = DownloadCompleted(
+                shard_metadata=target_shard,
+                node_id=NODE_ID,
+                total=target_shard.model_card.storage_size,
+                model_directory="/fake/target",
+            )
+            coordinator.download_status[TARGET_ID] = target_completed
+
+            # Drafter is intentionally NOT in download_status to
+            # simulate the post-restart cold-cache window before
+            # ``_emit_existing_download_progress`` runs.
+            assert DRAFTER_ID not in coordinator.download_status, (
+                "test setup must mirror post-restart cold-cache: "
+                "drafter is on disk but not in the in-memory map"
+            )
+            assert DRAFTER_ID not in coordinator.active_downloads, (
+                "test setup must mirror post-restart cold-cache: "
+                "drafter is on disk but not actively downloading"
+            )
+
+            async def fake_delete_model(model_id: ModelId) -> bool:
+                deleted_ids.append(model_id)
+                coordinator.download_status.pop(model_id, None)
+                return True
+
+            with patch(
+                "exo.download.coordinator.delete_model",
+                side_effect=fake_delete_model,
+            ):
+                await coordinator._delete_download(TARGET_ID)  # pyright: ignore[reportPrivateUsage]
+
+    assert TARGET_ID in deleted_ids, "target must be deleted from disk"
+    assert DRAFTER_ID in deleted_ids, (
+        "drafter must be cascaded into the delete even when its "
+        "in-memory status cache is cold (post-restart, pre-hydration "
+        "window). Pre-fix the gate ``child in active_downloads or "
+        "download_status`` silently skipped the cascade and left "
+        "the drafter weights orphaned on disk. "
+        f"deleted_ids={deleted_ids!r}"
+    )
+
+
 async def test_delete_cascade_rebuild_respects_other_referencing_target() -> (
     None
 ):
