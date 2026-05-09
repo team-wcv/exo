@@ -523,6 +523,121 @@ async def test_cancel_during_chain_aborts_drafter_download() -> None:
             )
 
 
+async def test_failed_target_does_not_chain_drafter() -> None:
+    """Codex P2 (PR #18 round-(N+2), coordinator.py:231): a target
+    that is already in ``DownloadFailed`` state must NOT trigger a
+    drafter chain. The round-(N+1) "backfill drafters even when
+    target was already tracked" branch swept failed targets into
+    the same fast-path, kicking off drafter downloads for a target
+    that won't itself download. Drafters served by a non-runnable
+    target are useless (the runner can't boot speculative decoding
+    without the target weights), so we must consume the network/
+    disk only when the target is at least possibly going to run.
+    """
+    target_shard = _make_shard(_make_target_card([DRAFTER_ID]))
+
+    async def fail_load(_: ModelId) -> ModelCard:
+        raise AssertionError(
+            "ModelCard.load must not be called when target is "
+            "already in DownloadFailed state"
+        )
+
+    with patch.object(ModelCard, "load", side_effect=fail_load):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            cmd_send,
+            _,
+        ):
+            # Pre-seed the target's download_status as FAILED.
+            from exo.shared.types.worker.downloads import DownloadFailed
+
+            coordinator.download_status[TARGET_ID] = DownloadFailed(
+                shard_metadata=target_shard,
+                node_id=NODE_ID,
+                error_message="simulated previous failure",
+                model_directory="/fake/target",
+            )
+
+            # Re-issuing StartDownload for a previously-failed target
+            # must NOT chain drafters. Pre-fix: the round-(N+1) code
+            # called ``self._spawn_drafter_chain(shard)`` from inside
+            # the failed-state fast-path branch; we'd get
+            # ``ModelCard.load`` and the AssertionError above.
+            await cmd_send.send(
+                ForwarderDownloadCommand(
+                    origin=SystemId("test"),
+                    command=StartDownload(
+                        target_node_id=NODE_ID, shard_metadata=target_shard
+                    ),
+                )
+            )
+            await asyncio.sleep(0.1)
+
+    # Drafter must NOT have been queued for download.
+    assert DRAFTER_ID not in downloader.ensured, (
+        "drafter download must NOT start when target is in "
+        f"DownloadFailed state; got ensured={downloader.ensured!r}"
+    )
+
+
+async def test_restart_target_re_chains_cancelled_drafter() -> None:
+    """Codex P2 (PR #18 round-(N+2), coordinator.py:437): after a
+    cancel cascade demotes a chained drafter to ``DownloadPending``,
+    a subsequent ``StartDownload`` for the same target is a fresh
+    user intent and must bring the drafter back to life. Pre-fix,
+    ``drafter_id in self.download_status`` short-circuited
+    regardless of the drafter's current state, so a once-cancelled
+    drafter never restarted and speculative decoding silently
+    stayed disabled until the operator manually started each
+    drafter.
+    """
+    target_shard = _make_shard(_make_target_card([DRAFTER_ID]))
+    drafter_shard = _make_shard(_make_drafter_card())
+    drafter_card = _make_drafter_card()
+
+    async def fake_load(model_id: ModelId) -> ModelCard:
+        if model_id == DRAFTER_ID:
+            return drafter_card
+        raise AssertionError(f"unexpected ModelCard.load for {model_id}")
+
+    with patch.object(ModelCard, "load", side_effect=fake_load):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            cmd_send,
+            event_recv,
+        ):
+            # Simulate the post-cancel state: the drafter was
+            # previously chained, then cancelled (DownloadPending).
+            from exo.shared.types.worker.downloads import DownloadPending
+
+            coordinator.download_status[DRAFTER_ID] = DownloadPending(
+                shard_metadata=drafter_shard,
+                node_id=NODE_ID,
+                model_directory="/fake/drafter",
+            )
+
+            await cmd_send.send(
+                ForwarderDownloadCommand(
+                    origin=SystemId("test"),
+                    command=StartDownload(
+                        target_node_id=NODE_ID, shard_metadata=target_shard
+                    ),
+                )
+            )
+            assert await _wait_for_completed(event_recv, TARGET_ID) is not None
+            assert await _wait_for_completed(event_recv, DRAFTER_ID) is not None
+
+    # Drafter must have been re-ensured: pre-fix this list contained
+    # only the target, because the drafter's stale ``DownloadPending``
+    # status short-circuited the chain branch.
+    assert DRAFTER_ID in downloader.ensured, (
+        "subsequent StartDownload(target) must re-chain a previously "
+        f"cancelled drafter; got ensured={downloader.ensured!r}"
+    )
+
+
 async def test_cancel_target_cascades_to_chained_drafter() -> None:
     """Codex flagged (P2, PR #18 round 2) that cancelling a target
     left chained drafters running independently. The fix wires a

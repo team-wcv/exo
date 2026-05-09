@@ -221,14 +221,29 @@ class DownloadCoordinator:
         # Check if already downloading, complete, or recently failed
         if model_id in self.download_status:
             status = self.download_status[model_id]
-            if isinstance(status, (DownloadOngoing, DownloadCompleted, DownloadFailed)):
+            if isinstance(status, (DownloadOngoing, DownloadCompleted)):
                 logger.debug(
-                    f"Download for {model_id} already in progress, complete, or failed, skipping"
+                    f"Download for {model_id} already in progress or complete, skipping"
                 )
                 # Even if the target was already in flight, the user may have
                 # just upgraded exo onto a build that knows about its drafter.
                 # Make sure the drafter download is chained either way.
                 self._spawn_drafter_chain(shard)
+                return
+            if isinstance(status, DownloadFailed):
+                # Codex P2 (PR #18 round-(N+2), coordinator.py:231): the
+                # round-(N+1) "backfill drafters even when target was
+                # already tracked" branch swept failed targets into the
+                # same fast-path, kicking off drafter downloads for a
+                # target that won't itself download. Drafters served by
+                # a non-runnable target are useless (the runner can't
+                # boot speculative decoding without the target weights),
+                # so consume the network/disk only when the target is
+                # at least possibly going to be runnable.
+                logger.debug(
+                    f"Download for {model_id} previously failed; "
+                    f"skipping drafter chain (drafter is useless without target)"
+                )
                 return
 
         # Check all model directories for pre-existing complete models
@@ -434,19 +449,34 @@ class DownloadCoordinator:
                 )
                 return
 
-            if drafter_id in self.download_status:
-                # Already tracked: still record the parent->child link
-                # so a subsequent target cancel propagates to the
-                # already-running drafter download. Avoids the case
-                # where a drafter started by an earlier target stays
-                # alive after the user cancels the only target that
-                # references it. (We don't check for OTHER targets
-                # also referencing this drafter -- if needed, the
-                # drafter is small enough that re-downloading it
-                # later is cheap, and tracking a many-to-many graph
-                # would balloon the coordinator state.)
+            existing_status = self.download_status.get(drafter_id)
+            if isinstance(existing_status, (DownloadOngoing, DownloadCompleted)):
+                # Already in flight or already on disk: record the
+                # parent->child link so a subsequent target cancel
+                # propagates to the live drafter download. Avoids
+                # the case where a drafter started by an earlier
+                # target stays alive after the user cancels the only
+                # target that references it. (We don't check for
+                # OTHER targets also referencing this drafter -- if
+                # needed, the drafter is small enough that
+                # re-downloading it later is cheap, and tracking a
+                # many-to-many graph would balloon the coordinator
+                # state.)
                 chained.append(drafter_id)
                 continue
+            # Codex P2 (PR #18 round-(N+2), coordinator.py:437):
+            # ``DownloadPending`` (e.g. after the user cancelled the
+            # drafter via ``CancelDownload`` cascade) and
+            # ``DownloadFailed`` are NOT terminal for re-chains. A
+            # subsequent ``StartDownload`` for the same target is a
+            # fresh user intent and should bring the drafter back to
+            # life. Pre-fix, ``drafter_id in self.download_status``
+            # short-circuited regardless of state, so once a drafter
+            # was cancelled it never restarted -- speculative
+            # decoding silently stayed disabled until the operator
+            # manually started each drafter. Falling through to the
+            # ``ModelCard.load`` + ``_start_download`` block below
+            # restores the drafter on the next chain run.
 
             try:
                 drafter_card = await ModelCard.load(drafter_id)
