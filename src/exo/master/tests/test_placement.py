@@ -1113,6 +1113,7 @@ def test_jaccl_placement_skips_thunderbolt_preflight_for_single_node_fallback(
         {},
         {solo_node: create_node_memory(1000)},
         node_network,
+        node_rdma_ctl={solo_node: NodeRdmaCtlStatus(enabled=True)},
     )
 
     assert len(placements) == 1
@@ -1203,6 +1204,10 @@ def test_jaccl_placement_accepts_maybe_ethernet_thunderbolt_bridge(
         {},
         {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
         node_network,
+        node_rdma_ctl={
+            node_a: NodeRdmaCtlStatus(enabled=True),
+            node_b: NodeRdmaCtlStatus(enabled=True),
+        },
     )
 
     assert len(placements) == 1
@@ -1271,6 +1276,10 @@ def test_jaccl_placement_requires_repaired_thunderbolt_ipv4_paths(
             {},
             {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
             node_network,
+            node_rdma_ctl={
+                node_a: NodeRdmaCtlStatus(enabled=True),
+                node_b: NodeRdmaCtlStatus(enabled=True),
+            },
         )
 
 
@@ -1370,7 +1379,19 @@ def test_jaccl_placement_falls_back_to_eligible_cycle_when_another_cycle_has_inv
         min_nodes=2,
     )
 
-    placements = place_instance(command, topology, {}, node_memory, node_network)
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        node_rdma_ctl={
+            good_a: NodeRdmaCtlStatus(enabled=True),
+            good_b: NodeRdmaCtlStatus(enabled=True),
+            bad_c: NodeRdmaCtlStatus(enabled=True),
+            bad_d: NodeRdmaCtlStatus(enabled=True),
+        },
+    )
 
     instance = next(iter(placements.values()))
     assert isinstance(instance, MlxJacclInstance)
@@ -1458,7 +1479,18 @@ def test_jaccl_placement_prefers_eligible_cycle_among_multiple_size_2_cycles(
         min_nodes=2,
     )
 
-    placements = place_instance(command, topology, {}, node_memory, node_network)
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        node_rdma_ctl={
+            node_a: NodeRdmaCtlStatus(enabled=True),
+            node_b: NodeRdmaCtlStatus(enabled=True),
+            node_c: NodeRdmaCtlStatus(enabled=True),
+        },
+    )
 
     instance = next(iter(placements.values()))
     assert isinstance(instance, MlxJacclInstance)
@@ -2125,7 +2157,17 @@ def test_jaccl_placement_singleton_fallback_picks_best_node_regardless_of_tb(
         min_nodes=1,
     )
 
-    placements = place_instance(command, topology, {}, node_memory, node_network)
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        node_rdma_ctl={
+            wifi_node: NodeRdmaCtlStatus(enabled=True),
+            tb_node: NodeRdmaCtlStatus(enabled=True),
+        },
+    )
 
     assert len(placements) == 1
     instance = next(iter(placements.values()))
@@ -2272,6 +2314,10 @@ def test_jaccl_placement_allows_nodes_with_unknown_network_info(
         {},
         {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
         node_network,
+        node_rdma_ctl={
+            node_a: NodeRdmaCtlStatus(enabled=True),
+            node_b: NodeRdmaCtlStatus(enabled=True),
+        },
     )
 
     assert len(placements) == 1
@@ -2363,6 +2409,10 @@ def test_jaccl_placement_allows_nodes_with_unclassified_interface_typing(
         {},
         {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
         node_network,
+        node_rdma_ctl={
+            node_a: NodeRdmaCtlStatus(enabled=True),
+            node_b: NodeRdmaCtlStatus(enabled=True),
+        },
     )
 
     assert len(placements) == 1
@@ -2439,6 +2489,10 @@ def test_jaccl_placement_still_rejects_nodes_with_known_non_tb_paths(
             {},
             {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
             node_network,
+            node_rdma_ctl={
+                node_a: NodeRdmaCtlStatus(enabled=True),
+                node_b: NodeRdmaCtlStatus(enabled=True),
+            },
         )
 
 
@@ -2522,6 +2576,10 @@ def test_jaccl_placement_rejects_nodes_with_only_loopback_unknown_typing(
             {},
             {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
             node_network,
+            node_rdma_ctl={
+                node_a: NodeRdmaCtlStatus(enabled=True),
+                node_b: NodeRdmaCtlStatus(enabled=True),
+            },
         )
 
 
@@ -2617,6 +2675,10 @@ def test_jaccl_placement_allows_nodes_with_partial_interface_typing(
         {},
         {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
         node_network,
+        node_rdma_ctl={
+            node_a: NodeRdmaCtlStatus(enabled=True),
+            node_b: NodeRdmaCtlStatus(enabled=True),
+        },
     )
 
     assert len(placements) == 1
@@ -2734,6 +2796,10 @@ def test_jaccl_placement_allows_bridge0_thunderbolt_with_unknown_typing(
         {},
         {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
         node_network,
+        node_rdma_ctl={
+            node_a: NodeRdmaCtlStatus(enabled=True),
+            node_b: NodeRdmaCtlStatus(enabled=True),
+        },
     )
 
     assert len(placements) == 1
@@ -2854,6 +2920,10 @@ def test_jaccl_placement_allows_non_zero_bridge_index_thunderbolt(
         {},
         {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
         node_network,
+        node_rdma_ctl={
+            node_a: NodeRdmaCtlStatus(enabled=True),
+            node_b: NodeRdmaCtlStatus(enabled=True),
+        },
     )
 
     assert len(placements) == 1
@@ -2958,6 +3028,10 @@ def test_jaccl_placement_rejects_nodes_with_vm_stack_bridges_and_primary_en(
             {},
             {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
             node_network,
+            node_rdma_ctl={
+                node_a: NodeRdmaCtlStatus(enabled=True),
+                node_b: NodeRdmaCtlStatus(enabled=True),
+            },
         )
 
 
@@ -3053,6 +3127,10 @@ def test_jaccl_placement_rejects_nodes_with_unknown_en0_and_typed_wifi(
             {},
             {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
             node_network,
+            node_rdma_ctl={
+                node_a: NodeRdmaCtlStatus(enabled=True),
+                node_b: NodeRdmaCtlStatus(enabled=True),
+            },
         )
 
 
@@ -3152,4 +3230,8 @@ def test_jaccl_placement_rejects_nodes_with_only_vpn_tunnel_unknown_typing(
             {},
             {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
             node_network,
+            node_rdma_ctl={
+                node_a: NodeRdmaCtlStatus(enabled=True),
+                node_b: NodeRdmaCtlStatus(enabled=True),
+            },
         )
