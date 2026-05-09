@@ -212,6 +212,104 @@ def test_migration_runs_inside_file_lock(tmp_path: Path) -> None:
     )
 
 
+class TestNodeIdKeypairScope:
+    """Codex P1 (PR #16 round-(N+3), main.py:74): the node-ID keypair
+    scope MUST account for every distinguishable per-process port,
+    not just ``--peer-download-port``. With peer-download disabled
+    the operator can legitimately keep the default
+    ``peer_download_port`` (no socket bind), so the previous
+    peer-only scope let two same-host processes share an identity.
+    """
+
+    def _build_args(
+        self,
+        *,
+        libp2p_port: int = 0,
+        api_port: int = 52415,
+        peer_download_port: int = 52416,
+        no_downloads: bool = False,
+        no_peer_download: bool = False,
+        spawn_api: bool = False,
+    ):  # noqa: ANN202
+        from exo.main import Args
+
+        return Args(
+            libp2p_port=libp2p_port,
+            api_port=api_port,
+            peer_download_port=peer_download_port,
+            no_downloads=no_downloads,
+            no_peer_download=no_peer_download,
+            spawn_api=spawn_api,
+        )
+
+    def test_distinct_libp2p_ports_yield_distinct_scopes(self) -> None:
+        from exo.main import (
+            _node_id_keypair_scope,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        scope_a = _node_id_keypair_scope(self._build_args(libp2p_port=4001))
+        scope_b = _node_id_keypair_scope(self._build_args(libp2p_port=4002))
+        assert scope_a != scope_b
+
+    def test_distinct_api_ports_yield_distinct_scopes(self) -> None:
+        from exo.main import (
+            _node_id_keypair_scope,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        scope_a = _node_id_keypair_scope(self._build_args(api_port=52415))
+        scope_b = _node_id_keypair_scope(self._build_args(api_port=52416))
+        assert scope_a != scope_b
+
+    def test_distinct_peer_download_ports_yield_distinct_scopes(self) -> None:
+        from exo.main import (
+            _node_id_keypair_scope,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        scope_a = _node_id_keypair_scope(self._build_args(peer_download_port=52416))
+        scope_b = _node_id_keypair_scope(self._build_args(peer_download_port=52417))
+        assert scope_a != scope_b
+
+    def test_disabled_peer_download_with_same_default_port_still_isolates(
+        self,
+    ) -> None:
+        """The original Codex P1 (round-(N+3)) regression: with
+        ``--no-peer-download`` two processes can both keep
+        ``peer_download_port=52416``. They MUST still get distinct
+        scopes when *some* other port differs (here, libp2p).
+        Pre-fix the scope was just ``peer_download_port`` and these
+        two configs collided on the same keypair."""
+        from exo.main import (
+            _node_id_keypair_scope,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        process_one = self._build_args(
+            libp2p_port=4001,
+            no_peer_download=True,
+            peer_download_port=52416,
+        )
+        process_two = self._build_args(
+            libp2p_port=4002,
+            no_peer_download=True,
+            peer_download_port=52416,
+        )
+        assert _node_id_keypair_scope(process_one) != _node_id_keypair_scope(
+            process_two
+        )
+
+    def test_identical_args_yield_identical_scope(self) -> None:
+        """Stability invariant: the same configuration on a single
+        process across restarts must hash to the same scope so the
+        node retains its identity across restarts."""
+        from exo.main import (
+            _node_id_keypair_scope,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        args = self._build_args(
+            libp2p_port=4001, api_port=52415, peer_download_port=52416
+        )
+        assert _node_id_keypair_scope(args) == _node_id_keypair_scope(args)
+
+
 def test_legacy_migration_adopts_into_scoped_path(tmp_path: Path) -> None:
     """When a process passes a scope and a legacy unscoped keypair
     exists, the legacy bytes must be adopted into the scoped path.

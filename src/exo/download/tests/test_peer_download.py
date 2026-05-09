@@ -461,6 +461,92 @@ class TestPeerDownloadClient:
         )
         assert not stale_partial.exists()
 
+    async def test_resume_with_200_response_discards_partial_and_restarts(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P1 (PR #16 round-(N+3), peer_download.py:162): when
+        the client resumes a download (``n_read > 0``) it sends a
+        ``Range`` header, but a non-compliant server is permitted to
+        ignore it and return full content with HTTP 200 instead of
+        206. Pre-fix the client appended the full body to the
+        partial, pushing ``n_read`` past ``expected_size`` and
+        renaming the oversized file as the "successful" download.
+        In offline mode hash verification is intentionally skipped,
+        so the bad bytes silently poisoned the model cache.
+
+        We stand up a tiny aiohttp server that returns full content
+        with 200 even when ``Range`` is set, prime a partial file,
+        and assert the client discards the partial, restarts from
+        zero, and lands the canonical bytes (matching ``expected_size``).
+        """
+        from aiohttp import web
+
+        canonical = b"the canonical model weights"
+
+        async def handler(request: web.Request) -> web.Response:
+            # Always return full content with HTTP 200, ignoring any
+            # ``Range`` header. This simulates the non-compliant
+            # peer server the codex finding flagged.
+            del request
+            return web.Response(body=canonical, status=200)
+
+        app = web.Application()
+        # Path must match the client's URL template:
+        # ``http://host:port/files/<model_id>/<file_path>``
+        _ = app.router.add_get("/files/test/weights.bin", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        try:
+            # Mirror the ``peer_server`` fixture: ``aiohttp.web.TCPSite``
+            # surfaces the kernel-assigned port through its private
+            # ``_server.sockets`` attribute. The module-level
+            # ``reportPrivateUsage=false`` and ``type: ignore`` here
+            # match the existing fixture's access pattern.
+            port: int = cast(
+                int,
+                site._server.sockets[0].getsockname()[1],  # type: ignore[union-attr]
+            )
+
+            download_dir = tmp_path / "downloads" / "test"
+            await aios.makedirs(download_dir, exist_ok=True)
+            # Prime a stale partial with bogus content to force the
+            # resume codepath (Range header) on the first attempt.
+            partial_path = download_dir / "weights.bin.partial"
+            stale_prefix = b"\xff" * (len(canonical) // 2)
+            async with aiofiles.open(partial_path, "wb") as f:
+                await f.write(stale_prefix)
+            assert (await aios.stat(partial_path)).st_size > 0
+
+            result = await download_file_from_peer(
+                "127.0.0.1",
+                port,
+                "test",
+                "weights.bin",
+                download_dir,
+                len(canonical),
+            )
+
+            assert result is not None, (
+                "the client should ultimately succeed by discarding the "
+                "stale partial and restarting from zero on the second "
+                "request"
+            )
+            assert result == download_dir / "weights.bin"
+            async with aiofiles.open(result, "rb") as f:
+                downloaded = await f.read()
+            assert downloaded == canonical, (
+                "200-on-resume must trigger a partial restart; the final "
+                "file must be the canonical bytes, not a duplicate-prefix "
+                "concatenation"
+            )
+            assert not partial_path.exists(), (
+                "successful download must remove the partial path"
+            )
+        finally:
+            await runner.cleanup()
+
     async def test_skip_already_complete(
         self, peer_server: PeerFileServer, temp_models_dir: Path, tmp_path: Path
     ) -> None:

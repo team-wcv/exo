@@ -59,19 +59,27 @@ class Node:
 
     @classmethod
     async def create(cls, args: "Args") -> Self:
-        # Codex P1 (PR #16 round-(N+2), router.py:297): scope the
-        # on-disk node-ID keypair by ``--peer-download-port``. That
-        # port already MUST differ between processes on the same
-        # host (see the ``--peer-download-port`` help text), making
-        # it the natural per-process disambiguator. Single-process
-        # deployments use the default port and therefore land on a
-        # stable scoped filename, preserving identity across
-        # restarts; multi-process same-host deployments get
-        # distinct keypair files (and therefore distinct
-        # ``NodeId``s) so peer-discovery's ``peer_node_id ==
-        # node_id`` self-skip and routing's unique-NodeId
-        # invariants continue to hold.
-        keypair = get_node_id_keypair(process_scope=args.peer_download_port)
+        # Codex P1 (PR #16 round-(N+3), main.py:74): scope the on-disk
+        # node-ID keypair by the *combination* of ports the operator
+        # has chosen, not just ``--peer-download-port``. The earlier
+        # peer-download-only scope leaked identity collisions when
+        # ``--no-downloads`` / ``--no-peer-download`` is set: that
+        # mode doesn't bind the peer file server, so two same-host
+        # processes can legitimately keep the default
+        # ``peer_download_port`` and would then load the same scoped
+        # keypair file -- producing identical ``NodeId``s and
+        # breaking election/routing's unique-NodeId invariants.
+        #
+        # Combined-port scoping is robust against every same-host
+        # multi-process configuration: at least one of the listening
+        # ports MUST differ between processes (libp2p, peer-download,
+        # api -- each is a distinct local socket bind), so the scope
+        # tuple differs whenever the actual configuration differs.
+        # Single-process deployments on default ports keep a stable
+        # filename (e.g. ``node_id.libp2p-0.api-52415.peer-52416.keypair``)
+        # so identity persists across restarts.
+        process_scope = _node_id_keypair_scope(args)
+        keypair = get_node_id_keypair(process_scope=process_scope)
         node_id = NodeId(keypair.to_node_id())
         session_id = SessionId(master_node_id=node_id, election_clock=0)
         router = Router.create(
@@ -425,6 +433,29 @@ class Node:
             name = identity.friendly_name if identity is not None else str(node_id)
             ages[name] = round((now - last_seen).total_seconds(), 3)
         return ages
+
+
+def _node_id_keypair_scope(args: "Args") -> str:
+    """Produce a stable per-process scope for the node-ID keypair file.
+
+    Combines every listening port the operator could plausibly
+    distinguish between same-host processes: ``--libp2p-port``,
+    ``--api-port``, and ``--peer-download-port``. At least one of
+    these MUST differ between two processes that share a host (each
+    is a distinct local socket bind), so the resulting scope is
+    always unique per process while remaining stable across
+    restarts of the same configuration.
+
+    Used by :func:`get_node_id_keypair` to avoid two same-host
+    processes loading the same scoped keypair file when peer
+    download is disabled (which would otherwise let them collide
+    on the default ``peer_download_port`` since no socket is
+    actually being bound). See Codex P1 (PR #16 round-(N+3),
+    main.py:74).
+    """
+    return (
+        f"libp2p-{args.libp2p_port}.api-{args.api_port}.peer-{args.peer_download_port}"
+    )
 
 
 def _darwin_en0_ip_address() -> str | None:

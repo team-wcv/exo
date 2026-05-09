@@ -147,6 +147,7 @@ async def download_file_from_peer(
                 headers["Range"] = f"bytes={n_read}-"
 
             got_bytes = False
+            range_was_requested = n_read > 0
             async with (
                 aiohttp.ClientSession(
                     timeout=aiohttp.ClientTimeout(total=300, sock_read=60)
@@ -156,6 +157,24 @@ async def download_file_from_peer(
                 if r.status == 416:
                     # Range not satisfiable - peer doesn't have more yet
                     pass
+                elif range_was_requested and r.status == 200:
+                    # Codex P1 (PR #16 round-(N+3), peer_download.py:162):
+                    # we sent a ``Range`` header (we have a partial), but
+                    # the peer ignored it and returned full content with
+                    # 200. Appending the body would duplicate the
+                    # already-downloaded prefix, push ``n_read`` past
+                    # ``expected_size``, and -- because offline mode
+                    # skips hash verification -- silently poison the
+                    # model file. Drop the partial and restart from
+                    # zero on the next loop iteration so the next
+                    # request gets fresh, intact bytes.
+                    logger.warning(
+                        f"Peer {peer_host} ignored Range header for "
+                        f"{file_path} (returned 200 instead of 206); "
+                        "discarding partial and restarting from zero"
+                    )
+                    await aios.remove(partial_path)
+                    n_read = 0
                 elif r.status in (200, 206):
                     async with aiofiles.open(
                         partial_path, "ab" if n_read > 0 else "wb"
