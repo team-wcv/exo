@@ -8,6 +8,7 @@ from typing import Callable, cast
 
 import aiofiles
 import aiofiles.os as aios
+import aiohttp
 import pytest
 
 from exo.download.peer_download import download_file_from_peer, get_peer_file_status
@@ -334,6 +335,136 @@ class TestPeerFileServerMultipleDirectories:
     async def test_constructor_rejects_empty_directory_list(self) -> None:
         with pytest.raises(ValueError, match="at least one models directory"):
             PeerFileServer(host="127.0.0.1", port=0, models_dirs=[])
+
+    async def test_status_unions_partial_in_first_root_with_complete_in_second(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex P2 (PR #16 round-(N+9), peer_file_server.py:201): if
+        an earlier root has a stale/incomplete model directory and a
+        later root has a complete copy, ``/status`` must surface the
+        complete file -- otherwise peers see the file as missing and
+        fall back to HuggingFace despite the local node having a
+        canonical copy on a different mount.
+        """
+        from aiohttp import web
+
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+        await aios.makedirs(first / "test--model", exist_ok=True)
+        await aios.makedirs(second / "test--model", exist_ok=True)
+
+        # First root has only a partial of weights.bin (incomplete).
+        partial_path = first / "test--model" / "weights.bin.partial"
+        canonical = b"the canonical model weights"
+        async with aiofiles.open(partial_path, "wb") as f:
+            await f.write(canonical[: len(canonical) // 2])
+        # Companion meta marking 50% safe.
+        meta_path = first / "test--model" / "weights.bin.partial.meta"
+        async with aiofiles.open(meta_path, "w") as f:
+            await f.write(
+                json.dumps(
+                    {
+                        "total": len(canonical),
+                        "safe_bytes": len(canonical) // 2,
+                    }
+                )
+            )
+
+        # Second root has the full canonical file (complete).
+        async with aiofiles.open(second / "test--model" / "weights.bin", "wb") as f:
+            await f.write(canonical)
+
+        server = PeerFileServer(
+            host="127.0.0.1", port=0, models_dirs=[first, second]
+        )
+        server._runner = web.AppRunner(server._app)
+        await server._runner.setup()
+        site = web.TCPSite(server._runner, "127.0.0.1", 0)
+        await site.start()
+        port_int: int = cast(int, site._server.sockets[0].getsockname()[1])  # type: ignore[union-attr]
+        server.port = port_int
+        try:
+            files = await get_peer_file_status("127.0.0.1", port_int, "test--model")
+            assert files is not None
+            file_map = {f.path: f for f in files}
+            assert "weights.bin" in file_map, (
+                "complete copy in the second root must surface in /status; "
+                "got files={file_map.keys()}"
+            )
+            assert file_map["weights.bin"].complete is True, (
+                "complete copy in the second root must dominate the "
+                "partial in the first root; otherwise peers will fall "
+                "back to HuggingFace"
+            )
+            assert file_map["weights.bin"].size == len(canonical)
+        finally:
+            await server.shutdown()
+
+    async def test_files_serves_complete_copy_when_first_root_has_only_partial(
+        self, tmp_path: Path
+    ) -> None:
+        """End-to-end: ``/files/<path>`` must select the root holding
+        the complete file even when an earlier root has only a
+        partial. Pre-fix the server returned 404 (or served the
+        smaller partial via the partial-bytes path) when a complete
+        file lived in a later root, forcing peers to fall back to
+        HuggingFace.
+        """
+        from aiohttp import web
+
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+        await aios.makedirs(first / "test--model", exist_ok=True)
+        await aios.makedirs(second / "test--model", exist_ok=True)
+
+        canonical = b"complete-canonical-bytes"
+        # First root has partial (with valid meta).
+        partial_path = first / "test--model" / "weights.bin.partial"
+        async with aiofiles.open(partial_path, "wb") as f:
+            await f.write(canonical[: len(canonical) // 2])
+        meta_path = first / "test--model" / "weights.bin.partial.meta"
+        async with aiofiles.open(meta_path, "w") as f:
+            await f.write(
+                json.dumps(
+                    {
+                        "total": len(canonical),
+                        "safe_bytes": len(canonical) // 2,
+                    }
+                )
+            )
+        # Second root has the complete file.
+        async with aiofiles.open(second / "test--model" / "weights.bin", "wb") as f:
+            await f.write(canonical)
+
+        server = PeerFileServer(
+            host="127.0.0.1", port=0, models_dirs=[first, second]
+        )
+        server._runner = web.AppRunner(server._app)
+        await server._runner.setup()
+        site = web.TCPSite(server._runner, "127.0.0.1", 0)
+        await site.start()
+        port_int: int = cast(int, site._server.sockets[0].getsockname()[1])  # type: ignore[union-attr]
+        server.port = port_int
+        try:
+            url = f"http://127.0.0.1:{port_int}/files/test--model/weights.bin"
+            async with (
+                aiohttp.ClientSession() as session,
+                session.get(url) as r,
+            ):
+                assert r.status == 200, (
+                    f"expected 200 from /files when complete copy exists in "
+                    f"a later root; got {r.status}"
+                )
+                body = await r.read()
+            assert body == canonical, (
+                f"expected canonical bytes from later root; got "
+                f"{len(body)} bytes (expected {len(canonical)})"
+            )
+            # Sanity: X-Exo-Complete header should mark this as a
+            # complete serving (not a partial-bytes fragment).
+            assert r.headers.get("X-Exo-Complete") == "true"
+        finally:
+            await server.shutdown()
 
 
 class TestPeerDownloadClient:

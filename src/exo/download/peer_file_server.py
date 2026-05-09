@@ -63,77 +63,140 @@ class PeerFileServer:
         return web.json_response({"status": "ok"})
 
     async def _handle_status(self, request: web.Request) -> web.Response:
-        """Return status of all files for a model (complete + in-progress)."""
+        """Return status of all files for a model (complete + in-progress).
+
+        Codex P2 (PR #16 round-(N+9), peer_file_server.py:201): when
+        a model's contents are split across multiple configured
+        roots (e.g. an earlier writable cache holds a partial copy
+        and a later read-only mount holds the full canonical copy),
+        report the union across every root that contains the model.
+        For files that appear in more than one root we keep the
+        most-complete entry (complete > larger partial) so peers see
+        the true 'most progressed' version of the file. The earlier
+        single-root behaviour caused the peer downloader to
+        miss-report missing files and silently fall back to
+        HuggingFace even when this node had a complete copy
+        elsewhere on disk.
+        """
         model_id = request.match_info["model_id"]
-        model_dir = await self._locate_model_dir(model_id)
-        if model_dir is None:
-            # No matching directory containing this model.
+        model_dirs = await self._locate_all_model_dirs(model_id)
+        if not model_dirs:
             return web.json_response({"files": []})
 
-        files: list[dict[str, object]] = []
-        for item in model_dir.rglob("*"):
-            relative_path = item.relative_to(model_dir).as_posix()
-            if item.is_dir() or relative_path.endswith(".partial.meta"):
-                continue
-            if _resolve_child(model_dir, relative_path) is None:
-                continue
+        # path -> entry; complete files dominate partials; larger
+        # partials dominate smaller ones when no complete is found.
+        merged: dict[str, dict[str, object]] = {}
 
-            if relative_path.endswith(".partial"):
-                # In-progress file - read meta for safe bytes
-                meta = await _read_partial_meta(item)
-                if meta:
-                    total = _meta_int(meta, "total")
-                    safe_bytes = _meta_int(meta, "safe_bytes")
-                    files.append(
+        def merge(entry: dict[str, object]) -> None:
+            path = cast(str, entry["path"])
+            existing = merged.get(path)
+            if existing is None:
+                merged[path] = entry
+                return
+            existing_complete = bool(existing["complete"])
+            new_complete = bool(entry["complete"])
+            new_partial_is_more_complete = (
+                not new_complete
+                and not existing_complete
+                and cast(int, entry["safe_bytes"])
+                > cast(int, existing["safe_bytes"])
+            )
+            if (new_complete and not existing_complete) or (
+                new_partial_is_more_complete
+            ):
+                merged[path] = entry
+            # complete-vs-complete: keep the first (sizes equal by
+            # construction, callers only need one entry).
+
+        for model_dir in model_dirs:
+            for item in model_dir.rglob("*"):
+                relative_path = item.relative_to(model_dir).as_posix()
+                if item.is_dir() or relative_path.endswith(".partial.meta"):
+                    continue
+                if _resolve_child(model_dir, relative_path) is None:
+                    continue
+
+                if relative_path.endswith(".partial"):
+                    meta = await _read_partial_meta(item)
+                    if meta:
+                        total = _meta_int(meta, "total")
+                        safe_bytes = _meta_int(meta, "safe_bytes")
+                        merge(
+                            {
+                                "path": relative_path.removesuffix(".partial"),
+                                "size": total,
+                                "complete": False,
+                                "safe_bytes": safe_bytes,
+                            }
+                        )
+                else:
+                    stat = await aios.stat(item)
+                    merge(
                         {
-                            "path": relative_path.removesuffix(".partial"),
-                            "size": total,
-                            "complete": False,
-                            "safe_bytes": safe_bytes,
+                            "path": relative_path,
+                            "size": stat.st_size,
+                            "complete": True,
+                            "safe_bytes": stat.st_size,
                         }
                     )
-            else:
-                # Complete file
-                stat = await aios.stat(item)
-                files.append(
-                    {
-                        "path": relative_path,
-                        "size": stat.st_size,
-                        "complete": True,
-                        "safe_bytes": stat.st_size,
-                    }
-                )
 
-        return web.json_response({"files": files})
+        return web.json_response({"files": list(merged.values())})
 
     async def _handle_file(self, request: web.Request) -> web.StreamResponse:
         """Serve a model file with Range request support.
 
         For complete files: standard HTTP file serving.
         For .partial files: serves only the safe byte range (flushed to disk).
+
+        Codex P2 (PR #16 round-(N+9), peer_file_server.py:201): when
+        a model's contents are split across multiple roots, prefer
+        the root holding a *complete* copy of the requested file
+        over the first root that merely contains the model
+        directory. Fall back to a partial copy only if no root has
+        the file complete. Pre-fix the server returned 404 for
+        files that lived in a later root, forcing peers to fall
+        back to HuggingFace despite a complete local copy.
         """
         model_id = request.match_info["model_id"]
         file_path = request.match_info["file_path"]
 
-        model_dir = await self._locate_model_dir(model_id)
-        if model_dir is None:
+        model_dirs = await self._locate_all_model_dirs(model_id)
+        if not model_dirs:
             return web.Response(status=404, text="Model not found")
 
-        complete_path = _resolve_child(model_dir, file_path)
-        partial_path = _resolve_child(model_dir, f"{file_path}.partial")
-        if complete_path is None or partial_path is None:
-            return web.Response(status=404, text="File not found")
+        complete_hit: Path | None = None
+        best_partial: tuple[Path, PartialMeta] | None = None
 
-        # Determine which file to serve and its safe size
-        if await aios.path.exists(complete_path):
-            serve_path = complete_path
-            file_size = (await aios.stat(complete_path)).st_size
+        for model_dir in model_dirs:
+            complete_candidate = _resolve_child(model_dir, file_path)
+            partial_candidate = _resolve_child(model_dir, f"{file_path}.partial")
+            if complete_candidate is None or partial_candidate is None:
+                continue
+            if complete_hit is None and await aios.path.exists(complete_candidate):
+                complete_hit = complete_candidate
+                # Complete copy in the first matching root wins; we
+                # don't need to scan the rest for this file.
+                break
+            if await aios.path.exists(partial_candidate):
+                meta = await _read_partial_meta(partial_candidate)
+                if (
+                    meta
+                    and _meta_int(meta, "safe_bytes") > 0
+                    and (
+                        best_partial is None
+                        or _meta_int(meta, "safe_bytes")
+                        > _meta_int(best_partial[1], "safe_bytes")
+                    )
+                ):
+                    best_partial = (partial_candidate, meta)
+
+        if complete_hit is not None:
+            serve_path = complete_hit
+            file_size = (await aios.stat(complete_hit)).st_size
             safe_bytes = file_size
             is_complete = True
-        elif await aios.path.exists(partial_path):
-            meta = await _read_partial_meta(partial_path)
-            if not meta or _meta_int(meta, "safe_bytes") == 0:
-                return web.Response(status=404, text="File not available yet")
+        elif best_partial is not None:
+            partial_path, meta = best_partial
             serve_path = partial_path
             file_size = _meta_int(meta, "total")
             safe_bytes = _meta_int(meta, "safe_bytes")
@@ -193,6 +256,12 @@ class PeerFileServer:
         probe the filesystem. We prefer the first directory in ``models_dirs``
         that has a matching subdirectory; this preserves caller-specified
         priority (e.g. writable before read-only) without re-sorting.
+
+        Note: callers that need to merge contents across multiple
+        roots should use :meth:`_locate_all_model_dirs` instead. That
+        helper exists to address Codex P2 (PR #16 round-(N+9),
+        peer_file_server.py:201) where an earlier incomplete root
+        masked a later complete copy.
         """
         for root in self.models_dirs:
             candidate = _resolve_child(root, model_id)
@@ -201,6 +270,34 @@ class PeerFileServer:
             if await aios.path.exists(candidate):
                 return candidate
         return None
+
+    async def _locate_all_model_dirs(self, model_id: str) -> list[Path]:
+        """Return every configured directory that contains ``model_id``.
+
+        Roots are returned in the same priority order as
+        ``self.models_dirs`` (writable before read-only) so callers
+        can short-circuit to the first complete copy. Each candidate
+        root is path-traversal-checked independently before we probe
+        the filesystem.
+
+        Codex P2 (PR #16 round-(N+9), peer_file_server.py:201):
+        ``_locate_model_dir`` returned the first root that *contained*
+        the model directory regardless of completeness. When an
+        earlier writable root held a partial download and a later
+        read-only mount held a complete copy, ``/status`` and
+        ``/files`` only saw the partial tree -- peers thought the
+        node had no canonical copy and fell back to HuggingFace.
+        Callers that merge across roots use this helper to scan
+        every match.
+        """
+        matches: list[Path] = []
+        for root in self.models_dirs:
+            candidate = _resolve_child(root, model_id)
+            if candidate is None:
+                continue
+            if await aios.path.exists(candidate):
+                matches.append(candidate)
+        return matches
 
 
 def _resolve_child(root: Path, relative_path: str) -> Path | None:

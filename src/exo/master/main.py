@@ -482,7 +482,18 @@ class Master:
 
     # These plan loops are the cracks showing in our event sourcing architecture - more things could be commands
     async def _plan(self) -> None:
-        node_inactivity_timeout = timedelta(seconds=5)
+        # Codex P1 (PR #16 round-(N+9), master/main.py:486): the
+        # inactivity timeout MUST stay safely above ``NodeGatheredInfo``
+        # cadence jitter -- 5s was too tight (any node that didn't
+        # publish telemetry within 5s, e.g. when fast probes are
+        # unavailable or delayed, would be marked timed out and have
+        # its instances deleted in the same _plan loop). Because
+        # this loop now ticks every second, normal jitter caused
+        # repeated false-positive ``NodeTimedOut`` events and
+        # unnecessary instance churn. Restore the upstream-safe
+        # 30s budget while keeping the 1s tick so the master still
+        # reacts quickly when a node *does* genuinely time out.
+        node_inactivity_timeout = timedelta(seconds=30)
         tick_interval_seconds = 1.0
 
         while True:
