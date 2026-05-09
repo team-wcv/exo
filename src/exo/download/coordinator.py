@@ -69,6 +69,15 @@ class DownloadCoordinator:
     # Per-model throttle for download progress events
     _last_progress_time: dict[ModelId, float] = field(default_factory=dict)
 
+    # Map of target model_id -> drafter model_ids spawned alongside it.
+    # When the user cancels or deletes the target, we propagate the
+    # cancellation/deletion to its chained drafters so they don't keep
+    # consuming network/disk after the user revoked the original
+    # download intent. Populated only when the drafter chain actually
+    # runs (offline/disabled-by-env paths short-circuit and add no
+    # children).
+    _drafter_children: dict[ModelId, list[ModelId]] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         self.shard_downloader.on_progress(self._download_progress_callback)
 
@@ -191,6 +200,20 @@ class DownloadCoordinator:
             await self.event_sender.send(
                 NodeDownloadProgress(download_progress=pending)
             )
+        # Codex flagged (P2, PR #18 round 2) that cancelling a target
+        # left chained drafters running in the background, consuming
+        # network/disk after the user revoked the original download
+        # intent. Pop the parent->children mapping (so we don't
+        # double-cancel on a follow-up cancel of the same target) and
+        # cascade the cancel.
+        children = self._drafter_children.pop(model_id, [])
+        for child_model_id in children:
+            if child_model_id in self.active_downloads:
+                logger.info(
+                    f"Cancelling chained drafter {child_model_id} alongside "
+                    f"target {model_id}"
+                )
+                await self._cancel_download(child_model_id)
 
     async def _start_download(self, shard: ShardMetadata) -> None:
         model_id = shard.model_card.model_id
@@ -205,7 +228,7 @@ class DownloadCoordinator:
                 # Even if the target was already in flight, the user may have
                 # just upgraded exo onto a build that knows about its drafter.
                 # Make sure the drafter download is chained either way.
-                await self._maybe_chain_drafter_download(shard)
+                self._spawn_drafter_chain(shard)
                 return
 
         # Check all model directories for pre-existing complete models
@@ -221,7 +244,7 @@ class DownloadCoordinator:
             await self.event_sender.send(
                 NodeDownloadProgress(download_progress=completed)
             )
-            await self._maybe_chain_drafter_download(shard)
+            self._spawn_drafter_chain(shard)
             return
 
         # Emit pending status
@@ -257,7 +280,7 @@ class DownloadCoordinator:
             await self.event_sender.send(
                 NodeDownloadProgress(download_progress=completed)
             )
-            await self._maybe_chain_drafter_download(shard)
+            self._spawn_drafter_chain(shard)
             return
 
         if self.offline:
@@ -276,7 +299,29 @@ class DownloadCoordinator:
 
         # Start actual download
         self._start_download_task(shard, initial_progress)
-        await self._maybe_chain_drafter_download(shard)
+        self._spawn_drafter_chain(shard)
+
+    def _spawn_drafter_chain(self, target_shard: ShardMetadata) -> None:
+        """Background the drafter chain so command processing doesn't block.
+
+        Codex flagged (P1, PR #18 round 2) that
+        ``_maybe_chain_drafter_download`` ran inline during
+        ``StartDownload`` handling. ``ModelCard.load`` falls through
+        to ``ModelCard.fetch_from_hf`` whenever the drafter card
+        isn't already in ``_card_cache``, and a slow/unreachable HF
+        fetch would block the command loop and delay unrelated
+        ``CancelDownload``/``DeleteDownload`` commands until the
+        client timeout. That turns a best-effort drafter step into
+        control-plane backpressure whenever drafter metadata is cold.
+
+        Fix: dispatch the chain on the coordinator's own task group
+        via ``start_soon`` so the command processor returns
+        immediately and remains responsive. Errors inside the chain
+        are still logged-and-swallowed (best-effort semantics
+        preserved); the only difference is that they no longer hold
+        up unrelated commands.
+        """
+        self._tg.start_soon(self._maybe_chain_drafter_download, target_shard)
 
     async def _maybe_chain_drafter_download(self, target_shard: ShardMetadata) -> None:
         """Enqueue downloads for every drafter declared on ``target_shard``'s
@@ -323,17 +368,29 @@ class DownloadCoordinator:
             )
             return
 
+        target_model_id = target_shard.model_card.model_id
+        chained: list[ModelId] = []
         for drafter_id in drafter_ids:
             if drafter_id in self.download_status:
-                continue  # already tracked
+                # Already tracked: still record the parent->child link
+                # so a subsequent target cancel propagates to the
+                # already-running drafter download. Avoids the case
+                # where a drafter started by an earlier target stays
+                # alive after the user cancels the only target that
+                # references it. (We don't check for OTHER targets
+                # also referencing this drafter -- if needed, the
+                # drafter is small enough that re-downloading it
+                # later is cheap, and tracking a many-to-many graph
+                # would balloon the coordinator state.)
+                chained.append(drafter_id)
+                continue
 
             try:
                 drafter_card = await ModelCard.load(drafter_id)
             except Exception as exc:
                 logger.warning(
                     f"Could not load drafter card {drafter_id} for "
-                    f"{target_shard.model_card.model_id}; skipping drafter "
-                    f"download: {exc}"
+                    f"{target_model_id}; skipping drafter download: {exc}"
                 )
                 continue
 
@@ -346,10 +403,17 @@ class DownloadCoordinator:
                 n_layers=drafter_card.n_layers,
             )
             logger.info(
-                f"Chaining drafter download {drafter_id} for "
-                f"{target_shard.model_card.model_id}"
+                f"Chaining drafter download {drafter_id} for {target_model_id}"
             )
             await self._start_download(drafter_shard)
+            chained.append(drafter_id)
+
+        if chained:
+            # Replace any prior children list rather than extending so
+            # repeated chain runs (e.g. coordinator restart, drafter
+            # field upgrade) reflect the current set of chained drafters
+            # rather than accumulating stale entries.
+            self._drafter_children[target_model_id] = chained
 
     def _start_download_task(
         self, shard: ShardMetadata, initial_progress: RepoDownloadProgress
@@ -406,6 +470,23 @@ class DownloadCoordinator:
         if model_id in self.active_downloads:
             logger.info(f"Cancelling active download for {model_id} before deletion")
             self.active_downloads[model_id].cancel()
+
+        # Cascade cancellation/deletion to chained drafters: the user
+        # is removing the target's download intent, so the drafters
+        # spawned alongside it should not keep running or stay on disk
+        # past the target's lifetime. Pop the mapping so we don't
+        # double-cascade on a subsequent delete of the same target.
+        children = self._drafter_children.pop(model_id, [])
+        for child_model_id in children:
+            if (
+                child_model_id in self.active_downloads
+                or child_model_id in self.download_status
+            ):
+                logger.info(
+                    f"Deleting chained drafter {child_model_id} alongside "
+                    f"target {model_id}"
+                )
+                await self._delete_download(child_model_id)
 
         # Delete from disk
         logger.info(f"Deleting model files for {model_id}")
