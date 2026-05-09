@@ -888,6 +888,132 @@ async def test_concurrent_chain_does_not_double_start_pending_drafter() -> None:
     )
 
 
+async def test_failed_drafter_retries_on_target_re_chain() -> None:
+    """Codex P1 (PR #18 round-(N+9), coordinator.py:267): if a
+    drafter download previously failed (e.g. transient network /
+    HF blip) and the user reissues ``StartDownload`` for the
+    target, the chain MUST retry the drafter.
+
+    Pre-fix the ``DownloadFailed`` short-circuit in
+    ``_start_download`` blocked all retries through that function,
+    including the drafter-chain path. So speculative decoding stayed
+    silently disabled until manual intervention even though the
+    user's re-issue is the supported retry trigger.
+
+    This test simulates the failed→retry flow by:
+    1. Pre-seeding the coordinator with ``DownloadFailed`` for the
+       drafter (no need to actually fail one to set up the state).
+    2. Issuing ``StartDownload`` for the target.
+    3. Asserting that the chain re-runs ``ensure_shard`` for the
+       drafter (so the retry is observable).
+    """
+    from exo.shared.types.worker.downloads import DownloadFailed
+
+    target_card = _make_target_card([DRAFTER_ID])
+    drafter_card = _make_drafter_card()
+    target_shard = _make_shard(target_card)
+    drafter_shard = _make_shard(drafter_card)
+
+    downloader = _RecordingShardDownloader()
+    with patch(
+        "exo.download.coordinator.ModelCard.load",
+        return_value=drafter_card,
+    ):
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            cmd_send,
+            event_recv,
+        ):
+            await asyncio.sleep(0)
+            # Pre-seed the failed-drafter state. Use the real
+            # internal types to mirror what would happen after a
+            # transient HF/network error.
+            coordinator.download_status[DRAFTER_ID] = DownloadFailed(
+                node_id=NODE_ID,
+                shard_metadata=drafter_shard,
+                error_message="HTTP 503 from HF (simulated transient)",
+            )
+
+            await cmd_send.send(
+                ForwarderDownloadCommand(
+                    origin=SystemId("test"),
+                    command=StartDownload(
+                        target_node_id=NODE_ID, shard_metadata=target_shard
+                    ),
+                )
+            )
+            assert await _wait_for_completed(event_recv, TARGET_ID) is not None
+            # The drafter must complete on the retry path. With
+            # the bug present this would time out because
+            # ``_start_download`` returned early on
+            # ``DownloadFailed`` without invoking ``ensure_shard``.
+            drafter_completed = await _wait_for_completed(event_recv, DRAFTER_ID)
+            assert drafter_completed is not None, (
+                "the drafter chain MUST retry through DownloadFailed when "
+                "the user reissues StartDownload for the target; "
+                "otherwise speculative decoding stays silently disabled. "
+                f"ensured shards: {downloader.ensured!r}"
+            )
+            assert DRAFTER_ID in downloader.ensured, (
+                "ensure_shard must run for the drafter on retry; "
+                f"got ensured={downloader.ensured!r}"
+            )
+
+
+async def test_failed_target_top_level_call_still_skips_drafter_chain() -> None:
+    """Regression guard for Codex P1 (PR #18 round-(N+9),
+    coordinator.py:267): the drafter-chain retry path must NOT
+    extend to top-level (user-initiated) target calls.
+
+    If the user issues ``StartDownload`` for a target that
+    previously failed, we still want to skip the drafter chain
+    (pre-fix behavior from round-(N+2)) because a drafter is
+    useless without a runnable target. The new
+    ``is_drafter_chain`` parameter is the gate: only chained
+    drafter calls retry through ``DownloadFailed``; top-level
+    calls retain the short-circuit.
+    """
+    from exo.shared.types.worker.downloads import DownloadFailed
+
+    target_card = _make_target_card([DRAFTER_ID])
+    target_shard = _make_shard(target_card)
+
+    downloader = _RecordingShardDownloader()
+    async with _running_coordinator(downloader) as (
+        coordinator,
+        cmd_send,
+        _event_recv,
+    ):
+        await asyncio.sleep(0)
+        # Pre-seed the failed-target state.
+        coordinator.download_status[TARGET_ID] = DownloadFailed(
+            node_id=NODE_ID,
+            shard_metadata=target_shard,
+            error_message="HTTP 503 from HF (target itself failed)",
+        )
+
+        # The user issues StartDownload for the target *again*
+        # (e.g. via stale UI state). With the failed-target
+        # short-circuit in place, this should NOT kick off a
+        # drafter download.
+        await cmd_send.send(
+            ForwarderDownloadCommand(
+                origin=SystemId("test"),
+                command=StartDownload(
+                    target_node_id=NODE_ID, shard_metadata=target_shard
+                ),
+            )
+        )
+        # Tiny grace window for any spurious drafter ensure_shard.
+        await asyncio.sleep(0.05)
+
+        assert DRAFTER_ID not in downloader.ensured, (
+            "failed target must NOT trigger drafter chain via top-level "
+            "_start_download (drafter is useless without target); "
+            f"ensured={downloader.ensured!r}"
+        )
+
+
 async def test_starting_downloads_cleared_on_completion() -> None:
     """The ephemeral ``_starting_downloads`` lock must be released
     after ``_start_download`` finishes, so a legitimate restart

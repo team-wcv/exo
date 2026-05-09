@@ -249,7 +249,26 @@ class DownloadCoordinator:
             )
             await self._cancel_download(child_model_id)
 
-    async def _start_download(self, shard: ShardMetadata) -> None:
+    async def _start_download(
+        self, shard: ShardMetadata, *, is_drafter_chain: bool = False
+    ) -> None:
+        """Start (or restart) a download.
+
+        Args:
+            shard: The shard to download.
+            is_drafter_chain: ``True`` when this call originates from
+                ``_maybe_chain_drafter_download`` for a drafter
+                companion. Drafter chains are allowed to retry past
+                a ``DownloadFailed`` status because the user
+                reissuing ``StartDownload`` for the target is the
+                supported retry trigger -- without this flag the
+                ``DownloadFailed`` short-circuit below would block
+                drafter retries forever (Codex P1, PR #18
+                round-(N+9), coordinator.py:267). Top-level (target)
+                calls keep the old behaviour: if the target itself
+                previously failed, do not silently kick off a
+                drafter download for a non-runnable model.
+        """
         model_id = shard.model_card.model_id
 
         # Check if already downloading, complete, or recently failed
@@ -262,7 +281,10 @@ class DownloadCoordinator:
                 # Even if the target was already in flight, the user may have
                 # just upgraded exo onto a build that knows about its drafter.
                 # Make sure the drafter download is chained either way.
-                self._spawn_drafter_chain(shard)
+                # Drafter chain calls don't recurse into another chain
+                # spawn here -- they're already inside one.
+                if not is_drafter_chain:
+                    self._spawn_drafter_chain(shard)
                 return
             if isinstance(status, DownloadFailed):
                 # Codex P2 (PR #18 round-(N+2), coordinator.py:231): the
@@ -274,11 +296,29 @@ class DownloadCoordinator:
                 # boot speculative decoding without the target weights),
                 # so consume the network/disk only when the target is
                 # at least possibly going to be runnable.
-                logger.debug(
-                    f"Download for {model_id} previously failed; "
-                    f"skipping drafter chain (drafter is useless without target)"
+                #
+                # Codex P1 (PR #18 round-(N+9), coordinator.py:267):
+                # this short-circuit must NOT apply to drafter
+                # chains. Pre-fix the branch blocked all retries
+                # through ``_start_download``, including the
+                # drafter-chain path -- so a transient drafter
+                # failure (network/HF) stayed permanent until manual
+                # intervention even when the user reissued
+                # ``StartDownload`` for the target. The supported
+                # retry trigger is exactly that re-issue, so let
+                # drafter chains fall through to the launch flow.
+                if not is_drafter_chain:
+                    logger.debug(
+                        f"Download for {model_id} previously failed; "
+                        f"skipping drafter chain (drafter is useless "
+                        f"without target)"
+                    )
+                    return
+                logger.info(
+                    f"Drafter chain retry for previously-failed "
+                    f"{model_id}: target was reissued so retry the "
+                    f"drafter to resume speculative decoding"
                 )
-                return
 
         # Codex P2 (PR #18 round-(N+3), coordinator.py:224): per-model
         # in-flight gate. We can't use ``download_status`` alone because
@@ -593,7 +633,14 @@ class DownloadCoordinator:
             # list that includes this drafter and cascades into it.
             remember_drafter_link(drafter_id)
             logger.info(f"Chaining drafter download {drafter_id} for {target_model_id}")
-            await self._start_download(drafter_shard)
+            # Codex P1 (PR #18 round-(N+9), coordinator.py:267):
+            # mark this as a drafter-chain call so a previously
+            # failed drafter is retried (the user reissuing
+            # ``StartDownload`` for the target is the supported
+            # retry trigger). Without this flag the failed-state
+            # short-circuit in ``_start_download`` would silently
+            # leave speculative decoding off until manual intervention.
+            await self._start_download(drafter_shard, is_drafter_chain=True)
 
             # Codex P1 (PR #18 round-(N+3), coordinator.py:212): close
             # the cancel-cascade race window. The cascade in
