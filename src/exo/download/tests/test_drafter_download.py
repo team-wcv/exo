@@ -702,3 +702,68 @@ async def test_cancel_target_cascades_to_chained_drafter() -> None:
         # And the parent->children mapping is cleared so a duplicate
         # cancel command doesn't try to cancel a stale drafter.
         assert TARGET_ID not in coordinator._drafter_children  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_rechain_preserves_drafter_link_for_cancel_cascade() -> None:
+    """Codex P2 (PR #18 round-(N+2), coordinator.py:442): when
+    ``StartDownload`` is re-issued for a target whose chain is still
+    in flight, the second chain run MUST mutate the same
+    ``_drafter_children`` list that any in-flight chain holds a
+    reference to. Pre-fix, the second run reassigned the dict slot
+    to a fresh list, orphaning the in-flight chain's appended
+    drafter ids and breaking the ``_cancel_download`` cascade.
+
+    We simulate the bug by directly invoking
+    ``_maybe_chain_drafter_download`` twice, capturing the list
+    object the first invocation observes, and asserting that drafter
+    ids appended via the second chain are visible through that
+    same captured reference -- which is what the cancel cascade
+    relies on.
+    """
+    target_shard = _make_shard(_make_target_card([DRAFTER_ID]))
+    drafter_card = _make_drafter_card()
+
+    async def fake_load(model_id: ModelId) -> ModelCard:
+        if model_id == DRAFTER_ID:
+            return drafter_card
+        raise AssertionError(f"unexpected ModelCard.load for {model_id}")
+
+    with patch.object(ModelCard, "load", side_effect=fake_load):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            _,
+            _,
+        ):
+            # First chain run -- pre-register and run synchronously
+            # so the slot exists when we capture the list reference.
+            coordinator._drafter_children.setdefault(TARGET_ID, [])  # pyright: ignore[reportPrivateUsage]
+            captured_list: list[ModelId] = coordinator._drafter_children[TARGET_ID]  # pyright: ignore[reportPrivateUsage]
+            await coordinator._maybe_chain_drafter_download(target_shard)  # pyright: ignore[reportPrivateUsage]
+
+            # The drafter must be visible through the captured list
+            # AND through the live dict-resolved list. Pre-fix, a
+            # second run would diverge these.
+            assert DRAFTER_ID in captured_list, (
+                "first chain run must populate the captured list ref"
+            )
+            assert captured_list is coordinator._drafter_children[TARGET_ID], (  # pyright: ignore[reportPrivateUsage]
+                "_drafter_children slot must NOT be reassigned by chain run"
+            )
+
+            # Second chain run (e.g. user re-issued StartDownload).
+            await coordinator._maybe_chain_drafter_download(target_shard)  # pyright: ignore[reportPrivateUsage]
+
+            # The captured list reference must still be the live one
+            # tracked by ``_drafter_children`` -- otherwise a cancel
+            # cascade based on ``_drafter_children[TARGET_ID]`` would
+            # miss any drafter the second run started.
+            assert captured_list is coordinator._drafter_children[TARGET_ID], (  # pyright: ignore[reportPrivateUsage]
+                "rechain must mutate the same list, not replace the slot, "
+                "so the cancel cascade always sees every drafter ever "
+                "started for this target"
+            )
+            # Dedup: the drafter must not be duplicated across runs.
+            assert captured_list.count(DRAFTER_ID) == 1, (
+                "rechain must dedup drafter ids it already linked"
+            )

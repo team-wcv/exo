@@ -432,14 +432,32 @@ class DownloadCoordinator:
             discard_chain_signal()
             return
 
-        # Replace any prior children list with a fresh accumulator so
-        # repeated chain runs (e.g. coordinator restart, drafter field
-        # upgrade) reflect the current drafter set rather than
-        # accumulating stale entries. We retain the same list object
-        # reference across the loop and append in place, so the cancel
-        # cascade always sees the up-to-date in-progress list.
-        self._drafter_children[target_model_id] = []
+        # Codex P2 (PR #18 round-(N+2), coordinator.py:442): we MUST
+        # keep the same list object across re-chained downloads.
+        # Pre-fix this slot was reassigned to a fresh empty list at
+        # the start of every chain run, so a chain that had captured
+        # the previous list reference (e.g. after the user re-issued
+        # ``StartDownload`` for a target already
+        # ``DownloadOngoing``/``DownloadCompleted``) would keep
+        # appending into the *orphaned* list. The cancel cascade
+        # only pops the dict's current value, so those appends became
+        # invisible and the corresponding drafter downloads kept
+        # running in the background after a cancel.
+        #
+        # The fix: mutate-in-place. ``setdefault`` (already done by
+        # ``_spawn_drafter_chain``) guarantees the key exists, and a
+        # cancellation pops it -- so by the time we get here, the
+        # list is either:
+        #   - empty (first chain run) or
+        #   - a shared accumulator across overlapping chain runs.
+        # Appending with a dedup guard avoids duplicates while
+        # ensuring every drafter id ever started for this target is
+        # in the live cancel-cascade list.
         chained = self._drafter_children[target_model_id]
+
+        def remember_drafter_link(drafter_id: ModelId) -> None:
+            if drafter_id not in chained:
+                chained.append(drafter_id)
 
         for drafter_id in drafter_ids:
             if cancelled():
@@ -462,7 +480,7 @@ class DownloadCoordinator:
                 # re-downloading it later is cheap, and tracking a
                 # many-to-many graph would balloon the coordinator
                 # state.)
-                chained.append(drafter_id)
+                remember_drafter_link(drafter_id)
                 continue
             # Codex P2 (PR #18 round-(N+2), coordinator.py:437):
             # ``DownloadPending`` (e.g. after the user cancelled the
@@ -508,7 +526,7 @@ class DownloadCoordinator:
             )
             # Append BEFORE the await so a concurrent cancel pops a
             # list that includes this drafter and cascades into it.
-            chained.append(drafter_id)
+            remember_drafter_link(drafter_id)
             logger.info(f"Chaining drafter download {drafter_id} for {target_model_id}")
             await self._start_download(drafter_shard)
 
