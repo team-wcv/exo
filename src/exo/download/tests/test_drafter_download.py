@@ -433,6 +433,96 @@ async def test_drafter_chain_runs_off_command_processing_path() -> None:
             await asyncio.sleep(0.1)
 
 
+async def test_cancel_during_chain_aborts_drafter_download() -> None:
+    """Codex P1 (PR #18 round-(N+1)): a CancelDownload that arrives
+    AFTER StartDownload but BEFORE the chain coroutine has registered
+    its drafters in ``_drafter_children`` must still prevent the
+    drafter download from starting. Pre-fix, the cancel cascade ran
+    against an empty children list (the chain hadn't populated it
+    yet) and the chain then merrily dispatched ``ensure_shard`` for
+    the drafter despite the user having revoked the parent intent.
+    Post-fix, ``_spawn_drafter_chain`` pre-registers an empty entry
+    and the chain re-checks membership after every ``await`` so the
+    cascade pops the entry and signals the chain to bail.
+
+    The race is reproduced deterministically by stalling
+    ``ModelCard.load`` so the chain reaches its post-load
+    cancellation re-check while a cancel is in flight.
+    """
+    target_shard = _make_shard(_make_target_card([DRAFTER_ID]))
+    drafter_card = _make_drafter_card()
+
+    drafter_load_started = asyncio.Event()
+    drafter_load_release = asyncio.Event()
+
+    async def slow_load(model_id: ModelId) -> ModelCard:
+        if model_id == DRAFTER_ID:
+            drafter_load_started.set()
+            await drafter_load_release.wait()
+            return drafter_card
+        raise AssertionError(f"unexpected ModelCard.load for {model_id}")
+
+    with patch.object(ModelCard, "load", side_effect=slow_load):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            cmd_send,
+            event_recv,
+        ):
+            await cmd_send.send(
+                ForwarderDownloadCommand(
+                    origin=SystemId("test"),
+                    command=StartDownload(
+                        target_node_id=NODE_ID, shard_metadata=target_shard
+                    ),
+                )
+            )
+            assert await _wait_for_completed(event_recv, TARGET_ID) is not None
+
+            # Wait for the chain to actually enter ``ModelCard.load``;
+            # at this point the cancel is racing the load resolution.
+            async with asyncio.timeout(2.0):
+                await drafter_load_started.wait()
+
+            # Cancel the target while the chain is hung mid-load.
+            # Pre-fix: ``_drafter_children[TARGET_ID]`` was empty, so
+            # the cascade had nothing to cancel; after release, the
+            # chain proceeded to call ``ensure_shard(DRAFTER_ID)``.
+            # Post-fix: the entry exists (pre-registered), the cancel
+            # cascade pops it, and the chain's post-load re-check
+            # sees ``cancelled() == True`` and returns.
+            await cmd_send.send(
+                ForwarderDownloadCommand(
+                    origin=SystemId("test"),
+                    command=CancelDownload(target_node_id=NODE_ID, model_id=TARGET_ID),
+                )
+            )
+
+            # Give the cancel command a moment to be processed
+            # before releasing the load.
+            await asyncio.sleep(0.1)
+            drafter_load_release.set()
+
+            # Allow the chain coroutine to run its post-load check.
+            await asyncio.sleep(0.1)
+
+            # Drafter download must NOT have been kicked off, because
+            # the parent target was cancelled before its load
+            # resolved. Only the target made it into ``ensured``.
+            assert DRAFTER_ID not in downloader.ensured, (
+                "drafter download must NOT start when its parent target "
+                "was cancelled mid-chain; got ensured="
+                f"{downloader.ensured!r}"
+            )
+            # The cancel cascade must also have removed the parent
+            # entry, so a duplicate cancel doesn't try to cascade
+            # into a stale drafter list.
+            assert TARGET_ID not in coordinator._drafter_children, (  # pyright: ignore[reportPrivateUsage]
+                "cancel cascade must clear _drafter_children for the "
+                "target so a duplicate cancel doesn't double-cascade"
+            )
+
+
 async def test_cancel_target_cascades_to_chained_drafter() -> None:
     """Codex flagged (P2, PR #18 round 2) that cancelling a target
     left chained drafters running independently. The fix wires a
@@ -460,7 +550,9 @@ async def test_cancel_target_cascades_to_chained_drafter() -> None:
 
         # Status entries needed by ``_cancel_download``'s pending
         # synthesis path.
-        def _ongoing_progress(downloaded_mb: int, total_mb: int) -> DownloadProgressData:
+        def _ongoing_progress(
+            downloaded_mb: int, total_mb: int
+        ) -> DownloadProgressData:
             return DownloadProgressData(
                 downloaded=Memory.from_mb(downloaded_mb),
                 downloaded_this_session=Memory.from_mb(downloaded_mb),

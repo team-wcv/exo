@@ -320,7 +320,22 @@ class DownloadCoordinator:
         are still logged-and-swallowed (best-effort semantics
         preserved); the only difference is that they no longer hold
         up unrelated commands.
+
+        Codex P1 (PR #18 round-(N+1)): pre-register an empty
+        ``_drafter_children`` entry synchronously here, BEFORE the
+        async chain runs. Without this, a ``CancelDownload``
+        arriving between ``_spawn_drafter_chain`` returning and
+        the chain coroutine populating its child list cancelled the
+        target but found no children to cascade into; the chain
+        then merrily started drafter downloads in the background
+        for a target the user just revoked. With pre-registration
+        plus incremental appends inside the chain (and a
+        membership re-check after every ``await``), the cancel
+        cascade either pops the partial list (cancelling already-
+        started drafters) or signals the in-flight chain to bail
+        out before starting any further drafters.
         """
+        self._drafter_children.setdefault(target_shard.model_card.model_id, [])
         self._tg.start_soon(self._maybe_chain_drafter_download, target_shard)
 
     async def _maybe_chain_drafter_download(self, target_shard: ShardMetadata) -> None:
@@ -340,15 +355,48 @@ class DownloadCoordinator:
         Each drafter is downloaded as a single ``PipelineShardMetadata`` for
         the entire model. Speculative decoding is single-device today (see
         ``mlx_generate``), so we never need a sharded drafter.
+
+        Cancellation contract (Codex P1 PR #18 round-(N+1)): the parent
+        ``_drafter_children[target_id]`` entry is the cancellation
+        signal. ``_spawn_drafter_chain`` pre-creates an empty list so
+        the cancel cascade in ``_cancel_download`` always finds the
+        parent. We pop-on-not-found in this coroutine to detect a
+        cancel that arrived between scheduling and entry, and we
+        re-check after every ``await`` (model card load and
+        ``_start_download`` itself can yield) to avoid starting new
+        drafter downloads after the user revoked the parent intent.
+        Each drafter is appended to the parent's list BEFORE the
+        ``_start_download`` await so a concurrent cancel pops a list
+        that includes this drafter and cascades into it correctly.
         """
+        target_model_id = target_shard.model_card.model_id
+
+        def cancelled() -> bool:
+            return target_model_id not in self._drafter_children
+
+        def discard_chain_signal() -> None:
+            # Drop the placeholder when no drafter work will run; we
+            # don't want a dangling empty entry leaking into the
+            # cancel cascade for any future re-trigger.
+            self._drafter_children.pop(target_model_id, None)
+
+        if cancelled():
+            logger.debug(
+                f"Drafter chain for {target_model_id} aborted before start: "
+                f"target was cancelled before chain coroutine ran."
+            )
+            return
+
         drafter_ids = list(target_shard.model_card.drafter_model_ids)
         if not drafter_ids:
+            discard_chain_signal()
             return
         if _drafter_disabled_by_env():
             logger.debug(
                 f"EXO_DISABLE_DRAFTER set; skipping drafter downloads "
-                f"{drafter_ids} for {target_shard.model_card.model_id}"
+                f"{drafter_ids} for {target_model_id}"
             )
+            discard_chain_signal()
             return
         if self.offline:
             # Offline mode: ``ModelCard.load`` falls through to
@@ -364,13 +412,28 @@ class DownloadCoordinator:
             # operator wants a drafter, they need to ship it locally.
             logger.debug(
                 f"Offline mode: skipping drafter card resolution "
-                f"{drafter_ids} for {target_shard.model_card.model_id}"
+                f"{drafter_ids} for {target_model_id}"
             )
+            discard_chain_signal()
             return
 
-        target_model_id = target_shard.model_card.model_id
-        chained: list[ModelId] = []
+        # Replace any prior children list with a fresh accumulator so
+        # repeated chain runs (e.g. coordinator restart, drafter field
+        # upgrade) reflect the current drafter set rather than
+        # accumulating stale entries. We retain the same list object
+        # reference across the loop and append in place, so the cancel
+        # cascade always sees the up-to-date in-progress list.
+        self._drafter_children[target_model_id] = []
+        chained = self._drafter_children[target_model_id]
+
         for drafter_id in drafter_ids:
+            if cancelled():
+                logger.info(
+                    f"Drafter chain for {target_model_id} aborted mid-flight: "
+                    f"target was cancelled."
+                )
+                return
+
             if drafter_id in self.download_status:
                 # Already tracked: still record the parent->child link
                 # so a subsequent target cancel propagates to the
@@ -394,6 +457,17 @@ class DownloadCoordinator:
                 )
                 continue
 
+            # Re-check after the card-load await: a cancel could have
+            # arrived during the HF round-trip. Without this re-check
+            # we'd kick off ``_start_download`` for a drafter whose
+            # parent the user has already cancelled.
+            if cancelled():
+                logger.info(
+                    f"Drafter chain for {target_model_id} aborted after "
+                    f"card load for {drafter_id}: target was cancelled."
+                )
+                return
+
             drafter_shard = PipelineShardMetadata(
                 model_card=drafter_card,
                 device_rank=0,
@@ -402,18 +476,11 @@ class DownloadCoordinator:
                 end_layer=drafter_card.n_layers,
                 n_layers=drafter_card.n_layers,
             )
-            logger.info(
-                f"Chaining drafter download {drafter_id} for {target_model_id}"
-            )
-            await self._start_download(drafter_shard)
+            # Append BEFORE the await so a concurrent cancel pops a
+            # list that includes this drafter and cascades into it.
             chained.append(drafter_id)
-
-        if chained:
-            # Replace any prior children list rather than extending so
-            # repeated chain runs (e.g. coordinator restart, drafter
-            # field upgrade) reflect the current set of chained drafters
-            # rather than accumulating stale entries.
-            self._drafter_children[target_model_id] = chained
+            logger.info(f"Chaining drafter download {drafter_id} for {target_model_id}")
+            await self._start_download(drafter_shard)
 
     def _start_download_task(
         self, shard: ShardMetadata, initial_progress: RepoDownloadProgress
