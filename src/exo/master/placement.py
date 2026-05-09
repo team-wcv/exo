@@ -545,7 +545,28 @@ def _node_has_or_lacks_known_jaccl_path(
     return "known_no_path"
 
 
-_THUNDERBOLT_CANDIDATE_INTERFACE_NAME = re.compile(r"^(en|bridge)\d+$")
+# Match the exact set of macOS interface names that can plausibly be
+# a Thunderbolt link or bridge:
+#
+# * ``en2`` ... ``en9`` and ``en10`` ... ``en9999`` -- ``en0`` and
+#   ``en1`` are reserved for Wi-Fi/primary NIC by Apple convention
+#   (also encoded in
+#   :func:`exo.utils.info_gatherer.system_info._get_interface_types_from_networksetup`,
+#   which classifies any other ``en\\d+`` as ``"maybe_ethernet"``
+#   because Apple Silicon Thunderbolt bridges always live on
+#   ``en2``/``en3``/``en4``). Excluding ``en0``/``en1`` prevents the
+#   permissive fallback from firing on a Wi-Fi-only node whose
+#   primary ``en0`` happened to land in ``"unknown"`` typing
+#   (e.g. due to a transient ``networksetup`` parse failure).
+# * ``bridge0`` -- the canonical macOS Thunderbolt Bridge service
+#   device (``info_gatherer`` explicitly looks it up by this name).
+#   Higher bridge indices (``bridge100``, ``bridge101`` from
+#   Parallels Desktop; ``bridge2``+ from VirtualBox) are virtualised
+#   networking stacks, NOT Thunderbolt, so admitting them would
+#   reintroduce the same false-positive class as ``utun*``/``wg*``.
+_THUNDERBOLT_CANDIDATE_INTERFACE_NAME = re.compile(
+    r"^(en[2-9]|en[1-9]\d+|bridge0)$"
+)
 
 
 def _is_plausible_thunderbolt_candidate(
@@ -555,41 +576,42 @@ def _is_plausible_thunderbolt_candidate(
     be a Thunderbolt bridge whose hardware-port line wasn't classified.
 
     The heuristic limits the permissive ``unknown``-typing fallback to
-    interfaces that *could* legitimately be a Thunderbolt bridge:
-
-    * the interface name matches ``en\\d+`` (canonical Apple
-      ``ifconfig`` naming for physical/bridged ethernet-style
-      adapters; Wi-Fi is ``en0``/``en1``, Thunderbolt bridges sit on
-      ``en2``/``en3``/``en4`` on every cluster machine we ship), OR
-      ``bridge\\d+`` (the Thunderbolt Bridge service device --
-      ``info_gatherer`` explicitly models the macOS Thunderbolt
-      Bridge as ``bridge0``, which does NOT appear in
-      ``networksetup -listallhardwareports`` and therefore typically
-      lands in ``NetworkInterfaceInfo`` with
-      ``interface_type='unknown'``); AND
-    * the interface advertises a routable IPv4 (filters out loopback,
-      link-local, and unset addresses via
-      :func:`_is_routable_jaccl_ipv4`).
+    interfaces whose names exactly match the Apple/macOS Thunderbolt
+    naming convention (see :data:`_THUNDERBOLT_CANDIDATE_INTERFACE_NAME`)
+    AND that advertise a routable IPv4
+    (:func:`_is_routable_jaccl_ipv4` filters loopback / link-local /
+    unset addresses).
 
     Tunnel/VPN adapters (``utun*``, ``tun*``, ``tap*``, ``wg*``,
     ``gif*``, ``stf*``, ``ipsec*``), Apple Wireless Direct Link
-    (``awdl*`` / ``llw*``), packet-capture (``pktap*``), and
-    loopback (``lo*``) all fail the name check, so a Wi-Fi-only node
-    that happens to have a Tailscale ``utun3`` link with a routable
-    ``100.x`` IPv4 no longer slips through the JACCL preflight.
+    (``awdl*`` / ``llw*``), packet-capture (``pktap*``), loopback
+    (``lo*``), VM-stack bridges (``bridge100``, ``bridge2``+), and
+    the Wi-Fi/primary leaves (``en0``, ``en1``) all fail the name
+    check, so a Wi-Fi-only node that happens to have a Tailscale
+    ``utun3`` link or a Parallels ``bridge100`` with a routable
+    IPv4 no longer slips through the JACCL preflight.
 
-    Codex P2 (PR #11 round-(N+13), placement.py:578): the regex was
-    initially scoped to ``en\\d+`` only. ``info_gatherer`` explicitly
-    models the macOS Thunderbolt Bridge as ``bridge0`` and that
-    device does not appear in ``networksetup
-    -listallhardwareports``, so on a node where the actual JACCL
-    path runs over the bridge service rather than a member ``en*``
-    leaf, the bridge interface lands here with
-    ``interface_type='unknown'`` and the round-(N+13) narrowing
-    rejected it -- causing false-negative JACCL preflight failures
-    on the very partial-typing scenario this fallback is meant to
-    tolerate. Round-(N+14) accepts ``bridge\\d+`` as a candidate
-    name in addition to ``en\\d+``.
+    Codex history:
+
+    Round-(N+13) introduced the helper with regex ``^en\\d+$`` --
+    too narrow because ``info_gatherer`` explicitly models the
+    macOS Thunderbolt Bridge as ``bridge0`` and that device does
+    not appear in ``networksetup -listallhardwareports``.
+
+    Round-(N+14) widened to ``^(en|bridge)\\d+$`` to admit
+    ``bridge0``. Codex flagged (P1, PR #11 round-(N+14),
+    placement.py:548) that this re-admitted ``bridge100``
+    (Parallels Desktop), ``bridge101`` (Parallels), arbitrary
+    ``bridge\\d+`` from VirtualBox/VMware, AND ``en0``/``en1``
+    (Wi-Fi/primary), so the Wi-Fi-only-on-VPN attack surface
+    re-opened with VM-stack bridges as the new bypass vector.
+
+    Round-(N+15) (this commit) narrows to the exact set:
+    ``en[2-9]`` / ``en[1-9]\\d+`` (excludes ``en0``/``en1``,
+    matches the ``maybe_ethernet`` reclassification convention in
+    :func:`exo.utils.info_gatherer.system_info._get_interface_types_from_networksetup`)
+    and ``bridge0`` only (the canonical macOS Thunderbolt Bridge
+    service device; higher bridge indices are VM stacks).
     """
     if not _THUNDERBOLT_CANDIDATE_INTERFACE_NAME.match(interface.name):
         return False

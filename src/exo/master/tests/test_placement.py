@@ -2594,6 +2594,195 @@ def test_jaccl_placement_allows_bridge0_thunderbolt_with_unknown_typing(
     )
 
 
+def test_jaccl_placement_rejects_nodes_with_vm_stack_bridges_and_primary_en(
+    model_card: ModelCard,
+) -> None:
+    """Codex P1 (PR #11 round-(N+14), placement.py:548): the
+    round-(N+14) widening to ``^(en|bridge)\\d+$`` was too broad in
+    two distinct ways:
+
+    * ``en0`` and ``en1`` are reserved for Wi-Fi/primary NIC by
+      Apple convention, so an unknown-typed ``en0`` on a Wi-Fi
+      node could fire the permissive fallback and bypass the
+      preflight.
+    * Higher bridge indices (``bridge100``/``bridge101`` from
+      Parallels Desktop, ``bridge2``+ from VirtualBox/VMware) are
+      virtualised networking stacks, NOT Thunderbolt. Admitting
+      them as plausible candidates re-opened the same Wi-Fi-only-
+      on-VPN bypass class that round-(N+13)/(N+14) was supposed to
+      close.
+
+    Round-(N+15) (this test) narrows the regex to the exact
+    Thunderbolt-naming convention: ``en[2-9]`` / ``en[1-9]\\d+``
+    (excluding ``en0``/``en1``) and ``bridge0`` only. A node whose
+    only ``"unknown"``-typed interfaces are ``en0`` (Wi-Fi primary)
+    plus ``bridge100`` (Parallels VM bridge) -- both with routable
+    IPv4 -- is now correctly classified as ``known_no_path`` and
+    placement is rejected with the actionable ``bb rdma repair``
+    error.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(2))
+    )
+
+    node_network = {
+        node_a: create_jaccl_node_network("192.168.10.10"),
+        node_b: NodeNetworkInfo(
+            interfaces=[
+                # Wi-Fi primary, properly typed -- this prevents the
+                # "all unknown" fallback in
+                # ``_interface_typing_is_missing`` from firing, so
+                # the verdict depends on the plausibility check
+                # below.
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.50",
+                    interface_type="wifi",
+                ),
+                # Parallels Desktop VM bridge -- a virtualised
+                # networking stack, NOT Thunderbolt. Pre-(N+15)
+                # the ``^(en|bridge)\\d+$`` regex admitted this as
+                # a plausible candidate and re-opened the bypass.
+                NetworkInterfaceInfo(
+                    name="bridge100",
+                    ip_address="10.211.55.2",
+                    interface_type="unknown",
+                ),
+            ]
+        ),
+    }
+
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    with pytest.raises(ValueError, match="bb rdma repair"):
+        place_instance(
+            command,
+            topology,
+            {},
+            {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
+            node_network,
+        )
+
+
+def test_jaccl_placement_rejects_nodes_with_unknown_en0_and_typed_wifi(
+    model_card: ModelCard,
+) -> None:
+    """Codex P1 (PR #11 round-(N+14), placement.py:548) follow-up:
+    in addition to ``bridge\\d+`` for ``\\d>0``, the
+    round-(N+14) regex also admitted ``en0`` and ``en1`` -- which
+    by Apple convention are Wi-Fi/primary NIC, NOT Thunderbolt.
+    Round-(N+15) restricts the ``en`` arm to ``en[2-9]`` /
+    ``en[1-9]\\d+`` to mirror the ``maybe_ethernet``
+    reclassification convention in
+    ``info_gatherer.system_info._get_interface_types_from_networksetup``.
+
+    This test pins the ``en0``-bypass scenario: a node with a
+    Thunderbolt-typed ``en1`` (test fixture treats ``en1`` as the
+    TB leaf for legacy reasons) AND an ``"unknown"``-typed ``en0``
+    with a routable IPv4. Pre-fix the unknown ``en0`` matched the
+    regex and fired the permissive branch even though the node had
+    a real TB candidate via ``en1`` -- which is fine for this
+    case, BUT the same bypass on a Wi-Fi-only node (Wi-Fi typed,
+    en0 mistakenly unknown-typed too) would fall through to
+    placement instead of ``bb rdma repair``.
+
+    Mirror the realistic failure mode: target node has Wi-Fi
+    (``wifi`` typed) plus an unknown-typed ``en0`` with the same
+    routable IP as Wi-Fi. ``en0`` post-(N+15) no longer matches
+    the candidate regex, so the unknown-typing fallback does not
+    fire, and placement is rejected with the expected error.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(2))
+    )
+
+    node_network = {
+        node_a: create_jaccl_node_network("192.168.10.10"),
+        node_b: NodeNetworkInfo(
+            interfaces=[
+                # Wi-Fi primary advertised on a different name (e.g.
+                # ``en2`` typed as ``"wifi"`` -- which never
+                # happens in practice but ensures the test
+                # doesn't conflate the typed-en0 vs unknown-en0
+                # cases).
+                NetworkInterfaceInfo(
+                    name="en2",
+                    ip_address="192.168.1.50",
+                    interface_type="wifi",
+                ),
+                # ``en0`` mistakenly typed as unknown (e.g. brief
+                # ``networksetup`` parse hiccup). Pre-(N+15) the
+                # ``^(en|bridge)\\d+$`` regex matched ``en0`` and
+                # the routable IPv4 fired the permissive branch.
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.51",
+                    interface_type="unknown",
+                ),
+            ]
+        ),
+    }
+
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    with pytest.raises(ValueError, match="bb rdma repair"):
+        place_instance(
+            command,
+            topology,
+            {},
+            {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
+            node_network,
+        )
+
+
 def test_jaccl_placement_rejects_nodes_with_only_vpn_tunnel_unknown_typing(
     model_card: ModelCard,
 ) -> None:
