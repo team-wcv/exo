@@ -2098,6 +2098,98 @@ def test_jaccl_placement_allows_nodes_with_unknown_network_info(
     )
 
 
+def test_jaccl_placement_allows_nodes_with_unclassified_interface_typing(
+    model_card: ModelCard,
+) -> None:
+    """Codex P1 (PR #11 round-(N+2)): when the upstream
+    ``system_info._get_interface_types_from_networksetup`` parse
+    fails, ``NodeNetworkInfo.interfaces`` is populated with IPs but
+    every entry's ``interface_type`` is ``None``/``"unknown"``. Pre-
+    fix this collapsed into ``known_no_path`` and rejected placement
+    even though we had no positive evidence of bad config -- the
+    gatherer just couldn't classify. Post-fix, this case is treated
+    as ``"unknown"`` (permissive) and placement proceeds, leaving
+    the JACCL backend to surface a clearer per-link error if the
+    IP turns out to be unusable at bind time.
+    """
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={
+            "storage_size": Memory.from_bytes(1500),
+            "n_layers": 12,
+            "hidden_size": 32,
+            "num_key_value_heads": 8,
+            "supports_tensor": True,
+        }
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_socket_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_socket_connection(1))
+    )
+
+    # Both nodes report interfaces but with NO interface_type info
+    # (the system_info parser's "we couldn't classify" output writes
+    # interface_type="unknown", which is also the field's default).
+    node_network = {
+        node_a: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en3",
+                    ip_address="192.168.10.10",
+                    interface_type="unknown",
+                ),
+            ]
+        ),
+        node_b: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en3",
+                    ip_address="192.168.10.11",
+                    interface_type="unknown",
+                ),
+            ]
+        ),
+    }
+
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        {node_a: create_node_memory(1000), node_b: create_node_memory(1000)},
+        node_network,
+    )
+
+    assert len(placements) == 1
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxJacclInstance), (
+        "MlxJaccl placement must succeed when interface typing is "
+        "unavailable for every interface (gatherer parse failure "
+        "case); without typing data we have no positive evidence of "
+        "bad config and must defer to topology-derived RDMA edges."
+    )
+
+
 def test_jaccl_placement_still_rejects_nodes_with_known_non_tb_paths(
     model_card: ModelCard,
 ) -> None:

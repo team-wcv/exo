@@ -504,18 +504,60 @@ def _node_has_or_lacks_known_jaccl_path(
 ) -> Literal["has_path", "known_no_path", "unknown"]:
     """Three-valued JACCL preflight verdict for a single node.
 
-    Returns ``"unknown"`` when ``node_id`` has no entry in
-    ``node_network`` (best-effort gatherer hasn't reported yet),
-    ``"has_path"`` when at least one Thunderbolt-style interface
-    advertises a routable IPv4, and ``"known_no_path"`` when network
-    info is present but no qualifying interface exists. Callers use
-    this to distinguish "we have no data" (be permissive) from "we
-    have data and it's bad" (reject with actionable guidance).
+    Returns ``"unknown"`` when:
+
+    * ``node_id`` has no entry in ``node_network`` at all (the
+      best-effort gatherer hasn't reported yet on this node), OR
+    * the entry exists but **interface typing is missing** for every
+      interface (e.g. the ``networksetup -listallhardwareports``
+      parse failed on the gatherer side, so we have IP addresses
+      but no ``interface_type`` field to classify them as
+      thunderbolt vs ethernet vs wifi).
+
+    Returns ``"has_path"`` when at least one Thunderbolt-style
+    interface advertises a routable IPv4. Returns ``"known_no_path"``
+    when typing IS available (at least one interface has a non-None,
+    non-``"unknown"`` ``interface_type``) but no qualifying interface
+    exists -- that's positive evidence of misconfiguration and we
+    surface the actionable ``bb rdma repair`` error.
+
+    Codex P1 (PR #11 round-(N+2)): pre-fix this helper collapsed
+    "interfaces present but typing unavailable" into ``known_no_path``
+    and rejected placement, even though we had no positive evidence
+    that the node actually lacked a Thunderbolt path. With this
+    refinement, the gatherer's partial-success/parse-failure case is
+    treated as ``unknown`` and placement proceeds; the JACCL backend
+    will surface a clearer per-link error if the IP turns out to be
+    unusable at bind time.
     """
     info = node_network.get(node_id)
     if info is None:
         return "unknown"
-    return "has_path" if _has_jaccl_thunderbolt_ipv4(info) else "known_no_path"
+    if _has_jaccl_thunderbolt_ipv4(info):
+        return "has_path"
+    if _interface_typing_is_missing(info):
+        return "unknown"
+    return "known_no_path"
+
+
+def _interface_typing_is_missing(network_info: NodeNetworkInfo) -> bool:
+    """Heuristic for "the gatherer couldn't classify this node's
+    interfaces" vs "the gatherer reports a node with no TB interfaces".
+
+    Returns ``True`` when ``network_info`` has no interfaces at all,
+    or when every interface has ``interface_type == "unknown"`` (the
+    field's default and the value
+    :func:`exo.utils.info_gatherer.system_info._get_interface_types_from_networksetup`
+    writes when its parse fails). This distinguishes the "transient
+    gatherer failure" case (treat as ``unknown``, permissive) from
+    the "node legitimately has only wifi/ethernet" case (treat as
+    ``known_no_path``, reject with repair guidance).
+    """
+    if not network_info.interfaces:
+        return True
+    return all(
+        interface.interface_type == "unknown" for interface in network_info.interfaces
+    )
 
 
 def _has_jaccl_thunderbolt_ipv4(network_info: NodeNetworkInfo | None) -> bool:
