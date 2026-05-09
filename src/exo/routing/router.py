@@ -296,10 +296,23 @@ def get_node_id_keypair(
     legacy_path: str | bytes | PathLike[str] | PathLike[bytes] | None = (
         EXO_LEGACY_NODE_ID_KEYPAIR
     ),
+    process_scope: int | str | None = None,
 ) -> Keypair:
     """
     Obtains the :class:`Keypair` associated with this node-ID.
     Obtain the :class:`PeerId` by from it.
+
+    Codex P1 (PR #16 round-(N+2), router.py:297): when ``process_scope``
+    is provided, the on-disk keypair filename is suffixed with the
+    scope (typically the libp2p / peer-download port the caller has
+    chosen). This preserves *per-process* node identity isolation
+    when multiple exo processes run on the same host -- the new
+    same-host multi-node workflow added in this PR (distinct
+    peer-download ports per process) needs each process to have a
+    distinct ``NodeId`` so peer discovery's ``peer_node_id ==
+    node_id`` self-skip and routing's unique-node-id assumptions
+    hold. Single-process deployments leave ``process_scope=None``
+    and continue using the shared persistent keypair file.
 
     On first call after the upgrade, if the new ``path`` (config dir)
     has no keypair yet but the legacy cache-dir ``legacy_path`` does,
@@ -309,20 +322,42 @@ def get_node_id_keypair(
     ``XDG_*`` dirs span filesystems), the legacy bytes are copied
     instead. Either way, the legacy file is removed once the new
     location holds a valid keypair so subsequent calls do not need
-    to re-check.
+    to re-check. Codex P2 (PR #16 round-(N+2), router.py:322): the
+    migration is performed INSIDE the file lock so two concurrent
+    processes can't both pass the existence check and then race
+    each other into divergent in-memory vs. on-disk identities.
     """
-    resolved_path = Path(str(path))
+    base_path = Path(str(path))
+    resolved_path = (
+        _scoped_keypair_path(base_path, process_scope)
+        if process_scope is not None
+        else base_path
+    )
+
+    # The legacy cache file pre-dates the per-process scoping change
+    # so it is intentionally NOT scope-suffixed. We migrate it as a
+    # one-shot identity adoption for whichever process happens to
+    # boot first; subsequent processes (with different scopes) will
+    # observe the legacy file already gone and start with fresh
+    # keypairs, which is exactly what per-process isolation requires.
+    resolved_legacy: Path | None = (
+        Path(str(legacy_path)) if legacy_path is not None else None
+    )
 
     def lock_path(p: str | bytes | PathLike[str] | PathLike[bytes]) -> Path:
         return Path(str(p) + ".lock")
 
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if legacy_path is not None:
-        _migrate_legacy_node_id_keypair(resolved_path, Path(str(legacy_path)))
-
-    # operate with cross-process lock to avoid race conditions
+    # operate with cross-process lock to avoid race conditions.
+    # The migration MUST run inside this lock so two processes that
+    # boot simultaneously can't both pass the migrator's existence
+    # check, race the keypair generation, and end up with the same
+    # on-disk file but divergent in-memory identities.
     with FileLock(lock_path(resolved_path)):
+        if resolved_legacy is not None:
+            _migrate_legacy_node_id_keypair(resolved_path, resolved_legacy)
+
         with open(resolved_path, "a+b") as f:  # opens in append-mode => starts at EOF
             # if non-zero EOF, then file exists => use to get node-ID
             if f.tell() != 0:
@@ -339,6 +374,23 @@ def get_node_id_keypair(
             keypair = Keypair.generate()
             f.write(keypair.to_bytes())
             return keypair
+
+
+def _scoped_keypair_path(base: Path, scope: int | str) -> Path:
+    """Return ``base`` with the process scope inserted before the
+    suffix (e.g. ``node_id.keypair`` + scope ``52415`` ->
+    ``node_id.52415.keypair``).
+
+    We insert the scope as a stem-suffix rather than as a directory
+    so concurrent processes on the same host share the parent dir
+    (and the file lock's inode-level coordination still works for
+    legacy-migration safety) while their identity files remain
+    distinct. Scope is rendered with ``str()`` so callers can pass
+    a port number, a UUID, a hostname, etc.
+    """
+    suffix = base.suffix or ".keypair"
+    stem = base.stem if base.suffix else base.name
+    return base.parent / f"{stem}.{scope}{suffix}"
 
 
 def _migrate_legacy_node_id_keypair(

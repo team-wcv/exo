@@ -59,7 +59,19 @@ class Node:
 
     @classmethod
     async def create(cls, args: "Args") -> Self:
-        keypair = get_node_id_keypair()
+        # Codex P1 (PR #16 round-(N+2), router.py:297): scope the
+        # on-disk node-ID keypair by ``--peer-download-port``. That
+        # port already MUST differ between processes on the same
+        # host (see the ``--peer-download-port`` help text), making
+        # it the natural per-process disambiguator. Single-process
+        # deployments use the default port and therefore land on a
+        # stable scoped filename, preserving identity across
+        # restarts; multi-process same-host deployments get
+        # distinct keypair files (and therefore distinct
+        # ``NodeId``s) so peer-discovery's ``peer_node_id ==
+        # node_id`` self-skip and routing's unique-NodeId
+        # invariants continue to hold.
+        keypair = get_node_id_keypair(process_scope=args.peer_download_port)
         node_id = NodeId(keypair.to_node_id())
         session_id = SessionId(master_node_id=node_id, election_clock=0)
         router = Router.create(
