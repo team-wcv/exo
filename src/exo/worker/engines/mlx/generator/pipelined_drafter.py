@@ -917,15 +917,26 @@ def _pipelined_speculative_step_body(
         draft_arr = mx.array(drafts, dtype=mx.uint32)
         verify_input = mx.concatenate([seed_arr, draft_arr])
         _diag_verify_t0 = time.perf_counter()
-        _spec_diag(
-            f"rank {_diag_rank}: round {_diag_round} about to call "
-            f"model(verify_input[None]) (verify_len={k_this + 1})"
-        )
         logits = model(verify_input[None], cache=prompt_cache)
+        # CRITICAL: force eval of ``logits`` on every target rank so the
+        # TP all-reduce kernels embedded in ``model()`` actually launch
+        # before any rank proceeds to its next blocking step. Without
+        # this, non-root ranks dispatch the verify forward (lazy graph
+        # only) and then enter the TCP recv in ``_broadcast_target_tokens``,
+        # leaving the all-reduce un-launched on their side. The root
+        # rank's ``mx.eval(sampled_batch)`` then deadlocks waiting for
+        # the matching all-reduce on every peer. This mirrors the
+        # prefill loop's ``mx.eval([c.state for c in prompt_cache])``,
+        # which is what made the round-0 prefill collectives pair up
+        # correctly on both ranks. Cost: one synchronization per round
+        # (~the verify forward time, which we'd block on at the sampler
+        # step anyway on root). Benefit: guaranteed pairing of TP
+        # collectives across all target ranks under JACCL or ring.
+        mx.eval(logits)
         _spec_diag(
-            f"rank {_diag_rank}: round {_diag_round} model(verify) "
-            f"dispatched in {(time.perf_counter() - _diag_verify_t0) * 1000:.1f}ms "
-            f"(NOT yet eval'd, MLX is lazy)"
+            f"rank {_diag_rank}: round {_diag_round} model(verify) + eval "
+            f"completed in {(time.perf_counter() - _diag_verify_t0) * 1000:.1f}ms "
+            f"(verify_len={k_this + 1})"
         )
         # logits shape: (1, k_this + 1, vocab)
 
