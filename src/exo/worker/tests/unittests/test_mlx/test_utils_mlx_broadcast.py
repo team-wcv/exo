@@ -217,28 +217,27 @@ class TestMxAllGatherTasksSingleRank:
 
 
 # ---------------------------------------------------------------------------
-# Authoritative agreement: end-to-end via fake group
+# Two-phase intersection agreement: end-to-end via in-process simulation
 # ---------------------------------------------------------------------------
 
 
-def _agree_authoritative(
-    root_tasks: list[TextGeneration],
-    consumer_tasks: list[TextGeneration],
-) -> tuple[list[TextGeneration], list[TextGeneration]]:
-    """Run the agreement protocol entirely in-process for unit testing.
+def _agree_intersection(
+    rank_views: list[list[TextGeneration]],
+) -> list[tuple[list[TextGeneration], list[TextGeneration]]]:
+    """Run the two-phase intersection protocol entirely in-process.
 
-    The real protocol uses :func:`mx_broadcast_int_list` (an
-    ``all_sum`` ride). We don't ship an actual MLX group into the
-    unit test, so this helper bypasses the collective and runs the
-    protocol end-to-end by feeding root's broadcast bytes directly
-    into the consumer's decoder. That validates the encode/decode
-    contract and the consumer-side filtering / leftover logic
-    without depending on MLX runtime behaviour.
+    Mirrors :func:`mx_all_gather_tasks` for ``len(rank_views)`` ranks
+    without spinning up MLX. Phase 1 is root's broadcast (the first
+    entry in ``rank_views`` is treated as root); phase 2 is the
+    cross-rank vote (sum of indicator vectors). Returns each rank's
+    ``(agreed, leftover)`` pair so tests can assert that all ranks
+    land on the SAME ``agreed`` set, which is the whole point of the
+    protocol -- without it, divergent admit decisions leave one rank
+    in the spec loop while the other re-enters ``agree_on_tasks``,
+    causing collective-stream cross-talk and downstream
+    ``IndexError`` in the detokenizer when broadcast token slots
+    arrive scrambled.
     """
-    # Mirror ``mx_all_gather_tasks`` root encode -> consumer decode
-    # without the collective. The collective is exercised in the
-    # cluster bench because it requires real ``mx.distributed`` to
-    # be initialised.
     from exo.worker.engines.mlx.utils_mlx import (
         _MX_AGREE_BUFFER_LEN,  # pyright: ignore[reportPrivateUsage]
         _MX_AGREE_MAX_TASKS,  # pyright: ignore[reportPrivateUsage]
@@ -246,6 +245,11 @@ def _agree_authoritative(
         _decode_task_id,  # pyright: ignore[reportPrivateUsage]
         _encode_task_id,  # pyright: ignore[reportPrivateUsage]
     )
+
+    if not rank_views:
+        return []
+    group_size = len(rank_views)
+    root_tasks = rank_views[0]
 
     admitted = root_tasks[:_MX_AGREE_MAX_TASKS]
     payload: list[int] = [len(admitted)]
@@ -260,89 +264,106 @@ def _agree_authoritative(
         end = start + _MX_TASK_ID_BYTES
         canonical_ids.append(_decode_task_id(payload[start:end]))
 
-    local_by_id: dict[TaskId, TextGeneration] = {t.task_id: t for t in consumer_tasks}
-    agreed: list[TextGeneration] = []
-    for tid in canonical_ids:
-        task = local_by_id.pop(TaskId(tid), None)
-        if task is not None:
-            agreed.append(task)
-    leftover = list(local_by_id.values())
-    return agreed, leftover
+    rank_locals: list[dict[TaskId, TextGeneration]] = [
+        {t.task_id: t for t in tasks} for tasks in rank_views
+    ]
+    votes_per_rank = [
+        [1 if cid in local else 0 for cid in canonical_ids] for local in rank_locals
+    ]
+    summed = [sum(votes[i] for votes in votes_per_rank) for i in range(count)]
+
+    results: list[tuple[list[TextGeneration], list[TextGeneration]]] = []
+    for local in rank_locals:
+        agreed: list[TextGeneration] = []
+        local_remaining = dict(local)
+        for i, cid in enumerate(canonical_ids):
+            if summed[i] != group_size:
+                continue
+            task = local_remaining.pop(TaskId(cid), None)
+            if task is not None:
+                agreed.append(task)
+        leftover = list(local_remaining.values())
+        results.append((agreed, leftover))
+    return results
 
 
-class TestAuthoritativeAgreement:
-    """Cross-rank agreement semantics validated through the wire codec
-    without spinning up an MLX group. Each test fixes a root view +
-    a consumer view, runs the encode/decode, and checks the consumer
-    landed on the canonical agreed set with the right leftovers."""
+class TestIntersectionAgreement:
+    """Cross-rank intersection semantics. The protocol's correctness
+    contract is that every rank that returns from
+    :func:`mx_all_gather_tasks` lands on the SAME ``agreed`` set, so
+    the next ``_admit_queued_tasks`` admits identical tasks on every
+    rank -- preventing the divergence that historically led to
+    cross-talk between admit collectives and spec-loop collectives."""
 
-    def test_consumer_matches_root(self) -> None:
-        # Both ranks see the same task: agreed = [task], leftover = [].
-        task = _make_task("alpha")
-        agreed, leftover = _agree_authoritative([task], [task])
-        assert [t.task_id for t in agreed] == ["alpha"]
-        assert leftover == []
+    def test_unanimous_admission(self) -> None:
+        a_root = _make_task("alpha")
+        a_peer = _make_task("alpha")
+        results = _agree_intersection([[a_root], [a_peer]])
+        assert len(results) == 2
+        for agreed, leftover in results:
+            assert [t.task_id for t in agreed] == ["alpha"]
+            assert leftover == []
 
-    def test_consumer_drops_unknown_root_tasks(self) -> None:
-        # Root has task that consumer hasn't received yet (libp2p
-        # delivery race): consumer admits the empty subset; the task
-        # surfaces next round once delivery completes. The consumer
-        # never desyncs from the canonical order.
-        root_only = _make_task("root-only")
-        agreed, leftover = _agree_authoritative([root_only], [])
-        assert agreed == []
-        assert leftover == []
+    def test_root_only_task_deferred_on_both_ranks(self) -> None:
+        # Root has task that peer hasn't received yet: NEITHER rank
+        # admits it. This is the whole reason for intersection
+        # rather than root-authoritative.
+        results = _agree_intersection([[_make_task("alpha")], []])
+        for agreed, _ in results:
+            assert agreed == []
+        assert [t.task_id for t in results[0][1]] == ["alpha"]
+        assert results[1][1] == []
 
-    def test_consumer_keeps_unknown_local_tasks_as_leftover(self) -> None:
-        # Consumer has a task root hasn't seen: leftover lets the
-        # caller stash it in ``_maybe_queue`` so it's eligible the
-        # next agreement round.
-        future = _make_task("future")
-        agreed, leftover = _agree_authoritative([], [future])
-        assert agreed == []
-        assert [t.task_id for t in leftover] == ["future"]
+    def test_peer_only_task_deferred_on_both_ranks(self) -> None:
+        results = _agree_intersection([[], [_make_task("future")]])
+        for agreed, _ in results:
+            assert agreed == []
+        assert results[0][1] == []
+        assert [t.task_id for t in results[1][1]] == ["future"]
 
-    def test_consumer_partial_overlap(self) -> None:
-        # Root has [alpha, beta], consumer has [alpha, gamma]:
-        # agreed=[alpha], leftover=[gamma]. Beta is silently dropped
-        # this round; gamma waits for root to see it.
-        alpha = _make_task("alpha")
-        consumer_alpha = _make_task("alpha")  # different object, same id
+    def test_partial_overlap_only_intersection_admitted(self) -> None:
+        a_root = _make_task("alpha")
+        a_peer = _make_task("alpha")
         beta = _make_task("beta")
         gamma = _make_task("gamma")
-        agreed, leftover = _agree_authoritative([alpha, beta], [consumer_alpha, gamma])
-        assert [t.task_id for t in agreed] == ["alpha"]
-        assert [t.task_id for t in leftover] == ["gamma"]
+        results = _agree_intersection([[a_root, beta], [a_peer, gamma]])
+        for agreed, _ in results:
+            assert [t.task_id for t in agreed] == ["alpha"]
+        assert [t.task_id for t in results[0][1]] == ["beta"]
+        assert [t.task_id for t in results[1][1]] == ["gamma"]
+
+    def test_three_rank_intersection(self) -> None:
+        # 3-rank target: agreed is what *every* rank has. Anything
+        # short of unanimous stays out.
+        results = _agree_intersection(
+            [
+                [_make_task("alpha"), _make_task("beta")],
+                [_make_task("alpha"), _make_task("beta")],
+                [_make_task("alpha")],
+            ]
+        )
+        for agreed, _ in results:
+            assert [t.task_id for t in agreed] == ["alpha"]
 
     def test_canonical_order_is_root_order(self) -> None:
-        # Master's plan order is authoritative. If consumer has the
-        # tasks in a different local order, agreement still comes back
-        # in root's order so every rank's ``self._queue`` extends
-        # identically.
-        a = _make_task("a")
-        b = _make_task("b")
-        c = _make_task("c")
-        consumer_a = _make_task("a")
-        consumer_b = _make_task("b")
-        consumer_c = _make_task("c")
-        agreed, leftover = _agree_authoritative(
-            [c, a, b], [consumer_b, consumer_a, consumer_c]
+        ids_root = ["c", "a", "b"]
+        ids_peer = ["b", "a", "c"]
+        results = _agree_intersection(
+            [
+                [_make_task(i) for i in ids_root],
+                [_make_task(i) for i in ids_peer],
+            ]
         )
-        assert [t.task_id for t in agreed] == ["c", "a", "b"]
-        assert leftover == []
+        for agreed, _ in results:
+            assert [t.task_id for t in agreed] == ids_root
 
     def test_root_caps_at_max_tasks(self) -> None:
-        # Hard cap on agreement payload size. Tasks beyond
-        # ``_MX_AGREE_MAX_TASKS`` get deferred to the next round.
         from exo.worker.engines.mlx.utils_mlx import (
             _MX_AGREE_MAX_TASKS,  # pyright: ignore[reportPrivateUsage]
         )
 
-        # Build a root list larger than the cap and a consumer that
-        # has every task locally. The consumer should still only
-        # admit ``_MX_AGREE_MAX_TASKS`` because that's all root can
-        # broadcast in a single round.
         many = [_make_task(f"t{i:02d}") for i in range(_MX_AGREE_MAX_TASKS + 4)]
-        consumer_copy = [_make_task(t.task_id) for t in many]
-        agreed, _leftover = _agree_authoritative(many, consumer_copy)
-        assert len(agreed) == _MX_AGREE_MAX_TASKS
+        peer_copy = [_make_task(t.task_id) for t in many]
+        results = _agree_intersection([many, peer_copy])
+        for agreed, _ in results:
+            assert len(agreed) == _MX_AGREE_MAX_TASKS

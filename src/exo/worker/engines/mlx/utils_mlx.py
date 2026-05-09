@@ -1330,6 +1330,60 @@ def mx_broadcast_int_list(
     return [int(v) for v in cast(list[int], summed.tolist())]
 
 
+def mx_all_sum_int_list(
+    values: list[int],
+    length: int,
+    group: mx.distributed.Group | None,
+) -> list[int]:
+    """Element-wise ``all_sum`` of an ``int32`` list across all ranks.
+
+    Unlike :func:`mx_broadcast_int_list` (one-rank-contributes), every
+    rank contributes its own ``values`` and every rank sees the
+    element-wise sum. Used by the two-collective intersection
+    protocol in :func:`mx_all_gather_tasks` to vote on which tasks
+    every rank has locally: each rank emits a ``[0, 1]`` indicator
+    vector and the sum equals the group's vote count per slot.
+
+    Same wire reliability story as :func:`mx_broadcast_int_list`:
+    rides MLX's well-exercised ``all_sum`` primitive, validates
+    int32 bounds explicitly so a stray Python ``-1`` doesn't wrap
+    silently.
+
+    Args:
+      values: This rank's contribution. Length must equal ``length``;
+        each value must be in ``[0, 2**31 - 1]``. After all-sum the
+        per-element bound is ``group_size * max(value)`` -- callers
+        sizing for ``[0, 1]`` indicators sit far below int32 max for
+        any plausible ``group_size``.
+      length: Buffer size, agreed by all ranks.
+      group: Distributed group; ``None`` short-circuits to a copy of
+        ``values`` (single-rank vote sums to itself).
+
+    Returns:
+      A list of length ``length`` with the element-wise sum of every
+      rank's ``values``, identical on every rank.
+
+    Raises:
+      ValueError: ``length`` is non-positive, ``values`` length
+        mismatches, or any value is out of int32 range.
+    """
+    if length < 1:
+        raise ValueError(f"mx_all_sum_int_list length must be >= 1, got {length}")
+    if len(values) != length:
+        raise ValueError(
+            f"mx_all_sum_int_list values must have length {length}, got {len(values)}"
+        )
+    _validate_broadcast_values(values)
+    if group is None:
+        return list(values)
+    buffer = mx.array(values, dtype=mx.int32)
+    summed = mx.distributed.all_sum(
+        buffer, group=group, stream=mx.default_stream(mx.Device(mx.cpu))
+    )
+    mx.eval(summed)
+    return [int(v) for v in cast(list[int], summed.tolist())]
+
+
 def _validate_broadcast_values(values: list[int]) -> None:
     """Range-check root-side broadcast values.
 
@@ -1411,63 +1465,77 @@ def mx_all_gather_tasks(
     tasks: list[TextGeneration],
     group: mx.distributed.Group | None,
 ) -> tuple[list[TextGeneration], list[TextGeneration]]:
-    """Root-authoritative task agreement across target ranks.
+    """Two-phase intersection-based task agreement across target ranks.
 
     Returns ``(agreed, leftover)`` where:
 
-      * ``agreed``: tasks every rank should admit this round, in the
-        canonical order set by the root rank. On root this is simply
-        the root-side ``tasks``; on non-root it is the subset of root's
-        broadcast that this rank also has locally (any root-side task
-        not yet visible here is silently dropped from this round and
-        will surface again next round once libp2p delivers it).
-      * ``leftover``: local tasks that didn't make it into ``agreed``.
-        For root this is always empty (root's view is canonical); for
-        non-root these are tasks the root hasn't seen yet, kept in the
-        caller's ``_maybe_queue`` for the next agreement cycle.
+      * ``agreed``: tasks every rank in the group has locally, in the
+        canonical order set by the root rank. Identical on every
+        rank by construction (the consensus is computed inside the
+        function, not after the return).
+      * ``leftover``: this rank's local tasks that didn't make it
+        into ``agreed`` (either root hasn't seen them yet or another
+        peer is still waiting on libp2p delivery). Every rank stashes
+        its leftover for the next agreement cycle.
 
-    Why authoritative rather than intersection-based:
-      The previous design used ``mx.distributed.all_gather`` to compute
-      the per-rank intersection. JACCL's ``all_gather`` was unreliable
-      on Apple Silicon for the small int32 buffers used here (peer
-      slots returned as float32 bit patterns), which forced a strict
-      drift-detection assertion on top of an ``all_sum`` hash. That
-      detector worked correctly but fired in steady state because the
-      master legitimately pushes tasks to ranks at slightly different
-      times (libp2p delivery races). Authoritative agreement rides on
-      the well-exercised ``all_sum`` primitive (via
-      :func:`mx_broadcast_int_list`) and tolerates the delivery race
-      naturally: rank N waits on its local task to be delivered before
-      it's eligible for admission, but never desyncs from the
-      collective.
+    Wire protocol:
+      Phase 1 (broadcast root's IDs):
+        Root encodes ``[count, id_0_chars, ..., id_(count-1)_chars]``
+        into a fixed ``_MX_AGREE_BUFFER_LEN`` int32 buffer
+        (zero-padded slots) and broadcasts via
+        :func:`mx_broadcast_int_list`. Non-root ranks decode it as
+        their canonical view of "candidate tasks".
+      Phase 2 (vote on intersection):
+        Every rank emits a ``[0, 1]`` vote vector indexed by phase-1
+        slot: 1 means "I have this task locally", 0 means "I don't".
+        :func:`mx_all_sum_int_list` element-wise-sums the votes
+        across the group. A slot whose sum equals ``group_size`` is
+        agreed -- every rank had it. Slots below ``group_size`` are
+        deferred (they re-enter the next round once delivery
+        completes).
+
+    Why intersection instead of root-authoritative:
+      Root-authoritative agreement (root admits all its tasks; non-
+      root admits only the subset it has locally) breaks the
+      collective-count contract. If root admits a task the non-root
+      doesn't have, non-root's ``_active_tasks`` stays empty, its
+      next ``step()`` calls ``agree_on_tasks`` again while root is
+      mid-``next(gen)`` issuing spec-loop ``all_sum`` collectives.
+      The two collective streams interleave on the wire and corrupt
+      each other's payloads (manifests as ``IndexError: list index
+      out of range`` in the detokenizer because broadcast tokens
+      arrive scrambled). Intersection keeps both ranks at the same
+      collective count: every rank that admits a task admits it on
+      the same step.
 
     Why ``group is None`` short-circuits without touching MLX:
       ``mx.distributed.all_gather(group=None)`` delegates to MLX's
       default group, which on an asymmetric runner is the parent
       (target+drafter) group. The drafter rank is busy in
       ``drafter_serve_loop`` doing its own ``recv`` on that same
-      default group, so an unguarded all-gather here cross-talks with
-      the drafter's wire protocol. When ``group is None`` we are by
-      construction the only participating rank, so every task is
-      trivially "agreed".
+      default group, so an unguarded all-gather here cross-talks
+      with the drafter's wire protocol. When ``group is None`` we
+      are by construction the only participating rank, so every
+      task is trivially "agreed".
+
+    Cost:
+      Two collectives per call (one broadcast + one all-sum), each
+      on small int32 buffers (~600 bytes). On Apple Silicon JACCL
+      this is sub-millisecond and runs only at admit boundaries,
+      not per token.
     """
     if group is None:
         return list(tasks), []
 
     is_root = group.rank() == 0
+    group_size = group.size()
 
-    # Build the canonical payload on root: ``[count, id_0_chars,
-    # id_1_chars, ...]``. UUIDs are pure ASCII so ``ord()`` lands
-    # cleanly in our int32 broadcast slots; the ``_validate_broadcast_values``
-    # guard in :func:`mx_broadcast_int_list` would catch any unexpected
-    # high-bit chars.
+    # ----- Phase 1: root broadcasts canonical task ID list -----
     if is_root:
         admitted = tasks[:_MX_AGREE_MAX_TASKS]
         payload: list[int] = [len(admitted)]
         for task in admitted:
             payload.extend(_encode_task_id(task.task_id))
-        # Pad remaining slots (no-task slots stay all-zero so the
-        # decoder's null check terminates cleanly).
         payload.extend([0] * (_MX_AGREE_BUFFER_LEN - len(payload)))
         broadcast = mx_broadcast_int_list(
             payload, _MX_AGREE_BUFFER_LEN, group, is_root=True
@@ -1480,12 +1548,10 @@ def mx_all_gather_tasks(
     count = broadcast[0]
     if count < 0 or count > _MX_AGREE_MAX_TASKS:
         # Programming error: root encoded a count outside the agreed
-        # bounds. This is a hard failure -- the buffer is corrupt and
-        # we cannot decode the rest of the payload safely.
+        # bounds. Hard failure -- buffer corrupt, can't decode safely.
         raise RuntimeError(
             f"mx_all_gather_tasks: broadcast count {count} outside "
-            f"[0, {_MX_AGREE_MAX_TASKS}]; broadcast buffer corrupt "
-            "(JACCL all_sum returned non-int32 data?)"
+            f"[0, {_MX_AGREE_MAX_TASKS}]; broadcast buffer corrupt"
         )
 
     canonical_ids: list[str] = []
@@ -1494,17 +1560,29 @@ def mx_all_gather_tasks(
         end = start + _MX_TASK_ID_BYTES
         canonical_ids.append(_decode_task_id(broadcast[start:end]))
 
-    if is_root:
-        return list(tasks[: len(canonical_ids)]), []
-
-    # Non-root: keep canonical order, drop entries we don't have yet,
-    # and stash unrecognised local tasks for the next round.
+    # ----- Phase 2: every rank votes on which canonical IDs it has -----
     local_by_id: dict[str, TextGeneration] = {t.task_id: t for t in tasks}
+    vote = [1 if cid in local_by_id else 0 for cid in canonical_ids]
+    vote.extend([0] * (_MX_AGREE_MAX_TASKS - count))
+    summed_vote = mx_all_sum_int_list(vote, _MX_AGREE_MAX_TASKS, group)
+
+    # ----- Phase 3: build agreed (intersection) and leftover -----
     agreed: list[TextGeneration] = []
-    for tid in canonical_ids:
-        task = local_by_id.pop(tid, None)
-        if task is not None:
-            agreed.append(task)
+    for i, cid in enumerate(canonical_ids):
+        if summed_vote[i] != group_size:
+            continue
+        local = local_by_id.pop(cid, None)
+        if local is None:
+            # Root contributed this ID but isn't a vote-counter on
+            # itself -- only possible if we're not root and we don't
+            # have the task. The vote sum requirement above handles
+            # this case (we'd have voted 0 and it wouldn't reach
+            # ``group_size``); reaching here means buffer corruption.
+            raise RuntimeError(
+                f"mx_all_gather_tasks: canonical id {cid} agreed by "
+                "vote but missing locally; vote/broadcast desync"
+            )
+        agreed.append(local)
     leftover = list(local_by_id.values())
     return agreed, leftover
 
