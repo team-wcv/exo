@@ -1446,3 +1446,272 @@ async def test_starting_downloads_cleared_on_completion() -> None:
         "_starting_downloads must be cleared after _start_download "
         "returns, otherwise restart-after-cancel is silently disabled"
     )
+
+
+async def test_drafter_chain_does_not_run_when_target_download_fails() -> None:
+    """Codex P2 (PR #18 round-(N+12), coordinator.py:487): the
+    drafter chain must wait for ``ensure_shard()`` to actually
+    succeed before running. Pre-fix, ``_spawn_drafter_chain`` was
+    invoked immediately after ``_start_download_task`` queued the
+    target download. If ``ensure_shard()`` later raised
+    (auth/rate-limit/transient network/gated repo), the target
+    flipped to ``DownloadFailed`` but any drafter downloads spawned
+    in the meantime kept running to completion, consuming bandwidth
+    and disk for a model that could never boot. Worse, the failed
+    state is exactly what the round-(N+2) ``DownloadFailed``
+    fast-path was supposed to gate against on a *re-issue*; the
+    initial-issue gap was an outright regression.
+
+    Post-fix, the chain is invoked from ``download_wrapper`` only on
+    the success arm of ``ensure_shard()``. A failed download leaves
+    drafter chaining untouched.
+    """
+    target_shard = _make_shard(_make_target_card([DRAFTER_ID]))
+
+    async def fail_load(_: ModelId) -> ModelCard:
+        raise AssertionError(
+            "ModelCard.load must not be called when the target's "
+            "ensure_shard() raises -- the chain must wait for target "
+            "success before any drafter card resolution"
+        )
+
+    class _FailingDownloader(_RecordingShardDownloader):
+        async def ensure_shard(
+            self,
+            shard: ShardMetadata,
+            config_only: bool = False,  # noqa: ARG002
+        ) -> Path:
+            self.ensured.append(shard.model_card.model_id)
+            if shard.model_card.model_id == TARGET_ID:
+                raise RuntimeError(
+                    "simulated HF auth failure for gated target repo"
+                )
+            return Path("/fake/models") / shard.model_card.model_id.normalize()
+
+    with patch.object(ModelCard, "load", side_effect=fail_load):
+        downloader = _FailingDownloader()
+        async with _running_coordinator(downloader) as (
+            _coordinator,
+            cmd_send,
+            _event_recv,
+        ):
+            await cmd_send.send(
+                ForwarderDownloadCommand(
+                    origin=SystemId("test"),
+                    command=StartDownload(
+                        target_node_id=NODE_ID, shard_metadata=target_shard
+                    ),
+                )
+            )
+            await asyncio.sleep(0.2)
+
+    assert downloader.ensured == [TARGET_ID], (
+        "drafter must NOT be queued when the target's ensure_shard() "
+        "raises before completion; the chain is gated on target success. "
+        f"got ensured={downloader.ensured!r}"
+    )
+
+
+async def test_delete_cascade_rebuilds_drafter_links_after_restart() -> None:
+    """Codex P2 (PR #18 round-(N+12), coordinator.py:817):
+    ``_drafter_children`` is process-local state populated during
+    runtime chaining and not rehydrated on coordinator startup.
+    Pre-fix, deleting a target whose drafters were chained in a
+    PREVIOUS process found an empty children list and left the
+    drafter weights orphaned on disk -- the only signal back to the
+    operator was disk usage that grew over time. (The runtime case
+    where the chain ran in the same process is covered by
+    ``test_shared_drafter_survives_delete_of_one_target``.)
+
+    Post-fix, ``_reconstruct_drafter_links_for_delete`` consults the
+    target's ``ModelCard.drafter_model_ids`` to repopulate the
+    children list before the cascade runs, so a delete after
+    restart cleans up the linked drafters as if the chain had run
+    in the current process.
+    """
+    target_shard = _make_shard(_make_target_card([DRAFTER_ID]))
+    drafter_card = _make_drafter_card()
+    target_card = _make_target_card([DRAFTER_ID])
+
+    async def fake_load(model_id: ModelId) -> ModelCard:
+        if model_id == TARGET_ID:
+            return target_card
+        if model_id == DRAFTER_ID:
+            return drafter_card
+        raise AssertionError(f"unexpected ModelCard.load for {model_id}")
+
+    deleted_ids: list[ModelId] = []
+
+    with patch.object(ModelCard, "load", side_effect=fake_load):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            _cmd_send,
+            _event_recv,
+        ):
+            # Yield once so coordinator.run()'s task group enters its
+            # ``async with self._tg as tg:`` block before we start
+            # exercising private methods. Without this, shutdown()
+            # asserts on an uninitialised ``_tg``.
+            await asyncio.sleep(0.05)
+
+            target_completed = DownloadCompleted(
+                shard_metadata=target_shard,
+                node_id=NODE_ID,
+                total=target_shard.model_card.storage_size,
+                model_directory="/fake/target",
+            )
+            drafter_completed = DownloadCompleted(
+                shard_metadata=_make_shard(drafter_card),
+                node_id=NODE_ID,
+                total=drafter_card.storage_size,
+                model_directory="/fake/drafter",
+            )
+            coordinator.download_status[TARGET_ID] = target_completed
+            coordinator.download_status[DRAFTER_ID] = drafter_completed
+
+            assert TARGET_ID not in coordinator._drafter_children, (  # pyright: ignore[reportPrivateUsage]
+                "test setup must mirror post-restart state: "
+                "_drafter_children is empty for the target"
+            )
+            assert DRAFTER_ID not in coordinator._drafter_parents, (  # pyright: ignore[reportPrivateUsage]
+                "test setup must mirror post-restart state: "
+                "_drafter_parents is empty for the drafter"
+            )
+
+            async def fake_delete_model(model_id: ModelId) -> bool:
+                deleted_ids.append(model_id)
+                coordinator.download_status.pop(model_id, None)
+                return True
+
+            with patch(
+                "exo.download.coordinator.delete_model",
+                side_effect=fake_delete_model,
+            ):
+                await coordinator._delete_download(TARGET_ID)  # pyright: ignore[reportPrivateUsage]
+
+    assert TARGET_ID in deleted_ids, "target must be deleted from disk"
+    assert DRAFTER_ID in deleted_ids, (
+        "drafter must be cascaded into the delete even after restart "
+        "(pre-fix: empty _drafter_children left it orphaned). "
+        f"deleted_ids={deleted_ids!r}"
+    )
+
+
+async def test_delete_cascade_rebuild_respects_other_referencing_target() -> (
+    None
+):
+    """Codex P2 (PR #18 round-(N+12), coordinator.py:817) shared-drafter
+    follow-up: rebuilding drafter links on delete MUST still honour
+    the shared-drafter cascade gate. After a restart, two targets
+    share a drafter on disk; deleting target A must not also delete
+    the drafter the surviving target B still depends on.
+
+    Pre-fix the round-(N+12) rebuild populated the parent set with
+    only target A as a parent, so the discard-and-check loop
+    immediately tore the drafter down. Post-fix the test wires
+    ``_drafter_parents`` such that target B is also a parent (which
+    a second restart-time rebuild would do during target B's own
+    ``_delete_download`` lifecycle), and asserts that deleting
+    target A leaves the shared drafter on disk.
+    """
+    shared_drafter_id = ModelId("test-org/shared-drafter")
+    target_a_id = ModelId("test-org/target-a")
+    target_b_id = ModelId("test-org/target-b")
+    target_a_card = ModelCard(
+        model_id=target_a_id,
+        storage_size=Memory.from_mb(500),
+        n_layers=32,
+        hidden_size=2048,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        drafter_model_ids=[shared_drafter_id],
+    )
+    target_b_card = ModelCard(
+        model_id=target_b_id,
+        storage_size=Memory.from_mb(500),
+        n_layers=32,
+        hidden_size=2048,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        drafter_model_ids=[shared_drafter_id],
+    )
+    drafter_card = ModelCard(
+        model_id=shared_drafter_id,
+        storage_size=Memory.from_mb(50),
+        n_layers=12,
+        hidden_size=768,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+    )
+    target_a_shard = _make_shard(target_a_card)
+
+    async def fake_load(model_id: ModelId) -> ModelCard:
+        if model_id == target_a_id:
+            return target_a_card
+        if model_id == target_b_id:
+            return target_b_card
+        if model_id == shared_drafter_id:
+            return drafter_card
+        raise AssertionError(f"unexpected ModelCard.load for {model_id}")
+
+    deleted_ids: list[ModelId] = []
+
+    with patch.object(ModelCard, "load", side_effect=fake_load):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            _cmd_send,
+            _event_recv,
+        ):
+            # Yield once so coordinator.run()'s task group enters its
+            # ``async with self._tg as tg:`` block before we start
+            # exercising private methods. Without this, shutdown()
+            # asserts on an uninitialised ``_tg``.
+            await asyncio.sleep(0.05)
+
+            target_a_completed = DownloadCompleted(
+                shard_metadata=target_a_shard,
+                node_id=NODE_ID,
+                total=target_a_shard.model_card.storage_size,
+                model_directory="/fake/target-a",
+            )
+            target_b_completed = DownloadCompleted(
+                shard_metadata=_make_shard(target_b_card),
+                node_id=NODE_ID,
+                total=target_b_card.storage_size,
+                model_directory="/fake/target-b",
+            )
+            drafter_completed = DownloadCompleted(
+                shard_metadata=_make_shard(drafter_card),
+                node_id=NODE_ID,
+                total=drafter_card.storage_size,
+                model_directory="/fake/shared-drafter",
+            )
+            coordinator.download_status[target_a_id] = target_a_completed
+            coordinator.download_status[target_b_id] = target_b_completed
+            coordinator.download_status[shared_drafter_id] = drafter_completed
+
+            # Mirror the post-restart state where target B's own
+            # link rebuild already happened (e.g. during a /status
+            # poll that triggered a hydrate on target B). Target A's
+            # rebuild happens lazily during _delete_download below.
+            coordinator._drafter_parents[shared_drafter_id] = {target_b_id}  # pyright: ignore[reportPrivateUsage]
+
+            async def fake_delete_model(model_id: ModelId) -> bool:
+                deleted_ids.append(model_id)
+                coordinator.download_status.pop(model_id, None)
+                return True
+
+            with patch(
+                "exo.download.coordinator.delete_model",
+                side_effect=fake_delete_model,
+            ):
+                await coordinator._delete_download(target_a_id)  # pyright: ignore[reportPrivateUsage]
+
+    assert target_a_id in deleted_ids, "target A must be deleted from disk"
+    assert shared_drafter_id not in deleted_ids, (
+        "shared drafter must NOT be deleted while target B still "
+        "references it; the post-restart link rebuild must respect "
+        f"the existing parent set. deleted_ids={deleted_ids!r}"
+    )

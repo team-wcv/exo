@@ -481,10 +481,24 @@ class DownloadCoordinator:
             await self.event_sender.send(NodeDownloadProgress(download_progress=failed))
             return
 
-        # Start actual download
-        self._start_download_task(shard, initial_progress)
-        if not is_drafter_chain:
-            self._spawn_drafter_chain(shard)
+        # Codex P2 (PR #18 round-(N+12), coordinator.py:487): defer
+        # ``_spawn_drafter_chain`` until ``ensure_shard()`` for the
+        # target actually succeeds. Pre-fix, the chain was spawned
+        # immediately after queuing the target download; if the
+        # target subsequently failed (auth/rate-limit/transient
+        # network/gated repo), the drafter downloads kept running
+        # to completion and consumed bandwidth + disk for a model
+        # that could never boot. ``download_wrapper`` (inside
+        # ``_start_download_task``) now invokes the chain on the
+        # success arm of ``ensure_shard()`` so drafters are only
+        # fetched when the target is actually runnable. The earlier
+        # already-cached / initial-progress-complete arms above
+        # still call ``_spawn_drafter_chain`` directly because
+        # those paths don't touch ``ensure_shard()`` at all -- the
+        # target is already a runnable model on disk.
+        self._start_download_task(
+            shard, initial_progress, is_drafter_chain=is_drafter_chain
+        )
 
     def _spawn_drafter_chain(self, target_shard: ShardMetadata) -> None:
         """Background the drafter chain so command processing doesn't block.
@@ -743,7 +757,11 @@ class DownloadCoordinator:
                 return
 
     def _start_download_task(
-        self, shard: ShardMetadata, initial_progress: RepoDownloadProgress
+        self,
+        shard: ShardMetadata,
+        initial_progress: RepoDownloadProgress,
+        *,
+        is_drafter_chain: bool = False,
     ) -> None:
         model_id = shard.model_card.model_id
 
@@ -760,9 +778,11 @@ class DownloadCoordinator:
         self.event_sender.send_nowait(NodeDownloadProgress(download_progress=status))
 
         async def download_wrapper(cancel_scope: anyio.CancelScope) -> None:
+            target_succeeded = False
             try:
                 with cancel_scope:
                     await self.shard_downloader.ensure_shard(shard)
+                    target_succeeded = True
             except Exception as e:
                 logger.error(f"Download failed for {model_id}: {e}")
                 failed = DownloadFailed(
@@ -780,10 +800,89 @@ class DownloadCoordinator:
                 pass
             finally:
                 self.active_downloads.pop(model_id, None)
+            # Codex P2 (PR #18 round-(N+12), coordinator.py:487):
+            # only chain drafters once the target download actually
+            # succeeded -- skip on failure (DownloadFailed branch
+            # above) AND on cancellation (cancel_scope.cancel_called
+            # implies the user revoked the intent before we even
+            # finished). ``is_drafter_chain`` short-circuits drafter
+            # subchains so a drafter being downloaded as part of an
+            # already-active chain doesn't spawn its own (already
+            # enforced upstream in ``_start_download_inner``, but
+            # mirrored here for the post-success entrypoint).
+            if (
+                target_succeeded
+                and not cancel_scope.cancel_called
+                and not is_drafter_chain
+            ):
+                self._spawn_drafter_chain(shard)
 
         scope = anyio.CancelScope()
         self._tg.start_soon(download_wrapper, scope)
         self.active_downloads[model_id] = scope
+
+    async def _reconstruct_drafter_links_for_delete(
+        self, model_id: ModelId
+    ) -> list[ModelId]:
+        """Pop the existing drafter children for ``model_id`` and merge
+        them with the drafter ids declared on its model card.
+
+        The merge handles the post-restart case where
+        ``_drafter_children`` is empty (process-local state, not
+        rehydrated on startup) but the user is deleting a target that
+        had drafters chained in an earlier process. Pre-fix, deleting
+        such a target left the drafter weights orphaned on disk and
+        the only signal back to the operator was disk usage that
+        slowly grew over time.
+
+        Resolution order:
+
+        1. Pop the existing chain entry (preserves the
+           "delete-once" semantics of the prior implementation --
+           re-deleting the same target after this call is a no-op).
+        2. Load the target's model card via ``ModelCard.load`` to
+           extract ``drafter_model_ids``. ``ModelCard.load`` reads
+           from the on-disk card cache first, so this is cheap when
+           the target's model files (including its card) are still
+           on disk -- which is the only case where the delete
+           cascade is meaningful anyway. ``ModelCard.load`` may
+           still fall through to ``fetch_from_hf``; the failure path
+           swallows the exception and returns just the in-memory
+           list.
+        3. Repopulate ``_drafter_parents`` for any rediscovered
+           drafter so that other still-referencing targets continue
+           to gate this delete cascade on "last reference"
+           semantics. Without this step, deleting target A would
+           also delete a drafter target B still depends on, even
+           when target B's chain in this process had already
+           registered its parent link.
+        """
+        existing = list(self._drafter_children.pop(model_id, []))
+        try:
+            target_card = await ModelCard.load(model_id)
+        except Exception as exc:
+            logger.debug(
+                f"Could not reload card for {model_id} during delete "
+                f"cascade rebuild ({exc}); using in-memory drafter "
+                f"links only ({len(existing)} entries)"
+            )
+            return existing
+
+        merged: list[ModelId] = list(existing)
+        seen: set[ModelId] = set(existing)
+        for drafter_id in target_card.drafter_model_ids:
+            if drafter_id in seen:
+                continue
+            merged.append(drafter_id)
+            seen.add(drafter_id)
+            # Treat the rediscovered link as if the chain ran in
+            # this process so the shared-drafter cascade gate
+            # behaves identically to the runtime path. ``setdefault``
+            # creates the parent set if it doesn't yet exist; we add
+            # the current ``model_id`` so the discard-and-check loop
+            # below removes it correctly.
+            self._drafter_parents.setdefault(drafter_id, set()).add(model_id)
+        return merged
 
     async def _delete_download(self, model_id: ModelId) -> None:
         # Protect read-only models from deletion
@@ -813,7 +912,19 @@ class DownloadCoordinator:
         # non-speculative behaviour and forcing an unnecessary
         # re-download next time the user reissued StartDownload for
         # it.
-        children = self._drafter_children.pop(model_id, [])
+        #
+        # Codex P2 (PR #18 round-(N+12), coordinator.py:817):
+        # ``_drafter_children`` is process-local state populated
+        # during runtime chaining and not rehydrated on startup.
+        # After an exo restart, deleting a target whose drafters
+        # were chained in a previous process would find the parent
+        # entry empty and leave the drafter weights orphaned on
+        # disk. Rebuild the parent->children list from the model
+        # card's ``drafter_model_ids`` here so the cascade still
+        # works post-restart (and the inverse parent set rebuilds
+        # alongside it so other still-referencing targets continue
+        # to protect the drafter from premature delete).
+        children = await self._reconstruct_drafter_links_for_delete(model_id)
         for child_model_id in children:
             parents = self._drafter_parents.get(child_model_id)
             if parents is not None:
