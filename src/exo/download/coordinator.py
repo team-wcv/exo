@@ -882,6 +882,25 @@ class DownloadCoordinator:
            also delete a drafter target B still depends on, even
            when target B's chain in this process had already
            registered its parent link.
+        4. Codex P1 (PR #18 round-(N+13), coordinator.py:910): scan
+           ALL known model cards (built-in + custom) for *other*
+           targets that declare any of these drafters as a chain
+           dependency, and add those targets as parents whenever
+           the other target is **installed on disk**. Pre-fix the
+           rebuild only registered the current ``model_id`` as a
+           parent, so a shared drafter whose other parent's chain
+           had not run in this process (e.g. the user only ever
+           downloaded one of the two targets that share the
+           drafter, OR the process restarted before any chain ran)
+           was incorrectly treated as orphaned and deleted by the
+           cascade -- silently degrading the surviving target back
+           to non-speculative behaviour. We restrict the discovered
+           parents to *installed* targets so a card declaring
+           ``drafter_model_ids = [x]`` for a model that was never
+           downloaded does not block legitimate deletion of ``x``;
+           the runtime ``_spawn_drafter_chain`` path uses the same
+           "only after the parent has actually been downloaded"
+           semantic, so this matches it.
         """
         existing = list(self._drafter_children.pop(model_id, []))
         try:
@@ -908,7 +927,89 @@ class DownloadCoordinator:
             # the current ``model_id`` so the discard-and-check loop
             # below removes it correctly.
             self._drafter_parents.setdefault(drafter_id, set()).add(model_id)
+
+        if merged:
+            await self._discover_other_drafter_parents(
+                deleting_model_id=model_id, drafters=merged
+            )
         return merged
+
+    async def _discover_other_drafter_parents(
+        self,
+        *,
+        deleting_model_id: ModelId,
+        drafters: list[ModelId],
+    ) -> None:
+        """Codex P1 (PR #18 round-(N+13), coordinator.py:910): rebuild
+        the inverse parent->drafter mapping for OTHER installed
+        targets that share any drafter in ``drafters``.
+
+        ``_reconstruct_drafter_links_for_delete`` only records the
+        currently-deleting target as a parent, so a shared drafter
+        whose other parent's chain has not run in this process
+        (typical post-restart) would be treated as unreferenced and
+        cascaded-deleted alongside the first target's removal --
+        breaking speculative decoding for the surviving target. We
+        scan every known card and, for each card that declares any
+        of these drafters AND whose own model is installed on disk,
+        register that card as a parent so the cascade's
+        last-reference gate correctly preserves the drafter.
+
+        Implementation notes:
+        * We deliberately exclude ``deleting_model_id`` from the
+          iteration: ``_reconstruct_drafter_links_for_delete`` has
+          already added it as a parent and the cascade loop
+          ``parents.discard(model_id)`` will pop it back out when
+          the delete proceeds.
+        * "Installed on disk" is determined via
+          ``resolve_existing_model``, which mirrors the post-restart
+          hydration path used by ``_emit_existing_download_progress``.
+          This intentionally ignores cards whose models were never
+          downloaded -- registering uninstalled cards as parents
+          would block legitimate deletes of orphaned drafters that
+          no installed target needs.
+        * ``get_model_cards`` failures are swallowed: the rebuild
+          is best-effort and the runtime parent map (set during
+          ``_spawn_drafter_chain``) remains the authoritative
+          source whenever it has been populated.
+        """
+        try:
+            all_cards = await get_model_cards()
+        except Exception as exc:
+            logger.debug(
+                f"Could not enumerate model cards while rebuilding "
+                f"shared-drafter parents during delete of "
+                f"{deleting_model_id} ({exc}); proceeding with the "
+                "current parent map. Other installed targets that "
+                "share a drafter may have been registered already "
+                "via runtime chain-spawn; if not, the cascade may "
+                "delete a still-referenced drafter."
+            )
+            return
+
+        drafter_set = set(drafters)
+        for other_card in all_cards:
+            other_id = other_card.model_id
+            if other_id == deleting_model_id:
+                continue
+            shared = drafter_set.intersection(other_card.drafter_model_ids)
+            if not shared:
+                continue
+            installed = await to_thread.run_sync(
+                resolve_existing_model, other_id, other_card
+            )
+            if installed is None:
+                continue
+            for drafter_id in shared:
+                parents = self._drafter_parents.setdefault(drafter_id, set())
+                if other_id not in parents:
+                    parents.add(other_id)
+                    logger.debug(
+                        f"Registered installed target {other_id} as a "
+                        f"parent of shared drafter {drafter_id} so the "
+                        f"delete cascade for {deleting_model_id} "
+                        f"preserves the drafter on disk."
+                    )
 
     async def _delete_download(self, model_id: ModelId) -> None:
         # Codex P2 (PR #18 round-(N+13), coordinator.py:337): cycle

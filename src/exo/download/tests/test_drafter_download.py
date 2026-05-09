@@ -2038,3 +2038,271 @@ async def test_delete_cascade_rebuild_respects_other_referencing_target() -> (
         "references it; the post-restart link rebuild must respect "
         f"the existing parent set. deleted_ids={deleted_ids!r}"
     )
+
+
+async def test_delete_cascade_rebuilds_other_parents_for_installed_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P1 (PR #18 round-(N+13), coordinator.py:910): when
+    deleting a target after a process restart, the rebuild must
+    discover OTHER installed targets that share the same drafter
+    and register them as parents so the cascade's last-reference
+    gate preserves the drafter on disk.
+
+    Pre-fix the rebuild only registered the *currently-deleting*
+    target as a parent; a shared drafter whose other parent's
+    chain had not yet been rebuilt in this process (the typical
+    post-restart state when only one target's delete has been
+    observed so far) was treated as orphaned and cascaded-deleted,
+    silently degrading the surviving target back to non-speculative
+    behaviour.
+
+    Post-fix the cascade scans every known model card. Any card
+    that (a) declares one of the rediscovered drafters AND (b) is
+    currently installed on disk gets registered as an additional
+    parent. The cascade's last-reference gate then preserves the
+    drafter exactly as it would for a runtime-chained pair of
+    targets that both still want it.
+    """
+    shared_drafter_id = ModelId("test-org/shared-drafter")
+    target_a_id = ModelId("test-org/target-a")
+    target_b_id = ModelId("test-org/target-b")
+    target_a_card = ModelCard(
+        model_id=target_a_id,
+        storage_size=Memory.from_mb(500),
+        n_layers=32,
+        hidden_size=2048,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        drafter_model_ids=[shared_drafter_id],
+    )
+    target_b_card = ModelCard(
+        model_id=target_b_id,
+        storage_size=Memory.from_mb(500),
+        n_layers=32,
+        hidden_size=2048,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        drafter_model_ids=[shared_drafter_id],
+    )
+    drafter_card = ModelCard(
+        model_id=shared_drafter_id,
+        storage_size=Memory.from_mb(50),
+        n_layers=12,
+        hidden_size=768,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+    )
+    target_a_shard = _make_shard(target_a_card)
+
+    async def fake_load(model_id: ModelId) -> ModelCard:
+        if model_id == target_a_id:
+            return target_a_card
+        if model_id == target_b_id:
+            return target_b_card
+        if model_id == shared_drafter_id:
+            return drafter_card
+        raise AssertionError(f"unexpected ModelCard.load for {model_id}")
+
+    async def fake_get_model_cards() -> list[ModelCard]:
+        return [target_a_card, target_b_card, drafter_card]
+
+    # Simulate "target B installed on disk, target A also installed
+    # on disk, drafter installed on disk" -- i.e. the typical
+    # post-restart state for a user with both Gemma 4 26B and 31B
+    # using the shared e2b drafter.
+    installed_dir = tmp_path / "models"
+    installed_dir.mkdir()
+
+    def fake_resolve_existing_model(
+        model_id: ModelId, card: ModelCard | None = None
+    ) -> Path | None:
+        if model_id in (target_a_id, target_b_id, shared_drafter_id):
+            return installed_dir / model_id.normalize()
+        return None
+
+    monkeypatch.setattr(
+        "exo.download.coordinator.resolve_existing_model",
+        fake_resolve_existing_model,
+    )
+
+    deleted_ids: list[ModelId] = []
+
+    with (
+        patch.object(ModelCard, "load", side_effect=fake_load),
+        patch(
+            "exo.download.coordinator.get_model_cards",
+            side_effect=fake_get_model_cards,
+        ),
+    ):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            _cmd_send,
+            _event_recv,
+        ):
+            # Yield so the coordinator's task group enters its
+            # ``async with self._tg as tg:`` block before we
+            # call private delete machinery.
+            await asyncio.sleep(0.05)
+
+            # Mirror a fresh post-restart state: download_status
+            # is hydrated for the currently-deleting target only.
+            # The surviving target B is installed on disk but
+            # its parent link has NOT been pre-seeded -- this is
+            # the regression Codex called out.
+            target_a_completed = DownloadCompleted(
+                shard_metadata=target_a_shard,
+                node_id=NODE_ID,
+                total=target_a_shard.model_card.storage_size,
+                model_directory="/fake/target-a",
+            )
+            coordinator.download_status[target_a_id] = target_a_completed
+
+            async def fake_delete_model(model_id: ModelId) -> bool:
+                deleted_ids.append(model_id)
+                coordinator.download_status.pop(model_id, None)
+                return True
+
+            with patch(
+                "exo.download.coordinator.delete_model",
+                side_effect=fake_delete_model,
+            ):
+                await coordinator._delete_download(target_a_id)  # pyright: ignore[reportPrivateUsage]
+
+    assert target_a_id in deleted_ids, "target A must be deleted from disk"
+    assert shared_drafter_id not in deleted_ids, (
+        "shared drafter must NOT be deleted: target B is installed "
+        "on disk and shares the drafter, so the rebuild must register "
+        "target B as an additional parent and the cascade must honour "
+        f"the last-reference gate. deleted_ids={deleted_ids!r}"
+    )
+
+
+async def test_delete_cascade_does_not_block_on_uninstalled_other_parents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other-parent rebuild MUST only register *installed*
+    targets. Otherwise a card declaring ``drafter_model_ids = [x]``
+    for a model that was never downloaded would block legitimate
+    deletion of ``x`` when its only real parent is also being
+    deleted -- leaving an orphaned drafter on disk.
+
+    This is the inverse correctness check for the round-(N+13)
+    fix: the new ``_discover_other_drafter_parents`` step uses
+    ``resolve_existing_model`` to filter to installed targets only,
+    so an uninstalled card sharing the same drafter must NOT
+    register as a parent and the cascade must proceed normally.
+    """
+    shared_drafter_id = ModelId("test-org/shared-drafter")
+    target_a_id = ModelId("test-org/target-a")
+    uninstalled_target_id = ModelId("test-org/uninstalled-target")
+    target_a_card = ModelCard(
+        model_id=target_a_id,
+        storage_size=Memory.from_mb(500),
+        n_layers=32,
+        hidden_size=2048,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        drafter_model_ids=[shared_drafter_id],
+    )
+    uninstalled_target_card = ModelCard(
+        model_id=uninstalled_target_id,
+        storage_size=Memory.from_mb(500),
+        n_layers=32,
+        hidden_size=2048,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        drafter_model_ids=[shared_drafter_id],
+    )
+    drafter_card = ModelCard(
+        model_id=shared_drafter_id,
+        storage_size=Memory.from_mb(50),
+        n_layers=12,
+        hidden_size=768,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+    )
+    target_a_shard = _make_shard(target_a_card)
+    drafter_shard = _make_shard(drafter_card)
+
+    async def fake_load(model_id: ModelId) -> ModelCard:
+        if model_id == target_a_id:
+            return target_a_card
+        if model_id == uninstalled_target_id:
+            return uninstalled_target_card
+        if model_id == shared_drafter_id:
+            return drafter_card
+        raise AssertionError(f"unexpected ModelCard.load for {model_id}")
+
+    async def fake_get_model_cards() -> list[ModelCard]:
+        return [target_a_card, uninstalled_target_card, drafter_card]
+
+    def fake_resolve_existing_model(
+        model_id: ModelId, card: ModelCard | None = None
+    ) -> Path | None:
+        # Only the deleting target and its drafter are installed
+        # on disk; the other card declaring the same drafter was
+        # never downloaded.
+        if model_id in (target_a_id, shared_drafter_id):
+            return Path("/fake") / model_id.normalize()
+        return None
+
+    monkeypatch.setattr(
+        "exo.download.coordinator.resolve_existing_model",
+        fake_resolve_existing_model,
+    )
+
+    deleted_ids: list[ModelId] = []
+
+    with (
+        patch.object(ModelCard, "load", side_effect=fake_load),
+        patch(
+            "exo.download.coordinator.get_model_cards",
+            side_effect=fake_get_model_cards,
+        ),
+    ):
+        downloader = _RecordingShardDownloader()
+        async with _running_coordinator(downloader) as (
+            coordinator,
+            _cmd_send,
+            _event_recv,
+        ):
+            await asyncio.sleep(0.05)
+
+            target_a_completed = DownloadCompleted(
+                shard_metadata=target_a_shard,
+                node_id=NODE_ID,
+                total=target_a_shard.model_card.storage_size,
+                model_directory="/fake/target-a",
+            )
+            drafter_completed = DownloadCompleted(
+                shard_metadata=drafter_shard,
+                node_id=NODE_ID,
+                total=drafter_card.storage_size,
+                model_directory="/fake/shared-drafter",
+            )
+            coordinator.download_status[target_a_id] = target_a_completed
+            coordinator.download_status[shared_drafter_id] = drafter_completed
+
+            async def fake_delete_model(model_id: ModelId) -> bool:
+                deleted_ids.append(model_id)
+                coordinator.download_status.pop(model_id, None)
+                return True
+
+            with patch(
+                "exo.download.coordinator.delete_model",
+                side_effect=fake_delete_model,
+            ):
+                await coordinator._delete_download(target_a_id)  # pyright: ignore[reportPrivateUsage]
+
+    assert target_a_id in deleted_ids
+    assert shared_drafter_id in deleted_ids, (
+        "drafter MUST cascade-delete: the only other card declaring it "
+        "(uninstalled_target) is not installed on disk, so it must NOT "
+        "register as a parent. Pre-(N+13)-fix-overshoot, registering "
+        "uninstalled cards would orphan the drafter on disk; the "
+        "installed-only filter prevents that. "
+        f"deleted_ids={deleted_ids!r}"
+    )
