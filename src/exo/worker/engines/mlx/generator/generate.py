@@ -3,9 +3,10 @@ import functools
 import math
 import time
 import uuid
-from typing import Any, Callable, Generator, cast, get_args
+from typing import Any, Callable, Generator, Literal, cast, get_args
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx_lm.generate import (
     PromptProcessingBatch,
     maybe_quantize_kv_cache,
@@ -76,6 +77,7 @@ from exo.worker.engines.mlx.generator.pipelined_drafter import (
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
+    CoupledDrafter,
     apply_chat_template,
     fix_unmatched_think_end_tokens,
     mx_barrier,
@@ -874,6 +876,42 @@ def extract_top_logprobs(
     return selected_logprob, top_logprob_items
 
 
+def _resolve_coupled_drafter_telemetry(
+    *,
+    coupled_dispatch_fired: bool,
+    coupled_drafter: CoupledDrafter | None,
+    effective_num_draft_tokens: int,
+) -> tuple[str | None, Literal["mtp", "dflash"] | None, int | None]:
+    """Compute coupled-drafter telemetry fields for ``GenerationStats``.
+
+    Codex P2 (PR #25 round-(N+1), generate.py:1710): the dispatch in
+    :func:`mlx_generate` builds a :class:`CoupledModelDrafter` only
+    when the loaded coupled drafter's ``kind`` is one we know how to
+    drive (``"mtp"`` today; ``"dflash"`` lands in a follow-up). When
+    the kind is not yet wired, dispatch falls back to
+    ``make_drafter(mode="none")`` and runs no speculation. The
+    telemetry stamper here gates on the DISPATCH signal
+    (``coupled_dispatch_fired``) rather than the RESOURCE signal
+    (``coupled_drafter`` present + active mode), so a loaded-but-
+    not-dispatched coupled drafter doesn't leak ``drafter_model_id``
+    / ``drafter_kind`` / ``num_draft_tokens`` onto a request that
+    actually ran with ``draft_mode="none"``.
+
+    Returns a 3-tuple ``(drafter_id, drafter_kind, num_draft_tokens)``
+    where any element is ``None`` iff coupled dispatch did not fire
+    for this request. Callers fall through to the standard /
+    pipelined / ngram telemetry branches when this returns
+    ``(None, None, None)``.
+    """
+    if coupled_dispatch_fired and coupled_drafter is not None:
+        return (
+            str(coupled_drafter.model_id),
+            coupled_drafter.kind,
+            effective_num_draft_tokens,
+        )
+    return (None, None, None)
+
+
 def _request_is_greedy_sampling(task: TextGenerationTaskParams) -> bool:
     """Return ``True`` iff the request samples deterministically.
 
@@ -913,6 +951,7 @@ def mlx_generate(
     asymmetric_drafter_transport: object | None = None,
     target_peer_fanout: object | None = None,
     precomputed_target_cache: KVCacheType | None = None,
+    coupled_drafter: CoupledDrafter | None = None,
 ) -> Generator[GenerationResponse]:
     """Generate tokens for ``task``.
 
@@ -1001,6 +1040,17 @@ def mlx_generate(
     # ``resolve_draft_mode`` but uses ``"pipelined"`` as the implicit
     # default for an asymmetric placement.
     has_asymmetric_drafter = asymmetric_drafter_rank is not None
+    # ``coupled_drafter`` is only valid on single-node placements:
+    # mtp/dflash drafters consume the target's hidden state every
+    # round, which the asymmetric / multi-rank dispatch can't
+    # transport without forwarding hidden tensors over the wire (and
+    # at that point you've eaten the whole speedup). The runner's
+    # placement gate enforces this; we additionally narrow inside
+    # ``mlx_generate`` so a misconfigured caller falls back cleanly
+    # to non-coupled dispatch instead of crashing the spec loop.
+    coupled_drafter_eligible: bool = (
+        coupled_drafter is not None and group is None and not has_asymmetric_drafter
+    )
     if has_asymmetric_drafter:
         draft_mode: DraftMode = resolve_asymmetric_draft_mode(
             has_asymmetric_drafter=True,
@@ -1014,6 +1064,7 @@ def mlx_generate(
             has_drafter_model=draft_model is not None,
             request_use_drafter=request_use_drafter,
             request_draft_mode=request_draft_mode,
+            has_coupled_drafter=coupled_drafter_eligible,
         )
     # Provisional gate -- re-narrowed after the short-output and
     # ngram-greedy demotions below so a per-request opt-out (or any
@@ -1080,6 +1131,17 @@ def mlx_generate(
     effective_draft_model = (
         draft_model if draft_mode in ("model", "pipelined") else None
     )
+    # Coupled (mtp/dflash) drafter dispatch: active only on single-node
+    # placements where the loader produced a coupled drafter, the
+    # resolved draft_mode would have used a sibling LM (i.e. ``"model"``),
+    # and the request didn't opt out via ``draft_mode="none"`` /
+    # ``use_drafter=False`` (both paths flip ``draft_mode`` to a non-
+    # ``"model"`` value above). Coupled drafters do NOT use ``draft_model``
+    # / ``drafter_caches`` -- they consume the target's hidden + shared KV
+    # in-place via :class:`CoupledModelDrafter`'s captured-prefill path --
+    # so ``spec_active`` stays ``False`` here on the coupled path and the
+    # standard drafter-cache bookkeeping below is correctly skipped.
+    coupled_drafter_active = coupled_drafter_eligible and draft_mode == "model"
     # Reused below: drafter-model paths need paired drafter caches; the
     # ngram and none paths don't. The variable name is preserved for
     # readability with the existing cache bookkeeping code below.
@@ -1417,6 +1479,20 @@ def mlx_generate(
     # site keeps the invariant obvious and prevents a future re-shape
     # of the active-flag formula from silently opening drafter
     # sockets for demoted-to-``"none"`` requests.
+    # Codex P2 (PR #25 round-(N+1), generate.py:1710): track whether
+    # the coupled-drafter dispatch actually fired (i.e. we constructed
+    # a :class:`CoupledModelDrafter` instance for this request) so the
+    # telemetry block below can gate on the DISPATCH signal rather
+    # than the RESOURCE signal (``coupled_drafter_active``). The
+    # resource signal is true whenever the loader produced a coupled
+    # drafter and ``draft_mode == "model"``, but a request can still
+    # land on the dispatch's "kind not yet wired" fallback (e.g.
+    # DFlash today), which routes through ``make_drafter(mode="none")``
+    # and runs no speculation. Without an explicit dispatch signal,
+    # ``GenerationStats`` would surface ``draft_mode="none"`` together
+    # with non-null coupled-drafter telemetry, misattributing the run
+    # on draft-performance dashboards.
+    coupled_dispatch_fired = False
     if asymmetric_drafter_active and draft_mode != "none":
         assert asymmetric_drafter_rank is not None
         target_subgroup_size = group.size() if group is not None else 1
@@ -1520,6 +1596,68 @@ def mlx_generate(
                 target_peer_fanout=target_peer_fanout,
                 is_target_root=False,
             )
+    elif coupled_drafter_active and coupled_drafter is not None:
+        # Single-node coupled-drafter dispatch: build the adapter +
+        # ``CoupledModelDrafter`` here rather than threading them through
+        # ``make_drafter``. The factory's per-mode wiring is built around
+        # standard drafters (``draft_model`` / ``draft_cache`` paired with
+        # mlx-lm's spec loop); coupled drafters carry no drafter cache and
+        # require the target adapter to be constructed against the live
+        # model instance, so a dedicated branch is clearer than overloading
+        # ``make_drafter`` with an entirely orthogonal third path.
+        from mlx_lm.models.gemma4_text import Model as _Gemma4LMModel
+
+        from exo.worker.engines.mlx.generator.coupled_drafter import (
+            CoupledModelDrafter,
+            Gemma4MTPTargetAdapter,
+        )
+
+        if coupled_drafter.kind == "mtp":
+            # The loader's ``attach_mtp_hooks`` already enforced that
+            # ``model`` is a Gemma 4 ``Model`` when a coupled drafter
+            # was paired with it; the ``isinstance`` here is the
+            # generator-side mirror (Gemma4MTPTargetAdapter requires
+            # exactly this concrete type) and the ``cast`` to ``nn.Module``
+            # for the loaded drafter narrows the ``object``-typed
+            # ``CoupledDrafter.model`` slot to the ``nn.Module``-Protocol
+            # API ``CoupledModelDrafter`` consumes (``bind`` /
+            # ``set_shared_kv`` / ``draft_block`` / ``accept_lens``).
+            if not isinstance(model, _Gemma4LMModel):
+                raise TypeError(
+                    f"coupled_drafter.kind='mtp' requires a Gemma 4 target; "
+                    f"got {type(model).__name__!r}. The loader's "
+                    "attach_mtp_hooks gate should have caught this."
+                )
+            target_adapter = Gemma4MTPTargetAdapter(model)
+            drafter = CoupledModelDrafter(
+                target_adapter=target_adapter,
+                drafter=cast("nn.Module", coupled_drafter.model),
+                kind=coupled_drafter.kind,
+                num_draft_tokens=effective_num_draft_tokens,
+            )
+            coupled_dispatch_fired = True
+        else:
+            # DFlash dispatch lands in a follow-up; if the loader
+            # surfaces a kind we don't yet drive, fall back loudly so
+            # the operator sees the gap instead of silently running
+            # with no drafter (which would just match the
+            # non-coupled-drafter path's behaviour).
+            logger.warning(
+                f"Coupled drafter kind={coupled_drafter.kind!r} is not yet "
+                "wired into the generator dispatch; falling back to plain "
+                "decoding for this request."
+            )
+            # ``coupled_dispatch_fired`` stays ``False`` (initialized
+            # above) on this fallback path -- the dispatch routes
+            # through ``make_drafter(mode="none")`` and no
+            # speculative work runs, so coupled telemetry must NOT
+            # be stamped on ``GenerationStats`` for this request.
+            drafter = make_drafter(
+                mode="none",
+                num_draft_tokens=effective_num_draft_tokens,
+                draft_model=None,
+                draft_cache=None,
+            )
     else:
         drafter = make_drafter(
             mode=draft_mode,
@@ -1612,23 +1750,62 @@ def mlx_generate(
                 # drafter rank into this instance.
                 telemetry_drafter_id: str | None = None
                 telemetry_k: int | None = None
-                if (
+                # Coupled-drafter telemetry: the loader stamps the
+                # drafter's ``model_id`` on ``coupled_drafter`` (Phase 2a)
+                # and the dispatch above pinned ``drafter.mode == "model"``
+                # so the existing acceptance-fraction code path works
+                # unchanged. We surface the architecture separately via
+                # ``drafter_kind`` so dashboards can disambiguate
+                # standard / mtp / dflash without re-shaping ``draft_mode``.
+                telemetry_drafter_kind: Literal["standard", "mtp", "dflash"] | None = (
+                    None
+                )
+                # Coupled-drafter branch (gated on dispatch signal --
+                # see :func:`_resolve_coupled_drafter_telemetry`).
+                coupled_id, coupled_kind, coupled_k = (
+                    _resolve_coupled_drafter_telemetry(
+                        coupled_dispatch_fired=coupled_dispatch_fired,
+                        coupled_drafter=coupled_drafter,
+                        effective_num_draft_tokens=effective_num_draft_tokens,
+                    )
+                )
+                if coupled_id is not None:
+                    telemetry_drafter_id = coupled_id
+                    telemetry_drafter_kind = coupled_kind
+                    telemetry_k = coupled_k
+                elif (
                     drafter.mode == "model" and effective_draft_model is not None
                 ) or drafter.mode == "pipelined":
                     telemetry_k = effective_num_draft_tokens
                     if drafter_model_id is not None:
                         telemetry_drafter_id = str(drafter_model_id)
+                    telemetry_drafter_kind = "standard"
                 elif drafter.mode == "ngram":
                     telemetry_k = effective_num_draft_tokens
 
                 # Pull per-round counters from the drafter when it
-                # surfaces them. Only the pipelined drafter does today;
-                # ``getattr(..., None)`` keeps this future-proof for
-                # drafter implementations that grow a ``metrics()``
-                # method later. ``mlx_lm``'s built-in spec loop doesn't
-                # expose proposal counts, so the ``"model"`` mode
-                # surfaces only ``accepted_draft_tokens`` (from the
-                # ``from_draft`` flag on each yielded token).
+                # surfaces them. Only the pipelined and coupled drafters
+                # do today; ``getattr(..., None)`` keeps this future-
+                # proof for drafter implementations that grow a
+                # ``metrics()`` method later. ``mlx_lm``'s built-in spec
+                # loop doesn't expose proposal counts, so the standard
+                # ``"model"`` mode surfaces only ``accepted_draft_tokens``
+                # (from the ``from_draft`` flag on each yielded token).
+                #
+                # Codex P2 (PR #25 round-(N+2), coupled_drafter.py:569):
+                # the coupled path emits both accepted drafts AND a
+                # verifier bonus token per round but yields a flat token
+                # stream with no per-token provenance, so flagging every
+                # round-loop emission as ``from_draft=True`` produced
+                # ``accepted > proposed`` on high-acceptance runs (full-
+                # acceptance round of K drafts emits K+1 tokens, all
+                # marked accepted, while proposed counts only K).
+                # :class:`CoupledModelDrafter` now reports
+                # ``accepted_draft_tokens`` directly (sum of
+                # ``drafter.accept_lens``) and emits ``from_draft=False``
+                # on every round-loop response, so we prefer the
+                # metric over the per-emit tally when the drafter
+                # surfaces it.
                 drafter_metrics_fn = cast(
                     "Callable[[], dict[str, int]] | None",
                     getattr(drafter, "metrics", None),
@@ -1638,6 +1815,16 @@ def mlx_generate(
                 )
                 proposed = int(drafter_metrics.get("proposed_draft_tokens", 0))
                 spec_rounds = int(drafter_metrics.get("spec_decode_rounds", 0))
+                accepted_from_metrics: int | None = (
+                    int(drafter_metrics["accepted_draft_tokens"])
+                    if "accepted_draft_tokens" in drafter_metrics
+                    else None
+                )
+                accepted = (
+                    accepted_from_metrics
+                    if accepted_from_metrics is not None
+                    else from_draft_count
+                )
 
                 stats = GenerationStats(
                     prompt_tps=float(prefill_tps or out.prompt_tps),
@@ -1646,11 +1833,12 @@ def mlx_generate(
                     generation_tokens=int(out.generation_tokens),
                     peak_memory_usage=Memory.from_gb(out.peak_memory),
                     drafter_model_id=telemetry_drafter_id,
-                    accepted_draft_tokens=from_draft_count,
+                    accepted_draft_tokens=accepted,
                     proposed_draft_tokens=proposed,
                     spec_decode_rounds=spec_rounds,
                     num_draft_tokens=telemetry_k,
                     draft_mode=drafter.mode,
+                    drafter_kind=telemetry_drafter_kind,
                 )
                 if not stop_matched and out.finish_reason not in get_args(FinishReason):
                     logger.warning(
@@ -1667,7 +1855,7 @@ def mlx_generate(
                 # populate this when the drafter surfaces a proposal
                 # count; otherwise leave it at 0 rather than guess.
                 rejected_prediction_tokens = (
-                    max(0, proposed - from_draft_count) if proposed > 0 else 0
+                    max(0, proposed - accepted) if proposed > 0 else 0
                 )
                 total_prompt_tokens = len(all_prompt_tokens)
                 usage = Usage(
@@ -1679,7 +1867,7 @@ def mlx_generate(
                     ),
                     completion_tokens_details=CompletionTokensDetails(
                         reasoning_tokens=0,
-                        accepted_prediction_tokens=from_draft_count,
+                        accepted_prediction_tokens=accepted,
                         rejected_prediction_tokens=rejected_prediction_tokens,
                     ),
                 )

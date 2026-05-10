@@ -831,14 +831,15 @@ class SequentialGenerator(Engine):
         else:
             effective_num_draft_tokens = self.num_draft_tokens
 
-        # Phase 2a invariant: ``coupled_drafter`` is loaded but the
-        # generator does not yet dispatch through the coupled-drafter
-        # round loop -- that lands in Phase 2b alongside the target-side
-        # ``rollback_speculative_cache`` / ``return_hidden`` /
-        # ``return_shared_kv`` hooks vendored into our mlx-lm fork. Until
-        # then the field is plumbed but unused; we deliberately do NOT
-        # pass it to ``mlx_generate`` because the function has no
-        # parameter for it (would be a ``TypeError`` on every request).
+        # Phase 2c lands the coupled-drafter dispatch: ``mlx_generate``
+        # now accepts the loader's ``CoupledDrafter`` and routes through
+        # :class:`CoupledModelDrafter` whenever the placement is single-
+        # node and the resolved ``draft_mode`` would have used a sibling
+        # drafter (i.e. ``"model"``). On asymmetric / multi-rank
+        # placements ``mlx_generate`` ignores ``coupled_drafter`` -- the
+        # builder gate already steered those topologies to the standard
+        # path, but we forward the field unconditionally so the dispatch
+        # narrows in one place.
         return mlx_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -859,6 +860,7 @@ class SequentialGenerator(Engine):
             asymmetric_drafter_transport=self.remote_drafter_transport,
             target_peer_fanout=self.target_peer_fanout,
             precomputed_target_cache=precomputed_target_cache,
+            coupled_drafter=self.coupled_drafter,
         )
 
     def close(self) -> None:

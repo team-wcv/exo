@@ -308,6 +308,101 @@ class TestResolveDraftMode:
         )
         assert result == "ngram"
 
+    def test_coupled_drafter_promotes_default_to_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A loaded coupled drafter must drive the implicit default the
+        same way a standard drafter does -- otherwise single-node
+        Gemma 4 deployments would never auto-engage MTP without an
+        explicit ``EXO_DRAFT_MODE=model`` knob."""
+        monkeypatch.delenv(EXO_DRAFT_MODE_ENV, raising=False)
+        result = resolve_draft_mode(
+            has_drafter_model=False,
+            request_use_drafter=None,
+            request_draft_mode=None,
+            has_coupled_drafter=True,
+        )
+        assert result == "model"
+
+    def test_coupled_drafter_satisfies_required_drafter_for_model_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pre-fix, an explicit ``draft_mode="model"`` request would
+        have demoted to ``"none"`` whenever ``has_drafter_model`` was
+        ``False`` -- which is the post-Phase-2a state on coupled-only
+        runners. The coupled-drafter signal must short-circuit that
+        demotion so the dispatch can route to
+        :class:`CoupledModelDrafter`.
+        """
+        monkeypatch.delenv(EXO_DRAFT_MODE_ENV, raising=False)
+        result = resolve_draft_mode(
+            has_drafter_model=False,
+            request_use_drafter=None,
+            request_draft_mode="model",
+            has_coupled_drafter=True,
+        )
+        assert result == "model"
+
+    def test_coupled_drafter_use_drafter_true_promotes_to_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``use_drafter=True`` with only a coupled drafter loaded must
+        promote to ``"model"`` (the bucket :class:`CoupledModelDrafter`
+        runs under), not ``"ngram"`` -- the operator deliberately
+        loaded MTP weights and the opt-in should engage them."""
+        monkeypatch.setenv(EXO_DRAFT_MODE_ENV, "none")
+        result = resolve_draft_mode(
+            has_drafter_model=False,
+            request_use_drafter=True,
+            request_draft_mode=None,
+            has_coupled_drafter=True,
+        )
+        assert result == "model"
+
+    def test_pipelined_request_with_coupled_only_demotes_to_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Codex P1 (PR #25 round-(N+0), drafter.py:289): pre-fix, a
+        coupled-only deployment that received an explicit
+        ``draft_mode="pipelined"`` (per-request override or stale
+        ``EXO_DRAFT_MODE=pipelined`` env default) propagated through
+        the resolver because ``has_coupled_drafter`` was wrongly
+        treated as satisfying ``"pipelined"`` availability. Pipelined
+        speculation runs on a STANDARD sibling drafter with its own
+        KV cache; coupled MTP/DFlash drafters share state with the
+        target via :class:`CoupledModelDrafter` and have no
+        independent cache. Without this gate, ``make_drafter`` later
+        raises ``ValueError`` and the request fails -- whereas the
+        documented contract is to downgrade to ``"none"`` with a
+        warning so misconfiguration stays observable but non-fatal.
+        """
+        monkeypatch.delenv(EXO_DRAFT_MODE_ENV, raising=False)
+        result = resolve_draft_mode(
+            has_drafter_model=False,
+            request_use_drafter=None,
+            request_draft_mode="pipelined",
+            has_coupled_drafter=True,
+        )
+        assert result == "none"
+
+    def test_pipelined_request_with_standard_drafter_passes_through_even_when_coupled_loaded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Counterpart to the demotion test: an asymmetric / sibling
+        deployment that ALSO loaded a coupled drafter (theoretical
+        future: dual-drafter card) must still honour an explicit
+        ``"pipelined"`` request, since ``has_drafter_model=True``
+        means there's a real sibling LM with its own cache.
+        """
+        monkeypatch.delenv(EXO_DRAFT_MODE_ENV, raising=False)
+        result = resolve_draft_mode(
+            has_drafter_model=True,
+            request_use_drafter=None,
+            request_draft_mode="pipelined",
+            has_coupled_drafter=True,
+        )
+        assert result == "pipelined"
+
 
 class TestResolveAsymmetricDraftMode:
     """Codex P1 (PR #20 round-(N+1), generate.py:949): per-request
