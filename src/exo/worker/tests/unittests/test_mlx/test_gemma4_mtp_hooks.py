@@ -128,6 +128,36 @@ def test_has_mtp_hooks_default_false() -> None:
     assert not has_mtp_hooks(object())
 
 
+def test_attach_mtp_hooks_walks_multimodal_wrapper() -> None:
+    """Vision-capable Gemma 4 loads as a wrapper exposing the LM via
+    ``.language_model``. The attach gate must walk the wrapper so the
+    multimodal target is treated identically to the text-only one --
+    otherwise vision-capable cards (e.g. ``gemma-4-26b-a4b-it-4bit``)
+    would always degrade to the standard drafter despite declaring a
+    ``coupled_drafter``.
+    """
+
+    text_model = _build_tiny_gemma4()
+
+    class _MultimodalWrapper:
+        """Mimics ``mlx_lm.models.gemma4.Model``'s relevant surface."""
+
+        def __init__(self, lm: Gemma4Model) -> None:
+            self.language_model: Gemma4Model = lm
+
+    wrapper = _MultimodalWrapper(text_model)
+
+    assert not has_mtp_hooks(wrapper)
+    assert not has_mtp_hooks(text_model)
+
+    attach_mtp_hooks(wrapper)
+
+    # Both the wrapper and the inner LM see the sentinel; the dispatch
+    # site reads it on whichever instance it has a handle to.
+    assert has_mtp_hooks(wrapper)
+    assert has_mtp_hooks(text_model)
+
+
 def test_gemma4_mtp_forward_logits_match_unhooked_call() -> None:
     """The hook must NOT change the logits the target produces.
 

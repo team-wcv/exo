@@ -115,6 +115,37 @@ class Gemma4MTPForwardOutput:
     shared_kv_states: dict[str, tuple[mx.array, mx.array]]
 
 
+def resolve_gemma4_text_model(target_model: object) -> Gemma4Model | None:
+    """Return the inner ``mlx_lm.models.gemma4_text.Model`` or ``None``.
+
+    mlx-lm exposes Gemma 4 in two shapes that both reach this
+    function via :func:`utils_mlx.load_mlx_items`:
+
+    - text-only checkpoints (e.g. ``gemma-4-26b-a4b-it-bf16``) load
+      as ``mlx_lm.models.gemma4_text.Model`` -- the inner LM IS the
+      ``target_model`` itself.
+    - multimodal checkpoints (e.g. ``gemma-4-26b-a4b-it-4bit`` with
+      vision) load as ``mlx_lm.models.gemma4.Model``, which wraps the
+      same gemma4_text Model under ``.language_model``. Vision /
+      multi-modal projector slots are stripped at load time, so the
+      wrapper exists purely to keep the model-id → class map flat.
+
+    The MTP hook surface (``forward_with_capture``,
+    ``rollback_speculative_cache``) operates on the gemma4_text
+    Model's attributes (``model.embed_tokens``, ``lm_head``,
+    ``tie_word_embeddings``, ``final_logit_softcapping``). Walking
+    one level lets the dispatch path stay correct for both shapes
+    without importing the multimodal wrapper class (which would
+    pull mlx-lm's vision deps into every cold path).
+    """
+    if isinstance(target_model, Gemma4Model):
+        return target_model
+    inner = getattr(target_model, "language_model", None)
+    if isinstance(inner, Gemma4Model):
+        return inner
+    return None
+
+
 def attach_mtp_hooks(target_model: object) -> None:
     """Mark a loaded Gemma 4 model as MTP-hooks-attached.
 
@@ -123,33 +154,56 @@ def attach_mtp_hooks(target_model: object) -> None:
     target as their first argument -- but we set a sentinel attribute
     so generator dispatch can verify the target is hook-capable.
 
-    The runtime ``isinstance`` check pairs the coupled-drafter kind
-    declared on the card with the actual class we got from mlx-lm's
-    auto-loader. Phase 2a's loader can degrade silently when mlx-vlm
-    reports a kind we don't dispatch; this gate catches the dual
-    failure mode where the card declares ``coupled_drafter`` but the
-    target was loaded as something other than ``gemma4_text.Model``
-    (e.g. operator pointed the card at a non-Gemma checkpoint).
+    The runtime check pairs the coupled-drafter kind declared on the
+    card with the actual class we got from mlx-lm's auto-loader.
+    Phase 2a's loader can degrade silently when mlx-vlm reports a
+    kind we don't dispatch; this gate catches the dual failure mode
+    where the card declares ``coupled_drafter`` but the target was
+    loaded as something other than a Gemma 4 ``Model`` (e.g. operator
+    pointed the card at a non-Gemma checkpoint).
+
+    The sentinel is set on BOTH the outer ``target_model`` (whatever
+    mlx-lm handed us) AND the inner ``gemma4_text.Model``. The outer
+    write keeps cheap ``has_mtp_hooks(model)`` checks at the dispatch
+    site working without forcing every call site to re-walk the
+    wrapper; the inner write means the adapter (which always operates
+    on the gemma4_text instance) sees the sentinel via the same
+    attribute lookup.
 
     Raises:
-        TypeError: when ``target_model`` is not a Gemma 4
-            ``mlx_lm.models.gemma4_text.Model`` instance. Caught one
-            level up in :mod:`exo.worker.engines.mlx.utils_mlx` to
+        TypeError: when ``target_model`` is not a Gemma 4 target,
+            either directly or via a ``language_model`` slot. Caught
+            one level up in :mod:`exo.worker.engines.mlx.utils_mlx` to
             log + degrade to standard drafting; never propagates to
             the generator dispatch.
     """
-    if not isinstance(target_model, Gemma4Model):
+    inner = resolve_gemma4_text_model(target_model)
+    if inner is None:
         raise TypeError(
-            f"attach_mtp_hooks expected mlx_lm.models.gemma4_text.Model, "
-            f"got {type(target_model).__name__!r}. The card's "
-            "coupled_drafter must be paired with a Gemma 4 target."
+            f"attach_mtp_hooks expected mlx_lm.models.gemma4_text.Model "
+            "(directly or via a multimodal wrapper exposing "
+            f"``.language_model``); got {type(target_model).__name__!r}. "
+            "The card's coupled_drafter must be paired with a Gemma 4 target."
         )
     setattr(target_model, _MTP_HOOKS_ATTACHED_ATTR, True)
+    if inner is not target_model:
+        setattr(inner, _MTP_HOOKS_ATTACHED_ATTR, True)
 
 
 def has_mtp_hooks(target_model: object) -> bool:
-    """True iff :func:`attach_mtp_hooks` has run on this target."""
-    return bool(getattr(target_model, _MTP_HOOKS_ATTACHED_ATTR, False))
+    """True iff :func:`attach_mtp_hooks` has run on this target.
+
+    Walks the multimodal wrapper -- ``attach_mtp_hooks`` marks both
+    the outer wrapper and the inner gemma4_text.Model, but defensive
+    callers (e.g. tests that build a wrapper around an already-marked
+    inner) get the right answer either way.
+    """
+    if bool(getattr(target_model, _MTP_HOOKS_ATTACHED_ATTR, False)):
+        return True
+    inner = resolve_gemma4_text_model(target_model)
+    if inner is None or inner is target_model:
+        return False
+    return bool(getattr(inner, _MTP_HOOKS_ATTACHED_ATTR, False))
 
 
 def _gemma4_text_forward_with_capture(
@@ -405,4 +459,5 @@ __all__ = [
     "gemma4_mtp_forward",
     "gemma4_rollback_speculative_cache",
     "has_mtp_hooks",
+    "resolve_gemma4_text_model",
 ]

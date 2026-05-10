@@ -1605,24 +1605,28 @@ def mlx_generate(
         # require the target adapter to be constructed against the live
         # model instance, so a dedicated branch is clearer than overloading
         # ``make_drafter`` with an entirely orthogonal third path.
-        from mlx_lm.models.gemma4_text import Model as _Gemma4LMModel
-
         from exo.worker.engines.mlx.generator.coupled_drafter import (
             CoupledModelDrafter,
             Gemma4MTPTargetAdapter,
+        )
+        from exo.worker.engines.mlx.vendor.gemma4_mtp_hooks import (
+            resolve_gemma4_text_model,
         )
 
         if coupled_drafter.kind == "mtp":
             # The loader's ``attach_mtp_hooks`` already enforced that
             # ``model`` is a Gemma 4 ``Model`` when a coupled drafter
-            # was paired with it; the ``isinstance`` here is the
-            # generator-side mirror (Gemma4MTPTargetAdapter requires
-            # exactly this concrete type) and the ``cast`` to ``nn.Module``
-            # for the loaded drafter narrows the ``object``-typed
-            # ``CoupledDrafter.model`` slot to the ``nn.Module``-Protocol
-            # API ``CoupledModelDrafter`` consumes (``bind`` /
-            # ``set_shared_kv`` / ``draft_block`` / ``accept_lens``).
-            if not isinstance(model, _Gemma4LMModel):
+            # was paired with it. The generator-side mirror walks the
+            # multimodal wrapper too -- vision-capable Gemma 4 (e.g.
+            # ``gemma-4-26b-a4b-it-4bit``) loads as
+            # ``mlx_lm.models.gemma4.Model`` whose ``language_model``
+            # is the gemma4_text Model the adapter targets. The ``cast``
+            # to ``nn.Module`` for the loaded drafter narrows the
+            # ``object``-typed ``CoupledDrafter.model`` slot to the
+            # ``nn.Module``-Protocol API ``CoupledModelDrafter``
+            # consumes (``bind`` / ``set_shared_kv`` / ``draft_block`` /
+            # ``accept_lens``).
+            if resolve_gemma4_text_model(model) is None:
                 raise TypeError(
                     f"coupled_drafter.kind='mtp' requires a Gemma 4 target; "
                     f"got {type(model).__name__!r}. The loader's "
