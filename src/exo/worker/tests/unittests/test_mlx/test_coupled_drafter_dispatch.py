@@ -671,3 +671,131 @@ class TestResolveCoupledDrafterTelemetry:
             effective_num_draft_tokens=4,
         )
         assert result == (None, None, None)
+
+
+# --------------------------------------------------------------------------- #
+# Logits processors flow through the coupled round loop
+# (Codex P1 PR #25 round-(N+3))
+# --------------------------------------------------------------------------- #
+
+
+class TestProcessorAwareSampler:
+    """Pin the contract of the wrapped sampler used in
+    :class:`CoupledModelDrafter.stream`.
+
+    Codex P1 (PR #25 round-(N+3), coupled_drafter.py:566): pre-fix
+    only :func:`_select_first_bonus` applied per-request
+    ``logits_processors`` (repetition / presence / frequency
+    penalties, the bench EOS-ban processor); ``run_coupled_round_loop``
+    received the bare ``sampler`` and so every token after the first
+    bypassed those processors. Coupled requests therefore diverged
+    from non-coupled decoding semantics from token 2 onwards.
+
+    The fix wraps ``sampler`` so each ``sampler(logits)`` call inside
+    mlx-vlm's ``_mtp_rounds`` first runs every processor against the
+    running emitted-token history. These tests pin the wrapper
+    behaviour without standing up the full round loop.
+    """
+
+    def test_empty_processors_returns_sampler_unchanged(self) -> None:
+        from exo.worker.engines.mlx.generator.coupled_drafter import (
+            _make_processor_aware_sampler,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        running: list[int] = []
+
+        def base_sampler(logits: mx.array) -> mx.array:
+            return mx.argmax(logits, axis=-1).astype(mx.int32)
+
+        wrapped = _make_processor_aware_sampler(
+            sampler=base_sampler,
+            logits_processors=[],
+            running_tokens=running,
+        )
+        assert wrapped is base_sampler, (
+            "empty processor list must short-circuit to the original "
+            "sampler so the no-processor path pays no per-call overhead"
+        )
+
+    def test_processor_runs_on_every_call_with_current_running_tokens(self) -> None:
+        from exo.worker.engines.mlx.generator.coupled_drafter import (
+            _make_processor_aware_sampler,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        running: list[int] = [10, 20]
+        captured_prev: list[list[int]] = []
+
+        def proc(prev: mx.array, logits: mx.array) -> mx.array:
+            captured_prev.append(
+                [int(t) for t in cast(list[int], prev.tolist())]
+            )
+            return logits
+
+        def base_sampler(logits: mx.array) -> mx.array:
+            return mx.argmax(logits, axis=-1).astype(mx.int32)
+
+        wrapped = _make_processor_aware_sampler(
+            sampler=base_sampler,
+            logits_processors=[proc],
+            running_tokens=running,
+        )
+
+        logits = mx.array([[0.1, 0.2, 0.3]])
+        _ = wrapped(logits)
+        running.append(30)
+        _ = wrapped(logits)
+        running.append(40)
+        _ = wrapped(logits)
+
+        assert captured_prev == [[10, 20], [10, 20, 30], [10, 20, 30, 40]], (
+            "each wrapped sampler call must snapshot the LATEST "
+            "running_tokens; pre-fix the processor never ran at all "
+            "inside the round loop"
+        )
+
+    def test_multiple_processors_apply_in_order(self) -> None:
+        from exo.worker.engines.mlx.generator.coupled_drafter import (
+            _make_processor_aware_sampler,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        running: list[int] = [1]
+        marks: list[str] = []
+
+        def proc_a(prev: mx.array, logits: mx.array) -> mx.array:
+            del prev
+            marks.append("a")
+            return logits + 1.0
+
+        def proc_b(prev: mx.array, logits: mx.array) -> mx.array:
+            del prev
+            marks.append("b")
+            return logits * 2.0
+
+        captured_logits: list[mx.array] = []
+
+        def base_sampler(logits: mx.array) -> mx.array:
+            captured_logits.append(logits)
+            return mx.argmax(logits, axis=-1).astype(mx.int32)
+
+        wrapped = _make_processor_aware_sampler(
+            sampler=base_sampler,
+            logits_processors=[proc_a, proc_b],
+            running_tokens=running,
+        )
+        _ = wrapped(mx.array([[0.0, 1.0, 2.0]]))
+
+        assert marks == ["a", "b"], (
+            "processors must apply in the order supplied (matching "
+            "_select_first_bonus and the standard ModelDrafter path)"
+        )
+        # Final logits seen by the sampler: ((x + 1) * 2)
+        # = ((0.0 + 1.0) * 2, (1.0 + 1.0) * 2, (2.0 + 1.0) * 2)
+        # = (2.0, 4.0, 6.0)
+        assert len(captured_logits) == 1
+        final = captured_logits[0]
+        expected = [2.0, 4.0, 6.0]
+        actual = [float(x) for x in cast(list[float], final[0].tolist())]
+        for got, want in zip(actual, expected, strict=True):
+            assert abs(got - want) < 1e-6, (
+                f"processor chain output mismatch; got {actual}, want {expected}"
+            )

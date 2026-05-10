@@ -30,6 +30,7 @@ from exo.worker.runner.llm_inference.batch_generator import (
 from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 
 from .cache import KVPrefixCache
+from .generator.coupled_drafter import is_coupled_drafter_dispatchable
 from .generator.drafter import EXO_DRAFT_MODE_ENV, parse_draft_mode
 from .types import Model
 from .utils_mlx import (
@@ -236,8 +237,23 @@ class MlxBuilder(Builder):
         # spec-decode hook. The coupled-drafter check is OR'd with
         # ``draft_model`` everywhere downstream so the existing standard-
         # drafter-only deployments are unaffected.
+        #
+        # Codex P2 (PR #25 round-(N+3), builder.py:241): gate the
+        # coupled signal on the drafter being DISPATCHABLE, not just
+        # loaded. The loader accepts both ``"mtp"`` and ``"dflash"``
+        # but the generator dispatch only drives ``"mtp"`` today --
+        # ``"dflash"`` falls back to ``make_drafter(mode="none")``
+        # inside :func:`mlx_generate`. Without this gate, a
+        # dflash-only setup would force :class:`SequentialGenerator`
+        # (losing batch throughput) while requests actually run plain
+        # decoding. ``is_coupled_drafter_dispatchable`` mirrors the
+        # generator's own dispatch check.
+        coupled_drafter_dispatchable = (
+            self.coupled_drafter is not None
+            and is_coupled_drafter_dispatchable(self.coupled_drafter.kind)
+        )
         any_drafter_loaded = (
-            self.draft_model is not None or self.coupled_drafter is not None
+            self.draft_model is not None or coupled_drafter_dispatchable
         )
         configured_draft_mode = parse_draft_mode(
             os.environ.get(EXO_DRAFT_MODE_ENV),
@@ -349,7 +365,8 @@ class MlxBuilder(Builder):
                         "BatchGenerator has no spec-decoding hook for request "
                         "overrides)"
                     )
-                elif self.coupled_drafter is not None:
+                elif coupled_drafter_dispatchable:
+                    assert self.coupled_drafter is not None  # narrowed by gate
                     logger.info(
                         f"using SequentialGenerator (coupled drafter loaded: "
                         f"{self.coupled_drafter.model_id} kind={self.coupled_drafter.kind!r}; "

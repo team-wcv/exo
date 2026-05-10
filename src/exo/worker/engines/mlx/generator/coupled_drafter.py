@@ -72,6 +72,34 @@ if TYPE_CHECKING:
 CoupledDrafterKind = Literal["mtp", "dflash"]
 
 
+# Codex P2 (PR #25 round-(N+3), builder.py:241): the set of coupled-
+# drafter kinds the generator dispatch can actually drive end-to-end.
+# Today only ``"mtp"`` is wired through :class:`CoupledModelDrafter` /
+# :class:`Gemma4MTPTargetAdapter`; ``"dflash"`` lands in a follow-up
+# but the loader already accepts it, so a dflash drafter can sit on
+# the runner without a dispatchable code path. Builder-side gates that
+# decide "is a coupled drafter usable for this request" must consult
+# this set rather than treating ``coupled_drafter is not None`` as
+# proof of dispatchability -- otherwise a dflash-only setup would
+# force :class:`SequentialGenerator` (losing batch throughput) while
+# the actual request still falls back to ``make_drafter(mode="none")``
+# inside :func:`mlx_generate`.
+DISPATCHABLE_COUPLED_DRAFTER_KINDS: frozenset[CoupledDrafterKind] = frozenset(
+    {"mtp"}
+)
+
+
+def is_coupled_drafter_dispatchable(kind: CoupledDrafterKind) -> bool:
+    """Return ``True`` iff the generator dispatch can drive ``kind``.
+
+    Mirrors the dispatch's own kind check in :func:`mlx_generate`.
+    Used by :class:`exo.worker.engines.mlx.builder.MlxModelBuilder` to
+    gate "drafter loaded" predicates on whether the drafter is
+    runnable, not just whether it's loaded.
+    """
+    return kind in DISPATCHABLE_COUPLED_DRAFTER_KINDS
+
+
 # mlx-vlm's ``_mtp_rounds`` is a private module-level helper without a
 # typed stub; resolve it lazily through ``importlib`` so the
 # type-check narrowing happens at the import boundary instead of every
@@ -262,6 +290,51 @@ def run_coupled_round_loop(
         token_dtype=token_dtype,
     ):
         yield token
+
+
+def _make_processor_aware_sampler(
+    *,
+    sampler: Callable[[mx.array], mx.array],
+    logits_processors: Sequence[Callable[[mx.array, mx.array], mx.array]],
+    running_tokens: list[int],
+) -> Callable[[mx.array], mx.array]:
+    """Wrap ``sampler`` to apply ``logits_processors`` on every call.
+
+    Codex P1 (PR #25 round-(N+3), coupled_drafter.py:566): mlx-vlm's
+    ``_mtp_rounds`` accepts a single-argument ``sampler(logits) ->
+    token`` callable and applies it both during drafter proposal
+    generation and target verification. Per-request
+    ``logits_processors`` (repetition / presence / frequency penalties
+    plus the bench EOS-ban processor) take ``(prev_tokens, logits)``,
+    so without an adapter they don't reach the round loop and coupled
+    requests diverge from non-coupled decoding semantics from token 2
+    onwards.
+
+    The wrapper closes over a mutable ``running_tokens`` buffer that
+    the caller updates after each emitted token. Each invocation
+    snapshots the buffer into an ``mx.array``, runs every processor
+    against it, then samples. Because the buffer reflects only
+    COMMITTED emissions (not speculative drafts the verifier may
+    reject), repetition / presence penalties react to actual output
+    history -- which is the correct semantic. Drafts that haven't
+    been accepted yet don't pollute the penalty's view.
+
+    Empty processor list is a fast path: we return ``sampler``
+    unchanged so the no-processor case pays no overhead.
+    """
+    if not logits_processors:
+        return sampler
+
+    processors = list(logits_processors)
+
+    def _wrapped(logits: mx.array) -> mx.array:
+        prev_tokens_array = mx.array(running_tokens, dtype=mx.uint32)
+        adjusted = logits
+        for proc in processors:
+            adjusted = proc(prev_tokens_array, adjusted)
+        return sampler(adjusted)
+
+    return _wrapped
 
 
 def _select_first_bonus(
@@ -501,16 +574,43 @@ class CoupledModelDrafter:
             prompt_tail_size / prompt_time if prompt_time > 0 else 0.0
         )
 
-        prev_tokens = (
-            mx.array(list(context_tokens), dtype=mx.uint32)
-            if context_tokens
-            else prompt.astype(mx.uint32)
+        # Codex P1 (PR #25 round-(N+3), coupled_drafter.py:566): the
+        # round loop must keep request-level logits processors
+        # (repetition / presence / frequency penalties, custom token
+        # bans, etc.) active for every emitted token, not just the
+        # first bonus. Pre-fix only ``_select_first_bonus`` ran the
+        # processors and ``run_coupled_round_loop`` received the bare
+        # ``sampler``, so requests that set logits_processors got
+        # different output distributions from token 2 onwards
+        # depending on whether the request landed on the coupled or
+        # standard path. ``running_tokens`` is a mutable closure-state
+        # buffer that grows as the round loop yields; the wrapped
+        # sampler reads it before each ``sampler(logits)`` call inside
+        # ``_mtp_rounds`` (drafter proposal AND target verify), so
+        # every call sees the latest emitted-token history. The
+        # snapshot is intentionally stale w.r.t. drafts that haven't
+        # been accepted yet -- you want repetition penalty to react to
+        # COMMITTED tokens, not speculative drafts that might be
+        # rejected.
+        running_tokens: list[int] = list(context_tokens) if context_tokens else [
+            int(t) for t in cast(list[int], prompt.tolist())
+        ]
+        processors_list: list[Callable[[mx.array, mx.array], mx.array]] = list(
+            logits_processors
         )
+
         first_bonus, first_logprobs = _select_first_bonus(
             last_logits=prefill_output.logits[:, -1:, :],
-            prev_tokens=prev_tokens,
+            prev_tokens=mx.array(running_tokens, dtype=mx.uint32),
             sampler=sampler,
-            logits_processors=list(logits_processors),
+            logits_processors=processors_list,
+        )
+
+        running_tokens.append(first_bonus)
+        wrapped_sampler = _make_processor_aware_sampler(
+            sampler=sampler,
+            logits_processors=processors_list,
+            running_tokens=running_tokens,
         )
 
         detokenizer = tokenizer.detokenizer
@@ -562,9 +662,10 @@ class CoupledModelDrafter:
                 prefill_output=prefill_output,
                 first_bonus=first_bonus,
                 max_tokens=max_tokens,
-                sampler=sampler,
+                sampler=wrapped_sampler,
                 draft_block_size=self._draft_block_size,
             ):
+                running_tokens.append(token)
                 emitted += 1
                 last_token = token
                 last_logprobs = zero_logprobs
