@@ -26,7 +26,7 @@ from exo.shared.constants import (
     EXO_MODELS_DIRS,
     RESOURCES_DIR,
 )
-from exo.shared.types.common import ModelId
+from exo.shared.types.common import ModelId, NodeId
 from exo.shared.types.memory import Memory
 from exo.shared.types.text_generation import ReasoningDialect
 from exo.utils.pydantic_ext import FrozenModel
@@ -168,6 +168,41 @@ class ModelCard(FrozenModel):
     # declares `[gemma-4-e2b-it-4bit, gemma-4-e4b-it-4bit]`), but cross-quant
     # drafters are allowed for advanced tuning.
     drafter_model_ids: list[ModelId] = Field(default_factory=list)
+    # Nodes the operator has designated as eligible drafter hosts. When this
+    # list is non-empty AND the model has at least one declared drafter, the
+    # placement layer attempts asymmetric placement: target ranks land on the
+    # selected target cycle, the drafter is loaded on the first eligible node
+    # reachable from target rank 0 (RDMA for `MlxJaccl`, socket for `MlxRing`),
+    # and the parent `mx.distributed` group spans both. Eligibility is
+    # *operator-controlled*, not auto-discovered: the operator opts a node in
+    # by listing its `NodeId` here (typically in a custom card under
+    # `~/.exo/custom_model_cards/`). If no listed node is reachable, placement
+    # emits a `DrafterPlacementDegraded` event and falls back -- the user's
+    # request still completes, the operator just doesn't get the asymmetric
+    # speedup until they fix the eligibility list. Empty (the default) preserves
+    # legacy single-device drafter behaviour.
+    drafter_eligible_nodes: list[NodeId] = Field(default_factory=list)
+    # Nodes the operator has designated as eligible *prefill-only* hosts for
+    # this model. When non-empty, placement auto-creates a single-rank
+    # prefill-only sibling instance on each viable node (sufficient RAM,
+    # alive in topology, not already a target/drafter rank) and emits an
+    # ``InstanceLinkCreated`` linking them to the decode instance. The
+    # master then routes incoming requests' prefill traffic across the
+    # linked prefill instances by in-flight task count, giving the
+    # decode instance multi-GPU prefill parallelism for free.
+    #
+    # This is the right lever for "I have spare nodes in my cluster --
+    # use them for prefill so slot N's TTFT doesn't queue behind slot 0's
+    # prefill on a single GPU." It composes orthogonally with
+    # ``drafter_eligible_nodes``: the chosen drafter node is excluded
+    # from prefill candidates automatically.
+    #
+    # Failure modes are loud-but-graceful: if a candidate fails RAM
+    # feasibility or is unreachable the placement layer skips it and
+    # logs; the decode instance still comes up. If *no* candidate
+    # succeeds, no link is emitted and the user's traffic prefills
+    # locally on the target rank as before.
+    prefill_eligible_nodes: list[NodeId] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _autodetect_vision(self) -> "ModelCard":

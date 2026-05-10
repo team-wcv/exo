@@ -159,3 +159,39 @@ class TestAcceptanceFractionForAdaptiveK:
         result = _acceptance_fraction_for_adaptive_k(_response(stats))
         assert result is not None
         assert math.isclose(result, 1.0)
+
+    def test_pipelined_mode_records_accepted_fraction(self) -> None:
+        # Codex P2 (PR #20 round-(N+5),
+        # batch_generator.py:111-112): asymmetric/pipelined drafting
+        # emits ``draft_mode="pipelined"`` with the same
+        # ``accepted_draft_tokens`` telemetry as ``model``, but the
+        # original gate excluded it from the rolling window. With
+        # ``EXO_ADAPTIVE_DRAFT_TOKENS=1`` enabled and asymmetric
+        # placement active, ``adaptive_num_draft_tokens`` therefore
+        # never adapted -- pinned to the fallback K forever. Verify the
+        # gate now feeds pipelined samples into the rolling window.
+        stats = _stats(
+            draft_mode="pipelined",
+            generation_tokens=10,
+            accepted_draft_tokens=7,
+            drafter_model_id="mlx-community/test-drafter",
+        )
+        result = _acceptance_fraction_for_adaptive_k(_response(stats))
+        assert result is not None
+        assert math.isclose(result, 0.7)
+
+    def test_pipelined_mode_records_zero_acceptance(self) -> None:
+        # An honest 0% acceptance run on the pipelined transport (e.g.
+        # cold drafter on a new domain) is a valid signal that adaptive
+        # K should shrink. Pre-fix this sample never reached the rolling
+        # window, so the controller stayed pinned to the fallback even
+        # when the drafter was actively hurting throughput.
+        stats = _stats(
+            draft_mode="pipelined",
+            generation_tokens=15,
+            accepted_draft_tokens=0,
+            drafter_model_id="mlx-community/test-drafter",
+        )
+        result = _acceptance_fraction_for_adaptive_k(_response(stats))
+        assert result is not None
+        assert math.isclose(result, 0.0)

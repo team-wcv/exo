@@ -292,13 +292,23 @@ export interface PrefillProgress {
   startedAt: number;
 }
 
+/** Drafting strategy that actually ran:
+ *   - "model": local in-process drafter via mlx_lm.speculative_generate_step
+ *   - "pipelined": asymmetric remote drafter on a separate node (V2 socket wire)
+ *   - "ngram": in-context suffix lookup (no extra weights)
+ *   - "eagle" / "lookahead": reserved
+ * ``null`` when the engine doesn't surface a mode (older runner builds);
+ * UI should fall back to the generic "SPEC" pill in that case. */
+export type DraftMode = "model" | "pipelined" | "ngram" | "eagle" | "lookahead";
+
+
 export interface DrafterStats {
   // ``modelId`` is null for n-gram speculation (no external drafter
   // model -- the suffix lookup runs in-process against the prompt and
   // the partial generation). The mode field below disambiguates the
   // "no drafter" case from "drafter with no metadata yet".
   modelId: string | null;
-  draftMode: "model" | "ngram";
+  draftMode: DraftMode | null;
   acceptedDraftTokens: number;
   generationTokens: number;
   numDraftTokens: number | null;
@@ -311,24 +321,30 @@ interface RawGenerationStats {
   drafter_model_id?: string | null;
   accepted_draft_tokens?: number;
   num_draft_tokens?: number | null;
-  draft_mode?: "model" | "ngram" | "none" | null;
+  draft_mode?: DraftMode | "none" | null;
 }
 
 // Build a DrafterStats record from the API's generation_stats payload, or
 // return null if the request didn't speculate. We accept stats whenever the
-// server reports either an explicit drafter model id (model speculation) or
-// a draft_mode of "ngram" (in-process suffix lookup, which has no model id).
+// server reports either an explicit drafter model id (model/pipelined
+// speculation) or a draft_mode of "ngram"/"eagle"/"lookahead" (drafters that
+// can run with or without a model id).
+//
+// Conflict-merge note (PR #20 round-(N+12)): expanded from the PR #19 helper
+// to also accept the asymmetric/pipelined modes added on this branch. The
+// gate must be true for any drafting that actually executed; only "none"
+// (and absent payloads with no drafter id) collapse to ``null``.
 function buildDrafterStats(stats: RawGenerationStats): DrafterStats | null {
   if (!stats.generation_tokens || stats.generation_tokens <= 0) return null;
-  const isNgram = stats.draft_mode === "ngram";
-  const isModel =
-    stats.draft_mode === "model" ||
-    (stats.draft_mode == null && stats.drafter_model_id != null);
-  if (!isNgram && !isModel) return null;
+  const mode = stats.draft_mode === "none" ? null : (stats.draft_mode ?? null);
+  const drafted =
+    mode !== null ||
+    (stats.drafter_model_id != null && stats.drafter_model_id !== "");
+  if (!drafted) return null;
   const accepted = stats.accepted_draft_tokens ?? 0;
   return {
     modelId: stats.drafter_model_id ?? null,
-    draftMode: isNgram ? "ngram" : "model",
+    draftMode: mode,
     acceptedDraftTokens: accepted,
     generationTokens: stats.generation_tokens,
     numDraftTokens: stats.num_draft_tokens ?? null,

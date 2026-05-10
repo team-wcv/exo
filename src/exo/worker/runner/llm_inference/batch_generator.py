@@ -1,7 +1,7 @@
 import itertools
 import os
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
 from typing import BinaryIO
@@ -28,18 +28,22 @@ from exo.shared.types.worker.runner_response import (
 from exo.utils.channels import MpReceiver, MpSender
 from exo.worker.disaggregated.server import PrefillRequest
 from exo.worker.engines.base import Engine
-from exo.worker.engines.mlx.cache import KVPrefixCache
+from exo.worker.engines.mlx.cache import KVPrefixCache, encode_prompt, make_kv_cache
 from exo.worker.engines.mlx.disaggregated.adapter import write_cache_to_wire
 from exo.worker.engines.mlx.disaggregated.serve import run_prefill_for_request
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.generator.generate import (
+    BatchedPrefillUnsupportedError,
     PrefillCancelled,
+    batched_prefill,
     mlx_generate,
     warmup_inference,
 )
-from exo.worker.engines.mlx.types import Model
+from exo.worker.engines.mlx.generator.remote_drafter import RemoteTransport
+from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
+    fix_unmatched_think_end_tokens,
     mx_all_gather_tasks,
     mx_any,
 )
@@ -83,14 +87,21 @@ def _acceptance_fraction_for_adaptive_k(
     starves it (a real spec round being silently dropped).
 
     Eligibility:
-      * ``stats.draft_mode in {"model", "ngram"}`` -- the request
-        actually ran a speculative loop. The previous gate keyed off
-        ``drafter_model_id is not None``, but n-gram speculation does
-        NOT load a drafter model (it speculates from the in-context
-        suffix), so its responses set ``drafter_model_id=None`` and
-        were silently dropped under
+      * ``stats.draft_mode in {"model", "ngram", "pipelined"}`` -- the
+        request actually ran a speculative loop. The previous gate
+        keyed off ``drafter_model_id is not None``, but n-gram
+        speculation does NOT load a drafter model (it speculates from
+        the in-context suffix), so its responses set
+        ``drafter_model_id=None`` and were silently dropped under
         ``EXO_DRAFT_MODE=ngram`` + ``EXO_ADAPTIVE_DRAFT_TOKENS=1``,
-        pinning K at the fallback value forever.
+        pinning K at the fallback value forever. ``pipelined`` mode
+        (asymmetric placement, drafter on a peer rank) emits the same
+        ``accepted_draft_tokens`` telemetry as ``model`` and must
+        feed the rolling window too -- pre-fix the gate excluded
+        ``pipelined`` so V3 socket-transport runs left
+        ``adaptive_num_draft_tokens`` permanently pinned to the
+        fallback (Codex P2, PR #20 round 5,
+        batch_generator.py:111-112).
       * ``stats.generation_tokens > 0`` -- guard the division. Empty
         generations (e.g. immediate stop sequence hit on prefill)
         carry no acceptance signal.
@@ -98,13 +109,14 @@ def _acceptance_fraction_for_adaptive_k(
     Returns:
       ``stats.accepted_draft_tokens / stats.generation_tokens`` when
       both gates pass; ``None`` otherwise. ``accepted_draft_tokens``
-      is populated identically in both ``model`` and ``ngram`` modes,
-      so the formula is unchanged across strategies.
+      is populated identically across ``model``, ``ngram``, and
+      ``pipelined`` modes, so the formula is unchanged across
+      strategies.
     """
     stats = response.stats
     if stats is None:
         return None
-    if stats.draft_mode not in ("model", "ngram"):
+    if stats.draft_mode not in ("model", "ngram", "pipelined"):
         return None
     if stats.generation_tokens <= 0:
         return None
@@ -119,6 +131,18 @@ EXO_DRAFTER_MIN_OUTPUT_TOKENS = "EXO_DRAFTER_MIN_OUTPUT_TOKENS"
 EXO_ADAPTIVE_DRAFT_TOKENS = "EXO_ADAPTIVE_DRAFT_TOKENS"  # "1" to enable
 DEFAULT_NUM_DRAFT_TOKENS = 5  # purpose-built family pairs hit ~80% acceptance
 DEFAULT_DRAFTER_MIN_OUTPUT_TOKENS = 16
+
+# Batched prefill (B>=2 prompts processed in one forward) is the
+# remaining lever for slot-1 TTFT on long-prompt mixed traffic. The
+# round-robin landed in PR #15 cut slot-1 TTFT 5.2x by interleaving
+# decode ticks; the residual 11s outliers in the 6K-token
+# long_context_summary bench are entirely sequential per-slot
+# prefills. Setting ``EXO_BATCH_PREFILL=0`` disables the optimisation
+# (escape hatch for shared-prefix workloads where the per-slot
+# prefix-cache hit rate exceeds the batched-forward speedup; see
+# ``mlx_generate``'s ``precomputed_target_cache`` docstring for the
+# trade-off rationale).
+EXO_BATCH_PREFILL = "EXO_BATCH_PREFILL"
 # Rolling-window size used by adaptive K. Keep small so the controller is
 # responsive to traffic shifts (code completion vs reasoning) without
 # oscillating on per-request noise.
@@ -210,6 +234,23 @@ class SequentialGenerator(Engine):
     # of observed acceptance fractions. Disabled by default so K stays
     # predictable for benchmarking.
     adaptive_draft_tokens: bool = False
+    # Asymmetric placement telemetry: ``drafter_rank_in_parent`` mirrors
+    # :attr:`DrafterPlacement.drafter_rank` (advisory only; the drafter
+    # is NOT a member of any ``mx.distributed.Group`` under the v3+
+    # wire). ``None`` for symmetric/single-device builds. When set
+    # together with ``remote_drafter_transport``, every request runs
+    # the pipelined+remote drafter path: the spec loop talks to the
+    # drafter via the dedicated drafter TCP socket owned by
+    # ``RemoteTransport`` rather than ``mx.distributed`` collectives.
+    drafter_rank_in_parent: int | None = None
+    # Long-lived transport bound to the drafter rank. Allocated once at
+    # builder.build() time; reused across requests so the executor
+    # thread + drafter cache lifecycle isn't paid per-request. Each
+    # in-flight request opens its own session via
+    # :meth:`RemoteTransport.open_session`; the per-session handle is
+    # the actual ``DrafterTransport`` consumed by the spec loop. Closed
+    # in :meth:`close` (sends ``OP_SHUTDOWN`` to the drafter rank).
+    remote_drafter_transport: RemoteTransport | None = None
     check_for_cancel_every: int = 50
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
@@ -223,7 +264,31 @@ class SequentialGenerator(Engine):
         default_factory=lambda: deque(maxlen=ADAPTIVE_K_WINDOW),
         init=False,
     )
-    _active: (
+    # Maximum number of in-flight tasks the runner will round-robin through
+    # in :meth:`step`. Set to 1 by ``builder.build`` whenever the runner
+    # owns a long-lived ``RemoteTransport`` (asymmetric pipelined drafter):
+    # the wire protocol assumes one in-flight prefill/forward session, so
+    # interleaving two target requests on the same socket would corrupt
+    # the drafter's per-request state. For all other configurations
+    # (no drafter, n-gram drafter, in-process model drafter where every
+    # ``mlx_generate`` call allocates its own draft KVCache) this defaults
+    # to ``EXO_MAX_CONCURRENT_REQUESTS`` and gives concurrent requests the
+    # cooperative-scheduling semantics the dispatcher always claimed but
+    # never delivered: prior to this field every spec-config runner pinned
+    # ``_active`` to a singular slot and slot 1's TTFT equalled slot 0's
+    # full completion time (measured 14s on a K=3 single-host n-gram bench
+    # in the PR #15 concurrency leg).
+    max_concurrent_tasks: int = 1
+    # Currently in-flight tasks, keyed by ``TaskId`` for O(1) cancel/finish.
+    # Insertion order is the round-robin order; ``OrderedDict`` makes that
+    # preservation explicit (CPython dicts already preserve it but we want
+    # the contract to be load-bearing). Capped by ``max_concurrent_tasks``;
+    # ``step`` round-robins one ``next(gen)`` call per active task per
+    # tick. Each tuple is (task, mlx generator, response queue, parsed-
+    # output generator) -- the same shape the previous singular ``_active``
+    # slot held, just multiplexed.
+    _active_tasks: OrderedDict[
+        TaskId,
         tuple[
             TextGeneration,
             # mlx generator that does work
@@ -232,9 +297,15 @@ class SequentialGenerator(Engine):
             GeneratorQueue[GenerationResponse],
             # generator to get parsed outputs
             Iterator[GenerationChunk | None],
-        ]
-        | None
-    ) = field(default=None, init=False)
+        ],
+    ] = field(default_factory=OrderedDict, init=False)
+    # Tasks that failed during ``_build_generator`` or mid-stream. Drained
+    # by ``step`` so per-task failures surface as ``FinishedResponse`` to
+    # the caller without taking down the runner subprocess. We accept the
+    # rank-desync risk: ``_build_generator`` failures are deterministic
+    # in practice (config / per-request K mismatch) so all ranks fail
+    # together; any non-deterministic failure was already a desync hazard.
+    _pending_failed: list[TaskId] = field(default_factory=list, init=False)
 
     def warmup(self):
         # Codex P2 (PR #19 round-(N+10), generate.py:525): forward the
@@ -292,47 +363,86 @@ class SequentialGenerator(Engine):
     ) -> Iterator[
         tuple[TaskId, GenerationChunk | FinishedResponse | CancelledResponse]
     ]:
-        if self._active is None:
-            self.agree_on_tasks()
-
-            if self._queue:
-                self._start_next()
-            else:
-                return map(
-                    lambda task: (task, CancelledResponse()), self._cancelled_tasks
-                )
-
-        assert self._active is not None
-
-        task, gen, queue, output_generator = self._active
         output: list[
             tuple[TaskId, GenerationChunk | CancelledResponse | FinishedResponse]
         ] = []
-        try:
-            response = next(gen)
-            queue.push(response)
-            # Observe drafter acceptance once the final stats arrive. We do
-            # this here (and not in mlx_generate) because the rolling buffer
-            # is owned by the generator and must persist across requests for
-            # adaptive K to converge.
-            if self.adaptive_draft_tokens:
-                fraction = _acceptance_fraction_for_adaptive_k(response)
-                if fraction is not None:
-                    self._recent_acceptance.append(fraction)
-            # drain potentially many responses every time
-            while (parsed := next(output_generator, None)) is not None:
-                output.append((task.task_id, parsed))
 
-        except (StopIteration, PrefillCancelled):
-            output.append((task.task_id, FinishedResponse()))
-            self._active = None
-            if self._queue:
-                self._start_next()
+        # Top up the active set from the queue. ``agree_on_tasks`` is a
+        # collective op across the MLX group; we only call it when there
+        # might be new work to admit (active set has slack and queue is
+        # potentially non-empty after ``agree_on_tasks`` runs). Calling
+        # it on every tick is safe but wastes a collective when the
+        # active set is already full.
+        if len(self._active_tasks) < self.max_concurrent_tasks:
+            self.agree_on_tasks()
+            self._admit_queued_tasks()
 
-        except Exception as e:
-            self._send_error(task, e)
-            self._active = None
-            raise
+        # Drain failures recorded by ``_start_next`` (this tick or any
+        # prior tick that left them queued) so the runner loop marks
+        # them complete and proceeds with the next task instead of
+        # tearing down the subprocess (regression: K=8 ValueError took
+        # the target rank with it on 14:35:05).
+        while self._pending_failed:
+            output.append((self._pending_failed.pop(0), FinishedResponse()))
+
+        if not self._active_tasks:
+            return itertools.chain(
+                iter(output),
+                map(
+                    lambda task: (task, CancelledResponse()),
+                    self._cancelled_tasks,
+                ),
+            )
+
+        # Round-robin one ``next(gen)`` per active task. Each generator
+        # owns its own KV cache (``mlx_generate`` allocates fresh caches
+        # per request), so interleaving generators per-tick is safe -- the
+        # only shared state is the model weights themselves, which are
+        # read-only during forward. Snapshot the items so per-task
+        # exceptions can ``del self._active_tasks[task_id]`` mid-iteration
+        # without invalidating the loop.
+        for task_id, (task, gen, queue, output_generator) in list(
+            self._active_tasks.items()
+        ):
+            try:
+                response = next(gen)
+                queue.push(response)
+                # Observe drafter acceptance once the final stats arrive. We
+                # do this here (and not in mlx_generate) because the rolling
+                # buffer is owned by the generator and must persist across
+                # requests for adaptive K to converge.
+                if self.adaptive_draft_tokens:
+                    fraction = _acceptance_fraction_for_adaptive_k(response)
+                    if fraction is not None:
+                        self._recent_acceptance.append(fraction)
+                # drain potentially many responses every time
+                while (parsed := next(output_generator, None)) is not None:
+                    output.append((task_id, parsed))
+
+            except (StopIteration, PrefillCancelled):
+                output.append((task_id, FinishedResponse()))
+                del self._active_tasks[task_id]
+
+            except Exception as e:
+                # Send error chunk to the client and mark the task finished,
+                # but DO NOT re-raise. Re-raising here propagates through
+                # ``handle_generation_tasks`` and triggers ``RunnerFailed``
+                # on the supervisor, which currently leaves a respawned
+                # target rank stuck in ``RunnerIdle`` because its drafter
+                # peer is still ``RunnerRunning`` (see
+                # ``_init_distributed_backend``). A single malformed
+                # request must never permanently brick a multi-rank
+                # instance, and with ``max_concurrent_tasks > 1`` it must
+                # not affect the *other* in-flight tasks either.
+                self._send_error(task, e)
+                del self._active_tasks[task_id]
+                output.append((task_id, FinishedResponse()))
+
+        # Top up again if we just retired any task -- keeps slot 1's
+        # TTFT independent of slot 0's completion length, which is the
+        # whole point of ``max_concurrent_tasks > 1``.
+        if self._queue and len(self._active_tasks) < self.max_concurrent_tasks:
+            self._admit_queued_tasks()
 
         return filter(
             lambda chunk: (
@@ -344,13 +454,142 @@ class SequentialGenerator(Engine):
             ),
         )
 
-    def _start_next(self) -> None:
-        task = self._queue.popleft()
+    def _admit_queued_tasks(self) -> None:
+        """Top up ``_active_tasks`` from ``_queue``, batching prefill when possible.
+
+        Cooperatively schedules eligible tasks through a single
+        :func:`batched_prefill` forward when ``EXO_BATCH_PREFILL`` is on
+        (default) and at least 2 tasks pass the eligibility filter
+        (``_batch_eligible_for_prefill``). Ineligible tasks (vision,
+        remote prefill, in-process model drafter, etc.) and any task
+        in a single-eligible-task admit cycle fall back to the
+        per-slot :meth:`_start_one` path. Eligibility is read at admit
+        time so a request that becomes ineligible mid-tick (e.g.
+        because ``EXO_BATCH_PREFILL`` was toggled) cleanly degrades.
+
+        The function never raises; per-task setup failures are routed
+        through :meth:`_send_error` + ``_pending_failed`` (same
+        liveness contract as :meth:`_start_one`).
+        """
+        if not self._queue:
+            return
+
+        # Drain the queue up to the active-set slack, then partition by
+        # batch eligibility. We can't peek-without-pop because
+        # ``self._queue`` is a deque drained by the caller, so collect
+        # candidates first and re-route into ``_start_one`` if the
+        # batch path bails.
+        slack = self.max_concurrent_tasks - len(self._active_tasks)
+        candidates: list[TextGeneration] = []
+        while self._queue and len(candidates) < slack:
+            candidates.append(self._queue.popleft())
+
+        if not candidates:
+            return
+
+        batch_enabled = os.environ.get(EXO_BATCH_PREFILL, "1") != "0"
+        if not batch_enabled:
+            for task in candidates:
+                self._start_one(task)
+            return
+
+        eligible: list[tuple[TextGeneration, mx.array, KVCacheType]] = []
+        leftover: list[TextGeneration] = []
+        for task in candidates:
+            prep = self._prepare_for_batch_prefill(task)
+            if prep is None:
+                leftover.append(task)
+            else:
+                eligible.append(prep)
+
+        logger.debug(
+            f"_admit_queued_tasks candidates={len(candidates)} "
+            f"eligible={len(eligible)} leftover={len(leftover)} "
+            f"slack={slack} batch_enabled={batch_enabled}"
+        )
+
+        # Single-eligible: a batched forward of size 1 has no parallelism
+        # win and adds the PromptBatch + merge_caches overhead, so just
+        # take the per-slot path.
+        if len(eligible) < 2:
+            for task in candidates:
+                self._start_one(task)
+            return
+
+        prompts = [tup[1] for tup in eligible]
+        caches = [tup[2] for tup in eligible]
+
         try:
-            gen = self._build_generator(task)
+            tps, total = batched_prefill(
+                model=self.model,
+                prompt_tokens_list=prompts,
+                caches_list=caches,
+            )
+            logger.info(
+                f"batched_prefill: {len(eligible)} slots, {total} tokens "
+                f"({tps:.1f} tok/s aggregate)"
+            )
+            for task, prompt_tokens, cache in eligible:
+                self._emit_prefill_complete(task, prompt_tokens)
+                self._start_one(task, precomputed_target_cache=cache)
+            for task in leftover:
+                self._start_one(task)
+            return
+        except BatchedPrefillUnsupportedError:
+            logger.info(
+                "batched_prefill unsupported for this model/cache; "
+                "falling back to per-slot prefill"
+            )
+            for task in candidates:
+                self._start_one(task)
+            return
         except Exception as e:
+            # Untyped failure: charge the error to every batched task so
+            # one bad request doesn't take the runner down. ``leftover``
+            # tasks were not part of the failed batch and proceed
+            # normally on the per-slot path.
+            for task, _, _ in eligible:
+                self._send_error(task, e)
+                self._pending_failed.append(task.task_id)
+            for task in leftover:
+                self._start_one(task)
+            return
+
+    def _start_one(
+        self,
+        task: TextGeneration,
+        *,
+        precomputed_target_cache: KVCacheType | None = None,
+    ) -> None:
+        """Build one slot's generator and add it to ``_active_tasks``.
+
+        ``precomputed_target_cache`` is forwarded to ``mlx_generate`` to
+        skip its prefix-cache lookup + local prefill. Set by
+        :meth:`_admit_queued_tasks` after a batched prefill; ``None``
+        otherwise.
+        """
+        # Only forward ``precomputed_target_cache`` when it was set so
+        # existing test seams that monkeypatch ``_build_generator`` with
+        # the legacy ``(self, task)`` signature still work; the per-slot
+        # admit path (``precomputed_target_cache is None``) is the
+        # default and predates the batched-prefill seam.
+        try:
+            if precomputed_target_cache is None:
+                gen = self._build_generator(task)
+            else:
+                gen = self._build_generator(
+                    task, precomputed_target_cache=precomputed_target_cache
+                )
+        except Exception as e:
+            # Preserve runner liveness: surface the error to the client
+            # via ``_send_error`` and queue a ``FinishedResponse`` for
+            # ``step`` to drain on the next tick. The active set is
+            # unchanged so the next ``step`` either picks up the next
+            # queued task or returns idle (instead of asserting and
+            # crashing the subprocess).
             self._send_error(task, e)
-            raise
+            self._pending_failed.append(task.task_id)
+            return
         queue = GeneratorQueue[GenerationResponse]()
 
         if task.task_params.bench:
@@ -367,7 +606,103 @@ class SequentialGenerator(Engine):
                 self.model_id,
                 task.task_params.tools,
             )
-        self._active = (task, gen, queue, output_generator)
+        self._active_tasks[task.task_id] = (task, gen, queue, output_generator)
+
+    def _batch_eligible_for_prefill(self, task: TextGeneration) -> bool:
+        """Return ``True`` when ``task`` can be co-prefilled with peers.
+
+        V1 eligibility is narrow on purpose: only single-rank text-only
+        generation without remote prefill or an in-process model
+        drafter. The asymmetric pipelined drafter still qualifies
+        because ``draft_model`` is ``None`` on the target rank — the
+        drafter cache lives on the remote rank and is prefilled per-
+        session over the wire, independent of target prefill batching.
+
+        Multi-rank target paths (TP/PP) are excluded because
+        :func:`pipeline_parallel_prefill`'s collective semantics need
+        per-slot driver loops; a follow-up can lift this once the
+        batched forward is folded into the pipeline driver.
+        """
+        params = task.task_params
+        if self.group is not None and self.group.size() > 1:
+            return False
+        if params.images:
+            return False
+        if params.prefill_endpoint is not None:
+            return False
+        # In-process model drafter ("model" mode) needs a paired
+        # drafter prefill aligned to the target's offset; batching
+        # only the target without batching the drafter would desync
+        # them. The asymmetric drafter (``self.draft_model is None``
+        # but ``remote_drafter_transport is not None``) is fine
+        # because its drafter prefill goes over the wire per-session.
+        return self.draft_model is None
+
+    def _prepare_for_batch_prefill(
+        self, task: TextGeneration
+    ) -> tuple[TextGeneration, mx.array, KVCacheType] | None:
+        """Encode the prompt and allocate a fresh cache for batched prefill.
+
+        Returns ``None`` when ``task`` is ineligible or when the
+        encoded prompt is too short to leave a decode-seed token
+        (length < 2). The encoding mirrors :func:`mlx_generate`'s
+        ``encode_prompt`` + ``fix_unmatched_think_end_tokens`` so the
+        cache offset agreed by ``batched_prefill`` matches what
+        ``mlx_generate`` later sees on the inner side of
+        ``precomputed_target_cache``.
+        """
+        if not self._batch_eligible_for_prefill(task):
+            return None
+        try:
+            prompt_str = apply_chat_template(self.tokenizer, task.task_params)
+            prompt_tokens = encode_prompt(self.tokenizer, prompt_str)
+            prompt_tokens = fix_unmatched_think_end_tokens(
+                prompt_tokens, self.tokenizer
+            )
+        except Exception:
+            # Encoding failure surfaces through the per-slot path so
+            # the existing ``_send_error`` plumbing reports it; we
+            # don't swallow it here.
+            logger.opt(exception=True).warning(
+                "Prompt encoding failed during batch-prefill prep; "
+                "falling back to per-slot path"
+            )
+            return None
+        if int(prompt_tokens.size) < 2:
+            return None
+        try:
+            cache = make_kv_cache(self.model)
+        except Exception:
+            logger.opt(exception=True).warning(
+                "make_kv_cache failed during batch-prefill prep; "
+                "falling back to per-slot path"
+            )
+            return None
+        return (task, prompt_tokens, cache)
+
+    def _emit_prefill_complete(
+        self, task: TextGeneration, prompt_tokens: mx.array
+    ) -> None:
+        """Fire a single ``processed=total`` ``PrefillProgressChunk``.
+
+        ``batched_prefill`` runs as one forward so per-chunk progress
+        events would mix slots. We elide intermediate progress and
+        emit a single completion event per slot at the end of the
+        batched forward so dashboards stop showing 0% prefill.
+        """
+        if self.device_rank != 0:
+            return
+        total = int(prompt_tokens.size)
+        self.event_sender.send(
+            ChunkGenerated(
+                command_id=task.command_id,
+                chunk=PrefillProgressChunk(
+                    model=self.model_id,
+                    processed_tokens=total,
+                    total_tokens=total,
+                ),
+            )
+        )
 
     def _send_error(self, task: TextGeneration, e: Exception) -> None:
         if self.device_rank == 0:
@@ -382,7 +717,12 @@ class SequentialGenerator(Engine):
                 )
             )
 
-    def _build_generator(self, task: TextGeneration) -> Generator[GenerationResponse]:
+    def _build_generator(
+        self,
+        task: TextGeneration,
+        *,
+        precomputed_target_cache: KVCacheType | None = None,
+    ) -> Generator[GenerationResponse]:
         _check_for_debug_prompts(task.task_params)
         prompt = apply_chat_template(self.tokenizer, task.task_params)
 
@@ -446,21 +786,29 @@ class SequentialGenerator(Engine):
             drafter_model_id=self.draft_model_id,
             num_draft_tokens=effective_num_draft_tokens,
             drafter_min_output_tokens=self.drafter_min_output_tokens,
+            asymmetric_drafter_rank=self.drafter_rank_in_parent,
+            asymmetric_drafter_transport=self.remote_drafter_transport,
+            precomputed_target_cache=precomputed_target_cache,
         )
 
     def close(self) -> None:
-        # Codex P2 (PR #18, batch_generator.py:104): release the
-        # drafter model alongside the target model. ``draft_model``
-        # is a second large MLX model reference held by
-        # ``SequentialGenerator`` for speculative decoding; if we
-        # only delete ``self.model``, the drafter weights stay
-        # resident on GPU until the runner subprocess exits, which
-        # leaks ~drafter_size of VRAM across runner restarts (and
-        # across instance teardown when the runner is recycled
-        # rather than killed). MLX has no explicit free hook beyond
-        # dropping the last reference, so the ``del`` here is the
-        # only release point.
-        del self.model, self.tokenizer, self.group, self.draft_model
+        if self.remote_drafter_transport is not None:
+            try:
+                self.remote_drafter_transport.shutdown()
+            except Exception:
+                # Drafter rank may already be gone (e.g. due to a
+                # parallel shutdown of the cluster); log and continue
+                # so target-side cleanup isn't blocked on a peer that
+                # can't ack. The shutdown call is idempotent so a
+                # later retry is harmless.
+                logger.opt(exception=True).warning(
+                    "Drafter rank shutdown failed; continuing close"
+                )
+            self.remote_drafter_transport = None
+        if self.draft_model is not None:
+            del self.draft_model
+            self.draft_model = None
+        del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
         cache = run_prefill_for_request(

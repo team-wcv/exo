@@ -15,6 +15,7 @@ from exo.download.download_utils import (
     map_repo_download_progress_to_download_progress_data,
     resolve_existing_model,
 )
+from exo.download.impl_shard_downloader import SingletonShardDownloader
 from exo.download.peer_shard_downloader import PeerAwareShardDownloader
 from exo.download.shard_downloader import ShardDownloader
 from exo.shared.constants import EXO_DEFAULT_MODELS_DIR, EXO_MODELS_READ_ONLY_DIRS
@@ -230,11 +231,15 @@ class DownloadCoordinator:
                         # Pass peer endpoints to the shard downloader if it supports it
                         if isinstance(self.shard_downloader, PeerAwareShardDownloader):
                             self.shard_downloader.set_available_peers(shard, peers)
-                        elif hasattr(self.shard_downloader, "shard_downloader") and isinstance(
-                            self.shard_downloader.shard_downloader, PeerAwareShardDownloader  # type: ignore[union-attr]
+                        elif isinstance(
+                            self.shard_downloader, SingletonShardDownloader
+                        ) and isinstance(
+                            self.shard_downloader.shard_downloader,
+                            PeerAwareShardDownloader,
                         ):
-                            # Unwrap SingletonShardDownloader
-                            self.shard_downloader.shard_downloader.set_available_peers(shard, peers)  # type: ignore[union-attr]
+                            self.shard_downloader.shard_downloader.set_available_peers(
+                                shard, peers
+                            )
                         await self._start_download(shard)
                     case DeleteDownload(model_id=model_id):
                         await self._delete_download(model_id)
@@ -589,6 +594,7 @@ class DownloadCoordinator:
         Each drafter is downloaded as a single ``PipelineShardMetadata`` for
         the entire model. Speculative decoding is single-device today (see
         ``mlx_generate``), so we never need a sharded drafter.
+
 
         Cancellation contract (Codex P1 PR #18 round-(N+1)): the parent
         ``_drafter_children[target_id]`` entry is the cancellation

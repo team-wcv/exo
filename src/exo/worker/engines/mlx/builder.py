@@ -1,11 +1,14 @@
 import contextlib
 import os
+import socket
 from collections.abc import Generator
 from dataclasses import dataclass
+from typing import cast
 
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
+from exo.shared.constants import EXO_MAX_CONCURRENT_REQUESTS
 from exo.shared.types.common import ModelId
 from exo.shared.types.events import Event
 from exo.shared.types.tasks import TaskId
@@ -43,13 +46,36 @@ class MlxBuilder(Builder):
     cancel_receiver: MpReceiver[TaskId]
     inference_model: Model | None = None
     tokenizer: TokenizerWrapper | None = None
+    # ``group`` is the target ranks' ``mx.distributed.Group``: pipeline
+    # / tensor / batch collectives all run on it. Under the v3+ wire
+    # the drafter is NOT a member of this group (asymmetric drafters
+    # talk to target rank 0 over a TCP socket; see ``drafter_socket``
+    # below).
     group: mx.distributed.Group | None = None
+    # Connected TCP socket from target rank 0 to the drafter rank.
+    # Set ONLY on target rank 0 of an asymmetric placement; ``None``
+    # everywhere else (other target ranks don't drive drafter IPC, and
+    # single-device / symmetric multi-rank builds have no drafter
+    # wire at all).
+    drafter_socket: socket.socket | None = None
+    drafter_rank_in_parent: int | None = None
     vision_processor: VisionProcessor | None = None
     draft_model: Model | None = None
     draft_model_id: ModelId | None = None
 
     def connect(self, bound_instance: BoundInstance) -> None:
-        self.group = initialize_mlx(bound_instance)
+        split = initialize_mlx(bound_instance)
+        self.group = split.target_subgroup
+        # Only target rank 0 in an asymmetric placement holds a drafter
+        # socket; every other rank sees ``None`` here. ``MlxGroupSplit``
+        # types it as ``object | None`` to keep the dataclass importable
+        # without ``socket``; cast back to the concrete type for
+        # consumers.
+        if split.drafter_socket is not None:
+            self.drafter_socket = cast(socket.socket, split.drafter_socket)
+        else:
+            self.drafter_socket = None
+        self.drafter_rank_in_parent = split.drafter_rank_in_parent
 
     def load(self, bound_instance: BoundInstance) -> Generator[ModelLoadingResponse]:
         (
@@ -67,6 +93,10 @@ class MlxBuilder(Builder):
             del self.tokenizer
         with contextlib.suppress(NameError, AttributeError):
             del self.group
+        if self.drafter_socket is not None:
+            with contextlib.suppress(OSError):
+                self.drafter_socket.close()
+            self.drafter_socket = None
         with contextlib.suppress(NameError, AttributeError):
             del self.draft_model
 
@@ -163,36 +193,53 @@ class MlxBuilder(Builder):
             "EXO_ALLOW_REQUEST_DRAFTING", ""
         ).lower() in {"1", "true", "yes"}
         is_single_device = self.group is None or self.group.size() == 1
+
+        # Asymmetric placement: drafter lives on a separate node; only
+        # target rank 0 owns the drafter wire (``drafter_socket``).
+        # Force the SequentialGenerator path (BatchGenerator has no
+        # spec-decoding hook) and build a long-lived RemoteTransport
+        # that the spec loop reuses across requests.
+        #
+        # Other target ranks in an asymmetric placement (rank >= 1) see
+        # ``drafter_socket is None`` and treat their build the same as
+        # symmetric multi-rank: they participate in target collectives
+        # but never call drafter ops directly. The spec loop's
+        # rank-0-only sampling decision keeps that invariant.
+        is_asymmetric_target_rank_zero = self.drafter_socket is not None
+        is_asymmetric = (
+            is_asymmetric_target_rank_zero or self.drafter_rank_in_parent is not None
+        )
+
+        # Conflict-merge note (PR #20 round-(N+12)): combines two
+        # gates on the path that forces ``SequentialGenerator`` over
+        # ``BatchGenerator``:
+        #
+        #   * PR #19's single-device-only sequential gate: in-process
+        #     drafting (model + ngram via ``EXO_ALLOW_REQUEST_DRAFTING``)
+        #     can only run on single-device runners because
+        #     multi-device ``mlx_generate`` demotes ``draft_mode`` to
+        #     ``"none"`` (see ``generate.py``). The gate honours
+        #     ``EXO_DRAFT_MODE=none`` to avoid losing batching with
+        #     zero speculative-decode benefit.
+        #   * PR #20's asymmetric-pipelined gate: when the runner is
+        #     a target rank in an asymmetric placement, batching is
+        #     incompatible with the drafter wire, so the sequential
+        #     path is mandatory regardless of ``draft_model`` /
+        #     ``EXO_DRAFT_MODE``.
         drafting_can_run_here = is_single_device
-        # Codex P1 (PR #19 round-(N+8), builder.py:169): the gate
-        # MUST honour ``EXO_DRAFT_MODE=none``. Pre-fix the gate
-        # forced ``SequentialGenerator`` whenever a drafter model was
-        # loaded, even if the operator explicitly opted out of
-        # speculation via ``EXO_DRAFT_MODE=none``. In that
-        # configuration ``mlx_generate`` resolves
-        # ``draft_mode="none"`` for every request (the env var
-        # overrides the loaded-drafter default), so we'd lose
-        # batching with zero spec-decode benefit -- a worker-wide
-        # throughput regression. ``allow_request_drafting`` still
-        # forces sequential because per-request overrides may
-        # legitimately raise ``draft_mode`` above ``"none"``.
         drafter_loaded_will_run = (
             self.draft_model is not None and configured_draft_mode != "none"
         )
         force_sequential_for_drafter = drafting_can_run_here and (
-            drafter_loaded_will_run or allow_request_drafting
+            drafter_loaded_will_run
+            or allow_request_drafting
+            or configured_draft_mode == "pipelined"
         )
         ngram_configured_without_force_sequential = (
             drafting_can_run_here
             and configured_draft_mode == "ngram"
             and not force_sequential_for_drafter
         )
-        # Codex P1 (PR #19 round-(N+8), builder.py:169): when the
-        # operator loaded a drafter model AND opted out of
-        # speculation via ``EXO_DRAFT_MODE=none``, log it explicitly
-        # so the choice is visible in startup logs (otherwise the
-        # operator might think the loaded drafter is participating
-        # while every request silently runs without speculation).
         drafter_loaded_but_explicitly_disabled = (
             drafting_can_run_here
             and self.draft_model is not None
@@ -200,8 +247,50 @@ class MlxBuilder(Builder):
             and not allow_request_drafting
         )
 
-        if os.environ.get("EXO_NO_BATCH") or force_sequential_for_drafter:
-            if force_sequential_for_drafter:
+        # Long-lived ``RemoteTransport`` (NOT a per-task DrafterTransport).
+        # Each in-flight request opens its own session via
+        # :meth:`RemoteTransport.open_session`; the session handle is the
+        # actual DrafterTransport consumed by the spec loop. See
+        # ``remote_drafter.py`` module docstring for the wire-protocol
+        # session multiplexing rationale.
+        from exo.worker.engines.mlx.generator.remote_drafter import RemoteTransport
+
+        remote_drafter_transport: RemoteTransport | None = None
+        if is_asymmetric_target_rank_zero:
+            assert self.drafter_socket is not None
+            from exo.worker.engines.mlx.generator.remote_drafter import (
+                make_remote_transport,
+            )
+
+            num_draft_tokens_remote = parse_env_int(
+                EXO_NUM_DRAFT_TOKENS, DEFAULT_NUM_DRAFT_TOKENS
+            )
+            target_world_size = self.group.size() if self.group is not None else 1
+            logger.info(
+                "Allocating long-lived RemoteTransport: "
+                f"target_world_size={target_world_size} "
+                f"drafter_rank={self.drafter_rank_in_parent} "
+                f"K={num_draft_tokens_remote} "
+                f"transport=tcp_socket"
+            )
+            remote_drafter_transport = make_remote_transport(
+                draft_model=None,
+                draft_cache=None,
+                num_draft_tokens=num_draft_tokens_remote,
+                sock=self.drafter_socket,
+            )
+
+        if (
+            os.environ.get("EXO_NO_BATCH")
+            or force_sequential_for_drafter
+            or is_asymmetric
+        ):
+            if is_asymmetric:
+                logger.info(
+                    "using SequentialGenerator (asymmetric placement: "
+                    "drafter lives on a separate MLX rank, pipelined+remote spec)"
+                )
+            elif force_sequential_for_drafter:
                 if allow_request_drafting and self.draft_model is None:
                     logger.info(
                         "using SequentialGenerator (EXO_ALLOW_REQUEST_DRAFTING set; "
@@ -227,11 +316,33 @@ class MlxBuilder(Builder):
             adaptive_draft_tokens = os.environ.get(
                 EXO_ADAPTIVE_DRAFT_TOKENS, ""
             ).lower() in {"1", "true", "yes"}
-            if force_sequential_for_drafter:
+            if force_sequential_for_drafter or is_asymmetric:
                 logger.info(
-                    f"speculative decoding: mode={configured_draft_mode}, "
+                    f"speculative decoding: mode={'pipelined+remote' if is_asymmetric else configured_draft_mode}, "
                     f"K={num_draft_tokens} (adaptive={adaptive_draft_tokens}), "
                     f"skip_drafter_when_max_tokens<={drafter_min_output_tokens}"
+                )
+
+            # Concurrent in-flight tasks. Asymmetric pipelined+remote
+            # rides the same ``EXO_MAX_CONCURRENT_REQUESTS`` cap as every
+            # other config now that the wire protocol carries a
+            # ``session_id`` slot: each in-flight target request opens
+            # its own ``_SessionHandle`` via
+            # ``RemoteTransport.open_session()`` and the drafter rank
+            # multiplexes per-session KV caches. The wire stays serial
+            # (single ``ThreadPoolExecutor`` on the target, single recv
+            # loop on the drafter) so ``mx.distributed.send/recv``
+            # ordering is preserved; concurrency comes from interleaving
+            # forward / verify rounds across sessions, which is the
+            # whole point of asymmetric placement -- keep the drafter
+            # rank busy serving session A while the target verifies
+            # session B's drafts.
+            max_concurrent_tasks = EXO_MAX_CONCURRENT_REQUESTS
+            if max_concurrent_tasks > 1:
+                logger.info(
+                    f"SequentialGenerator round-robin concurrency: "
+                    f"max_concurrent_tasks={max_concurrent_tasks} "
+                    f"(EXO_MAX_CONCURRENT_REQUESTS)"
                 )
 
             return SequentialGenerator(
@@ -251,6 +362,9 @@ class MlxBuilder(Builder):
                 num_draft_tokens=num_draft_tokens,
                 drafter_min_output_tokens=drafter_min_output_tokens,
                 adaptive_draft_tokens=adaptive_draft_tokens,
+                drafter_rank_in_parent=self.drafter_rank_in_parent,
+                remote_drafter_transport=remote_drafter_transport,
+                max_concurrent_tasks=max_concurrent_tasks,
             )
         else:
             # Codex P1 (PR #19 round-(N+3), builder.py:136): make the
