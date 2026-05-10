@@ -173,7 +173,27 @@ def place_instance(
     # unfiltered set -- the user gets target placement at the cost of the
     # asymmetric drafter, and `_select_drafter_placement` emits a
     # ``AllEligibleNodesInTargetCycle`` degradation downstream.
+    #
+    # Codex P1.3 (PR #20): the reservation filter must also respect
+    # memory feasibility. Pre-fix, ``cycles_excluding_drafters`` was
+    # adopted as long as it was non-empty -- which would drop the only
+    # memory-feasible cycle when every spare-target candidate was too
+    # small for the model. ``filter_cycles_by_memory`` would then
+    # return ``[]`` and the placement aborted with "No cycles found
+    # with sufficient memory" even though the unfiltered set had at
+    # least one feasible cycle (it just happened to include a
+    # drafter-eligible node). We instead probe ``cycles_excluding_drafters``
+    # against memory first; if that yields zero feasible cycles we
+    # fall back to the unfiltered set so the instance still lands.
+    # ``_select_drafter_placement`` emits ``AllEligibleNodesInTargetCycle``
+    # downstream so the operator sees the asymmetric drafter degradation.
     eligible_drafter_set = set(command.model_card.drafter_eligible_nodes)
+    cycles_with_sufficient_memory = filter_cycles_by_memory(
+        candidate_cycles,
+        node_memory,
+        command.model_card.storage_size,
+        allow_single_node_total_memory=allow_single_node_total_memory,
+    )
     if eligible_drafter_set and command.model_card.drafter_model_ids:
         cycles_excluding_drafters = [
             cycle
@@ -181,13 +201,15 @@ def place_instance(
             if not (set(cycle.node_ids) & eligible_drafter_set)
         ]
         if cycles_excluding_drafters:
-            candidate_cycles = cycles_excluding_drafters
-    cycles_with_sufficient_memory = filter_cycles_by_memory(
-        candidate_cycles,
-        node_memory,
-        command.model_card.storage_size,
-        allow_single_node_total_memory=allow_single_node_total_memory,
-    )
+            feasible_excluding_drafters = filter_cycles_by_memory(
+                cycles_excluding_drafters,
+                node_memory,
+                command.model_card.storage_size,
+                allow_single_node_total_memory=allow_single_node_total_memory,
+            )
+            if feasible_excluding_drafters:
+                candidate_cycles = cycles_excluding_drafters
+                cycles_with_sufficient_memory = feasible_excluding_drafters
     if len(cycles_with_sufficient_memory) == 0:
         raise ValueError("No cycles found with sufficient memory")
 
@@ -366,34 +388,24 @@ def place_instance(
             topology=topology,
         )
 
-    # Single-node target cycle requires Pipeline sharding (PP=1). The
-    # backend choice depends on whether an asymmetric drafter rank will
-    # extend the parent ``mx.distributed`` group beyond size 1: ring lacks
-    # ``Group.split`` / ``send/recv`` so an N+1=2 parent group cannot use
-    # it; jaccl supports both. We therefore peek at drafter eligibility
-    # before locking the backend, then re-run the full drafter selection
-    # below with the (possibly upgraded) ``instance_meta``.
+    # Single-node target cycle requires Pipeline sharding (PP=1). Under
+    # the V3+ asymmetric-drafter wire, the drafter rank does NOT join
+    # the target's ``mx.distributed`` group; it talks to target rank 0
+    # over a direct TCP socket (see ``DrafterPlacement``). A single-
+    # rank target therefore never needs ``mx.distributed`` at all and
+    # ring stays sufficient regardless of drafter eligibility.
+    #
+    # Codex P1.4 (PR #20, placement.py:396): pre-fix, the asymmetric-
+    # drafter peek auto-upgraded ``MlxRing -> MlxJaccl`` whenever the
+    # card declared drafter-eligible nodes -- which then forced
+    # ``_validate_jaccl_thunderbolt_ipv4_paths`` to fire and fail on
+    # any Wi-Fi/Ethernet-only single-node deploy. Single-rank targets
+    # don't need a distributed group, so the upgrade was both
+    # unnecessary and actively harmful. Keep ring locked in for
+    # single-rank cycles; the drafter socket wire is independent.
     if len(selected_cycle) == 1:
         sharding = Sharding.Pipeline
-        will_attempt_asymmetric_drafter = (
-            bool(command.model_card.drafter_eligible_nodes)
-            and bool(command.model_card.drafter_model_ids)
-            and any(
-                node_id in topology.list_nodes()
-                and node_id not in selected_cycle.node_ids
-                for node_id in command.model_card.drafter_eligible_nodes
-            )
-        )
-        if not will_attempt_asymmetric_drafter:
-            instance_meta = InstanceMeta.MlxRing
-        elif instance_meta == InstanceMeta.MlxRing:
-            # User asked for ring but the model declares an asymmetric
-            # drafter on a separate node. Auto-upgrade to jaccl since ring
-            # cannot support the parent group's split + send/recv path.
-            # If jaccl reachability fails downstream, drafter selection
-            # emits a degradation event and target falls back to ring
-            # symmetric (no drafter), restoring V1 ring behavior.
-            instance_meta = InstanceMeta.MlxJaccl
+        instance_meta = InstanceMeta.MlxRing
 
     # Three independent post-selection adjustments. They land in this
     # order so the JACCL preflight fails fast (raising a node-specific
@@ -444,17 +456,13 @@ def place_instance(
         download_status=download_status or {},
     )
 
-    # If the auto-upgrade to MlxJaccl above didn't yield a drafter (e.g.
-    # no RDMA path to the eligible node), revert to MlxRing for the
-    # symmetric single-rank target. The degradation event was already
-    # emitted by ``_select_drafter_placement``; the user's instance
-    # still completes, just without speculative decoding.
-    if (
-        len(selected_cycle) == 1
-        and instance_meta == InstanceMeta.MlxJaccl
-        and drafter_placement is None
-    ):
-        instance_meta = InstanceMeta.MlxRing
+    # Codex P1.4: under the V3+ wire, single-rank target cycles always
+    # use ``MlxRing`` (no auto-upgrade to ``MlxJaccl`` even when an
+    # asymmetric drafter is reachable). The drafter wire is a TCP
+    # socket independent of ``mx.distributed``, so there's no need
+    # for jaccl's ``Group.split``. The pre-fix revert path (jaccl ->
+    # ring on missing drafter placement) is therefore dead under the
+    # new policy and removed; ring is locked in upstream.
 
     # Asymmetric placement (``drafter_placement is not None``) keeps the
     # drafter rank OUT of the parent ``mx.distributed`` group: the

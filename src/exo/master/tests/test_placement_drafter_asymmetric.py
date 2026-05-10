@@ -107,15 +107,17 @@ def _bidi_rdma(topology: Topology, a: NodeId, b: NodeId, iface: int) -> None:
     )
 
 
-def test_asymmetric_single_node_target_auto_upgrades_to_jaccl() -> None:
-    """Single-node target + RDMA-reachable drafter => asymmetric jaccl.
+def test_asymmetric_single_node_target_stays_on_ring() -> None:
+    """Single-node target + RDMA-reachable drafter => asymmetric ring.
 
-    Single-rank target requires Pipeline sharding, but the parent group
-    spans 2 ranks (1 target + 1 drafter) and ring backend lacks
-    ``Group.split`` / ``send/recv``. Placement therefore auto-upgrades
-    ``MlxRing`` -> ``MlxJaccl`` whenever asymmetric drafter placement
-    will succeed, so the parent group can use jaccl for the drafter
-    transport.
+    Codex P1.4 (PR #20): the V3+ wire keeps the drafter rank OUT of
+    ``mx.distributed`` -- it talks to target rank 0 over a plain TCP
+    socket. A single-rank target therefore never needs ``Group.split``
+    / ``send/recv`` and stays on ``MlxRing`` even when an asymmetric
+    drafter is reachable. Pre-fix the placement auto-upgraded
+    ``MlxRing -> MlxJaccl`` here, which then triggered the JACCL
+    Thunderbolt-IPv4 preflight on Wi-Fi/Ethernet single-node deploys
+    and caused unnecessary placement failures.
     """
     target_node, drafter_node = NodeId(), NodeId()
     topology = Topology()
@@ -154,7 +156,7 @@ def test_asymmetric_single_node_target_auto_upgrades_to_jaccl() -> None:
     assert len(placements) == 1
     assert not degradations
     instance = next(iter(placements.values()))
-    assert isinstance(instance, MlxJacclInstance)
+    assert isinstance(instance, MlxRingInstance)
     assert instance.drafter_placement is not None
     placement = instance.drafter_placement
     assert placement.drafter_node_id == drafter_node
@@ -172,10 +174,10 @@ def test_asymmetric_ring_socket_only_places_drafter_over_socket() -> None:
     v3+ wire decoupled the drafter from ``mx.distributed`` -- the wire
     runs over a plain TCP socket. RDMA is therefore no longer required
     for asymmetric placement; a socket-only path between target rank 0
-    and the drafter node is sufficient. The instance still upgrades
-    ``MlxRing -> MlxJaccl`` because the target ranks (1 here) are
-    fine to leave on jaccl, but the drafter wire itself runs over TCP
-    regardless of the target backend.
+    and the drafter node is sufficient. Codex P1.4: single-node
+    targets stay on ``MlxRing`` (no ``MlxJaccl`` auto-upgrade) and
+    the drafter wire still runs over TCP regardless of the target
+    backend.
     """
     target_node, drafter_node = NodeId(), NodeId()
     topology = Topology()
@@ -222,10 +224,11 @@ def test_asymmetric_ring_socket_only_places_drafter_over_socket() -> None:
 def test_asymmetric_jaccl_places_drafter_with_rdma_reachability() -> None:
     """Two-node target (RDMA cycle) + RDMA-reachable drafter => asymmetric jaccl.
 
-    Single-node target gets downgraded MlxJaccl -> MlxRing by the legacy
-    ``len(selected_cycle) == 1 -> InstanceMeta.MlxRing`` rewrite, so to
-    exercise asymmetric jaccl we need the target to span 2 RDMA-connected
-    nodes + a 3rd drafter node with RDMA edges to both.
+    Single-node targets always land on ``MlxRing`` (Codex P1.4: the
+    drafter wire is a TCP socket independent of ``mx.distributed``,
+    so single-rank cycles never need jaccl). To exercise asymmetric
+    jaccl we therefore need the target to span 2 RDMA-connected nodes
+    plus a 3rd drafter node with RDMA edges to both.
     """
     target_a, target_b, drafter_node = NodeId(), NodeId(), NodeId()
     topology = Topology()
@@ -784,10 +787,12 @@ def test_asymmetric_continues_scanning_after_first_candidate_missing_memory() ->
 def test_asymmetric_round_trip_serialization() -> None:
     """An asymmetric instance round-trips through pydantic serialisation.
 
-    Single-node target auto-upgrades to ``MlxJaccl`` for the asymmetric
-    parent group (ring lacks split + send/recv), so the round-trip is
-    exercised on ``MlxJacclInstance`` here. RDMA edges to the drafter
-    node make the auto-upgrade viable.
+    Codex P1.4 (PR #20): single-node targets stay on ``MlxRing`` even
+    when an asymmetric drafter is reachable, because the V3+ wire
+    runs the drafter over a TCP socket independent of
+    ``mx.distributed`` -- ring's lack of ``Group.split`` is irrelevant
+    for a single-rank target. The round-trip is therefore exercised
+    on ``MlxRingInstance`` here.
     """
     target_node, drafter_node = NodeId(), NodeId()
     topology = Topology()
@@ -821,11 +826,11 @@ def test_asymmetric_round_trip_serialization() -> None:
         },
     )
     instance = next(iter(placements.values()))
-    assert isinstance(instance, MlxJacclInstance)
+    assert isinstance(instance, MlxRingInstance)
     assert instance.drafter_placement is not None
 
     dumped = instance.model_dump()
-    rehydrated = MlxJacclInstance.model_validate(dumped)
+    rehydrated = MlxRingInstance.model_validate(dumped)
     assert rehydrated == instance
     assert rehydrated.drafter_placement is not None
     assert (

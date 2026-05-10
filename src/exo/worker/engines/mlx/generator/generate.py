@@ -1356,7 +1356,14 @@ def mlx_generate(
     # drafter rank until the runner shuts down.
     drafter: Drafter
     asymmetric_session: object | None = None
-    if asymmetric_drafter_active:
+    # Codex P2.3 (PR #20): explicitly require ``draft_mode != "none"``
+    # in addition to ``asymmetric_drafter_active``. Today the active
+    # flag is derived as ``... and draft_mode == "pipelined"`` so the
+    # check is a tautology, but spelling it out at the session-open
+    # site keeps the invariant obvious and prevents a future re-shape
+    # of the active-flag formula from silently opening drafter
+    # sockets for demoted-to-``"none"`` requests.
+    if asymmetric_drafter_active and draft_mode != "none":
         assert asymmetric_drafter_rank is not None
         target_subgroup_size = group.size() if group is not None else 1
         from exo.worker.engines.mlx.generator.drafter_transport import (

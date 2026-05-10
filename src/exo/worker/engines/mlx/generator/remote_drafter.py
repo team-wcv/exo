@@ -106,8 +106,9 @@ COMMAND_FRAME_SIZE: Final[int] = 9
 """Fixed size of a command frame (uint32 ints).
 
 Carries [op, num_inputs, num_forwards, input_0, input_1, trim_amount,
-session_id, 0, 0]. Two trailing zero slots reserved for future
-extension without bumping the wire version on the byte layer."""
+session_id, target_drafts_buffer_size, 0]. The trailing zero slot is
+reserved for future extension without bumping the wire version on the
+byte layer."""
 
 ACK_FRAME_SIZE: Final[int] = 1
 """Fixed size of an ack frame (uint32 ints). The single int is reserved
@@ -165,10 +166,12 @@ def _build_command_frame(
     num_forwards: int,
     trim_amount: int,
     session_id: int,
+    target_drafts_buffer_size: int,
 ) -> list[int]:
     """Pack command parameters into a fixed-length uint32 list.
 
-    Layout: ``[op, num_inputs, num_forwards, input_0, input_1, trim_amount, session_id, 0, 0]``.
+    Layout: ``[op, num_inputs, num_forwards, input_0, input_1, trim_amount,
+    session_id, target_drafts_buffer_size, 0]``.
 
     ``inputs`` must have length 0, 1, or 2 (the spec loop only ever
     passes length-1 or length-2 inputs to ``forward``; ``OP_TRIM_CACHE``,
@@ -181,11 +184,30 @@ def _build_command_frame(
     realistic deployment. Wraparound is not handled (the runner would
     have to serve > 4 billion concurrent requests; if that ever
     happens, switch the counter to a free-list of recycled ids).
+
+    ``target_drafts_buffer_size`` is the target rank's local
+    ``num_draft_tokens + 1``. The drafter validates it against its own
+    ``drafts_buffer_size`` on ``OP_FORWARD`` so a mismatch -- the
+    "drafter K > target K" reverse-drift case that the
+    ``num_forwards > drafts_buffer_size`` guard cannot catch on its
+    own -- fails fast with a clear runtime error instead of silently
+    desyncing the wire (drafter would otherwise pad replies to its own
+    ``drafts_buffer_size`` while the target reads only
+    ``target_drafts_buffer_size``, leaving surplus bytes in the socket
+    buffer that corrupt the next command frame). Carried on every
+    frame so the drafter doesn't have to maintain per-session size
+    state; one extra uint32 per command is negligible vs the prompt-
+    tail payload.
     """
     if len(inputs) > 2:
         raise ValueError(f"inputs length must be in [0, 2], got {len(inputs)}")
     if not 0 <= session_id <= 0xFFFFFFFF:
         raise ValueError(f"session_id must fit in uint32, got {session_id}")
+    if not 0 <= target_drafts_buffer_size <= 0xFFFFFFFF:
+        raise ValueError(
+            f"target_drafts_buffer_size must fit in uint32, "
+            f"got {target_drafts_buffer_size}"
+        )
     return [
         op,
         len(inputs),
@@ -194,15 +216,18 @@ def _build_command_frame(
         inputs[1] if len(inputs) >= 2 else 0,
         trim_amount,
         session_id,
-        0,
+        target_drafts_buffer_size,
         0,
     ]
 
 
-def _decode_command_frame(flat: list[int]) -> tuple[int, list[int], int, int, int]:
+def _decode_command_frame(
+    flat: list[int],
+) -> tuple[int, list[int], int, int, int, int]:
     """Inverse of :func:`_build_command_frame`.
 
-    Returns ``(op, inputs, num_forwards, trim_amount, session_id)``.
+    Returns ``(op, inputs, num_forwards, trim_amount, session_id,
+    target_drafts_buffer_size)``.
     """
     if len(flat) != COMMAND_FRAME_SIZE:
         raise ValueError(
@@ -213,8 +238,16 @@ def _decode_command_frame(flat: list[int]) -> tuple[int, list[int], int, int, in
     num_forwards = flat[2]
     trim_amount = flat[5]
     session_id = flat[6]
+    target_drafts_buffer_size = flat[7]
     inputs = flat[3 : 3 + num_inputs]
-    return op, inputs, num_forwards, trim_amount, session_id
+    return (
+        op,
+        inputs,
+        num_forwards,
+        trim_amount,
+        session_id,
+        target_drafts_buffer_size,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +415,7 @@ class RemoteTransport:
             num_forwards=num_forwards,
             trim_amount=0,
             session_id=session_id,
+            target_drafts_buffer_size=self._num_draft_tokens + 1,
         )
         send_uint32_frame(self._sock, frame)
         # Drafts buffer is fixed-size at K + 1 (the upper bound of any
@@ -397,6 +431,7 @@ class RemoteTransport:
             num_forwards=0,
             trim_amount=n_positions,
             session_id=session_id,
+            target_drafts_buffer_size=self._num_draft_tokens + 1,
         )
         send_uint32_frame(self._sock, frame)
         ack = recv_uint32_frame(self._sock, ACK_FRAME_SIZE)
@@ -414,6 +449,7 @@ class RemoteTransport:
             num_forwards=0,
             trim_amount=0,
             session_id=SESSION_ID_NONE,
+            target_drafts_buffer_size=self._num_draft_tokens + 1,
         )
         send_uint32_frame(self._sock, frame)
         # Best-effort recv: if the drafter has already torn down, the
@@ -439,6 +475,7 @@ class RemoteTransport:
             num_forwards=num_prompt_tokens,
             trim_amount=0,
             session_id=session_id,
+            target_drafts_buffer_size=self._num_draft_tokens + 1,
         )
         send_uint32_frame(self._sock, frame)
         if num_prompt_tokens > 0:
@@ -459,6 +496,7 @@ class RemoteTransport:
             num_forwards=0,
             trim_amount=0,
             session_id=session_id,
+            target_drafts_buffer_size=self._num_draft_tokens + 1,
         )
         send_uint32_frame(self._sock, frame)
         ack = recv_uint32_frame(self._sock, ACK_FRAME_SIZE)
@@ -608,7 +646,14 @@ def drafter_serve_loop(
 
     while True:
         flat = recv_uint32_frame(sock, COMMAND_FRAME_SIZE)
-        op, inputs, num_forwards, trim_amount, session_id = _decode_command_frame(flat)
+        (
+            op,
+            inputs,
+            num_forwards,
+            trim_amount,
+            session_id,
+            target_drafts_buffer_size,
+        ) = _decode_command_frame(flat)
 
         if op == OP_SHUTDOWN:
             # Drop every session's cache before the serve loop returns
@@ -647,37 +692,57 @@ def drafter_serve_loop(
             continue
 
         if op == OP_FORWARD:
+            # Wire-protocol invariants checked BEFORE any session
+            # state lookup: the v3 reply is a fixed-width
+            # ``drafts_buffer_size`` (== ``num_draft_tokens + 1``)
+            # frame on every ``OP_FORWARD``. The target side calls
+            # ``recv_uint32_frame(sock, target_drafts_buffer_size)``
+            # and consumes exactly that many ints. The two sizes MUST
+            # agree: any mismatch leaves bytes in the socket buffer
+            # (drafter K > target K) or under-reads the response
+            # (target K > drafter K), and either case corrupts the
+            # next round-trip's command frame. Validating before the
+            # session-cache lookup means a desynced wire fails with a
+            # protocol-level error rather than an incidental
+            # "unknown session" error caused by garbage in slot 6.
+            #
+            # Symmetric-drift guard, in priority order:
+            #
+            # 1. ``target_drafts_buffer_size != drafts_buffer_size`` --
+            #    catches both directions of drift (target K > drafter
+            #    K and drafter K > target K). Carried explicitly on
+            #    the frame because the drafter cannot infer target's
+            #    K from ``num_forwards`` alone (target may legitimately
+            #    request fewer than its max under adaptive K).
+            # 2. ``num_forwards > drafts_buffer_size`` -- defense in
+            #    depth: implied by guard 1 in nominal cases, but a
+            #    target that mistakenly sends ``num_forwards`` beyond
+            #    its own buffer would otherwise tip ``_run_drafter_*``
+            #    into an out-of-bounds slice.
+            if target_drafts_buffer_size != drafts_buffer_size:
+                raise RuntimeError(
+                    f"OP_FORWARD wire-size mismatch: drafter "
+                    f"drafts_buffer_size={drafts_buffer_size} "
+                    f"(EXO_NUM_DRAFT_TOKENS={num_draft_tokens}), target "
+                    f"target_drafts_buffer_size="
+                    f"{target_drafts_buffer_size} (target K+1). Each "
+                    f"side reads/writes its own size, so the surplus or "
+                    f"shortfall would corrupt the next command frame. "
+                    f"Restart the runner with the same "
+                    f"EXO_NUM_DRAFT_TOKENS on every rank."
+                )
+            if num_forwards > drafts_buffer_size:
+                raise RuntimeError(
+                    f"OP_FORWARD num_forwards={num_forwards} exceeds "
+                    f"wire-protocol budget drafts_buffer_size="
+                    f"{drafts_buffer_size}; target requested more "
+                    f"forwards than its own buffer can hold."
+                )
             session_cache = sessions.get(session_id)
             if session_cache is None:
                 raise RuntimeError(
                     f"OP_FORWARD for unknown session {session_id}; "
                     f"OP_PREFILL must allocate the session first"
-                )
-            # Codex P1 (PR #20 round-(N+12), remote_drafter.py:663):
-            # the v3 wire protocol contracts to a fixed reply width of
-            # ``drafts_buffer_size`` (== ``num_draft_tokens + 1``) on
-            # every ``OP_FORWARD``. The target side calls
-            # ``recv_uint32_frame(sock, drafts_buffer_size)`` and
-            # consumes exactly that many ints; if the drafter ever sent
-            # more, the surplus would stick around in the socket buffer
-            # and corrupt the next op (the next ``recv_uint32_frame``
-            # would deserialize a phantom command frame). Pre-fix the
-            # only safety net was the no-op ``[0] * (size - len)`` pad,
-            # which silently produced an empty list when ``num_forwards
-            # > drafts_buffer_size`` (a config-drift situation: drafter
-            # and target started with different ``EXO_NUM_DRAFT_TOKENS``)
-            # and let the wire desync. Validate the reply width here so
-            # any drift fails the next ``recv`` round-trip with a
-            # well-formed runtime error instead of a wedged socket.
-            if num_forwards > drafts_buffer_size:
-                raise RuntimeError(
-                    f"OP_FORWARD num_forwards={num_forwards} exceeds "
-                    f"wire-protocol budget drafts_buffer_size="
-                    f"{drafts_buffer_size}; the target ranks and the "
-                    f"drafter rank disagree on EXO_NUM_DRAFT_TOKENS "
-                    f"(drafter K+1={drafts_buffer_size}, target K+1="
-                    f"{num_forwards}). Restart the runner with the "
-                    f"same EXO_NUM_DRAFT_TOKENS on every rank."
                 )
             outputs = _run_drafter_forwards_remote(
                 draft_model=draft_model,
@@ -686,14 +751,26 @@ def drafter_serve_loop(
                 num_forwards=num_forwards,
             )
             # ``_run_drafter_forwards_remote`` is contracted to return
-            # exactly ``num_forwards`` ints, so the padding below is a
+            # exactly ``num_forwards`` ints. The padding below is a
             # no-op when ``num_forwards == drafts_buffer_size`` and
-            # zero-fills the trailing slots otherwise. The
-            # ``num_forwards > drafts_buffer_size`` case is rejected
-            # above, so the multiplier here is always non-negative.
+            # zero-fills the trailing slots otherwise. Codex P1.5:
+            # explicit assert + length comparison guards against an
+            # ``outputs`` list longer than ``drafts_buffer_size`` that
+            # would otherwise produce a *negative* multiplier on the
+            # padding (silently truncating in surprising ways). Both
+            # invariants are upheld by the ``num_forwards`` guard above
+            # plus the contract of ``_run_drafter_forwards_remote``;
+            # the asserts make the wire-protocol invariant explicit at
+            # the point we compute the padded reply.
             assert len(outputs) == num_forwards, (
                 f"drafter forwarded {len(outputs)} tokens, expected "
                 f"{num_forwards} (wire-protocol invariant)"
+            )
+            assert len(outputs) <= drafts_buffer_size, (
+                f"drafter outputs len={len(outputs)} exceeds "
+                f"drafts_buffer_size={drafts_buffer_size}; the "
+                f"num_forwards <= drafts_buffer_size guard above "
+                f"should have prevented this"
             )
             padded = list(outputs) + [0] * (drafts_buffer_size - len(outputs))
             send_uint32_frame(sock, padded)

@@ -6,12 +6,14 @@ import re
 import sys
 import tempfile
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast, final
 
 if TYPE_CHECKING:
+    import socket as _socket_module
+
     from exo.worker.engines.mlx.vision import VisionProcessor
 
 # Monkey-patch for transformers 5.x compatibility
@@ -365,12 +367,18 @@ def _maybe_accept_drafter_socket(
         # available on the host, ``bind_target_listener`` will raise
         # and the failure is loud rather than silent.
         bind_host = "::"
-    listener = bind_target_listener(bind_host, placement.drafter_socket_port)
+    listener = _bind_drafter_listener_with_retry(
+        bind_host=bind_host,
+        bind_target_listener=bind_target_listener,
+        initial_port=placement.drafter_socket_port,
+        advertised_host=placement.drafter_socket_host,
+    )
     try:
         logger.info(
             f"target rank 0 listening for drafter on "
-            f"{bind_host}:{placement.drafter_socket_port} "
-            f"(advertised {placement.drafter_socket_host})"
+            f"{bind_host}:{listener.getsockname()[1]} "
+            f"(advertised {placement.drafter_socket_host}:"
+            f"{placement.drafter_socket_port})"
         )
         conn = accept_drafter(listener, timeout_seconds=180.0)
         logger.info("target rank 0 accepted drafter connection")
@@ -380,6 +388,76 @@ def _maybe_accept_drafter_socket(
         # connected for the instance lifetime); close it as soon as
         # accept returns to free the port.
         listener.close()
+
+
+_DRAFTER_BIND_RETRY_BUDGET: Final[int] = 8
+"""Number of bind attempts tolerated before giving up on the drafter listener.
+
+Codex P1.2 (PR #20): the master allocates ``drafter_socket_port`` via
+:func:`exo.utils.ports.random_ephemeral_port`, which kernel-vets the
+port on the master's host. In cross-host deploys (master and target
+rank 0 on different hosts) the master cannot vet the target's port
+allocations, so ``bind_target_listener`` may still hit ``EADDRINUSE``.
+Eight re-rolls give the runtime a generous chance to find a free port
+on the target's kernel before surfacing a placement-time failure.
+"""
+
+
+def _bind_drafter_listener_with_retry(
+    *,
+    bind_host: str,
+    bind_target_listener: Callable[[str, int], "_socket_module.socket"],
+    initial_port: int,
+    advertised_host: str,
+) -> "_socket_module.socket":
+    """Bind the drafter listener, re-rolling the port on ``EADDRINUSE``.
+
+    Codex P1.2 (PR #20, placement.py:800): the master picks
+    ``drafter_socket_port`` via
+    :func:`exo.utils.ports.random_ephemeral_port`, kernel-vetted on
+    the master's host but not across hosts. When master and target
+    rank 0 sit on different hosts a transient race against the
+    target's kernel can leave the master-picked port in use locally,
+    so :func:`bind_target_listener` raises ``OSError(EADDRINUSE)``.
+    Re-rolling via :func:`random_ephemeral_port` and retrying a small
+    number of times turns that into a self-healing bind step instead
+    of an immediate runner failure. The drafter dials the placement's
+    original port, so a re-rolled port leaves accept blocked until
+    its 180s timeout (after which the runner re-places); that's
+    strictly better than the pre-fix immediate-fail behavior because
+    most ``EADDRINUSE`` events on a target host are transient and
+    the very next ``random_ephemeral_port`` returns the same kernel-
+    free port the master originally picked.
+    """
+    from exo.utils.ports import random_ephemeral_port
+
+    current_port = initial_port
+    attempts = 0
+    last_error: OSError | None = None
+    while attempts < _DRAFTER_BIND_RETRY_BUDGET:
+        try:
+            return bind_target_listener(bind_host, current_port)
+        except OSError as bind_error:
+            last_error = bind_error
+            attempts += 1
+            if attempts >= _DRAFTER_BIND_RETRY_BUDGET:
+                break
+            new_port = random_ephemeral_port()
+            logger.warning(
+                f"bind_target_listener({bind_host}, {current_port}) raised "
+                f"{bind_error!r}; re-rolling to port {new_port} "
+                f"(attempt {attempts}/{_DRAFTER_BIND_RETRY_BUDGET}, "
+                f"advertised host {advertised_host})"
+            )
+            current_port = new_port
+    raise OSError(
+        last_error.errno if last_error is not None else None,
+        f"failed to bind drafter listener on {bind_host} after "
+        f"{_DRAFTER_BIND_RETRY_BUDGET} attempts (last error: "
+        f"{last_error!r}); re-rolling did not yield a free port. "
+        f"Operator should check whether another process on this host "
+        f"is monopolising the ephemeral port range.",
+    ) from last_error
 
 
 EXO_DISABLE_DRAFTER_ENV = "EXO_DISABLE_DRAFTER"

@@ -37,16 +37,16 @@ from exo.worker.engines.mlx.generator.remote_drafter import (
 
 
 @pytest.mark.parametrize(
-    ("op", "inputs", "num_forwards", "trim_amount", "session_id"),
+    ("op", "inputs", "num_forwards", "trim_amount", "session_id", "target_buf"),
     [
-        (OP_FORWARD, [42], 4, 0, 0),
-        (OP_FORWARD, [10, 20], 5, 0, 7),
-        (OP_TRIM_CACHE, [], 0, 7, 3),
-        (OP_SHUTDOWN, [], 0, 0, SESSION_ID_NONE),
-        (OP_PREFILL, [], 1024, 0, 1),
-        (OP_PREFILL, [], 0, 0, 0),
-        (OP_END_SESSION, [], 0, 0, 42),
-        (OP_FORWARD, [1], 2, 0, 0xFFFFFFFE),
+        (OP_FORWARD, [42], 4, 0, 0, 5),
+        (OP_FORWARD, [10, 20], 5, 0, 7, 6),
+        (OP_TRIM_CACHE, [], 0, 7, 3, 5),
+        (OP_SHUTDOWN, [], 0, 0, SESSION_ID_NONE, 5),
+        (OP_PREFILL, [], 1024, 0, 1, 5),
+        (OP_PREFILL, [], 0, 0, 0, 5),
+        (OP_END_SESSION, [], 0, 0, 42, 5),
+        (OP_FORWARD, [1], 2, 0, 0xFFFFFFFE, 9),
     ],
 )
 def test_command_frame_round_trip(
@@ -55,6 +55,7 @@ def test_command_frame_round_trip(
     num_forwards: int,
     trim_amount: int,
     session_id: int,
+    target_buf: int,
 ) -> None:
     """Every command shape we send must round-trip through encode + decode."""
     flat = _build_command_frame(
@@ -63,17 +64,24 @@ def test_command_frame_round_trip(
         num_forwards=num_forwards,
         trim_amount=trim_amount,
         session_id=session_id,
+        target_drafts_buffer_size=target_buf,
     )
     assert len(flat) == COMMAND_FRAME_SIZE
 
-    decoded_op, decoded_inputs, decoded_num_forwards, decoded_trim, decoded_sid = (
-        _decode_command_frame(flat)
-    )
+    (
+        decoded_op,
+        decoded_inputs,
+        decoded_num_forwards,
+        decoded_trim,
+        decoded_sid,
+        decoded_target_buf,
+    ) = _decode_command_frame(flat)
     assert decoded_op == op
     assert decoded_inputs == inputs
     assert decoded_num_forwards == num_forwards
     assert decoded_trim == trim_amount
     assert decoded_sid == session_id
+    assert decoded_target_buf == target_buf
 
 
 def test_command_frame_rejects_long_inputs() -> None:
@@ -84,6 +92,7 @@ def test_command_frame_rejects_long_inputs() -> None:
             num_forwards=4,
             trim_amount=0,
             session_id=0,
+            target_drafts_buffer_size=5,
         )
 
 
@@ -95,6 +104,21 @@ def test_command_frame_rejects_session_id_out_of_uint32_range() -> None:
             num_forwards=2,
             trim_amount=0,
             session_id=2**33,
+            target_drafts_buffer_size=5,
+        )
+
+
+def test_command_frame_rejects_target_buffer_out_of_uint32_range() -> None:
+    with pytest.raises(
+        ValueError, match=r"target_drafts_buffer_size must fit in uint32"
+    ):
+        _build_command_frame(
+            op=OP_FORWARD,
+            inputs=[1],
+            num_forwards=2,
+            trim_amount=0,
+            session_id=0,
+            target_drafts_buffer_size=2**33,
         )
 
 
@@ -173,12 +197,13 @@ def test_session_handle_forward_serialises_command_with_session_id() -> None:
         future = session.forward([42], num_forwards=4)
 
         cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
-        op, inputs, num_forwards, trim, sid = _decode_command_frame(cmd)
+        op, inputs, num_forwards, trim, sid, target_buf = _decode_command_frame(cmd)
         assert op == OP_FORWARD
         assert inputs == [42]
         assert num_forwards == 4
         assert trim == 0
         assert sid == session.session_id
+        assert target_buf == session.num_draft_tokens + 1
 
         # Reply with K+1 = 5 drafts; the spec loop slices to num_forwards.
         _write_uint32s(drafter_side, [10, 11, 12, 13, 0])
@@ -199,7 +224,7 @@ def test_session_handle_trim_cache_emits_session_scoped_command() -> None:
         thread = threading.Thread(target=_trim)
         thread.start()
         cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
-        op, _, _, trim, sid = _decode_command_frame(cmd)
+        op, _, _, trim, sid, _ = _decode_command_frame(cmd)
         assert op == OP_TRIM_CACHE
         assert trim == 3
         assert sid == session.session_id
@@ -240,7 +265,7 @@ def test_session_handle_reset_and_prefill_sends_command_array_and_recv_ack() -> 
         thread.start()
 
         cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
-        op, inputs, num_forwards, trim, sid = _decode_command_frame(cmd)
+        op, inputs, num_forwards, trim, sid, _ = _decode_command_frame(cmd)
         assert op == OP_PREFILL
         assert inputs == []
         assert num_forwards == len(prompt)
@@ -273,7 +298,7 @@ def test_session_handle_reset_and_prefill_empty_prompt_skips_array_send() -> Non
         thread.start()
 
         cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
-        op, _, num_forwards, _, _ = _decode_command_frame(cmd)
+        op, _, num_forwards, _, _, _ = _decode_command_frame(cmd)
         assert op == OP_PREFILL
         assert num_forwards == 0
 
@@ -299,7 +324,7 @@ def test_session_handle_shutdown_sends_op_end_session() -> None:
         thread.start()
 
         cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
-        op, _, _, _, sid = _decode_command_frame(cmd)
+        op, _, _, _, sid, _ = _decode_command_frame(cmd)
         assert op == OP_END_SESSION
         assert sid == session.session_id
         _write_uint32s(drafter_side, [ACK_OK])
@@ -324,7 +349,7 @@ def test_session_handle_rejects_use_after_shutdown() -> None:
 
         def _shutdown_then_ack() -> None:
             cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
-            op, _, _, _, _ = _decode_command_frame(cmd)
+            op, _, _, _, _, _ = _decode_command_frame(cmd)
             assert op == OP_END_SESSION
             _write_uint32s(drafter_side, [ACK_OK])
 
@@ -350,7 +375,7 @@ def test_remote_transport_shutdown_sends_op_and_drains_executor() -> None:
 
         def _ack_shutdown() -> None:
             cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
-            op, _, _, _, _ = _decode_command_frame(cmd)
+            op, _, _, _, _, _ = _decode_command_frame(cmd)
             assert op == OP_SHUTDOWN
             _write_uint32s(drafter_side, [ACK_OK])
 
@@ -371,7 +396,7 @@ def test_remote_transport_rejects_use_after_shutdown() -> None:
     def _ack_shutdown() -> None:
         try:
             cmd = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
-            op, _, _, _, _ = _decode_command_frame(cmd)
+            op, _, _, _, _, _ = _decode_command_frame(cmd)
             assert op == OP_SHUTDOWN
             _write_uint32s(drafter_side, [ACK_OK])
         except (ConnectionError, OSError):
@@ -422,6 +447,7 @@ def test_drafter_serve_loop_handles_shutdown_immediately() -> None:
             num_forwards=0,
             trim_amount=0,
             session_id=SESSION_ID_NONE,
+            target_drafts_buffer_size=5,
         )
         _write_uint32s(target_sock, shutdown_frame)
 
@@ -457,6 +483,7 @@ def test_drafter_serve_loop_handles_end_session_for_unknown_session() -> None:
             num_forwards=0,
             trim_amount=0,
             session_id=99,
+            target_drafts_buffer_size=5,
         )
         shutdown_frame = _build_command_frame(
             op=OP_SHUTDOWN,
@@ -464,6 +491,7 @@ def test_drafter_serve_loop_handles_end_session_for_unknown_session() -> None:
             num_forwards=0,
             trim_amount=0,
             session_id=SESSION_ID_NONE,
+            target_drafts_buffer_size=5,
         )
         _write_uint32s(target_sock, end_frame)
         _write_uint32s(target_sock, shutdown_frame)
@@ -518,10 +546,50 @@ def test_drafter_serve_loop_rejects_op_for_unknown_session() -> None:
             num_forwards=0,
             trim_amount=2,
             session_id=42,
+            target_drafts_buffer_size=5,
         )
         _write_uint32s(target_sock, trim_frame)
 
         with pytest.raises(RuntimeError, match="OP_TRIM_CACHE for unknown session"):
+            drafter_serve_loop(
+                draft_model=None,  # pyright: ignore[reportArgumentType]
+                make_draft_cache=_empty_cache_factory,  # pyright: ignore[reportArgumentType]
+                num_draft_tokens=4,
+                sock=drafter_sock,
+            )
+    finally:
+        target_sock.close()
+        drafter_sock.close()
+
+
+def test_drafter_serve_loop_rejects_reverse_k_drift() -> None:
+    """``OP_FORWARD`` with mismatched buffer sizes (drafter K > target K) crashes.
+
+    Regression test for the reverse-drift wire desync: when the
+    drafter is configured with ``num_draft_tokens=4`` (buffer 5) but
+    the target is configured with ``num_draft_tokens=2`` (buffer 3),
+    the drafter would otherwise pad replies to 5 uint32s while the
+    target reads only 3, leaving 2 ints in the socket buffer to be
+    misinterpreted as part of the next command frame. The symmetric
+    drift guard catches this BEFORE the response is sent.
+    """
+    from exo.worker.engines.mlx.generator.remote_drafter import drafter_serve_loop
+
+    target_sock, drafter_sock = _socket_pair()
+    try:
+        # Target advertises K+1 = 3 (num_draft_tokens=2); drafter
+        # below is started with num_draft_tokens=4 (K+1 = 5).
+        forward_frame = _build_command_frame(
+            op=OP_FORWARD,
+            inputs=[1],
+            num_forwards=2,
+            trim_amount=0,
+            session_id=0,
+            target_drafts_buffer_size=3,
+        )
+        _write_uint32s(target_sock, forward_frame)
+
+        with pytest.raises(RuntimeError, match=r"OP_FORWARD wire-size mismatch"):
             drafter_serve_loop(
                 draft_model=None,  # pyright: ignore[reportArgumentType]
                 make_draft_cache=_empty_cache_factory,  # pyright: ignore[reportArgumentType]
