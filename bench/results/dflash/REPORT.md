@@ -27,7 +27,7 @@ The MoE 35B-A3B is particularly striking: it's the second-fastest
 target-only generation of the three (because only ~3B params are
 active per token), yet DFlash still delivers a 4.30x speedup on top
 of that fast baseline. The combination yields **377 t/s steady-state
-generation on a 35B-class model on a single MacBook Pro M3 Ultra**.
+generation on a 35B-class model on a single MacBook Pro M5 Max**.
 
 The 122B-A10B result is the first end-to-end DFlash measurement on a
 multi-node tensor-parallel placement. The coupled-drafter dispatch

@@ -5,7 +5,7 @@ target's `coupled_drafter` declared in the model card) on a single
 wc-smbp host, post Phase 3 ship of `Drafter` + `CoupledModelDrafter`.
 
 ## Hardware / software
-- Host: `wc-smbp` (Apple silicon, 128 GB unified memory)
+- Host: `wc-smbp` (Apple M5 Max MacBook Pro, 128 GB unified memory)
 - Branch: `team-wcv/main` @ `ed3897f7` (Phase 3 cards merged)
 - mlx-vlm: 0.5.0
 - Generation backend: `MlxRingInstance`, single device, pipeline sharding
