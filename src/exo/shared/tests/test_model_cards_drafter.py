@@ -257,16 +257,26 @@ def test_coupled_drafter_composes_with_standard_drafter_list() -> None:
     assert rehydrated.coupled_drafter == coupled
 
 
-@pytest.mark.asyncio
-async def test_shipped_gemma4_cards_omit_coupled_drafter_in_phase1() -> None:
-    """Gate against accidentally landing card updates in the Phase-1 PR.
+_GEMMA4_MTP_DRAFTER = ModelId("mlx-community/gemma-4-E2B-it-assistant-bf16")
 
-    Updating shipped Gemma 4 cards to declare ``coupled_drafter`` is the job
-    of Phase 3 (cards + placement + smoke), once the loader (Phase 2) can
-    actually consume the field. Landing the card update earlier would cause
-    the loader to silently ignore the field on every Phase-1 deployment,
-    masking real bugs in the Phase-2 dispatch logic when it eventually ships.
-    This test removes itself in Phase 3.
+
+@pytest.mark.asyncio
+async def test_shipped_gemma4_cards_declare_mtp_coupled_drafter() -> None:
+    """All shipped Gemma 4 31B / 26B-A4B cards point at the MTP assistant drafter.
+
+    Phase-3 contract: every Gemma 4 large-target quant ships a
+    ``coupled_drafter`` set to the bf16 MTP assistant
+    (``gemma-4-E2B-it-assistant-bf16``). The drafter is published only as
+    bf16 by the upstream because it's a 78M-parameter model where
+    quantisation pressure on the wired-memory pool is negligible
+    (~158 MB total) and quant noise materially hurts the acceptance rate
+    that drives the speedup. Quantised target × bf16 coupled drafter is
+    the supported pairing.
+
+    Pinning every shipped quant on this single drafter id lets a single
+    download (cached the first time any Gemma 4 card runs MTP) serve every
+    Gemma-4 large quant on the same node, which is the right behaviour
+    for a fleet that ships several quants of the same family side-by-side.
     """
     cards = {card.model_id: card for card in await get_model_cards()}
     for target_str in {
@@ -274,9 +284,43 @@ async def test_shipped_gemma4_cards_omit_coupled_drafter_in_phase1() -> None:
         *_gemma4_26b_expectations(),
     }:
         target_id = ModelId(target_str)
-        if target_id not in cards:
-            continue
-        assert cards[target_id].coupled_drafter is None, (
-            f"{target_id} declares coupled_drafter in shipped TOML; that "
-            "should land in the Phase 3 PR after the loader can consume it."
+        assert target_id in cards, f"{target_id} card missing"
+        card = cards[target_id]
+        assert card.coupled_drafter == _GEMMA4_MTP_DRAFTER, (
+            f"{target_id} coupled_drafter mismatch: got "
+            f"{card.coupled_drafter!r}, expected {_GEMMA4_MTP_DRAFTER!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_shipped_gemma4_cards_keep_standard_drafter_list_alongside_mtp() -> None:
+    """Phase-3 cards keep ``drafter_model_ids`` populated next to ``coupled_drafter``.
+
+    The two drafter paths are complementary, not exclusive:
+    - On a single-node placement (``drafter_placement is None``) the
+      worker tries the coupled MTP drafter first (``utils_mlx.load_mlx_items``).
+    - On an asymmetric placement (``drafter_placement is not None``,
+      driven by populated ``drafter_eligible_nodes``) the coupled path is
+      bypassed and the standard external drafter list is used because
+      coupled drafters can't ship hidden states / KV across the wire
+      cheaply. Removing ``drafter_model_ids`` would silently disable
+      drafting for every cluster that has ``drafter_eligible_nodes``
+      populated -- a mode regression we want to prevent at the card
+      level.
+
+    This test pins both lists side-by-side so a future "simplification"
+    PR doesn't drop the standard drafters under the assumption that
+    MTP supersedes them.
+    """
+    cards = {card.model_id: card for card in await get_model_cards()}
+    for target_str, expected_drafters in {
+        **_gemma4_31b_expectations(),
+        **_gemma4_26b_expectations(),
+    }.items():
+        target_id = ModelId(target_str)
+        assert target_id in cards, f"{target_id} card missing"
+        card = cards[target_id]
+        assert card.coupled_drafter == _GEMMA4_MTP_DRAFTER
+        assert card.drafter_model_ids == [ModelId(d) for d in expected_drafters], (
+            f"{target_id} drafter_model_ids mismatch: got {card.drafter_model_ids!r}"
         )
