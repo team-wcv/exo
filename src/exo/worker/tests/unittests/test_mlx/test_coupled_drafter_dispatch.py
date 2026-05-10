@@ -36,6 +36,7 @@ from exo.worker.engines.mlx.generator.coupled_drafter import (
 )
 from exo.worker.engines.mlx.generator.drafter import Drafter
 from exo.worker.engines.mlx.types import KVCacheType, Model
+from exo.worker.engines.mlx.utils_mlx import CoupledDrafter
 from exo.worker.engines.mlx.vendor.gemma4_mtp_hooks import attach_mtp_hooks
 
 # --------------------------------------------------------------------------- #
@@ -487,3 +488,122 @@ def test_metrics_after_stream_reflects_round_count() -> None:
     )
     # block_size=4 → 3 drafts proposed per round.
     assert metrics["proposed_draft_tokens"] == metrics["spec_decode_rounds"] * 3
+
+
+# --------------------------------------------------------------------------- #
+# Coupled telemetry gating (Codex P2 PR #25 round-(N+1))
+# --------------------------------------------------------------------------- #
+
+
+class TestResolveCoupledDrafterTelemetry:
+    """Pin the contract of :func:`_resolve_coupled_drafter_telemetry`.
+
+    Codex P2 (PR #25 round-(N+1), generate.py:1710): the telemetry
+    block in :func:`mlx_generate` previously gated coupled-drafter
+    fields on the RESOURCE signal (``coupled_drafter_active`` --
+    "we loaded a coupled drafter and the request resolved to
+    ``draft_mode='model'``"). When the loaded coupled drafter's
+    kind is one we don't yet drive (``"dflash"`` today), the
+    dispatch falls back to ``make_drafter(mode='none')`` and runs
+    no speculation, so the telemetry must reflect that fallback.
+    The helper extracted in this commit gates on the DISPATCH
+    signal (``coupled_dispatch_fired``) so a loaded-but-not-
+    dispatched coupled drafter never leaks ``drafter_model_id`` /
+    ``drafter_kind`` / ``num_draft_tokens`` onto a request that
+    actually ran with ``draft_mode='none'``.
+    """
+
+    @staticmethod
+    def _make_coupled_drafter(kind: str) -> CoupledDrafter:
+        from exo.shared.types.common import ModelId
+        from exo.worker.engines.mlx.utils_mlx import CoupledDrafterKind
+
+        return CoupledDrafter(
+            model_id=ModelId("mlx-community/coupled-test-drafter"),
+            kind=cast("CoupledDrafterKind", kind),
+            model=object(),
+        )
+
+    def test_dispatch_fired_returns_telemetry(self) -> None:
+        from exo.worker.engines.mlx.generator.generate import (
+            _resolve_coupled_drafter_telemetry,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        coupled = self._make_coupled_drafter("mtp")
+        drafter_id, drafter_kind, num_draft_tokens = (
+            _resolve_coupled_drafter_telemetry(
+                coupled_dispatch_fired=True,
+                coupled_drafter=coupled,
+                effective_num_draft_tokens=4,
+            )
+        )
+        assert drafter_id == "mlx-community/coupled-test-drafter"
+        assert drafter_kind == "mtp"
+        assert num_draft_tokens == 4
+
+    def test_dispatch_not_fired_zeros_telemetry_even_with_loaded_drafter(
+        self,
+    ) -> None:
+        """The fallback path: ``coupled_drafter`` is loaded (e.g.
+        the loader produced a ``"dflash"`` drafter), but dispatch
+        chose ``make_drafter(mode='none')`` because the kind is
+        unwired. Coupled telemetry must be zeroed so
+        ``GenerationStats`` doesn't misattribute the request.
+        """
+        from exo.worker.engines.mlx.generator.generate import (
+            _resolve_coupled_drafter_telemetry,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        coupled = self._make_coupled_drafter("dflash")
+        drafter_id, drafter_kind, num_draft_tokens = (
+            _resolve_coupled_drafter_telemetry(
+                coupled_dispatch_fired=False,
+                coupled_drafter=coupled,
+                effective_num_draft_tokens=4,
+            )
+        )
+        assert drafter_id is None, (
+            "coupled fallback (dispatch did not fire) must NOT stamp "
+            "drafter_model_id"
+        )
+        assert drafter_kind is None, (
+            "coupled fallback must NOT stamp drafter_kind -- pre-fix this "
+            "leaked 'dflash' onto draft_mode='none' requests"
+        )
+        assert num_draft_tokens is None, (
+            "coupled fallback must NOT stamp num_draft_tokens -- the "
+            "fallback runs no speculation"
+        )
+
+    def test_no_coupled_drafter_loaded_zeros_telemetry(self) -> None:
+        """Standard / pipelined / ngram / none requests don't carry a
+        coupled drafter; helper returns the empty tuple so the
+        caller falls through to its other branches.
+        """
+        from exo.worker.engines.mlx.generator.generate import (
+            _resolve_coupled_drafter_telemetry,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        result = _resolve_coupled_drafter_telemetry(
+            coupled_dispatch_fired=False,
+            coupled_drafter=None,
+            effective_num_draft_tokens=4,
+        )
+        assert result == (None, None, None)
+
+    def test_dispatch_fired_with_no_drafter_is_defensive_zero(self) -> None:
+        """The dispatch signal can't be ``True`` while ``coupled_drafter
+        is None`` in the production code path, but the helper still
+        defends against it: returning the empty tuple is safer than
+        constructing an ``str(None)`` model id.
+        """
+        from exo.worker.engines.mlx.generator.generate import (
+            _resolve_coupled_drafter_telemetry,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        result = _resolve_coupled_drafter_telemetry(
+            coupled_dispatch_fired=True,
+            coupled_drafter=None,
+            effective_num_draft_tokens=4,
+        )
+        assert result == (None, None, None)
