@@ -59,6 +59,7 @@ from exo.worker.engines.mlx.vendor.gemma4_mtp_hooks import (
     gemma4_mtp_forward,
     gemma4_rollback_speculative_cache,
     has_mtp_hooks,
+    resolve_gemma4_text_model,
 )
 
 if TYPE_CHECKING:
@@ -149,8 +150,22 @@ class Gemma4MTPTargetAdapter:
     ``mx.eval`` / cache-resizing as before.
     """
 
-    def __init__(self, target_model: Gemma4Model) -> None:
-        if not has_mtp_hooks(target_model):
+    def __init__(self, target_model: object) -> None:
+        # Accept either ``mlx_lm.models.gemma4_text.Model`` directly or
+        # the multimodal ``mlx_lm.models.gemma4.Model`` wrapper that
+        # exposes the LM under ``.language_model``. Vision-capable
+        # checkpoints (e.g. ``gemma-4-26b-a4b-it-4bit``) load as the
+        # latter; the adapter's hooks operate on the inner LM either
+        # way, so we resolve once at construction time.
+        inner = resolve_gemma4_text_model(target_model)
+        if inner is None:
+            raise TypeError(
+                "Gemma4MTPTargetAdapter expected a Gemma 4 target "
+                "(``mlx_lm.models.gemma4_text.Model`` directly, or a "
+                "multimodal wrapper exposing it via ``.language_model``); "
+                f"got {type(target_model).__name__!r}."
+            )
+        if not has_mtp_hooks(inner):
             # The hook attach is gated by ``utils_mlx.load_mlx_items`` --
             # if we got here without the attach call, the loader's
             # post-load wiring drifted from this dispatch.
@@ -159,7 +174,7 @@ class Gemma4MTPTargetAdapter:
                 "MTP hooks; call attach_mtp_hooks(target) at load time. "
                 "This is a runtime guard against loader/dispatch drift."
             )
-        self._target: Gemma4Model = target_model
+        self._target: Gemma4Model = inner
 
     @property
     def target(self) -> Gemma4Model:
