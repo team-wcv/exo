@@ -61,26 +61,50 @@ The collective overhead per round is two small ``all_sum`` calls
 (drafts ``k+1`` ints, target tokens ``k+1`` ints) -- microsecond-
 range on Thunderbolt RDMA, negligible against the verify forward.
 
-Known limitation: drafter-rank death mid-generation
-----------------------------------------------------
+Recovery: drafter-rank death mid-generation
+-------------------------------------------
 If the drafter rank crashes between rounds, root's
-``transport.forward`` raises ``ConnectionError`` and root's
-``mlx_generate`` exits via the request-level ``finally`` (which
-shuts the broken session down cleanly). Non-root target ranks are
-blocked inside :func:`_broadcast_drafts` waiting for root to feed
-drafts; they have no out-of-band signal that root has aborted, so
-they hang on the collective until the runner is restarted.
+``transport.forward`` raises :class:`OSError` (subclassed as
+``ConnectionError`` / ``BrokenPipeError`` depending on which side
+closed). The recovery is layered:
 
-This is the same failure mode as any target-side rank death (the
-TP collective stalls the survivors), and the operator-restart
-recovery path is identical. A follow-up could thread a
-"termination sentinel" through the existing length-prefix slot
-(which has unused encoding space above ``k``) so root broadcasts
-one final aborted-round signal before exiting; non-root ranks
-would then exit cleanly. Out of scope for the current pass --
-drafter death is rare in the operator-managed deployment we
-target, and the existing failure mode is fail-loud rather than
-silent corruption.
+  1. **Within-request abort** (this module). Before re-raising, the
+     :func:`_pipelined_speculative_step` wrapper broadcasts
+     :data:`DRAFT_ABORT_SENTINEL` on the draft channel. Non-root
+     ranks decode the sentinel inside :func:`_broadcast_drafts` and
+     raise :class:`DrafterAbortedError`, exiting their spec loop in
+     lockstep with root rather than blocking on a next-round
+     broadcast that will never arrive. The
+     :class:`exo.worker.engines.mlx.generator.remote_drafter.RemoteTransport`
+     also flips a sticky ``is_failed`` flag so subsequent
+     :meth:`open_session` calls fail fast instead of allocating a
+     new spec session on a dead wire.
+
+  2. **Cross-request teardown** (control plane). The runner
+     subprocess that owned the failed transport surfaces the
+     exception out of ``mlx_generate``, the runner crashes, the
+     supervisor reports :class:`RunnerFailed`, and the master's
+     worker-plan ``_kill_runner`` rule shuts every peer rank down
+     in the same instance. A fresh placement is re-issued on the
+     next planning tick.
+
+  3. **Drafter-node disconnect** (control plane). When the drafter
+     *node* goes offline (rather than the drafter *process*), the
+     master's instance-deletion loop iterates
+     ``instance.all_node_to_runner`` (target + drafter) and emits
+     :class:`InstanceDeleted` once the drafter node leaves
+     ``connected_node_ids``. Workers pick up the deletion in the
+     usual plan tick. Total time-to-recovery is bounded by the
+     master's ``node_inactivity_timeout`` (5 s) plus the
+     supervisor's SIGTERM/SIGKILL escalation budget (worst case
+     ~25 s), the same envelope as a target-rank crash.
+
+Target-rank death (a peer target rank in the TP subgroup) takes
+the same path as case 3 above: the master's instance-deletion
+loop already covered ``shard_assignments.node_to_runner``; the
+worker plan's ``_kill_runner`` rule gossips ``RunnerFailed``
+across the surviving ranks and the supervisor SIGKILL chain
+unblocks any in-flight TP collectives.
 
 Cache accounting (drafter side) -- this is the only complex bit, so
 spelled out here once and referenced from the code:
@@ -129,8 +153,11 @@ a bug, please flag it.
 
 from __future__ import annotations
 
+import contextlib
+import os as _diag_os
+import sys as _diag_sys
 import time
-from typing import Callable, Generator, Sequence, cast, final
+from typing import Callable, Final, Generator, Sequence, Sized, cast, final
 
 import mlx.core as mx
 from mlx_lm.generate import GenerationResponse
@@ -143,7 +170,66 @@ from exo.worker.engines.mlx.generator.drafter_transport import (
     DraftFuture,
 )
 from exo.worker.engines.mlx.types import KVCacheType, Model
-from exo.worker.engines.mlx.utils_mlx import mx_broadcast_int_list
+from exo.worker.engines.mlx.utils_mlx import (
+    TargetPeerFanout,
+    mx_broadcast_int_list,
+    target_peer_broadcast_int_list,
+)
+from exo.worker.runner.bootstrap import logger as _diag_logger
+
+# Per-round spec-decode diagnostics. Off by default; set
+# ``EXO_SPEC_DIAG=1`` to enable. When enabled, each call writes both
+# to loguru and to ``/tmp/spec_diag_<pid>.log`` so diagnostics survive
+# whatever's swallowing the runner subprocess's stdout (loguru
+# forwarding has been observed to drop on some nodes in our cluster).
+#
+# Added during gemma-4 asymmetric-drafter bring-up to localize a
+# TP-collective deadlock; the hooks are kept (gated) so future
+# correctness regressions can be isolated quickly without redeploying
+# with new logging.
+_SPEC_DIAG_ENABLED: Final[bool] = _diag_os.environ.get("EXO_SPEC_DIAG", "") in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _spec_diag(message: str) -> None:
+    """Emit a spec-decode diagnostic line. No-op unless ``EXO_SPEC_DIAG``."""
+    if not _SPEC_DIAG_ENABLED:
+        return
+    _diag_logger.info(message)
+    try:
+        path = f"/tmp/spec_diag_{_diag_os.getpid()}.log"
+        with open(path, "a", encoding="utf-8") as fh:
+            _ = fh.write(f"{time.time():.6f} {message}\n")
+    except OSError:
+        try:
+            _ = _diag_sys.stderr.write(f"[spec-diag fallback] {message}\n")
+            _diag_sys.stderr.flush()
+        except OSError:
+            pass
+
+
+# Length-prefix slot value reserved for the "drafter aborted" signal.
+# Picked from the int32 positive range so it survives
+# ``_validate_broadcast_values`` (well above any legitimate ``K``,
+# below ``_MX_BROADCAST_MAX_VALUE`` so the validator accepts it).
+DRAFT_ABORT_SENTINEL: Final[int] = (1 << 31) - 2
+
+
+@final
+class DrafterAbortedError(RuntimeError):
+    """Raised by non-root target ranks when root signals draft abort.
+
+    Root encodes :data:`DRAFT_ABORT_SENTINEL` in the broadcast
+    length-prefix slot when its ``transport.forward()`` raises
+    (drafter rank crashed, socket dropped, etc). Non-root ranks
+    decode the sentinel inside :func:`_broadcast_drafts` and raise
+    this exception so the spec loop on every rank exits in lockstep,
+    rather than non-root hanging forever on the next-round draft
+    broadcast that root will never send.
+    """
 
 
 def _get_eos_ids(tokenizer: TokenizerWrapper) -> list[int]:
@@ -151,6 +237,63 @@ def _get_eos_ids(tokenizer: TokenizerWrapper) -> list[int]:
     if eos is None:
         return []
     return eos
+
+
+def _get_tokenizer_vocab_size(tokenizer: TokenizerWrapper) -> int | None:
+    """Return the *full* tokenizer vocabulary size including added tokens.
+
+    Used by the spec-decode loop as an early sanity check on emitted
+    token ids: anything outside ``[0, vocab_size)`` cannot have come
+    from a clean broadcast (the sampler and drafter both produce ids
+    in that range), so it always points at a wire-level corruption
+    upstream. Returns ``None`` when the tokenizer doesn't expose a
+    vocab size (extremely defensive; mlx_lm tokenizers do).
+
+    Important: HuggingFace fast tokenizers expose ``vocab_size`` as the
+    *base* vocabulary, which excludes added tokens (chat templates,
+    EOS, control tokens). Using ``vocab_size`` alone made this guard
+    misclassify legitimate added tokens as wire corruption and
+    crash the runner. We therefore prefer:
+
+    1. ``len(tokenizer)`` -- the canonical HF API for the full
+       vocabulary including added tokens.
+    2. ``vocab_size + len(get_added_vocab())`` -- explicit added-token
+       sum when the tokenizer-wrapper hides ``__len__``.
+    3. ``max(vocab.values()) + 1`` -- last-resort scan over the
+       internal vocab map (slow path, but used only on tokenizers
+       that don't expose either of the above).
+    4. ``vocab_size`` -- only when nothing else is available; this
+       falls back to the original behaviour and may incorrectly
+       flag added tokens, but is still better than disabling the
+       guard entirely.
+    """
+    inner: object = getattr(tokenizer, "_tokenizer", None)
+    if inner is None:
+        return None
+    try:
+        full_len = len(cast("Sized", inner))
+    except TypeError:
+        full_len = None
+    if isinstance(full_len, int) and full_len > 0:
+        return full_len
+    base: int | None = None
+    raw_base: object = getattr(inner, "vocab_size", None)
+    if isinstance(raw_base, int) and raw_base > 0:
+        base = raw_base
+    added: int = 0
+    get_added = getattr(inner, "get_added_vocab", None)
+    if callable(get_added):
+        try:
+            added_vocab = cast("dict[object, object]", get_added())
+            added = len(added_vocab)
+        except Exception:
+            added = 0
+    if base is not None:
+        return base + added
+    vocab: object = getattr(inner, "vocab", None)
+    if isinstance(vocab, dict) and vocab:
+        return max(cast("dict[object, int]", vocab).values()) + 1
+    return None
 
 
 def _process_logits_for_position(
@@ -192,6 +335,7 @@ class PipelinedModelDrafter:
         transport: DrafterTransport | None,
         num_draft_tokens: int,
         target_group: mx.distributed.Group | None = None,
+        target_peer_fanout: TargetPeerFanout | None = None,
         is_target_root: bool = True,
     ) -> None:
         if num_draft_tokens < 1:
@@ -224,7 +368,18 @@ class PipelinedModelDrafter:
         self._transport = transport
         self._num_draft_tokens = num_draft_tokens
         self._target_group = target_group
+        self._target_peer_fanout = target_peer_fanout
         self._is_target_root = is_target_root
+        # Per-request spec-decode telemetry. Mutated in place by the
+        # spec body each round; read by ``mlx_generate`` after streaming
+        # completes to populate ``GenerationStats``. Single-request
+        # lifecycle (a fresh drafter is built per request in
+        # ``mlx_generate``), so no thread-safety concerns.
+        self._metrics: dict[str, int] = {
+            "proposed_draft_tokens": 0,
+            "accepted_draft_tokens": 0,
+            "spec_decode_rounds": 0,
+        }
 
     @property
     def mode(self) -> DraftMode:
@@ -233,6 +388,18 @@ class PipelinedModelDrafter:
     @property
     def num_draft_tokens(self) -> int:
         return self._num_draft_tokens
+
+    def metrics(self) -> dict[str, int]:
+        """Snapshot of accumulated spec-decode metrics for this request.
+
+        Keys: ``proposed_draft_tokens`` (total drafts proposed across all
+        rounds), ``accepted_draft_tokens`` (drafts the target accepted),
+        ``spec_decode_rounds`` (rounds executed). Acceptance rate is
+        ``accepted / proposed`` when ``proposed > 0``. Counters reset on
+        each new request via the per-request drafter construction in
+        ``mlx_generate``; mutate in lockstep with the spec loop.
+        """
+        return dict(self._metrics)
 
     def stream(
         self,
@@ -260,7 +427,9 @@ class PipelinedModelDrafter:
             num_draft_tokens=self._num_draft_tokens,
             prefill_step_size=prefill_step_size,
             target_group=self._target_group,
+            target_peer_fanout=self._target_peer_fanout,
             is_target_root=self._is_target_root,
+            metrics=self._metrics,
         )
 
     def shutdown(self) -> None:
@@ -283,7 +452,9 @@ def _pipelined_stream_generate(
     num_draft_tokens: int,
     prefill_step_size: int,
     target_group: mx.distributed.Group | None = None,
+    target_peer_fanout: TargetPeerFanout | None = None,
     is_target_root: bool = True,
+    metrics: dict[str, int] | None = None,
 ) -> Generator[GenerationResponse, None, None]:
     """Mirror of ``mlx_lm.stream_generate`` framing for the pipelined drafter.
 
@@ -294,6 +465,12 @@ def _pipelined_stream_generate(
     detokenizer = tokenizer.detokenizer
     detokenizer.reset()  # type: ignore[reportUnknownMemberType]
     eos_ids = _get_eos_ids(tokenizer)
+    # Vocab bound for early surfacing of broadcast corruption.
+    # ``add_token`` would otherwise blow up deep inside the SPM
+    # detokenizer with ``IndexError: list index out of range`` and
+    # the operator has to dig through the mlx_lm internals to learn
+    # which token id was bogus.
+    vocab_size = _get_tokenizer_vocab_size(tokenizer)
 
     token_iter = _pipelined_speculative_step(
         prompt=prompt,
@@ -307,7 +484,9 @@ def _pipelined_stream_generate(
         prefill_step_size=prefill_step_size,
         prompt_token_count=len(context_tokens),
         target_group=target_group,
+        target_peer_fanout=target_peer_fanout,
         is_target_root=is_target_root,
+        metrics=metrics,
     )
 
     prompt_size = len(context_tokens)
@@ -326,6 +505,15 @@ def _pipelined_stream_generate(
         if token in eos_ids:
             finish_reason = "stop"
             break
+        if vocab_size is not None and not 0 <= token < vocab_size:
+            raise RuntimeError(
+                f"pipelined drafter emitted token id {token} outside "
+                f"tokenizer vocab [0, {vocab_size}); "
+                "this is a wire-protocol bug in the spec-decode "
+                "broadcast path (cross-stream JACCL collision or "
+                "rank divergence). The runner will crash and the "
+                "supervisor will rebuild the instance."
+            )
         detokenizer.add_token(token)  # type: ignore[reportUnknownMemberType]
         if (n + 1) == max_tokens:
             finish_reason = "length"
@@ -360,11 +548,41 @@ def _pipelined_stream_generate(
     )
 
 
+def _broadcast_int_list(
+    payload: list[int] | None,
+    *,
+    length: int,
+    target_group: mx.distributed.Group | None,
+    target_peer_fanout: TargetPeerFanout | None,
+    is_root: bool,
+) -> list[int]:
+    """Pick the correct fixed-length int broadcast for the active wiring.
+
+    Multi-target asymmetric placements ride
+    :func:`target_peer_broadcast_int_list` (TCP fanout, immune to
+    JACCL int/float wire conflation). Every other path -- single-rank
+    targets, symmetric multi-rank without a drafter, test fakes that
+    bring up a ``mx.distributed.Group`` without populating a fanout
+    -- falls through to :func:`mx_broadcast_int_list`. The fallback
+    is correct in those cases because the JACCL bug only manifests
+    when the spec-decode int broadcasts interleave with the model's
+    TP ``all_sum`` collectives on the same group; without spec
+    decode (no drafter) or without a multi-rank target (no TP
+    collectives) the interleaving cannot happen.
+    """
+    if target_peer_fanout is not None:
+        return target_peer_broadcast_int_list(
+            payload, length, target_peer_fanout, is_root=is_root
+        )
+    return mx_broadcast_int_list(payload, length, target_group, is_root=is_root)
+
+
 def _broadcast_drafts(
     drafts: list[int] | None,
     *,
     k: int,
     target_group: mx.distributed.Group | None,
+    target_peer_fanout: TargetPeerFanout | None,
     is_root: bool,
 ) -> list[int]:
     """Rank-0 broadcast of a draft list, padded to ``k`` slots + length prefix.
@@ -380,7 +598,7 @@ def _broadcast_drafts(
     ``drafts`` on the root and is a programming error elsewhere (the
     consumer rank must always have a group to receive on).
     """
-    if target_group is None:
+    if target_group is None and target_peer_fanout is None:
         if not is_root or drafts is None:
             raise RuntimeError("non-root broadcast consumer requires target_group")
         return list(drafts)
@@ -393,15 +611,66 @@ def _broadcast_drafts(
                 "transport must clamp before broadcasting"
             )
         payload = [len(drafts)] + list(drafts) + [0] * (k - len(drafts))
-        broadcast = mx_broadcast_int_list(payload, k + 1, target_group, is_root=True)
+        broadcast = _broadcast_int_list(
+            payload,
+            length=k + 1,
+            target_group=target_group,
+            target_peer_fanout=target_peer_fanout,
+            is_root=True,
+        )
     else:
-        broadcast = mx_broadcast_int_list(None, k + 1, target_group, is_root=False)
+        broadcast = _broadcast_int_list(
+            None,
+            length=k + 1,
+            target_group=target_group,
+            target_peer_fanout=target_peer_fanout,
+            is_root=False,
+        )
     actual_len = broadcast[0]
+    if actual_len == DRAFT_ABORT_SENTINEL:
+        # Root has flagged a drafter-side failure (see
+        # :func:`_broadcast_abort`). Surface a typed exception so the
+        # spec loop on this rank exits in lockstep with root rather
+        # than waiting on the next-round broadcast that won't arrive.
+        raise DrafterAbortedError(
+            "drafter aborted; root signalled abort via length-prefix "
+            "sentinel after a transport-side failure"
+        )
     if actual_len < 0 or actual_len > k:
         raise RuntimeError(
             f"draft broadcast decoded invalid length {actual_len} (buffer {broadcast})"
         )
     return broadcast[1 : 1 + actual_len]
+
+
+def _broadcast_abort(
+    *,
+    k: int,
+    target_group: mx.distributed.Group | None,
+    target_peer_fanout: TargetPeerFanout | None,
+) -> None:
+    """Root-only: broadcast the abort sentinel on the draft channel.
+
+    Encodes :data:`DRAFT_ABORT_SENTINEL` as the length-prefix of an
+    otherwise-zero ``k + 1`` int payload, matching the wire shape of
+    a normal :func:`_broadcast_drafts` round so non-root ranks
+    decode it on the same fixed-size collective they were already
+    waiting on. Non-root surfaces it as :class:`DrafterAbortedError`.
+
+    Single-rank short-circuit (``target_group is None``): no peers
+    to notify, so this is a no-op. The local rank still re-raises
+    the underlying transport exception that triggered the abort.
+    """
+    if target_group is None and target_peer_fanout is None:
+        return
+    payload = [DRAFT_ABORT_SENTINEL] + [0] * k
+    _ = _broadcast_int_list(
+        payload,
+        length=k + 1,
+        target_group=target_group,
+        target_peer_fanout=target_peer_fanout,
+        is_root=True,
+    )
 
 
 def _broadcast_target_tokens(
@@ -410,6 +679,7 @@ def _broadcast_target_tokens(
     k: int,
     k_this: int,
     target_group: mx.distributed.Group | None,
+    target_peer_fanout: TargetPeerFanout | None,
     is_root: bool,
 ) -> list[int]:
     """Rank-0 broadcast of post-verify sampled tokens, slot count ``k + 1``.
@@ -431,7 +701,7 @@ def _broadcast_target_tokens(
     Single-rank short-circuit (``target_group is None``): identity on
     root; programming error on consumer (no broadcast peer).
     """
-    if target_group is None:
+    if target_group is None and target_peer_fanout is None:
         if not is_root or target_tokens is None:
             raise RuntimeError("non-root broadcast consumer requires target_group")
         if len(target_tokens) != k_this + 1:
@@ -451,9 +721,21 @@ def _broadcast_target_tokens(
                 "emits exactly that many tokens per round"
             )
         payload = list(target_tokens) + [0] * (k - k_this)
-        broadcast = mx_broadcast_int_list(payload, k + 1, target_group, is_root=True)
+        broadcast = _broadcast_int_list(
+            payload,
+            length=k + 1,
+            target_group=target_group,
+            target_peer_fanout=target_peer_fanout,
+            is_root=True,
+        )
     else:
-        broadcast = mx_broadcast_int_list(None, k + 1, target_group, is_root=False)
+        broadcast = _broadcast_int_list(
+            None,
+            length=k + 1,
+            target_group=target_group,
+            target_peer_fanout=target_peer_fanout,
+            is_root=False,
+        )
     return broadcast[: k_this + 1]
 
 
@@ -470,7 +752,79 @@ def _pipelined_speculative_step(
     prefill_step_size: int,
     prompt_token_count: int,
     target_group: mx.distributed.Group | None = None,
+    target_peer_fanout: TargetPeerFanout | None = None,
     is_target_root: bool = True,
+    metrics: dict[str, int] | None = None,
+) -> Generator[tuple[int, mx.array, bool], None, None]:
+    """Public spec-step generator with drafter-failure recovery.
+
+    Wraps :func:`_pipelined_speculative_step_body` so that any
+    :class:`OSError` originating from the drafter wire on the root
+    rank (socket close, broken pipe, peer reset, etc.) also
+    broadcasts :data:`DRAFT_ABORT_SENTINEL` to non-root target
+    ranks. Non-root decodes it inside :func:`_broadcast_drafts`
+    and raises :class:`DrafterAbortedError`, exiting the spec loop
+    in lockstep with root. Without this wrap, root would re-raise
+    cleanly while non-root sat indefinitely on the next-round
+    draft broadcast that root will never send.
+
+    Non-root and single-rank placements pass through unchanged:
+    non-root never touches the transport (so there is nothing to
+    abort from); :func:`_broadcast_abort` short-circuits when
+    ``target_group is None`` (no peers to notify). The local rank
+    re-raises the underlying exception in both cases.
+    """
+    inner = _pipelined_speculative_step_body(
+        prompt=prompt,
+        model=model,
+        transport=transport,
+        prompt_cache=prompt_cache,
+        max_tokens=max_tokens,
+        sampler=sampler,
+        logits_processors=logits_processors,
+        num_draft_tokens=num_draft_tokens,
+        prefill_step_size=prefill_step_size,
+        prompt_token_count=prompt_token_count,
+        target_group=target_group,
+        target_peer_fanout=target_peer_fanout,
+        is_target_root=is_target_root,
+        metrics=metrics,
+    )
+    try:
+        yield from inner
+    except OSError:
+        if is_target_root:
+            # Recovery best-effort: if the abort broadcast itself
+            # fails (e.g. ``target_group`` is also dead), the
+            # supervisor SIGKILL chain still tears non-root
+            # runners down via the master's instance-deletion
+            # path. Suppression keeps the original ``OSError``
+            # intact for the caller's traceback.
+            with contextlib.suppress(Exception):
+                _broadcast_abort(
+                    k=num_draft_tokens,
+                    target_group=target_group,
+                    target_peer_fanout=target_peer_fanout,
+                )
+        raise
+
+
+def _pipelined_speculative_step_body(
+    *,
+    prompt: mx.array,
+    model: Model,
+    transport: DrafterTransport | None,
+    prompt_cache: KVCacheType,
+    max_tokens: int,
+    sampler: Callable[[mx.array], mx.array],
+    logits_processors: list[Callable[[mx.array, mx.array], mx.array]],
+    num_draft_tokens: int,
+    prefill_step_size: int,
+    prompt_token_count: int,
+    target_group: mx.distributed.Group | None = None,
+    target_peer_fanout: TargetPeerFanout | None = None,
+    is_target_root: bool = True,
+    metrics: dict[str, int] | None = None,
 ) -> Generator[tuple[int, mx.array, bool], None, None]:
     """Cross-round speculative decoding loop using ``transport``.
 
@@ -513,18 +867,42 @@ def _pipelined_speculative_step(
     k = num_draft_tokens
     y = prompt.astype(mx.uint32)
 
+    _diag_rank = (
+        target_group.rank()
+        if target_group is not None
+        else (0 if is_target_root else -1)
+    )
+    _spec_diag(
+        f"rank {_diag_rank}: spec body entered "
+        f"(prompt size={int(prompt.size)}, k={k}, root={is_target_root})"
+    )
+
     # Mirror mlx_lm._prefill: caller has aligned ``prompt_cache`` to
     # ``context_tokens[:-2]`` via ``exo.prefill`` + ``trim(2)``; this loop
     # advances the cache by one more token, leaving ``y`` (length 1) as
     # the seed for the spec loop.
+    _diag_prefill_iters = 0
     while y.size > 1:
+        _diag_prefill_t0 = time.perf_counter()
         n_to_process = min(prefill_step_size, y.size - 1)
         model(y[:n_to_process][None], cache=prompt_cache)
         mx.eval([c.state for c in prompt_cache])  # type: ignore[reportArgumentType]
         y = y[n_to_process:]
         mx.clear_cache()
+        _spec_diag(
+            f"rank {_diag_rank}: spec-body prefill iter "
+            f"{_diag_prefill_iters} done in "
+            f"{(time.perf_counter() - _diag_prefill_t0) * 1000:.1f}ms "
+            f"(remaining y.size={int(y.size)})"
+        )
+        _diag_prefill_iters += 1
 
+    _diag_seed_t0 = time.perf_counter()
     seed = int(y.item())
+    _spec_diag(
+        f"rank {_diag_rank}: seed materialized in "
+        f"{(time.perf_counter() - _diag_seed_t0) * 1000:.1f}ms (seed={seed})"
+    )
     # ``prev_tokens`` carries the running token sequence (prompt +
     # emitted) so logits processors with state see consistent context.
     # Mirror :func:`drafter._ngram_speculative_step`: start from prompt.
@@ -536,16 +914,40 @@ def _pipelined_speculative_step(
     # drafter forward issues a socket round-trip; on non-root target
     # ranks we skip that and just receive the broadcast.
     if transport is not None:
+        _diag_fwd_t0 = time.perf_counter()
+        _spec_diag(
+            f"rank {_diag_rank}: round 0 about to call transport.forward([seed], k={k})"
+        )
         drafts_future = transport.forward([seed], k)
         drafts_local: list[int] | None = drafts_future.result()
+        _spec_diag(
+            f"rank {_diag_rank}: round 0 transport.forward "
+            f"returned in {(time.perf_counter() - _diag_fwd_t0) * 1000:.1f}ms "
+            f"(drafts_local len={len(drafts_local) if drafts_local else 0})"
+        )
     else:
         drafts_local = None
+    _diag_bcast_t0 = time.perf_counter()
+    _spec_diag(
+        f"rank {_diag_rank}: round 0 about to call "
+        f"_broadcast_drafts (root={is_target_root})"
+    )
     drafts = _broadcast_drafts(
-        drafts_local, k=k, target_group=target_group, is_root=is_target_root
+        drafts_local,
+        k=k,
+        target_group=target_group,
+        target_peer_fanout=target_peer_fanout,
+        is_root=is_target_root,
+    )
+    _spec_diag(
+        f"rank {_diag_rank}: round 0 _broadcast_drafts done "
+        f"in {(time.perf_counter() - _diag_bcast_t0) * 1000:.1f}ms "
+        f"(drafts len={len(drafts)})"
     )
 
     speculative_future: DraftFuture | None = None
     ntoks = 0
+    _diag_round = 0
 
     while ntoks < max_tokens:
         budget = max_tokens - ntoks
@@ -553,6 +955,11 @@ def _pipelined_speculative_step(
         if k_this < 1:
             break
         drafts = drafts[:k_this]
+        _diag_round += 1
+        _spec_diag(
+            f"rank {_diag_rank}: round {_diag_round} top "
+            f"(ntoks={ntoks}, k_this={k_this})"
+        )
 
         # ----- Cross-round speculation: dispatch in parallel with verify -----
         # Speculate only when:
@@ -582,7 +989,28 @@ def _pipelined_speculative_step(
         seed_arr = mx.array([seed], dtype=mx.uint32)
         draft_arr = mx.array(drafts, dtype=mx.uint32)
         verify_input = mx.concatenate([seed_arr, draft_arr])
+        _diag_verify_t0 = time.perf_counter()
         logits = model(verify_input[None], cache=prompt_cache)
+        # CRITICAL: force eval of ``logits`` on every target rank so the
+        # TP all-reduce kernels embedded in ``model()`` actually launch
+        # before any rank proceeds to its next blocking step. Without
+        # this, non-root ranks dispatch the verify forward (lazy graph
+        # only) and then enter the TCP recv in ``_broadcast_target_tokens``,
+        # leaving the all-reduce un-launched on their side. The root
+        # rank's ``mx.eval(sampled_batch)`` then deadlocks waiting for
+        # the matching all-reduce on every peer. This mirrors the
+        # prefill loop's ``mx.eval([c.state for c in prompt_cache])``,
+        # which is what made the round-0 prefill collectives pair up
+        # correctly on both ranks. Cost: one synchronization per round
+        # (~the verify forward time, which we'd block on at the sampler
+        # step anyway on root). Benefit: guaranteed pairing of TP
+        # collectives across all target ranks under JACCL or ring.
+        mx.eval(logits)
+        _spec_diag(
+            f"rank {_diag_rank}: round {_diag_round} model(verify) + eval "
+            f"completed in {(time.perf_counter() - _diag_verify_t0) * 1000:.1f}ms "
+            f"(verify_len={k_this + 1})"
+        )
         # logits shape: (1, k_this + 1, vocab)
 
         target_logprobs: list[mx.array]
@@ -618,12 +1046,31 @@ def _pipelined_speculative_step(
             )
             target_logprobs = [batched_logprobs[i] for i in range(k_this + 1)]
             if is_target_root:
+                _diag_sample_t0 = time.perf_counter()
+                _spec_diag(
+                    f"rank {_diag_rank}: round {_diag_round} root: about to "
+                    f"call sampler(batched_logprobs)"
+                )
                 sampled_batch = sampler(batched_logprobs)
+                _spec_diag(
+                    f"rank {_diag_rank}: round {_diag_round} root: about to "
+                    f"mx.eval(sampled_batch) (this forces verify forward + "
+                    f"all_sum to actually run)"
+                )
                 mx.eval(sampled_batch)
+                _spec_diag(
+                    f"rank {_diag_rank}: round {_diag_round} root: "
+                    f"mx.eval(sampled_batch) done in "
+                    f"{(time.perf_counter() - _diag_sample_t0) * 1000:.1f}ms"
+                )
                 target_tokens = [int(t) for t in sampled_batch.tolist()]  # type: ignore[reportUnknownArgumentType]
             else:
                 # Filled by broadcast below; skip the sampler entirely.
                 target_tokens = []
+                _spec_diag(
+                    f"rank {_diag_rank}: round {_diag_round} non-root: "
+                    f"skipped sampler, awaiting broadcast"
+                )
         else:
             # Stateful path: logits processors (e.g. repetition penalty)
             # depend on ``running_prev`` which only resolves between
@@ -662,12 +1109,23 @@ def _pipelined_speculative_step(
         # accept/reject decisions are bit-identical. Single-rank
         # placements (``target_group is None``) short-circuit to
         # identity, so this is free for the non-multi-target paths.
+        _diag_tbcast_t0 = time.perf_counter()
+        _spec_diag(
+            f"rank {_diag_rank}: round {_diag_round} about to call "
+            f"_broadcast_target_tokens (root={is_target_root})"
+        )
         target_tokens = _broadcast_target_tokens(
             target_tokens if is_target_root else None,
             k=k,
             k_this=k_this,
             target_group=target_group,
+            target_peer_fanout=target_peer_fanout,
             is_root=is_target_root,
+        )
+        _spec_diag(
+            f"rank {_diag_rank}: round {_diag_round} _broadcast_target_tokens "
+            f"done in {(time.perf_counter() - _diag_tbcast_t0) * 1000:.1f}ms "
+            f"(target_tokens len={len(target_tokens)})"
         )
 
         # ----- Greedy accept loop -----
@@ -677,6 +1135,17 @@ def _pipelined_speculative_step(
                 num_accepted += 1
             else:
                 break
+
+        # Per-round telemetry: ``k_this`` drafts proposed,
+        # ``num_accepted`` accepted by the greedy verifier. The bonus
+        # token (target's correction or full-accept tail) is *not* a
+        # draft, so it doesn't count against acceptance rate. Mutates
+        # the caller's dict in place; ``metrics is None`` for the
+        # synthetic single-rank tests that bypass the drafter wrapper.
+        if metrics is not None:
+            metrics["proposed_draft_tokens"] += k_this
+            metrics["accepted_draft_tokens"] += num_accepted
+            metrics["spec_decode_rounds"] += 1
 
         # ----- Emit accepted drafts + correction/bonus -----
         emit_count = num_accepted + 1
@@ -767,11 +1236,22 @@ def _pipelined_speculative_step(
         else:
             next_drafts_local = None
 
+        _diag_nbcast_t0 = time.perf_counter()
+        _spec_diag(
+            f"rank {_diag_rank}: round {_diag_round} about to call "
+            f"_broadcast_drafts (next, accepted={num_accepted}/{k_this})"
+        )
         next_drafts = _broadcast_drafts(
             next_drafts_local,
             k=k,
             target_group=target_group,
+            target_peer_fanout=target_peer_fanout,
             is_root=is_target_root,
+        )
+        _spec_diag(
+            f"rank {_diag_rank}: round {_diag_round} _broadcast_drafts (next) "
+            f"done in {(time.perf_counter() - _diag_nbcast_t0) * 1000:.1f}ms "
+            f"(next_drafts len={len(next_drafts)})"
         )
 
         seed = next_seed

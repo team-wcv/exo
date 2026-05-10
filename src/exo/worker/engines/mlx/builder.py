@@ -59,6 +59,11 @@ class MlxBuilder(Builder):
     # wire at all).
     drafter_socket: socket.socket | None = None
     drafter_rank_in_parent: int | None = None
+    # Inter-target-rank TCP fanout for the spec-decode int-broadcast
+    # wire. Allocated by :func:`initialize_mlx` on multi-target
+    # asymmetric placements; ``None`` for single-target / symmetric
+    # builds. See :class:`TargetPeerFanout`.
+    target_peer_fanout: object | None = None
     vision_processor: VisionProcessor | None = None
     draft_model: Model | None = None
     draft_model_id: ModelId | None = None
@@ -76,6 +81,7 @@ class MlxBuilder(Builder):
         else:
             self.drafter_socket = None
         self.drafter_rank_in_parent = split.drafter_rank_in_parent
+        self.target_peer_fanout = split.target_peer_fanout
 
     def load(self, bound_instance: BoundInstance) -> Generator[ModelLoadingResponse]:
         (
@@ -364,6 +370,7 @@ class MlxBuilder(Builder):
                 adaptive_draft_tokens=adaptive_draft_tokens,
                 drafter_rank_in_parent=self.drafter_rank_in_parent,
                 remote_drafter_transport=remote_drafter_transport,
+                target_peer_fanout=self.target_peer_fanout,
                 max_concurrent_tasks=max_concurrent_tasks,
             )
         else:

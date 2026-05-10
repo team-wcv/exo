@@ -423,6 +423,109 @@ def test_remote_transport_rejects_invalid_num_draft_tokens() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Drafter-death recovery: ``RemoteTransport.is_failed`` flag
+# ---------------------------------------------------------------------------
+
+
+def test_remote_transport_is_failed_starts_false() -> None:
+    """A freshly-constructed transport is healthy."""
+    transport, drafter_side = _make_transport()
+    try:
+        assert transport.is_failed is False
+    finally:
+        drafter_side.close()
+        transport.shutdown()
+
+
+def test_remote_transport_marks_failed_when_drafter_closes_mid_forward() -> None:
+    """The blocking forward helper flips ``is_failed`` on socket close.
+
+    Pre-fix failure mode: a peer-side close mid-frame raised
+    ``ConnectionError`` once but left the transport looking healthy,
+    so subsequent ``open_session`` calls would happily allocate a
+    fresh session against a dead wire and the spec loop would re-
+    discover the failure on every request.
+    """
+    transport, drafter_side = _make_transport()
+    try:
+        session = transport.open_session()
+        future = session.forward([42], num_forwards=4)
+        # Drain the command frame so the drafter side is in a known
+        # state, then close it before responding -- this models a
+        # drafter rank that crashed after receiving the request.
+        _ = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
+        drafter_side.close()
+        with pytest.raises((ConnectionError, OSError)):
+            future.result(timeout=2.0)
+        assert transport.is_failed is True
+    finally:
+        # ``shutdown`` is best-effort against a dead wire; the
+        # contextlib.suppress inside it swallows the secondary error.
+        transport.shutdown()
+
+
+def test_remote_transport_open_session_rejects_after_failure() -> None:
+    """Once a wire-level failure has surfaced, no new session is allowed.
+
+    Subsequent requests must NOT allocate a fresh session on a known-
+    dead wire -- the runner will be torn down by the master's
+    instance-deletion path and a new placement issued. ``open_session``
+    raising RuntimeError is the fail-loud signal that bridges that
+    gap.
+    """
+    transport, drafter_side = _make_transport()
+    try:
+        session = transport.open_session()
+        future = session.forward([42], num_forwards=4)
+        _ = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
+        drafter_side.close()
+        with pytest.raises((ConnectionError, OSError)):
+            future.result(timeout=2.0)
+        assert transport.is_failed is True
+        with pytest.raises(RuntimeError, match="wire-level failure"):
+            _ = transport.open_session()
+    finally:
+        transport.shutdown()
+
+
+def test_remote_transport_marks_failed_when_drafter_closes_mid_trim() -> None:
+    """The trim helper also flips ``is_failed`` on socket close.
+
+    Trim is on the cache-reconciliation path between rounds; failure
+    here surfaces the same way as a forward failure and must mark
+    the transport so the next request fails fast.
+    """
+    transport, drafter_side = _make_transport()
+    try:
+        session = transport.open_session()
+
+        def _do_trim() -> Exception | None:
+            try:
+                session.trim_cache(3)
+            except Exception as exc:
+                return exc
+            return None
+
+        result_box: list[Exception | None] = []
+
+        def _runner() -> None:
+            result_box.append(_do_trim())
+
+        thread = threading.Thread(target=_runner)
+        thread.start()
+        # Drain the command frame, then drop the connection without
+        # acking -- mid-trim drafter death.
+        _ = _read_uint32s(drafter_side, COMMAND_FRAME_SIZE)
+        drafter_side.close()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+        assert isinstance(result_box[0], (ConnectionError, OSError))
+        assert transport.is_failed is True
+    finally:
+        transport.shutdown()
+
+
+# ---------------------------------------------------------------------------
 # drafter_serve_loop dispatch
 # ---------------------------------------------------------------------------
 

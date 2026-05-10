@@ -1,5 +1,4 @@
 import errno
-import hashlib
 import ipaddress
 import json
 import os
@@ -8,9 +7,9 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, cast, final
+from typing import TYPE_CHECKING, Any, Final, Literal, cast, final
 
 if TYPE_CHECKING:
     import socket as _socket_module
@@ -230,6 +229,11 @@ class MlxGroupSplit:
         drafter (``placement.drafter_rank``). Carried for telemetry
         and the few legacy call sites that branch on "is asymmetric";
         ``None`` for symmetric placement.
+      * ``target_peer_fanout`` -- inter-target-rank TCP fanout for
+        spec-decode int broadcasts (see :class:`TargetPeerFanout`).
+        ``None`` for single-target instances or symmetric placements
+        without a drafter (no spec-decode hot path; legacy
+        ``mx_broadcast_int_list`` is sufficient).
     """
 
     parent: mx.distributed.Group | None
@@ -243,9 +247,66 @@ class MlxGroupSplit:
     (:mod:`builder`) cast back to ``socket.socket`` before passing to
     :func:`make_remote_transport`."""
 
+    target_peer_fanout: "TargetPeerFanout | None" = None
+    """Inter-target-rank TCP fanout for spec-decode int broadcasts.
+
+    Allocated alongside the drafter socket on multi-target asymmetric
+    placements. ``None`` for single-target or symmetric instances.
+    Built once at bootstrap; the spec-decode loop reuses it for every
+    round."""
+
     @property
     def is_asymmetric(self) -> bool:
         return self.drafter_rank_in_parent is not None
+
+
+@final
+@dataclass(frozen=True)
+class TargetPeerFanout:
+    """Direct TCP int-broadcast wire between target rank 0 and its peers.
+
+    Replaces :func:`mx.distributed.send` / :func:`recv` on the
+    spec-decode hot path. JACCL on Apple Silicon conflates int32
+    broadcasts on the target group with the model's float32 TP
+    ``all_sum`` collectives; the former occasionally returns the
+    latter's logit memory reinterpreted as int32, surfacing as
+    out-of-vocab token ids (~``10^9``) deep in the SPM detokenizer.
+
+    The model's TP ``all_sum`` collectives stay on JACCL/RDMA -- they
+    carry multi-MB tensor reductions where vendor RDMA wins
+    decisively. Only the tiny (~24-byte) int32 broadcasts move to TCP,
+    where Thunderbolt with ``TCP_NODELAY`` adds <100µs per round
+    (negligible against a ~30ms verifier forward).
+
+    Topology:
+      * On target rank 0: ``peer_sockets`` holds one connection per
+        non-zero peer rank, indexed by peer rank.
+      * On a peer target rank (rank > 0): ``rank_zero_socket`` holds
+        the single connection back to rank 0.
+
+    Both shapes are produced by :func:`_setup_target_peer_fanout` at
+    instance bootstrap and are immutable for the runner's lifetime.
+    Reconnect-on-failure is intentionally NOT supported: a transport
+    failure on this wire is treated as a hard runner failure (same as
+    a TP all-reduce failure) and the supervisor rebuilds the instance.
+    """
+
+    rank: int
+    """Caller's target rank inside the parent group; matches
+    ``MlxGroupSplit.parent.rank()`` when ``parent`` is set."""
+
+    peer_sockets: dict[int, object] = field(default_factory=dict)
+    """Rank 0 only: ``{peer_rank: socket.socket}``. Empty on rank > 0."""
+
+    rank_zero_socket: object | None = None
+    """Rank > 0 only: connected socket back to rank 0. ``None`` on rank 0."""
+
+    expected_world_size: int = 1
+    """Target world size (every rank in the fanout sees the same value).
+
+    Stored explicitly so the broadcast helpers can sanity-check that
+    rank 0's ``peer_sockets`` cover all peers without re-deriving the
+    world size from a possibly-discarded group handle."""
 
 
 def initialize_mlx(bound_instance: BoundInstance) -> MlxGroupSplit:
@@ -294,11 +355,18 @@ def initialize_mlx(bound_instance: BoundInstance) -> MlxGroupSplit:
         placement=placement,
     )
 
+    target_peer_fanout = _maybe_setup_target_peer_fanout(
+        bound_instance=bound_instance,
+        target_world_size=target_world_size,
+        placement=placement,
+    )
+
     return MlxGroupSplit(
         parent=parent,
         target_subgroup=parent,
         drafter_rank_in_parent=drafter_rank_in_parent,
         drafter_socket=drafter_socket,
+        target_peer_fanout=target_peer_fanout,
     )
 
 
@@ -465,6 +533,143 @@ def _bind_drafter_listener_same_port_retry(
         f"another process on this host; re-place the instance to "
         f"draw a fresh port.",
     ) from last_error
+
+
+def _maybe_setup_target_peer_fanout(
+    *,
+    bound_instance: BoundInstance,
+    target_world_size: int,
+    placement: object,
+) -> TargetPeerFanout | None:
+    """Bring up the inter-target-rank TCP int-broadcast wire.
+
+    Multi-target asymmetric placements need a TCP fanout between
+    target rank 0 and its peers because the JACCL backend conflates
+    the model's float32 TP ``all_sum`` with int32 broadcasts on the
+    same group (see :class:`TargetPeerFanout` docstring). Single-rank
+    targets and symmetric placements (no drafter) have no spec-decode
+    hot path, so they don't need this wire and the function returns
+    ``None``.
+
+    Bootstrap protocol:
+
+      * Target rank 0 binds 0.0.0.0:``placement.target_peer_socket_port``
+        and accepts ``target_world_size - 1`` incoming connections.
+      * Each non-zero target rank dials
+        ``placement.target_peer_hosts_by_rank[my_rank]:target_peer_socket_port``
+        with bounded retry (the listener may not be up yet on the
+        first attempt because ``accept`` and ``connect`` race during
+        bootstrap).
+
+    The drafter rank is NOT in this fanout: it has its own dedicated
+    wire to target rank 0 (see :func:`_maybe_accept_drafter_socket`).
+    Skipping the fanout for the drafter rank is the right call
+    because the drafter never broadcasts int frames to target peers
+    -- it only exchanges drafts/verify with rank 0.
+
+    Failure mode: a dial timeout / accept timeout raises
+    :class:`ConnectionError` or :class:`socket.timeout`, which
+    bubbles up to the runner and surfaces as a connect-task failure.
+    The cluster does not silently wedge.
+    """
+    from exo.shared.types.worker.instances import DrafterPlacement
+
+    if placement is None or not isinstance(placement, DrafterPlacement):
+        return None
+    if target_world_size <= 1:
+        return None
+    if bound_instance.is_drafter_rank:
+        return None
+    # Codex P1 (PR #21 round-(N+9), instances.py:97):
+    # ``target_peer_socket_port`` is optional for wire-schema
+    # compatibility with pre-fanout placements (rolling upgrades,
+    # replayed historical events). When the field is absent we cannot
+    # bind a fanout listener, so degrade gracefully to the legacy
+    # behavior: no peer wire, no spec-decode int broadcasts. Multi-rank
+    # asymmetric instances produced by current placement always include
+    # the port, so this branch only fires for legacy payloads.
+    if placement.target_peer_socket_port is None:
+        logger.warning(
+            "DrafterPlacement.target_peer_socket_port is unset (legacy "
+            "or rolling-upgrade payload); skipping target-peer fanout. "
+            "Spec-decode int broadcasts will fall back to the parent "
+            "mx.distributed group, which is bandwidth-suboptimal but "
+            "functionally correct."
+        )
+        return None
+
+    rank = bound_instance.parent_rank
+    expected_world_size = target_world_size
+    target_peer_socket_port = placement.target_peer_socket_port
+
+    # Imported lazily to avoid pulling the socket module into module
+    # import for runners that never reach this code path.
+    from exo.worker.engines.mlx.generator.target_peer_socket import (
+        accept_target_peers,
+        bind_target_peer_listener,
+        dial_target_zero,
+    )
+
+    if rank == 0:
+        listener = bind_target_peer_listener(
+            "0.0.0.0",
+            target_peer_socket_port,
+            backlog=expected_world_size - 1,
+        )
+        try:
+            logger.info(
+                f"target rank 0 listening for {expected_world_size - 1} "
+                f"target peers on 0.0.0.0:{target_peer_socket_port}"
+            )
+            conns = accept_target_peers(
+                listener,
+                expected_peers=expected_world_size - 1,
+                timeout_seconds=180.0,
+            )
+            logger.info(
+                f"target rank 0 accepted {len(conns)} target-peer connection(s)"
+            )
+        finally:
+            listener.close()
+        # The peer rank that wrote each connection is implicit (we
+        # accept in connection order, but peers can dial in any
+        # order). Spec-decode broadcasts don't need rank-indexed
+        # peers -- rank 0 sends the same payload to every peer per
+        # round -- so we store sockets in arbitrary stable order
+        # keyed by accept order. The spec-decode broadcast helper
+        # iterates ``peer_sockets.values()`` and ignores keys.
+        peer_sockets: dict[int, object] = {idx: c for idx, c in enumerate(conns)}
+        return TargetPeerFanout(
+            rank=0,
+            peer_sockets=peer_sockets,
+            rank_zero_socket=None,
+            expected_world_size=expected_world_size,
+        )
+
+    rank_zero_host = placement.target_peer_hosts_by_rank.get(str(rank))
+    if rank_zero_host is None:
+        raise RuntimeError(
+            f"target peer rank {rank} (key={str(rank)!r}) has no entry "
+            f"in DrafterPlacement.target_peer_hosts_by_rank "
+            f"({placement.target_peer_hosts_by_rank}); placement is "
+            "malformed"
+        )
+    logger.info(
+        f"target peer rank {rank} dialing target rank 0 at "
+        f"{rank_zero_host}:{target_peer_socket_port}"
+    )
+    conn = dial_target_zero(
+        rank_zero_host,
+        target_peer_socket_port,
+        total_timeout_seconds=180.0,
+    )
+    logger.info(f"target peer rank {rank} connected to target rank 0")
+    return TargetPeerFanout(
+        rank=rank,
+        peer_sockets={},
+        rank_zero_socket=conn,
+        expected_world_size=expected_world_size,
+    )
 
 
 EXO_DISABLE_DRAFTER_ENV = "EXO_DISABLE_DRAFTER"
@@ -792,14 +997,10 @@ def shard_and_load(
 
 def get_tokenizer(model_path: Path, shard_metadata: ShardMetadata) -> TokenizerWrapper:
     """Load tokenizer for a model shard. Delegates to load_tokenizer_for_model_id."""
-    trust_remote_code = (
-        shard_metadata.model_card.trust_remote_code
-        or os.environ.get("EXO_TRUST_REMOTE_CODE") == "1"
-    )
     return load_tokenizer_for_model_id(
         shard_metadata.model_card.model_id,
         model_path,
-        trust_remote_code=trust_remote_code,
+        trust_remote_code=shard_metadata.model_card.trust_remote_code,
     )
 
 
@@ -1346,9 +1547,7 @@ def mlx_cleanup(
 def mx_any(bool_: bool, group: mx.distributed.Group | None) -> bool:
     if group is None:
         return bool_
-    num_true = mx.distributed.all_sum(
-        mx.array(bool_), group=group, stream=mx.default_stream(mx.Device(mx.cpu))
-    )
+    num_true = mx.distributed.all_sum(mx.array(bool_), group=group)
     mx.eval(num_true)
     return num_true.item() > 0
 
@@ -1356,11 +1555,7 @@ def mx_any(bool_: bool, group: mx.distributed.Group | None) -> bool:
 def mx_barrier(group: mx.distributed.Group | None):
     if group is None:
         return
-    mx.eval(
-        mx.distributed.all_sum(
-            mx.array(1.0), group=group, stream=mx.default_stream(mx.Device(mx.cpu))
-        )
-    )
+    mx.eval(mx.distributed.all_sum(mx.array(1.0), group=group))
 
 
 # ``int32`` lower / upper bounds. Values broadcast through
@@ -1373,6 +1568,60 @@ def mx_barrier(group: mx.distributed.Group | None):
 # max) and reject negatives explicitly so a caller passing a Python
 # ``-1`` doesn't silently wrap into a 4-billion-ish "valid" int32.
 _MX_BROADCAST_MAX_VALUE: Final[int] = (1 << 31) - 1
+# Toggle to dump every broadcast call's send/recv buffers. Set via
+# ``EXO_PROBE_BROADCAST=1`` for ad-hoc diagnostics; leave off in
+# steady state because the per-token logging spam quickly dominates.
+_BROADCAST_PROBE: Final[bool] = bool(os.environ.get("EXO_PROBE_BROADCAST"))
+
+
+# Distributed backend literal -- matches the strings we pass to
+# ``mx.distributed.init(backend=...)`` in :func:`mlx_distributed_init`.
+DistributedBackend = Literal["ring", "jaccl"]
+
+
+def _detect_distributed_backend() -> DistributedBackend:
+    """Resolve the active MLX distributed backend from the env vars
+    set by :func:`mlx_distributed_init`.
+
+    Why env-var sniffing instead of asking the group: ``mx.distributed.Group``
+    only exposes ``rank()`` / ``size()`` / ``split()`` and gives no
+    public hook for the backend name. We control the init path
+    (:func:`mlx_distributed_init`) and set ``MLX_HOSTFILE`` for ring
+    and ``MLX_IBV_DEVICES`` (plus ``MLX_JACCL_COORDINATOR``) for
+    jaccl, so checking those env vars is a deterministic, in-process
+    signal that doesn't require threading a backend literal through
+    every call site.
+
+    Backend selection matters because the ring backend is built around
+    collective primitives (``all_sum`` / ``all_gather``) and does not
+    support arbitrary point-to-point ``send`` / ``recv`` between
+    non-neighbor ranks; multi-rank ring deployments would fail or
+    hang the moment :func:`mx_broadcast_int_list` issued a
+    ``send(dst=N)`` for a non-neighbor ``N``. JACCL, on the other
+    hand, supports arbitrary ``send`` / ``recv`` and we deliberately
+    use that to keep int32 broadcasts off the same all-reduce wire as
+    TP float32 collectives (see the docstring on
+    :func:`mx_broadcast_int_list` for the historical wire-conflation
+    bug).
+
+    Returns:
+      ``"ring"`` when ``MLX_HOSTFILE`` is set, else ``"jaccl"``.
+      Defaults to ``"ring"`` when neither marker is present so the
+      ring-safe code path runs in ambiguous setups (e.g. tests that
+      construct a fake group without going through
+      :func:`mlx_distributed_init`).
+
+    Raises:
+      None. Detection is best-effort by design: the caller already
+      gated multi-rank entry on ``group is not None``, and a
+      misdetected backend at most picks the slower-but-correct
+      collective path.
+    """
+    if os.environ.get("MLX_HOSTFILE"):
+        return "ring"
+    if os.environ.get("MLX_IBV_DEVICES") or os.environ.get("MLX_JACCL_COORDINATOR"):
+        return "jaccl"
+    return "ring"
 
 
 def mx_broadcast_int_list(
@@ -1384,22 +1633,52 @@ def mx_broadcast_int_list(
 ) -> list[int]:
     """Broadcast a fixed-length int list from one rank to all peers.
 
-    Implementation: all-sum of an ``int32`` buffer where non-root ranks
-    contribute zeros. Reuses MLX's well-exercised ``all_sum`` collective
-    (the same one the model's TP forward depends on every step), so the
-    primitive's reliability is bounded by JACCL's ``all_sum`` rather than
-    its problematic ``all_gather`` (see :func:`mx_all_gather_tasks`).
+    Backend-aware implementation:
+
+      * ``ring``: use ``all_sum`` of an int32 buffer where non-root
+        ranks contribute zeros and root contributes ``values``. Sum
+        across the group recovers ``values`` element-wise (root's
+        contribution is the only nonzero summand). MLX's ring backend
+        is built around collective primitives and does not support
+        arbitrary point-to-point ``send`` / ``recv`` between
+        non-neighbor ranks, so this is the only ring-safe option.
+      * ``jaccl``: rank-0 fanout via :func:`mx.distributed.send` /
+        :func:`mx.distributed.recv`. Root issues one send to every
+        peer; each peer issues a single matching recv from rank 0.
+
+    Why split by backend: under JACCL the model's TP layers issue
+    ``all_sum`` on the same target group on float32 buffers, every
+    layer, every forward. A previous revision used ``all_sum`` for
+    this broadcast on JACCL too and observed silent corruption on
+    the spec-decode hot path: with >100 in-flight ``all_sum``
+    collectives per round all on the same group, JACCL's pairing
+    logic occasionally matched our int32 "broadcast" on rank A
+    against the model's float32 TP all-reduce on rank B, scrambling
+    the int32 buffer (symptom: token ids ~10^9 emitted by the spec
+    loop, ``IndexError`` deep in the SPM detokenizer). Switching to
+    ``send`` / ``recv`` on JACCL makes this broadcast a different
+    primitive than the TP all-reduce so JACCL has no opportunity to
+    merge them. Ring lacks both the JACCL pairing pitfall and the
+    arbitrary-``send`` capability, so it stays on ``all_sum``.
+
+    Caller note: the spec-decode hot path no longer routes through
+    this function -- it uses :func:`target_peer_broadcast_int_list`
+    over a dedicated TCP fanout (see :class:`TargetPeerFanout`). The
+    only remaining caller is :func:`mx_all_gather_tasks` at admit
+    boundaries, which fires far below TP all-reduce frequency, so
+    even on JACCL the wire-conflation risk is low; the
+    ``send`` / ``recv`` path is kept for defense-in-depth.
 
     The fixed-length contract means the caller pads to ``length`` on
-    root and both ranks agree on ``length`` ahead of time. This avoids
-    a count-then-payload two-collective handshake that would double the
-    wire round-trips on the spec-decode hot path.
+    root and both ranks agree on ``length`` ahead of time, which keeps
+    the recv shape (or all_sum buffer shape) known statically.
 
     Args:
       values: On root, a list of exactly ``length`` ints to broadcast.
         Each value must be in ``[0, 2**31 - 1]``. Negative values are
-        rejected explicitly so a stray ``-1`` doesn't silently wrap to
-        ``0xFFFFFFFF`` and corrupt the broadcast. Ignored on non-root.
+        rejected explicitly so a stray ``-1`` doesn't silently wrap
+        on the int32 cast and corrupt the broadcast. Ignored on
+        non-root.
       length: Buffer size, agreed by all ranks. Must be ``>= 1``.
       group: Distributed group; ``None`` is a single-rank short-circuit
         that simply returns ``values`` (root-only).
@@ -1433,20 +1712,195 @@ def mx_broadcast_int_list(
         _validate_broadcast_values(values)
         return list(values)
 
+    group_size = group.size()
+
+    if is_root and (values is None or len(values) != length):
+        raise ValueError(
+            "mx_broadcast_int_list root rank requires values of "
+            f"length {length}, got {None if values is None else len(values)}"
+        )
+    if is_root:
+        # ``cast`` for the type-checker: validated above.
+        _validate_broadcast_values(cast(list[int], values))
+
+    backend = _detect_distributed_backend()
+
+    if backend == "ring":
+        # Ring backend: collective ``all_sum``. Root contributes the
+        # values, every other rank contributes a zero buffer of the
+        # same shape, so the element-wise sum is ``values``. This is
+        # the only ring-safe broadcast primitive (ring rejects
+        # arbitrary point-to-point ``send`` / ``recv`` between
+        # non-neighbor ranks).
+        if is_root:
+            local = mx.array(cast(list[int], values), dtype=mx.int32)
+        else:
+            local = mx.zeros(shape=(length,), dtype=mx.int32)
+        summed = mx.distributed.all_sum(local, group=group)
+        mx.eval(summed)
+        out = [int(v) for v in cast(list[int], summed.tolist())]
+        if _BROADCAST_PROBE:
+            role = "ROOT" if is_root else "PEER"
+            logger.warning(
+                f"mx_broadcast_int_list[ring] {role} recovered {out} (len={length})"
+            )
+        return out
+
+    # JACCL backend: send/recv fanout from rank 0.
+    if is_root:
+        send_buffer = mx.array(cast(list[int], values), dtype=mx.int32)
+        for dst in range(1, group_size):
+            sent = mx.distributed.send(send_buffer, dst=dst, group=group)
+            mx.eval(sent)
+        if _BROADCAST_PROBE:
+            logger.warning(
+                f"mx_broadcast_int_list[jaccl] ROOT sent {values} (len={length})"
+            )
+        return list(cast(list[int], values))
+
+    received = mx.distributed.recv(shape=(length,), dtype=mx.int32, src=0, group=group)
+    mx.eval(received)
+    out = [int(v) for v in cast(list[int], received.tolist())]
+    if _BROADCAST_PROBE:
+        logger.warning(
+            f"mx_broadcast_int_list[jaccl] PEER recvd {out} (expected len={length})"
+        )
+    return out
+
+
+def target_peer_broadcast_int_list(
+    values: list[int] | None,
+    length: int,
+    fanout: TargetPeerFanout,
+    *,
+    is_root: bool,
+) -> list[int]:
+    """Broadcast a fixed-length signed int list over the TCP fanout.
+
+    Drop-in replacement for :func:`mx_broadcast_int_list` on the
+    spec-decode hot path. Same shape contract (``length`` agreed by
+    every rank up front; root passes ``values``, peers pass
+    ``None``); the only difference is that this version rides direct
+    TCP sockets instead of ``mx.distributed.send`` / ``recv``,
+    sidestepping the JACCL int/float wire-conflation bug entirely.
+
+    Wire format (every frame): ``length`` little-endian signed int32
+    values, no header. The peer side knows ``length`` from the same
+    shape contract the caller agreed to.
+
+    Args:
+      values: On root, exactly ``length`` int32-range values to
+        broadcast. Ignored on peers.
+      length: Buffer size, agreed by all ranks. Must be ``>= 1``.
+      fanout: Pre-built fanout from :func:`_maybe_setup_target_peer_fanout`.
+        Carries the per-rank role (rank 0 vs peer) and the connected
+        sockets. Mismatched ``is_root`` vs ``fanout.rank`` is a caller
+        bug and raises :class:`ValueError`.
+      is_root: ``True`` on rank 0, ``False`` elsewhere. Asserted
+        against ``fanout.rank``.
+
+    Returns:
+      A list of ``length`` ints identical on every rank, equal to
+      root's ``values``.
+
+    Raises:
+      ValueError: caller-bug conditions (length, values shape,
+        is_root vs rank mismatch).
+      ConnectionError: a peer closed the socket mid-frame; surfaces
+        as a runner failure for the supervisor to rebuild.
+    """
+    import socket as _socket
+
+    from exo.worker.engines.mlx.generator.target_peer_socket import (
+        recv_int32_frame,
+        send_int32_frame,
+    )
+
+    if length < 1:
+        raise ValueError(
+            f"target_peer_broadcast_int_list length must be >= 1, got {length}"
+        )
+    if is_root != (fanout.rank == 0):
+        raise ValueError(
+            f"target_peer_broadcast_int_list is_root={is_root} disagrees "
+            f"with fanout.rank={fanout.rank}; exactly one rank in the "
+            "fanout must pass is_root=True"
+        )
     if is_root:
         if values is None or len(values) != length:
             raise ValueError(
-                "mx_broadcast_int_list root rank requires values of "
-                f"length {length}, got {None if values is None else len(values)}"
+                "target_peer_broadcast_int_list root rank requires values "
+                f"of length {length}, got "
+                f"{None if values is None else len(values)}"
             )
-        _validate_broadcast_values(values)
-        buffer = mx.array(values, dtype=mx.int32)
-    else:
-        buffer = mx.zeros((length,), dtype=mx.int32)
+        for sock in fanout.peer_sockets.values():
+            assert isinstance(sock, _socket.socket)  # narrow object -> socket
+            send_int32_frame(sock, values)
+        return list(values)
+    sock = fanout.rank_zero_socket
+    if sock is None:
+        raise RuntimeError(
+            "target_peer_broadcast_int_list called on peer rank but "
+            "fanout.rank_zero_socket is None; bootstrap must populate it"
+        )
+    assert isinstance(sock, _socket.socket)
+    return recv_int32_frame(sock, length)
 
-    summed = mx.distributed.all_sum(
-        buffer, group=group, stream=mx.default_stream(mx.Device(mx.cpu))
-    )
+
+def mx_all_sum_int_list(
+    values: list[int],
+    length: int,
+    group: mx.distributed.Group | None,
+) -> list[int]:
+    """Element-wise ``all_sum`` of an ``int32`` list across all ranks.
+
+    Unlike :func:`mx_broadcast_int_list` (one-rank-contributes), every
+    rank contributes its own ``values`` and every rank sees the
+    element-wise sum. Used by the two-collective intersection
+    protocol in :func:`mx_all_gather_tasks` to vote on which tasks
+    every rank has locally: each rank emits a ``[0, 1]`` indicator
+    vector and the sum equals the group's vote count per slot.
+
+    Same wire reliability story as :func:`mx_broadcast_int_list`:
+    rides MLX's well-exercised ``all_sum`` primitive, validates
+    int32 bounds explicitly so a stray Python ``-1`` doesn't wrap
+    silently.
+
+    Args:
+      values: This rank's contribution. Length must equal ``length``;
+        each value must be in ``[0, 2**31 - 1]``. After all-sum the
+        per-element bound is ``group_size * max(value)`` -- callers
+        sizing for ``[0, 1]`` indicators sit far below int32 max for
+        any plausible ``group_size``.
+      length: Buffer size, agreed by all ranks.
+      group: Distributed group; ``None`` short-circuits to a copy of
+        ``values`` (single-rank vote sums to itself).
+
+    Returns:
+      A list of length ``length`` with the element-wise sum of every
+      rank's ``values``, identical on every rank.
+
+    Raises:
+      ValueError: ``length`` is non-positive, ``values`` length
+        mismatches, or any value is out of int32 range.
+    """
+    if length < 1:
+        raise ValueError(f"mx_all_sum_int_list length must be >= 1, got {length}")
+    if len(values) != length:
+        raise ValueError(
+            f"mx_all_sum_int_list values must have length {length}, got {len(values)}"
+        )
+    _validate_broadcast_values(values)
+    if group is None:
+        return list(values)
+    buffer = mx.array(values, dtype=mx.int32)
+    # ``all_sum`` is acceptable here because :func:`mx_all_sum_int_list`
+    # is only called from the task agreement protocol, which fires at
+    # admit boundaries -- not on the per-token spec-decode hot path.
+    # The thrash that broke the broadcast helper (interleaving with
+    # the model's TP all-reduce 100+ times per round) does not apply
+    # at this call frequency.
+    summed = mx.distributed.all_sum(buffer, group=group)
     mx.eval(summed)
     return [int(v) for v in cast(list[int], summed.tolist())]
 
@@ -1506,146 +1960,221 @@ def _parse_kimi_tool_calls(text: str):
         return [_parse_single_tool(text)]
 
 
+# Maximum number of tasks the agreement protocol can carry per round.
+# Sized to ``EXO_MAX_CONCURRENT_REQUESTS`` (default 8) plus headroom for
+# transient ``_maybe_queue`` build-up; tasks beyond this slot count get
+# deferred to the next agreement round, never lost. Matches the sizing
+# the supervisor already enforces via ``max_concurrent_tasks`` at the
+# generator layer, so steady-state oversubscription is not a real
+# concern.
+_MX_AGREE_MAX_TASKS: Final[int] = 16
+# UUID4 string length (``len("01234567-...-...-...-............") == 36``).
+# The agreement protocol broadcasts task IDs as fixed-width ASCII so
+# every rank can decode the same canonical payload. Hashes are not
+# enough on their own because root needs to specify *which* tasks are
+# in the agreed set without leaving the consumer guessing on collision.
+_MX_TASK_ID_BYTES: Final[int] = 36
+# Buffer layout: ``[count, task_id_bytes_0, task_id_bytes_1, ...]`` where
+# each task_id slot is ``_MX_TASK_ID_BYTES`` ints (one ASCII char per
+# int32 slot). A char fits trivially in int32, and using one slot per
+# char avoids endian / packing concerns at the cost of ~4x bandwidth --
+# acceptable since this only runs at admit boundaries, not per-token.
+_MX_AGREE_BUFFER_LEN: Final[int] = 1 + _MX_AGREE_MAX_TASKS * _MX_TASK_ID_BYTES
+
+
 def mx_all_gather_tasks(
     tasks: list[TextGeneration],
     group: mx.distributed.Group | None,
 ) -> tuple[list[TextGeneration], list[TextGeneration]]:
-    """Cross-rank task agreement that tolerates partial arrival.
+    """Two-phase intersection-based task agreement across target ranks.
 
-    Returns ``(agreed, different)`` where ``agreed`` is the subset of
-    ``tasks`` that *every* rank in ``group`` has, and ``different`` is
-    the subset only some ranks have. The caller (``agree_on_tasks``)
-    enqueues ``agreed`` immediately and retains ``different`` for the
-    next tick, so benign pubsub timing skew (rank 0 has ``[A, B]``
-    while rank 1 still only has ``[A]``) converges naturally without
-    aborting decode.
+    Returns ``(agreed, leftover)`` where:
 
-    Codex P1 (PR #20 round-(N+2), utils_mlx.py:1451): the previous
-    drift-detector hash-equality check raised ``RuntimeError`` on any
-    cross-rank divergence, which turned that benign timing skew into
-    a runner-killing failure. The fix below restores the original
-    intersection semantics while still avoiding JACCL's unreliable
-    ``all_gather`` primitive.
+      * ``agreed``: tasks every rank in the group has locally, in the
+        canonical order set by the root rank. Identical on every
+        rank by construction (the consensus is computed inside the
+        function, not after the return).
+      * ``leftover``: this rank's local tasks that didn't make it
+        into ``agreed`` (either root hasn't seen them yet or another
+        peer is still waiting on libp2p delivery). Every rank stashes
+        its leftover for the next agreement cycle.
+
+    Wire protocol:
+      Phase 1 (broadcast root's IDs):
+        Root encodes ``[count, id_0_chars, ..., id_(count-1)_chars]``
+        into a fixed ``_MX_AGREE_BUFFER_LEN`` int32 buffer
+        (zero-padded slots) and broadcasts via
+        :func:`mx_broadcast_int_list`. Non-root ranks decode it as
+        their canonical view of "candidate tasks".
+      Phase 2 (vote on intersection):
+        Every rank emits a ``[0, 1]`` vote vector indexed by phase-1
+        slot: 1 means "I have this task locally", 0 means "I don't".
+        :func:`mx_all_sum_int_list` element-wise-sums the votes
+        across the group. A slot whose sum equals ``group_size`` is
+        agreed -- every rank had it. Slots below ``group_size`` are
+        deferred (they re-enter the next round once delivery
+        completes).
+
+    Why intersection instead of root-authoritative:
+      Root-authoritative agreement (root admits all its tasks; non-
+      root admits only the subset it has locally) breaks the
+      collective-count contract. If root admits a task the non-root
+      doesn't have, non-root's ``_active_tasks`` stays empty, its
+      next ``step()`` calls ``agree_on_tasks`` again while root is
+      mid-``next(gen)`` issuing spec-loop ``all_sum`` collectives.
+      The two collective streams interleave on the wire and corrupt
+      each other's payloads (manifests as ``IndexError: list index
+      out of range`` in the detokenizer because broadcast tokens
+      arrive scrambled). Intersection keeps both ranks at the same
+      collective count: every rank that admits a task admits it on
+      the same step.
+
+    Why ``group is None`` short-circuits without touching MLX:
+      ``mx.distributed.all_gather(group=None)`` delegates to MLX's
+      default group, which on an asymmetric runner is the parent
+      (target+drafter) group. The drafter rank is busy in
+      ``drafter_serve_loop`` doing its own ``recv`` on that same
+      default group, so an unguarded all-gather here cross-talks
+      with the drafter's wire protocol. When ``group is None`` we
+      are by construction the only participating rank, so every
+      task is trivially "agreed".
+
+    Cost:
+      Two collectives per call (one broadcast + one all-sum), each
+      on small int32 buffers (~600 bytes). On Apple Silicon JACCL
+      this is sub-millisecond and runs only at admit boundaries,
+      not per token.
     """
-    # Single-rank short-circuit. ``mx.distributed.all_gather(group=None)``
-    # delegates to the MLX *default* group, which on an asymmetric runner
-    # is the parent (target+drafter) group. The drafter rank is busy in
-    # ``drafter_serve_loop`` doing its own ``recv`` on that same default
-    # group, so an unguarded all-gather here cross-talks with the
-    # drafter's wire protocol and corrupts the next command frame the
-    # drafter decodes (manifesting as ``num_forwards must be >= 1, got
-    # 0``). When ``group is None`` we are by construction the only
-    # participating rank, so every task is trivially "agreed".
     if group is None:
         return list(tasks), []
 
-    # JACCL's ``all_gather`` is unreliable for small task-agreement
-    # buffers on Apple Silicon: it sporadically reads peer slots back
-    # as float32 bit patterns rather than the int32 we wrote (observed:
-    # count gather returning ``[1, 1068875521]`` -> 0x3FB80001 / a
-    # float32 representation), which forced a 144 GB padded-buffer
-    # allocation and crashed the runner with ``[metal::malloc]
-    # Attempting to allocate ...``. We therefore build the intersection
-    # over the well-exercised ``all_sum`` primitive instead, in three
-    # collectives:
-    #
-    #   1. Root broadcasts the count of its tasks (1 int32).
-    #   2. Root broadcasts the hash pair (2 int32 per task) of its
-    #      sorted task IDs. 62 bits per task is well below the
-    #      birthday-collision threshold for any practical queue size.
-    #   3. Every rank contributes a presence bitmap (1 int32 per
-    #      root-task: 1 if rank has that hash, 0 otherwise) via
-    #      ``all_sum``. A slot whose sum equals ``group.size()`` is in
-    #      the universally-present intersection.
-    #
-    # When root has zero tasks (a perfectly normal cold-start state),
-    # the second/third collectives are skipped and every non-root rank's
-    # local tasks fall through to ``different`` for retry next tick.
-    sorted_tasks = sorted(tasks, key=lambda t: t.task_id)
     is_root = group.rank() == 0
-
-    root_count = mx_broadcast_int_list(
-        [len(sorted_tasks)] if is_root else None,
-        length=1,
-        group=group,
-        is_root=is_root,
-    )[0]
-
-    if root_count == 0:
-        # Root has nothing to agree on. Every local task on a non-root
-        # rank stays in ``different`` for the next tick.
-        return [], sorted_tasks
-
-    pairs_per_task = 2
-    hash_buffer_length = root_count * pairs_per_task
-
-    if is_root:
-        root_pairs: list[int] = []
-        for task in sorted_tasks:
-            high, low = _task_id_hash_pair(task.task_id)
-            root_pairs.append(high)
-            root_pairs.append(low)
-    else:
-        root_pairs = []  # ignored; non-root passes None below
-
-    root_hashes_flat = mx_broadcast_int_list(
-        root_pairs if is_root else None,
-        length=hash_buffer_length,
-        group=group,
-        is_root=is_root,
-    )
-
-    local_pair_set: set[tuple[int, int]] = {
-        _task_id_hash_pair(task.task_id) for task in sorted_tasks
-    }
-    presence: list[int] = []
-    root_pair_seq: list[tuple[int, int]] = []
-    for index in range(root_count):
-        pair = (
-            root_hashes_flat[index * pairs_per_task],
-            root_hashes_flat[index * pairs_per_task + 1],
-        )
-        root_pair_seq.append(pair)
-        presence.append(1 if pair in local_pair_set else 0)
-
-    presence_buffer = mx.array(presence, dtype=mx.int32)
-    counts_array = mx.distributed.all_sum(
-        presence_buffer,
-        group=group,
-        stream=mx.default_stream(mx.Device(mx.cpu)),
-    )
-    mx.eval(counts_array)
-    counts: list[int] = [int(value) for value in cast(list[int], counts_array.tolist())]
     group_size = group.size()
-    agreed_pair_set: set[tuple[int, int]] = {
-        root_pair_seq[index]
-        for index, count in enumerate(counts)
-        if count == group_size
-    }
 
+    # ----- Phase 1: root broadcasts canonical task ID list -----
+    if is_root:
+        admitted = tasks[:_MX_AGREE_MAX_TASKS]
+        payload: list[int] = [len(admitted)]
+        for task in admitted:
+            payload.extend(_encode_task_id(task.task_id))
+        payload.extend([0] * (_MX_AGREE_BUFFER_LEN - len(payload)))
+        broadcast = mx_broadcast_int_list(
+            payload, _MX_AGREE_BUFFER_LEN, group, is_root=True
+        )
+    else:
+        broadcast = mx_broadcast_int_list(
+            None, _MX_AGREE_BUFFER_LEN, group, is_root=False
+        )
+
+    count = broadcast[0]
+    if count < 0 or count > _MX_AGREE_MAX_TASKS:
+        # Programming error: root encoded a count outside the agreed
+        # bounds. Hard failure -- buffer corrupt, can't decode safely.
+        raise RuntimeError(
+            f"mx_all_gather_tasks: broadcast count {count} outside "
+            f"[0, {_MX_AGREE_MAX_TASKS}]; broadcast buffer corrupt"
+        )
+
+    canonical_ids: list[str] = []
+    for i in range(count):
+        start = 1 + i * _MX_TASK_ID_BYTES
+        end = start + _MX_TASK_ID_BYTES
+        canonical_ids.append(_decode_task_id(broadcast[start:end]))
+
+    # ----- Phase 2: every rank votes on which canonical IDs it has -----
+    local_by_id: dict[str, TextGeneration] = {t.task_id: t for t in tasks}
+    vote = [1 if cid in local_by_id else 0 for cid in canonical_ids]
+    vote.extend([0] * (_MX_AGREE_MAX_TASKS - count))
+    summed_vote = mx_all_sum_int_list(vote, _MX_AGREE_MAX_TASKS, group)
+
+    # ----- Phase 3: build agreed (intersection) and leftover -----
     agreed: list[TextGeneration] = []
-    different: list[TextGeneration] = []
-    for task in sorted_tasks:
-        if _task_id_hash_pair(task.task_id) in agreed_pair_set:
-            agreed.append(task)
+    for i, cid in enumerate(canonical_ids):
+        if summed_vote[i] != group_size:
+            continue
+        local = local_by_id.pop(cid, None)
+        if local is None:
+            # Root contributed this ID but isn't a vote-counter on
+            # itself -- only possible if we're not root and we don't
+            # have the task. The vote sum requirement above handles
+            # this case (we'd have voted 0 and it wouldn't reach
+            # ``group_size``); reaching here means buffer corruption.
+            raise RuntimeError(
+                f"mx_all_gather_tasks: canonical id {cid} agreed by "
+                "vote but missing locally; vote/broadcast desync"
+            )
+        agreed.append(local)
+
+    # Codex P1 (PR #21 round 3): preserve admission progress when the
+    # first page of ``tasks`` contains IDs that aren't yet present on
+    # every peer.
+    #
+    # Pre-fix behavior: ``leftover`` was just ``local_by_id.values()``,
+    # which preserves dict insertion order. So if ``tasks[:k]`` were
+    # all stuck (e.g., a fresh peer whose first 16 deliveries were
+    # delayed), root would re-broadcast the same first page every
+    # round and tasks at positions ``k..N`` could starve indefinitely
+    # because they never entered the canonical broadcast.
+    #
+    # Fix: split the leftover into two regions and concatenate them so
+    # next round's ``tasks[:_MX_AGREE_MAX_TASKS]`` is biased toward
+    # candidates that haven't been broadcast yet.
+    #   front_of_leftover: tasks that were never in the canonical
+    #     broadcast (positions >= count) -- these have never had a
+    #     chance to be admitted, prioritize them.
+    #   back_of_leftover: canonical tasks that didn't reach
+    #     intersection -- demote them so they don't keep blocking
+    #     root's first page. They still get retried, just rotated
+    #     behind everything that hasn't been tried yet.
+    canonical_id_set: set[str] = set(canonical_ids)
+    front_of_leftover: list[TextGeneration] = []
+    back_of_leftover: list[TextGeneration] = []
+    for task in tasks:
+        if task.task_id not in local_by_id:
+            # Already admitted into ``agreed``.
+            continue
+        if task.task_id in canonical_id_set:
+            back_of_leftover.append(task)
         else:
-            different.append(task)
-    return agreed, different
+            front_of_leftover.append(task)
+    leftover = front_of_leftover + back_of_leftover
+    return agreed, leftover
 
 
-def _task_id_hash_pair(task_id: str) -> tuple[int, int]:
-    """Stable 62-bit (high, low) hash pair for a task ID.
+def _encode_task_id(task_id: str) -> list[int]:
+    """ASCII-encode ``task_id`` into ``_MX_TASK_ID_BYTES`` int32 slots.
 
-    Two 31-bit halves so the broadcast buffer can carry both without
-    crossing :func:`mx_broadcast_int_list`'s ``[0, 2**31 - 1]`` value
-    range (which the int32 ``all_sum`` requires to avoid wrap-around).
-    Birthday-collision threshold is around ``2**31 ~= 2 billion``
-    distinct task IDs -- well above any practical scheduler queue.
-    BLAKE2b is deterministic across processes and seed-free, so two
-    runner subprocesses always derive the same digest from the same
-    task ID without bypassing Python's salted ``hash()``.
+    Right-pads with zeros if ``task_id`` is shorter than the slot
+    count; raises if it's longer or contains non-ASCII (UUIDs are pure
+    ASCII by construction, so any rejection here points at upstream
+    bugs).
     """
-    digest = hashlib.blake2b(task_id.encode("utf-8"), digest_size=8).digest()
-    high = int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
-    low = int.from_bytes(digest[4:], "big") & 0x7FFFFFFF
-    return high, low
+    encoded = task_id.encode("ascii")
+    if len(encoded) > _MX_TASK_ID_BYTES:
+        raise ValueError(
+            f"task_id {task_id!r} exceeds {_MX_TASK_ID_BYTES} bytes; "
+            "agreement buffer slot is sized for UUID4 strings only"
+        )
+    out = [int(b) for b in encoded]
+    out.extend([0] * (_MX_TASK_ID_BYTES - len(out)))
+    return out
+
+
+def _decode_task_id(slots: list[int]) -> str:
+    """Inverse of :func:`_encode_task_id`: int32 slots -> ASCII string.
+
+    Stops at the first zero byte (the encode pad), so the result is
+    bounded by ``_MX_TASK_ID_BYTES``. Any non-ASCII byte is rejected
+    locally rather than silently coerced; the broadcast contract
+    requires ASCII-only IDs.
+    """
+    chars: list[str] = []
+    for value in slots:
+        if value == 0:
+            break
+        if value < 0 or value > 127:
+            raise ValueError(
+                f"task_id slot {value} outside ASCII range; broadcast payload corrupt"
+            )
+        chars.append(chr(value))
+    return "".join(chars)

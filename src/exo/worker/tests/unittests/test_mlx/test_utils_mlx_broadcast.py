@@ -11,14 +11,13 @@ relies on for cross-rank determinism without spinning up MLX or
   * :func:`_validate_broadcast_values` -- the int32 bounds are tighter
     than Python's ``int`` range, so out-of-range values from a callsite
     bug must raise rather than wrap silently.
-  * :func:`_hash_task_list` -- deterministic across runner subprocesses
-    (does not depend on ``PYTHONHASHSEED``) and sensitive to ordering
-    (so transposed task lists hash differently and the drift check
-    catches them).
+  * :func:`_encode_task_id` / :func:`_decode_task_id` -- ASCII codec
+    used by ``mx_all_gather_tasks`` to broadcast canonical task IDs.
+    Round-trip and bounds are verifiable without MLX.
   * :func:`mx_all_gather_tasks` -- the single-rank short-circuit. The
-    multi-rank drift path needs an actual ``mx.distributed`` group, so
-    we cover the structural contract here and the cluster bench
-    exercises the real collective.
+    multi-rank root-authoritative agreement path needs an actual
+    ``mx.distributed`` group, so we cover the structural contract here
+    and the cluster bench exercises the real collective.
 
 Kept MLX-free so it runs in milliseconds on CI alongside the rest of
 the unittest suite.
@@ -38,7 +37,10 @@ from exo.shared.types.text_generation import (
 from exo.shared.types.worker.instances import InstanceId
 from exo.worker.engines.mlx.utils_mlx import (
     _MX_BROADCAST_MAX_VALUE,  # pyright: ignore[reportPrivateUsage]
-    _task_id_hash_pair,  # pyright: ignore[reportPrivateUsage]
+    _MX_TASK_ID_BYTES,  # pyright: ignore[reportPrivateUsage]
+    _decode_task_id,  # pyright: ignore[reportPrivateUsage]
+    _detect_distributed_backend,  # pyright: ignore[reportPrivateUsage]
+    _encode_task_id,  # pyright: ignore[reportPrivateUsage]
     _validate_broadcast_values,  # pyright: ignore[reportPrivateUsage]
     mx_all_gather_tasks,
     mx_broadcast_int_list,
@@ -121,6 +123,77 @@ class TestMxBroadcastIntListSingleRank:
 
 
 # ---------------------------------------------------------------------------
+# Backend detection (controls which distributed primitive we use)
+# ---------------------------------------------------------------------------
+
+
+class TestDetectDistributedBackend:
+    """``_detect_distributed_backend`` resolves ring vs jaccl from the
+    env vars set by :func:`mlx_distributed_init`. Backend selection
+    matters because MLX's ring backend does not support arbitrary
+    point-to-point ``send`` / ``recv`` between non-neighbor ranks --
+    multi-rank ring deployments would fail or hang the moment
+    :func:`mx_broadcast_int_list` issued a ``send(dst=N)`` for a
+    non-neighbor ``N``. Confirm the helper picks the ring-safe path
+    whenever the ring marker (``MLX_HOSTFILE``) is present and the
+    JACCL path only when the JACCL markers are present in isolation."""
+
+    def test_ring_backend_when_hostfile_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MLX_HOSTFILE", "/tmp/hosts.json")
+        monkeypatch.delenv("MLX_IBV_DEVICES", raising=False)
+        monkeypatch.delenv("MLX_JACCL_COORDINATOR", raising=False)
+        assert _detect_distributed_backend() == "ring"
+
+    def test_jaccl_backend_when_ibv_devices_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("MLX_HOSTFILE", raising=False)
+        monkeypatch.setenv("MLX_IBV_DEVICES", "/tmp/devices.json")
+        monkeypatch.delenv("MLX_JACCL_COORDINATOR", raising=False)
+        assert _detect_distributed_backend() == "jaccl"
+
+    def test_jaccl_backend_when_only_coordinator_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # ``MLX_JACCL_COORDINATOR`` is set alongside ``MLX_IBV_DEVICES``
+        # by :func:`mlx_distributed_init`, but treat either one as a
+        # sufficient marker so a partially-populated env doesn't
+        # silently route through the slower ring path.
+        monkeypatch.delenv("MLX_HOSTFILE", raising=False)
+        monkeypatch.delenv("MLX_IBV_DEVICES", raising=False)
+        monkeypatch.setenv("MLX_JACCL_COORDINATOR", "tcp://10.0.0.1:1234")
+        assert _detect_distributed_backend() == "jaccl"
+
+    def test_ring_wins_when_both_markers_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Pathological env where both markers are set (e.g. an old
+        # JACCL run leaked vars into a fresh ring session). Defaulting
+        # to ring is the conservative choice: the all-sum primitive
+        # works on JACCL too (it just gives up the wire-conflation
+        # protection that ``send`` / ``recv`` provided), whereas
+        # routing through ``send`` / ``recv`` on ring is a hard
+        # failure.
+        monkeypatch.setenv("MLX_HOSTFILE", "/tmp/hosts.json")
+        monkeypatch.setenv("MLX_IBV_DEVICES", "/tmp/devices.json")
+        assert _detect_distributed_backend() == "ring"
+
+    def test_defaults_to_ring_when_no_markers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Test fakes that build a fake ``Group`` without going through
+        # :func:`mlx_distributed_init` shouldn't crash on a missing
+        # backend marker -- pick the ring-safe path so the helper
+        # stays callable from unit tests.
+        monkeypatch.delenv("MLX_HOSTFILE", raising=False)
+        monkeypatch.delenv("MLX_IBV_DEVICES", raising=False)
+        monkeypatch.delenv("MLX_JACCL_COORDINATOR", raising=False)
+        assert _detect_distributed_backend() == "ring"
+
+
+# ---------------------------------------------------------------------------
 # Task-list hashing (drift detection)
 # ---------------------------------------------------------------------------
 
@@ -148,33 +221,40 @@ def _make_task(task_id: str) -> TextGeneration:
     )
 
 
-class TestTaskIdHashPair:
-    """``_task_id_hash_pair`` must be deterministic, sensitive to ID
-    content, and produce values that fit inside the int32 positive
-    range so the pair can ride :func:`mx_broadcast_int_list`'s
-    int32 ``all_sum`` buffer without wrap-around. BLAKE2b is
-    seed-free so two runner subprocesses must agree on the digest
-    without depending on Python's salted ``hash()``.
-    """
+class TestTaskIdCodec:
+    """``_encode_task_id`` / ``_decode_task_id`` are the wire codec for
+    the root-authoritative agreement protocol. Round-trip must be
+    exact and bounds must be enforced; otherwise a corrupt payload
+    silently misagrees on which task to admit."""
 
-    def test_deterministic_across_calls(self) -> None:
-        assert _task_id_hash_pair("alpha") == _task_id_hash_pair("alpha")
+    def test_round_trip_uuid4(self) -> None:
+        ident = "01234567-89ab-cdef-0123-456789abcdef"
+        encoded = _encode_task_id(ident)
+        assert len(encoded) == _MX_TASK_ID_BYTES
+        assert _decode_task_id(encoded) == ident
 
-    def test_sensitive_to_id_content(self) -> None:
-        # If two distinct task IDs hashed to the same pair, agreement
-        # would silently admit a task that root doesn't actually have.
-        assert _task_id_hash_pair("alpha") != _task_id_hash_pair("beta")
+    def test_short_id_is_zero_padded(self) -> None:
+        encoded = _encode_task_id("alpha")
+        # Trailing slots stay zero so the decoder's null terminator
+        # logic stops at the right place.
+        assert encoded[5:] == [0] * (_MX_TASK_ID_BYTES - 5)
+        assert _decode_task_id(encoded) == "alpha"
 
-    def test_pair_components_in_int32_positive_range(self) -> None:
-        for ident in (
-            "a",
-            "alpha",
-            "very-long-task-id-with-lots-of-bytes-" * 4,
-            "\u00e9\u00e8\u00ea",  # non-ascii bytes exercise utf-8 path
-        ):
-            high, low = _task_id_hash_pair(ident)
-            assert 0 <= high <= _MX_BROADCAST_MAX_VALUE
-            assert 0 <= low <= _MX_BROADCAST_MAX_VALUE
+    def test_rejects_oversize_id(self) -> None:
+        too_long = "a" * (_MX_TASK_ID_BYTES + 1)
+        with pytest.raises(ValueError, match="exceeds"):
+            _encode_task_id(too_long)
+
+    def test_rejects_non_ascii_byte_on_decode(self) -> None:
+        bogus = [200] + [0] * (_MX_TASK_ID_BYTES - 1)
+        with pytest.raises(ValueError, match="outside ASCII range"):
+            _decode_task_id(bogus)
+
+    def test_decoder_stops_at_null(self) -> None:
+        # Two real chars, then a null, then garbage: decoder must
+        # stop at the null and ignore the trailing data.
+        slots = [ord("a"), ord("b"), 0, ord("z")] + [0] * (_MX_TASK_ID_BYTES - 4)
+        assert _decode_task_id(slots) == "ab"
 
 
 # ---------------------------------------------------------------------------
@@ -184,9 +264,9 @@ class TestTaskIdHashPair:
 
 class TestMxAllGatherTasksSingleRank:
     """Single-rank short-circuit: returns the local task list as-is and
-    never invokes a collective. The drift-detection branch needs an
-    actual ``mx.distributed`` group and is exercised by the cluster
-    bench."""
+    never invokes a collective. The multi-rank root-authoritative path
+    needs an actual ``mx.distributed`` group and is exercised by the
+    cluster bench."""
 
     def test_empty_input(self) -> None:
         agreed, different = mx_all_gather_tasks([], group=None)
@@ -209,244 +289,293 @@ class TestMxAllGatherTasksSingleRank:
 
 
 # ---------------------------------------------------------------------------
-# mx_all_gather_tasks multi-rank order-agnostic agreement
+# Two-phase intersection agreement: end-to-end via in-process simulation
 # ---------------------------------------------------------------------------
 
 
-class _FakeGroup:
-    """Stand-in for ``mx.distributed.Group`` with just the
-    ``rank()``/``size()`` surface ``mx_all_gather_tasks`` exercises.
+def _agree_intersection(
+    rank_views: list[list[TextGeneration]],
+) -> list[tuple[list[TextGeneration], list[TextGeneration]]]:
+    """Run the two-phase intersection protocol entirely in-process.
 
-    We avoid importing MLX so the unittest suite stays MLX-free.
+    Mirrors :func:`mx_all_gather_tasks` for ``len(rank_views)`` ranks
+    without spinning up MLX. Phase 1 is root's broadcast (the first
+    entry in ``rank_views`` is treated as root); phase 2 is the
+    cross-rank vote (sum of indicator vectors). Returns each rank's
+    ``(agreed, leftover)`` pair so tests can assert that all ranks
+    land on the SAME ``agreed`` set, which is the whole point of the
+    protocol -- without it, divergent admit decisions leave one rank
+    in the spec loop while the other re-enters ``agree_on_tasks``,
+    causing collective-stream cross-talk and downstream
+    ``IndexError`` in the detokenizer when broadcast token slots
+    arrive scrambled.
+    """
+    from exo.worker.engines.mlx.utils_mlx import (
+        _MX_AGREE_BUFFER_LEN,  # pyright: ignore[reportPrivateUsage]
+        _MX_AGREE_MAX_TASKS,  # pyright: ignore[reportPrivateUsage]
+        _MX_TASK_ID_BYTES,  # pyright: ignore[reportPrivateUsage]
+        _decode_task_id,  # pyright: ignore[reportPrivateUsage]
+        _encode_task_id,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    if not rank_views:
+        return []
+    group_size = len(rank_views)
+    root_tasks = rank_views[0]
+
+    admitted = root_tasks[:_MX_AGREE_MAX_TASKS]
+    payload: list[int] = [len(admitted)]
+    for task in admitted:
+        payload.extend(_encode_task_id(task.task_id))
+    payload.extend([0] * (_MX_AGREE_BUFFER_LEN - len(payload)))
+
+    count = payload[0]
+    canonical_ids: list[str] = []
+    for i in range(count):
+        start = 1 + i * _MX_TASK_ID_BYTES
+        end = start + _MX_TASK_ID_BYTES
+        canonical_ids.append(_decode_task_id(payload[start:end]))
+
+    rank_locals: list[dict[TaskId, TextGeneration]] = [
+        {t.task_id: t for t in tasks} for tasks in rank_views
+    ]
+    votes_per_rank = [
+        [1 if cid in local else 0 for cid in canonical_ids] for local in rank_locals
+    ]
+    summed = [sum(votes[i] for votes in votes_per_rank) for i in range(count)]
+
+    canonical_id_set = {TaskId(cid) for cid in canonical_ids}
+    results: list[tuple[list[TextGeneration], list[TextGeneration]]] = []
+    for rank_idx, local in enumerate(rank_locals):
+        agreed: list[TextGeneration] = []
+        local_remaining = dict(local)
+        for i, cid in enumerate(canonical_ids):
+            if summed[i] != group_size:
+                continue
+            task = local_remaining.pop(TaskId(cid), None)
+            if task is not None:
+                agreed.append(task)
+        # Mirror ``mx_all_gather_tasks``'s starvation-avoiding leftover
+        # ordering (Codex P1, PR #21 round 3): tasks that never made it
+        # into the canonical broadcast (never given a chance) go to
+        # the front, canonical-but-not-agreed tasks go to the back.
+        front_of_leftover: list[TextGeneration] = []
+        back_of_leftover: list[TextGeneration] = []
+        for task in rank_views[rank_idx]:
+            if task.task_id not in local_remaining:
+                continue
+            if task.task_id in canonical_id_set:
+                back_of_leftover.append(task)
+            else:
+                front_of_leftover.append(task)
+        leftover = front_of_leftover + back_of_leftover
+        results.append((agreed, leftover))
+    return results
+
+
+class TestIntersectionAgreement:
+    """Cross-rank intersection semantics. The protocol's correctness
+    contract is that every rank that returns from
+    :func:`mx_all_gather_tasks` lands on the SAME ``agreed`` set, so
+    the next ``_admit_queued_tasks`` admits identical tasks on every
+    rank -- preventing the divergence that historically led to
+    cross-talk between admit collectives and spec-loop collectives."""
+
+    def test_unanimous_admission(self) -> None:
+        a_root = _make_task("alpha")
+        a_peer = _make_task("alpha")
+        results = _agree_intersection([[a_root], [a_peer]])
+        assert len(results) == 2
+        for agreed, leftover in results:
+            assert [t.task_id for t in agreed] == ["alpha"]
+            assert leftover == []
+
+    def test_root_only_task_deferred_on_both_ranks(self) -> None:
+        # Root has task that peer hasn't received yet: NEITHER rank
+        # admits it. This is the whole reason for intersection
+        # rather than root-authoritative.
+        results = _agree_intersection([[_make_task("alpha")], []])
+        for agreed, _ in results:
+            assert agreed == []
+        assert [t.task_id for t in results[0][1]] == ["alpha"]
+        assert results[1][1] == []
+
+    def test_peer_only_task_deferred_on_both_ranks(self) -> None:
+        results = _agree_intersection([[], [_make_task("future")]])
+        for agreed, _ in results:
+            assert agreed == []
+        assert results[0][1] == []
+        assert [t.task_id for t in results[1][1]] == ["future"]
+
+    def test_partial_overlap_only_intersection_admitted(self) -> None:
+        a_root = _make_task("alpha")
+        a_peer = _make_task("alpha")
+        beta = _make_task("beta")
+        gamma = _make_task("gamma")
+        results = _agree_intersection([[a_root, beta], [a_peer, gamma]])
+        for agreed, _ in results:
+            assert [t.task_id for t in agreed] == ["alpha"]
+        assert [t.task_id for t in results[0][1]] == ["beta"]
+        assert [t.task_id for t in results[1][1]] == ["gamma"]
+
+    def test_three_rank_intersection(self) -> None:
+        # 3-rank target: agreed is what *every* rank has. Anything
+        # short of unanimous stays out.
+        results = _agree_intersection(
+            [
+                [_make_task("alpha"), _make_task("beta")],
+                [_make_task("alpha"), _make_task("beta")],
+                [_make_task("alpha")],
+            ]
+        )
+        for agreed, _ in results:
+            assert [t.task_id for t in agreed] == ["alpha"]
+
+    def test_canonical_order_is_root_order(self) -> None:
+        ids_root = ["c", "a", "b"]
+        ids_peer = ["b", "a", "c"]
+        results = _agree_intersection(
+            [
+                [_make_task(i) for i in ids_root],
+                [_make_task(i) for i in ids_peer],
+            ]
+        )
+        for agreed, _ in results:
+            assert [t.task_id for t in agreed] == ids_root
+
+    def test_root_caps_at_max_tasks(self) -> None:
+        from exo.worker.engines.mlx.utils_mlx import (
+            _MX_AGREE_MAX_TASKS,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        many = [_make_task(f"t{i:02d}") for i in range(_MX_AGREE_MAX_TASKS + 4)]
+        peer_copy = [_make_task(t.task_id) for t in many]
+        results = _agree_intersection([many, peer_copy])
+        for agreed, _ in results:
+            assert len(agreed) == _MX_AGREE_MAX_TASKS
+
+
+class TestNoStarvationWhenFirstPageStuck:
+    """Codex P1 (PR #21 round 3): a queue larger than
+    ``_MX_AGREE_MAX_TASKS`` whose entire first page is missing on a
+    peer would have starved tasks at positions ``>= _MX_AGREE_MAX_TASKS``
+    indefinitely, because every round root re-broadcast the same
+    ``tasks[:_MX_AGREE_MAX_TASKS]`` and tasks past the cap never
+    entered the canonical set.
+
+    The fix demotes canonical-but-not-agreed IDs to the back of
+    leftover, so the next agreement round's first page is biased
+    toward fresh candidates that haven't been broadcast yet.
     """
 
-    def __init__(self, rank: int, size: int = 2) -> None:
-        self._rank = rank
-        self._size = size
-
-    def rank(self) -> int:
-        return self._rank
-
-    def size(self) -> int:
-        return self._size
-
-
-class TestMxAllGatherTasksAgreement:
-    """Codex P1 (PR #20 round-(N+2), utils_mlx.py:1451): the previous
-    hash-equality drift detector hard-failed on benign cross-rank
-    timing skew (rank 0 has ``[A, B]`` while rank 1 has ``[A]``),
-    turning a normal scheduling state into a runner-killing
-    ``RuntimeError``. ``agree_on_tasks`` documents that some ranks
-    "may have received [tasks] in different order or not at all", so
-    the agreement primitive must instead return:
-
-      * ``agreed`` -- the *intersection* of all ranks' task sets
-        (universally present) -- to be admitted into the active set
-        on this tick.
-      * ``different`` -- the local tasks NOT in the intersection --
-        to be retried on the next tick once pubsub catches up.
-
-    These tests stub both the int-list broadcast and ``all_sum`` so
-    we can exercise the structural agreement protocol without an
-    actual ``mx.distributed`` group. The cluster bench covers the
-    real collective.
-    """
-
-    def _setup_collectives(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        *,
-        root_task_ids: list[str],
-        all_ranks_task_ids: list[list[str]],
-    ) -> None:
-        """Wire up fakes for ``mx_broadcast_int_list`` and
-        ``mx.distributed.all_sum`` that simulate the cluster's
-        collective behaviour. ``all_ranks_task_ids[i]`` is the task
-        IDs known to rank ``i`` at agreement time. The fakes
-        synthesise root's view (count + hashes) and the all-sum
-        presence vector that ``mx_all_gather_tasks`` consumes.
+    def test_first_page_all_missing_advances_via_demotion(self) -> None:
+        """Round 1 stalls (all canonical IDs missing on peer); round 2
+        must broadcast tasks that were beyond the cap, not the same
+        stuck first page.
         """
-        from exo.worker.engines.mlx import utils_mlx as utils_mlx_mod
+        from exo.worker.engines.mlx.utils_mlx import (
+            _MX_AGREE_MAX_TASKS,  # pyright: ignore[reportPrivateUsage]
+        )
 
-        root_count = len(root_task_ids)
-        # Sorted as the production code sorts, so the broadcast buffer
-        # mirrors what root would produce.
-        sorted_root_ids = sorted(root_task_ids)
-        root_pairs: list[int] = []
-        for tid in sorted_root_ids:
-            high, low = _task_id_hash_pair(tid)
-            root_pairs.append(high)
-            root_pairs.append(low)
+        max_tasks: int = _MX_AGREE_MAX_TASKS
+        # Build a deeply-backlogged root queue. The first ``max_tasks``
+        # IDs are stuck (peer hasn't received them yet); the remaining
+        # ``max_tasks + 4`` IDs are present on every rank.
+        stuck_ids = [f"stuck{i:02d}" for i in range(max_tasks)]
+        deliverable_ids = [f"ok{i:02d}" for i in range(max_tasks + 4)]
 
-        def fake_broadcast(
-            values: list[int] | None,
-            *,
-            length: int,
-            group: object,
-            is_root: bool,
-        ) -> list[int]:
-            # All ranks see root's broadcast result, regardless of who
-            # called us. The two distinct calls (count, then hashes)
-            # are disambiguated by ``length``.
-            if length == 1:
-                return [root_count]
-            assert length == root_count * 2, (
-                f"broadcast length {length} doesn't match root's "
-                f"count*2 ({root_count * 2})"
-            )
-            return list(root_pairs)
+        root_view = [_make_task(tid) for tid in stuck_ids + deliverable_ids]
+        peer_view = [_make_task(tid) for tid in deliverable_ids]
 
-        # ``mx.distributed.all_sum`` is mocked at the call site by
-        # patching it to return a buffer where each slot equals the
-        # sum across all ranks of "this rank has root's i-th task".
-        # That's exactly what the cluster collective would produce.
-        per_rank_presences: list[list[int]] = []
-        for rank_ids in all_ranks_task_ids:
-            rank_pairs = {_task_id_hash_pair(tid) for tid in rank_ids}
-            presence: list[int] = []
-            for tid in sorted_root_ids:
-                presence.append(1 if _task_id_hash_pair(tid) in rank_pairs else 0)
-            per_rank_presences.append(presence)
-        summed_presence = [
-            sum(rank_presence[i] for rank_presence in per_rank_presences)
-            for i in range(root_count)
-        ]
+        # ----- Round 1: every canonical ID misses on the peer -----
+        round_1 = _agree_intersection([root_view, peer_view])
+        root_admitted_r1, root_leftover_r1 = round_1[0]
+        peer_admitted_r1, peer_leftover_r1 = round_1[1]
+        assert root_admitted_r1 == []
+        assert peer_admitted_r1 == []
 
-        class _FakeAllSumResult:
-            def __init__(self, values: list[int]) -> None:
-                self._values = values
+        # Pre-fix, root's leftover would have been the original order
+        # (stuck first), so round 2 would have had the same first page
+        # and made no progress. The fix demotes stuck canonical IDs
+        # to the back so deliverable IDs are now at the front.
+        root_leftover_ids_r1 = [t.task_id for t in root_leftover_r1]
+        # First ``max_tasks + 4`` slots should be deliverable tasks
+        # (the ones that were beyond the cap in round 1).
+        assert root_leftover_ids_r1[: len(deliverable_ids)] == deliverable_ids, (
+            "deliverable tasks must rotate to the front of root's "
+            "leftover so the next agreement round can broadcast them; "
+            f"got {root_leftover_ids_r1!r}"
+        )
+        # Stuck IDs are demoted to the tail.
+        assert root_leftover_ids_r1[len(deliverable_ids) :] == stuck_ids, (
+            "stuck canonical tasks must be demoted to the back "
+            f"got {root_leftover_ids_r1!r}"
+        )
 
-            def tolist(self) -> list[int]:
-                return list(self._values)
+        # ----- Round 2: deliverable tasks finally get broadcast -----
+        round_2 = _agree_intersection([root_leftover_r1, peer_leftover_r1])
+        root_admitted_r2, root_leftover_r2 = round_2[0]
+        peer_admitted_r2, _peer_leftover_r2 = round_2[1]
 
-        def fake_all_sum(
-            buffer: object,
-            *,
-            group: object,  # noqa: ARG001
-            stream: object | None = None,  # noqa: ARG001
-        ) -> _FakeAllSumResult:
-            # The production code only reads ``.tolist()`` after
-            # ``mx.eval``; we ignore the actual buffer contents
-            # because the protocol's correctness depends on the
-            # cluster-wide sum, not on any single rank's contribution.
-            del buffer
-            return _FakeAllSumResult(summed_presence)
+        # The first ``max_tasks`` deliverable IDs land in the canonical
+        # broadcast and are admitted by both ranks.
+        admitted_ids = {t.task_id for t in root_admitted_r2}
+        assert admitted_ids == set(deliverable_ids[:max_tasks]), (
+            f"first {max_tasks} deliverable IDs must be admitted in "
+            f"round 2 once the demotion lifts the starvation; got "
+            f"admitted={sorted(admitted_ids)}"
+        )
+        # Both ranks land on the same agreed set (the protocol's core
+        # contract: divergence breaks collective-stream sync).
+        assert {t.task_id for t in peer_admitted_r2} == admitted_ids
 
-        # Patch both helpers. ``mx_broadcast_int_list`` is a module-
-        # level symbol; ``mx.distributed.all_sum`` is dotted-imported.
-        monkeypatch.setattr(utils_mlx_mod, "mx_broadcast_int_list", fake_broadcast)
+        # Root's leftover after round 2 should still contain the stuck
+        # IDs and the four deliverable IDs that didn't fit in round 2's
+        # canonical broadcast.
+        root_leftover_ids_r2 = {t.task_id for t in root_leftover_r2}
+        assert root_leftover_ids_r2 == set(stuck_ids) | set(
+            deliverable_ids[max_tasks:]
+        ), (
+            "round-2 leftover must keep the still-stuck IDs and the "
+            f"deliverable IDs beyond the cap; got {root_leftover_ids_r2!r}"
+        )
 
-        import mlx.core as mx_mod
-
-        monkeypatch.setattr(mx_mod.distributed, "all_sum", fake_all_sum)
-
-        # ``mx.eval`` is a no-op for our fake result.
-        def _fake_eval(*_args: object, **_kwargs: object) -> None:
-            return None
-
-        monkeypatch.setattr(mx_mod, "eval", _fake_eval)
-
-    def test_intersection_when_rank_is_partial(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Rank 0 has ``[A, B]``; rank 1 only has ``[A]`` (pubsub
-        timing skew). Both ranks must agree on ``[A]``, with rank
-        0's ``[B]`` deferred to ``different`` for retry next tick.
+    def test_partial_first_page_miss_does_not_block_beyond_cap_tasks(self) -> None:
+        """A subtler variant: root queue is exactly larger than the
+        cap, only one of the first-page IDs is missing. The pre-fix
+        leftover would still have rotated the missing ID into round
+        2's first page, but the deliverable tasks beyond position
+        ``max_tasks`` would still see the missing ID at the head of
+        root's broadcast each round, slowing throughput. The fix
+        keeps the head of next round's queue clear of stuck IDs.
         """
-        self._setup_collectives(
-            monkeypatch,
-            root_task_ids=["alpha", "beta"],
-            all_ranks_task_ids=[["alpha", "beta"], ["alpha"]],
+        from exo.worker.engines.mlx.utils_mlx import (
+            _MX_AGREE_MAX_TASKS,  # pyright: ignore[reportPrivateUsage]
         )
 
-        # Rank 0 sees both tasks; ``different`` carries the not-yet-
-        # universally-present ``beta`` for retry.
-        agreed_root, different_root = mx_all_gather_tasks(
-            [_make_task("alpha"), _make_task("beta")],
-            group=_FakeGroup(rank=0, size=2),  # pyright: ignore[reportArgumentType]
-        )
-        assert [t.task_id for t in agreed_root] == ["alpha"]
-        assert [t.task_id for t in different_root] == ["beta"]
+        max_tasks: int = _MX_AGREE_MAX_TASKS
+        # Single stuck ID at root's head, plus ``max_tasks`` deliverable IDs.
+        stuck_id = "stuck00"
+        deliverable_ids = [f"ok{i:02d}" for i in range(max_tasks)]
 
-        # Rank 1 has only ``[A]``; everything it has is in the
-        # intersection.
-        agreed_rank1, different_rank1 = mx_all_gather_tasks(
-            [_make_task("alpha")],
-            group=_FakeGroup(rank=1, size=2),  # pyright: ignore[reportArgumentType]
-        )
-        assert [t.task_id for t in agreed_rank1] == ["alpha"]
-        assert different_rank1 == []
+        root_view = [_make_task(tid) for tid in [stuck_id] + deliverable_ids]
+        peer_view = [_make_task(tid) for tid in deliverable_ids]
 
-    def test_full_match_returns_everything_in_agreed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """When every rank has the same task set, ``agreed`` is the
-        full canonically-sorted list and ``different`` is empty. This
-        is the steady-state happy path."""
-        self._setup_collectives(
-            monkeypatch,
-            root_task_ids=["alpha", "beta"],
-            all_ranks_task_ids=[["alpha", "beta"], ["alpha", "beta"]],
-        )
-        # Note: rank 1 receives in different order than rank 0.
-        agreed, different = mx_all_gather_tasks(
-            [_make_task("beta"), _make_task("alpha")],
-            group=_FakeGroup(rank=1, size=2),  # pyright: ignore[reportArgumentType]
-        )
-        assert [t.task_id for t in agreed] == ["alpha", "beta"]
-        assert different == []
+        # Round 1: canonical = stuck + first 15 deliverable IDs.
+        # Peer admits 15 deliverable, stuck is deferred.
+        round_1 = _agree_intersection([root_view, peer_view])
+        root_admitted_r1, root_leftover_r1 = round_1[0]
+        admitted_ids_r1 = {t.task_id for t in root_admitted_r1}
+        assert admitted_ids_r1 == set(deliverable_ids[: max_tasks - 1])
 
-    def test_disjoint_sets_yield_empty_intersection(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """If ranks have totally disjoint task IDs, the intersection
-        is empty and every rank's local tasks fall into
-        ``different`` -- no RuntimeError. Genuine pubsub divergence
-        recovers via retry rather than runner death."""
-        self._setup_collectives(
-            monkeypatch,
-            root_task_ids=["alpha"],
-            all_ranks_task_ids=[["alpha"], ["beta"]],
+        # Stuck ID is at the BACK of root's leftover, the last
+        # deliverable ID is at the FRONT (it was beyond the cap).
+        root_leftover_ids_r1 = [t.task_id for t in root_leftover_r1]
+        assert root_leftover_ids_r1 == [
+            deliverable_ids[max_tasks - 1],
+            stuck_id,
+        ], (
+            "demotion must keep beyond-cap deliverable tasks at the "
+            "front and push the stuck canonical task to the back; "
+            f"got {root_leftover_ids_r1!r}"
         )
-
-        agreed, different = mx_all_gather_tasks(
-            [_make_task("beta")],
-            group=_FakeGroup(rank=1, size=2),  # pyright: ignore[reportArgumentType]
-        )
-        assert agreed == []
-        assert [t.task_id for t in different] == ["beta"]
-
-    def test_root_empty_returns_no_agreement(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """When root has no tasks (e.g. cold start), no agreement is
-        possible this tick; non-root ranks return their entire local
-        list as ``different`` for retry. Crucially: no ``RuntimeError``
-        even though rank 1 has tasks rank 0 doesn't."""
-        self._setup_collectives(
-            monkeypatch,
-            root_task_ids=[],
-            all_ranks_task_ids=[[], ["alpha"]],
-        )
-
-        agreed, different = mx_all_gather_tasks(
-            [_make_task("alpha")],
-            group=_FakeGroup(rank=1, size=2),  # pyright: ignore[reportArgumentType]
-        )
-        assert agreed == []
-        assert [t.task_id for t in different] == ["alpha"]
-
-    def test_all_empty_steady_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Cluster steady-state with no pending tasks anywhere: no
-        agreement and no error."""
-        self._setup_collectives(
-            monkeypatch,
-            root_task_ids=[],
-            all_ranks_task_ids=[[], []],
-        )
-        agreed, different = mx_all_gather_tasks(
-            [],
-            group=_FakeGroup(rank=1, size=2),  # pyright: ignore[reportArgumentType]
-        )
-        assert agreed == []
-        assert different == []
