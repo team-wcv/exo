@@ -74,6 +74,9 @@ from exo.worker.engines.mlx.auto_parallel import (
     tensor_auto_parallel,
 )
 from exo.worker.engines.mlx.types import Model
+from exo.worker.engines.mlx.vendor.qwen3_5_dflash_hooks import (
+    DFlashHooksNotImplementedError as _DFlashHooksNotImplementedError,
+)
 from exo.worker.runner.bootstrap import logger
 
 
@@ -734,6 +737,59 @@ class CoupledDrafter:
     model: object
 
 
+# Exceptions :func:`_dispatch_attach_coupled_hooks` may raise that the
+# loader caller should treat as "drafter loaded but not dispatchable on
+# this target -- degrade to standard drafting" rather than crashes:
+#
+# - :class:`TypeError` -- right kind, wrong target architecture (e.g.
+#   card declared a ``coupled_drafter`` of kind ``"mtp"`` but the target
+#   loaded as something other than a Gemma 4 ``Model``).
+# - :class:`exo.worker.engines.mlx.vendor.qwen3_5_dflash_hooks.DFlashHooksNotImplementedError`
+#   -- right kind, hooks not yet vendored for that kind. Today raised by
+#   the dflash skeleton; deletion follows the qwen3_5 vendor work.
+#
+# Listed at module scope (rather than caught inline) so the exception
+# tuple stays a single source of truth -- adding a future coupled-drafter
+# kind extends the tuple here once and the loader picks it up automatically.
+# ``_DFlashHooksNotImplementedError`` is imported at the top of the file
+# alongside other vendor imports so ruff E402 stays happy.
+_COUPLED_HOOK_ATTACH_FALLBACK_EXCEPTIONS: tuple[type[Exception], ...] = (
+    TypeError,
+    _DFlashHooksNotImplementedError,
+)
+
+
+def _dispatch_attach_coupled_hooks(kind: CoupledDrafterKind, model: object) -> None:
+    """Mark ``model`` as wired for ``kind``'s coupled-drafter hooks.
+
+    Per-kind dispatcher around the vendor modules' ``attach_*_hooks``
+    helpers. Splitting the dispatch out of the load path lets the
+    loader stay kind-agnostic -- adding a new coupled-drafter kind
+    only requires extending this match plus the vendor module, not
+    touching :func:`load_mlx_items`.
+
+    Raises:
+        TypeError: ``model`` is the wrong target architecture for
+            the declared ``kind``. Caller falls back to standard
+            drafting (see :data:`_COUPLED_HOOK_ATTACH_FALLBACK_EXCEPTIONS`).
+        DFlashHooksNotImplementedError: ``kind == "dflash"`` and the
+            qwen3_5 hook surface is still a skeleton. Same fallback.
+    """
+    match kind:
+        case "mtp":
+            from exo.worker.engines.mlx.vendor.gemma4_mtp_hooks import (
+                attach_mtp_hooks,
+            )
+
+            attach_mtp_hooks(model)
+        case "dflash":
+            from exo.worker.engines.mlx.vendor.qwen3_5_dflash_hooks import (
+                attach_dflash_hooks,
+            )
+
+            attach_dflash_hooks(model)
+
+
 def _coupled_drafter_weight_size_bytes(coupled_id: ModelId) -> int:
     """Best-effort coupled-drafter on-disk size for the wired-memory bump.
 
@@ -1082,13 +1138,9 @@ def load_mlx_items(
         if bound_instance.instance.drafter_placement is None:
             coupled_drafter = _try_load_coupled_drafter(target_card)
             if coupled_drafter is not None:
-                from exo.worker.engines.mlx.vendor.gemma4_mtp_hooks import (
-                    attach_mtp_hooks,
-                )
-
                 try:
-                    attach_mtp_hooks(model)
-                except TypeError as e:
+                    _dispatch_attach_coupled_hooks(coupled_drafter.kind, model)
+                except _COUPLED_HOOK_ATTACH_FALLBACK_EXCEPTIONS as e:
                     logger.warning(
                         f"Coupled drafter loaded for "
                         f"{target_card.model_id} but target type "
