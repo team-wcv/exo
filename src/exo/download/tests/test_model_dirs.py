@@ -42,6 +42,19 @@ def _create_incomplete_model(model_dir: Path) -> None:
     # model.safetensors is missing
 
 
+def _create_single_file_safetensors_model(model_dir: Path) -> None:
+    """Create a complete model that ships a single safetensors with no index.
+
+    Mirrors the layout HuggingFace publishes for many small / quantized
+    single-file checkpoints (e.g. coupled MTP drafters) where there is no
+    ``model.safetensors.index.json``.
+    """
+    model_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "model.safetensors").write_bytes(b"weights")
+    (model_dir / "config.json").write_text('{"model_type": "test"}')
+    (model_dir / "tokenizer.json").write_text("{}")
+
+
 # ---------------------------------------------------------------------------
 # resolve_existing_model
 # ---------------------------------------------------------------------------
@@ -119,6 +132,60 @@ class TestResolveExistingModel:
             patch("exo.download.download_utils.EXO_MODELS_DIRS", (writable,)),
         ):
             assert resolve_existing_model(MODEL_ID) == ro2 / NORMALIZED
+
+    def test_finds_single_file_safetensors_model_without_index(
+        self, tmp_path: Path
+    ) -> None:
+        """Coupled MTP drafters (e.g. ``mlx-community/gemma-4-e2b-it-4bit``)
+        ship as a single ``model.safetensors`` plus ``config.json`` with no
+        ``model.safetensors.index.json``. ``resolve_existing_model`` must
+        accept that layout so the runtime can pick the drafter up natively
+        instead of needing a manual index bootstrap.
+        """
+        writable = tmp_path / "writable"
+        _create_single_file_safetensors_model(writable / NORMALIZED)
+        with (
+            patch("exo.download.download_utils.EXO_MODELS_READ_ONLY_DIRS", ()),
+            patch("exo.download.download_utils.EXO_MODELS_DIRS", (writable,)),
+        ):
+            assert resolve_existing_model(MODEL_ID) == writable / NORMALIZED
+
+    def test_skips_single_file_directory_without_config_json(
+        self, tmp_path: Path
+    ) -> None:
+        """A bare safetensors file without ``config.json`` is not a model
+        checkpoint -- the scanner must keep returning ``None`` so callers
+        don't mark such directories complete (e.g. tokenizer-only stashes).
+        """
+        writable = tmp_path / "writable"
+        model_dir = writable / NORMALIZED
+        model_dir.mkdir(parents=True)
+        (model_dir / "model.safetensors").write_bytes(b"weights")
+        with (
+            patch("exo.download.download_utils.EXO_MODELS_READ_ONLY_DIRS", ()),
+            patch("exo.download.download_utils.EXO_MODELS_DIRS", (writable,)),
+        ):
+            assert resolve_existing_model(MODEL_ID) is None
+
+    def test_skips_directory_with_multiple_safetensors_and_no_index(
+        self, tmp_path: Path
+    ) -> None:
+        """Multi-file safetensors layouts MUST keep their index file -- we
+        cannot infer the expected weight set from disk alone, so the
+        original "no index, no opinion" semantics still apply when there
+        are 2+ ``*.safetensors`` files.
+        """
+        writable = tmp_path / "writable"
+        model_dir = writable / NORMALIZED
+        model_dir.mkdir(parents=True)
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"a")
+        (model_dir / "model-00002-of-00002.safetensors").write_bytes(b"b")
+        (model_dir / "config.json").write_text('{"model_type": "test"}')
+        with (
+            patch("exo.download.download_utils.EXO_MODELS_READ_ONLY_DIRS", ()),
+            patch("exo.download.download_utils.EXO_MODELS_DIRS", (writable,)),
+        ):
+            assert resolve_existing_model(MODEL_ID) is None
 
 
 # ---------------------------------------------------------------------------
