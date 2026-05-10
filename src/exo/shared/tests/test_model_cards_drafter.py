@@ -257,39 +257,51 @@ def test_coupled_drafter_composes_with_standard_drafter_list() -> None:
     assert rehydrated.coupled_drafter == coupled
 
 
-_GEMMA4_MTP_DRAFTER = ModelId("mlx-community/gemma-4-E2B-it-assistant-bf16")
+_GEMMA4_31B_MTP_DRAFTER = ModelId("mlx-community/gemma-4-31B-it-assistant-bf16")
+_GEMMA4_26B_A4B_MTP_DRAFTER = ModelId(
+    "mlx-community/gemma-4-26B-A4B-it-assistant-bf16"
+)
 
 
 @pytest.mark.asyncio
 async def test_shipped_gemma4_cards_declare_mtp_coupled_drafter() -> None:
-    """All shipped Gemma 4 31B / 26B-A4B cards point at the MTP assistant drafter.
+    """All shipped Gemma 4 31B / 26B-A4B cards declare a target-matched MTP drafter.
 
-    Phase-3 contract: every Gemma 4 large-target quant ships a
-    ``coupled_drafter`` set to the bf16 MTP assistant
-    (``gemma-4-E2B-it-assistant-bf16``). The drafter is published only as
-    bf16 by the upstream because it's a 78M-parameter model where
-    quantisation pressure on the wired-memory pool is negligible
-    (~158 MB total) and quant noise materially hurts the acceptance rate
-    that drives the speedup. Quantised target × bf16 coupled drafter is
-    the supported pairing.
+    Phase-3 contract: every shipped Gemma 4 large-target quant ships a
+    ``coupled_drafter`` pointed at the bf16 MTP assistant trained
+    against THAT target's hidden size. mlx-community publishes one
+    assistant per target family:
 
-    Pinning every shipped quant on this single drafter id lets a single
-    download (cached the first time any Gemma 4 card runs MTP) serve every
-    Gemma-4 large quant on the same node, which is the right behaviour
-    for a fleet that ships several quants of the same family side-by-side.
+    - ``gemma-4-31b-it-*`` →  ``gemma-4-31B-it-assistant-bf16`` (~0.5B)
+    - ``gemma-4-26b-a4b-it-*`` →  ``gemma-4-26B-A4B-it-assistant-bf16`` (~0.4B)
+
+    The ``E2B`` / ``E4B`` assistants exist but are sized for the
+    ``gemma-4-e2b`` / ``gemma-4-e4b`` targets respectively; pairing them
+    with a 26B-A4B or 31B target raises a matmul shape mismatch in
+    ``mlx_vlm.speculative.drafters.gemma4_assistant.draft_block`` because
+    the drafter's pre-projection head is sized to the trained-against
+    target's ``hidden_size``. Pinning the target-matched assistant per
+    quant variant locks that pairing in.
+
+    The assistants are published only as bf16: at ~80 MB - 0.5 GB they
+    cost no memory pressure, and quant noise on the drafter materially
+    hurts acceptance rate (which is what drives the speedup).
     """
     cards = {card.model_id: card for card in await get_model_cards()}
-    for target_str in {
-        *_gemma4_31b_expectations(),
-        *_gemma4_26b_expectations(),
-    }:
-        target_id = ModelId(target_str)
-        assert target_id in cards, f"{target_id} card missing"
-        card = cards[target_id]
-        assert card.coupled_drafter == _GEMMA4_MTP_DRAFTER, (
-            f"{target_id} coupled_drafter mismatch: got "
-            f"{card.coupled_drafter!r}, expected {_GEMMA4_MTP_DRAFTER!r}"
-        )
+
+    expected_drafter_per_family: dict[ModelId, set[str]] = {
+        _GEMMA4_31B_MTP_DRAFTER: set(_gemma4_31b_expectations()),
+        _GEMMA4_26B_A4B_MTP_DRAFTER: set(_gemma4_26b_expectations()),
+    }
+    for expected_drafter, target_strs in expected_drafter_per_family.items():
+        for target_str in target_strs:
+            target_id = ModelId(target_str)
+            assert target_id in cards, f"{target_id} card missing"
+            card = cards[target_id]
+            assert card.coupled_drafter == expected_drafter, (
+                f"{target_id} coupled_drafter mismatch: got "
+                f"{card.coupled_drafter!r}, expected {expected_drafter!r}"
+            )
 
 
 @pytest.mark.asyncio
@@ -313,14 +325,20 @@ async def test_shipped_gemma4_cards_keep_standard_drafter_list_alongside_mtp() -
     MTP supersedes them.
     """
     cards = {card.model_id: card for card in await get_model_cards()}
-    for target_str, expected_drafters in {
-        **_gemma4_31b_expectations(),
-        **_gemma4_26b_expectations(),
-    }.items():
-        target_id = ModelId(target_str)
-        assert target_id in cards, f"{target_id} card missing"
-        card = cards[target_id]
-        assert card.coupled_drafter == _GEMMA4_MTP_DRAFTER
-        assert card.drafter_model_ids == [ModelId(d) for d in expected_drafters], (
-            f"{target_id} drafter_model_ids mismatch: got {card.drafter_model_ids!r}"
-        )
+
+    paired_expectations: list[tuple[dict[str, list[str]], ModelId]] = [
+        (_gemma4_31b_expectations(), _GEMMA4_31B_MTP_DRAFTER),
+        (_gemma4_26b_expectations(), _GEMMA4_26B_A4B_MTP_DRAFTER),
+    ]
+    for expectations, expected_drafter in paired_expectations:
+        for target_str, expected_drafters in expectations.items():
+            target_id = ModelId(target_str)
+            assert target_id in cards, f"{target_id} card missing"
+            card = cards[target_id]
+            assert card.coupled_drafter == expected_drafter
+            assert card.drafter_model_ids == [
+                ModelId(d) for d in expected_drafters
+            ], (
+                f"{target_id} drafter_model_ids mismatch: got "
+                f"{card.drafter_model_ids!r}"
+            )
