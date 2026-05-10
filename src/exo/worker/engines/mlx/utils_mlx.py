@@ -855,6 +855,7 @@ def _try_load_coupled_drafter(model_card: ModelCard) -> CoupledDrafter | None:
         from mlx_vlm.speculative import (  # pyright: ignore[reportMissingTypeStubs]
             drafters as _mlxvlm_drafters,
         )
+
         load_drafter = cast(
             Callable[..., tuple[object, str]],
             _mlxvlm_drafters.load_drafter,
@@ -996,6 +997,92 @@ def _maybe_load_drafter(model_card: ModelCard) -> tuple[ModelId, Model] | None:
     return drafter_id, cast(Model, drafter_model)
 
 
+def _try_load_collocated_drafter(
+    target_card: ModelCard,
+    model: nn.Module,
+    *,
+    allow_standard_drafter_fallback: bool,
+) -> tuple[CoupledDrafter | None, ModelId | None, Model | None]:
+    """Resolve the collocated drafter (coupled or standard) for ``model``.
+
+    Coupled-drafter precedence: when the card declares
+    ``coupled_drafter`` we try it first because it's the path that
+    yields the multi-x DFlash / MTP speedup. If the coupled load
+    fails (mlx-vlm missing, weights absent, kind unrecognised, target
+    type unsupported) we either fall through to the standard
+    external-drafter list (single-device, where the standard drafter
+    *is* dispatchable) or return empty-handed (multi-device, where
+    the generator can't dispatch standard drafters yet so loading
+    one would just waste memory).
+
+    On a successful coupled load we ALSO attach the target-side hooks
+    (``attach_mtp_hooks`` / ``attach_dflash_hooks``). The hook is the
+    *capability gate* that :func:`mlx_generate` reads -- without it,
+    the dispatch declines to route the request through the coupled
+    path and the loaded coupled drafter stays passive. Hook
+    attachment can fail on its own (e.g. the card incorrectly pairs a
+    Gemma 4 ``coupled_drafter`` with a non-Gemma target); we treat
+    that as another degrade-to-standard signal rather than a hard
+    load failure so traffic keeps flowing through whichever drafter
+    path is available.
+
+    Used by both single-device and symmetric multi-rank (tensor-
+    parallel) placements. Tensor parallel works because coupled
+    drafters (~0.5-3 GB) replicate per rank and consume the post-
+    all-reduce hidden state, which is identical on every rank. The
+    drafter's own KV / SSM state replicates with the same logic.
+    Asymmetric multi-rank uses a separate ``DrafterRunner`` reachable
+    over the parent group and is handled by the caller (the
+    ``drafter_placement is not None`` branch).
+
+    Args:
+        target_card: The target model card; supplies the
+            ``coupled_drafter`` and ``drafter_model_ids`` declarations.
+        model: The (possibly sharded) loaded target. Coupled hooks
+            attach to this object's wrapper / inner-text-model
+            sentinel attributes.
+        allow_standard_drafter_fallback: Whether to fall back to
+            :func:`_maybe_load_drafter` when no coupled drafter loads.
+            Pass ``True`` for single-device placements (the standard
+            drafter is dispatchable). Pass ``False`` for multi-device
+            placements -- :func:`mlx_generate` declines to dispatch
+            standard drafters when ``group is not None`` today, so a
+            loaded standard drafter would just sit in memory unused.
+
+    Returns:
+        ``(coupled_drafter, drafter_id, drafter_model)`` where at
+        most one of ``coupled_drafter`` and ``drafter_model`` is
+        non-None. ``drafter_id`` is populated only on a successful
+        standard-drafter load -- coupled-drafter attribution is
+        threaded through ``GenerationStats`` from
+        :data:`CoupledDrafter.model_id` instead, see
+        :func:`_resolve_coupled_drafter_telemetry`.
+    """
+    coupled_drafter = _try_load_coupled_drafter(target_card)
+    if coupled_drafter is not None:
+        try:
+            _dispatch_attach_coupled_hooks(coupled_drafter.kind, model)
+        except _COUPLED_HOOK_ATTACH_FALLBACK_EXCEPTIONS as e:
+            logger.warning(
+                f"Coupled drafter loaded for "
+                f"{target_card.model_id} but target type "
+                f"{type(model).__name__!r} is incompatible "
+                f"with the {coupled_drafter.kind} hooks "
+                f"(error: {e}). Discarding coupled drafter "
+                "and falling back to standard drafting."
+            )
+            coupled_drafter = None
+    if coupled_drafter is not None:
+        return coupled_drafter, None, None
+    if not allow_standard_drafter_fallback:
+        return None, None, None
+    drafter_pair = _maybe_load_drafter(target_card)
+    if drafter_pair is None:
+        return None, None, None
+    drafter_id, drafter_model = drafter_pair
+    return None, drafter_id, drafter_model
+
+
 def _drafter_weight_size_bytes(drafter_id: ModelId) -> int:
     """Best-effort drafter-on-disk size for the wired-memory bump.
 
@@ -1102,58 +1189,14 @@ def load_mlx_items(
         # drafter is a separate ``DrafterRunner`` reachable via
         # ``RemoteTransport`` over the parent group, and loading a
         # second copy locally would just duplicate the weights and
-        # confuse the spec-decode loop.
-        #
-        # Coupled-drafter precedence: when the card declares
-        # ``coupled_drafter`` we try it first because it's the path
-        # that yields the ~2x MTP speedup on single-node placements.
-        # Coupled drafters can't ride asymmetric placement (their wire
-        # would have to ship full hidden states / KV cache entries
-        # cross-node) so the surrounding ``drafter_placement is None``
-        # check covers this -- by the time we're here, we've already
-        # decided drafter + target collocate. If the coupled load
-        # fails (mlx-vlm missing, weights absent, kind unrecognised,
-        # target type unsupported), we fall through to the standard
-        # external-drafter list so the user still gets *some*
-        # speculative decoding via the existing path.
-        #
-        # On a successful coupled load we ALSO attach the target-side
-        # MTP hooks (``attach_mtp_hooks``). The hook is the *capability
-        # gate* that the upcoming ``mlx_generate`` dispatch reads --
-        # without it, the dispatch declines to route the request
-        # through the coupled path and ``coupled_drafter`` remains
-        # passive. Hook attachment can fail on its own (e.g. the card
-        # incorrectly pairs a Gemma 4 ``coupled_drafter`` with a non-
-        # Gemma target); we treat that as another degrade-to-standard
-        # signal rather than a hard load failure so traffic keeps
-        # flowing through whichever drafter path is available.
-        #
-        # ``drafter_id`` is intentionally NOT populated from a
-        # successful coupled load yet: the generator does not yet
-        # dispatch through the coupled path, so any request
-        # "attributed" to the coupled drafter would be misleading --
-        # the speculative decoding it promises is not yet running.
-        # The follow-up dispatch wiring is where the attribution
-        # turns truthful and ``drafter_id`` will be set there.
+        # confuse the spec-decode loop. See
+        # :func:`_try_load_collocated_drafter` for the coupled-vs-
+        # standard precedence and fallback rules; both single-device
+        # and tensor-parallel placements use the same helper.
         if bound_instance.instance.drafter_placement is None:
-            coupled_drafter = _try_load_coupled_drafter(target_card)
-            if coupled_drafter is not None:
-                try:
-                    _dispatch_attach_coupled_hooks(coupled_drafter.kind, model)
-                except _COUPLED_HOOK_ATTACH_FALLBACK_EXCEPTIONS as e:
-                    logger.warning(
-                        f"Coupled drafter loaded for "
-                        f"{target_card.model_id} but target type "
-                        f"{type(model).__name__!r} is incompatible "
-                        f"with the {coupled_drafter.kind} hooks "
-                        f"(error: {e}). Discarding coupled drafter "
-                        "and falling back to standard drafting."
-                    )
-                    coupled_drafter = None
-            if coupled_drafter is None:
-                drafter_pair = _maybe_load_drafter(target_card)
-                if drafter_pair is not None:
-                    drafter_id, drafter_model = drafter_pair
+            coupled_drafter, drafter_id, drafter_model = _try_load_collocated_drafter(
+                target_card, model, allow_standard_drafter_fallback=True
+            )
         else:
             # Codex P2 (PR #20 round-(N+10), utils_mlx.py:578):
             # single-rank asymmetric target also has a remote drafter
@@ -1185,9 +1228,26 @@ def load_mlx_items(
         # Without this, ``GenerationStats.drafter_model_id`` stays
         # ``None`` for every multi-target asymmetric request even
         # though the drafter is materially serving traffic.
+        #
+        # Symmetric multi-rank (tensor-parallel) placements have
+        # ``drafter_placement is None`` and reach the same coupled-
+        # drafter loader as the single-device branch: each TP rank
+        # replicates the (small) coupled drafter and consumes the
+        # post-all-reduce hidden state locally. Standard external
+        # drafters still can't ride tensor parallel today
+        # (``_maybe_load_drafter`` returns weights paired with a
+        # standard generation step that ``mlx_generate`` only routes
+        # under ``group is None``), so the loader will produce a
+        # standard drafter for TP placements too -- the generator
+        # caps that path off downstream with a ``"none"`` draft mode
+        # while the coupled path stays active.
         drafter_placement = bound_instance.instance.drafter_placement
         if drafter_placement is not None:
             drafter_id = drafter_placement.drafter_model_id
+        else:
+            coupled_drafter, drafter_id, drafter_model = _try_load_collocated_drafter(
+                target_card, model, allow_standard_drafter_fallback=False
+            )
 
     mx.clear_cache()
 

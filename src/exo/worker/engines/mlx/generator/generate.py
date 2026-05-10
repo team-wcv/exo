@@ -1040,16 +1040,19 @@ def mlx_generate(
     # ``resolve_draft_mode`` but uses ``"pipelined"`` as the implicit
     # default for an asymmetric placement.
     has_asymmetric_drafter = asymmetric_drafter_rank is not None
-    # ``coupled_drafter`` is only valid on single-node placements:
-    # mtp/dflash drafters consume the target's hidden state every
-    # round, which the asymmetric / multi-rank dispatch can't
-    # transport without forwarding hidden tensors over the wire (and
-    # at that point you've eaten the whole speedup). The runner's
-    # placement gate enforces this; we additionally narrow inside
-    # ``mlx_generate`` so a misconfigured caller falls back cleanly
-    # to non-coupled dispatch instead of crashing the spec loop.
+    # Coupled drafters are valid on every collocated placement -- the
+    # drafter consumes the target's hidden state in-process, which is
+    # cheap to produce on single-device and on symmetric tensor-
+    # parallel (the post-all-reduce hidden state is identical on every
+    # rank, so each rank can drive its replicated drafter
+    # independently and the per-rank ``mx.random`` lockstep produces
+    # the same bonus tokens). The asymmetric drafter placement, by
+    # contrast, would have to ship full hidden tensors / KV cache
+    # entries cross-node every round and lose the speedup; the loader
+    # never produces a coupled drafter on that path so the
+    # ``has_asymmetric_drafter`` exclusion is belt-and-braces.
     coupled_drafter_eligible: bool = (
-        coupled_drafter is not None and group is None and not has_asymmetric_drafter
+        coupled_drafter is not None and not has_asymmetric_drafter
     )
     if has_asymmetric_drafter:
         draft_mode: DraftMode = resolve_asymmetric_draft_mode(
@@ -1057,7 +1060,15 @@ def mlx_generate(
             request_use_drafter=request_use_drafter,
             request_draft_mode=request_draft_mode,
         )
-    elif group is not None:
+    elif group is not None and not coupled_drafter_eligible:
+        # Multi-device standard drafters still can't ride the TP /
+        # pipeline-parallel path -- ``stream_generate`` doesn't thread
+        # the secondary ``draft_model`` through ``group``, and n-gram
+        # drafting hasn't been wired through the broadcast either. We
+        # narrow on ``coupled_drafter_eligible`` because the coupled
+        # path is self-contained on each rank: every TP rank loads a
+        # replicated drafter and consumes the post-all-reduce hidden
+        # state in-process, so no extra group routing is needed.
         draft_mode = "none"
     else:
         draft_mode = resolve_draft_mode(
@@ -1597,7 +1608,7 @@ def mlx_generate(
                 is_target_root=False,
             )
     elif coupled_drafter_active and coupled_drafter is not None:
-        # Single-node coupled-drafter dispatch: build the adapter +
+        # Coupled-drafter dispatch: build the adapter +
         # ``CoupledModelDrafter`` here rather than threading them through
         # ``make_drafter``. The factory's per-mode wiring is built around
         # standard drafters (``draft_model`` / ``draft_cache`` paired with
@@ -1605,6 +1616,15 @@ def mlx_generate(
         # require the target adapter to be constructed against the live
         # model instance, so a dedicated branch is clearer than overloading
         # ``make_drafter`` with an entirely orthogonal third path.
+        #
+        # This branch runs on both single-device and tensor-parallel
+        # placements. The TP target's per-rank ``__call__`` reduces its
+        # output to the full hidden state (via the in-layer
+        # ``ShardedToAllLinear`` / ``ShardedMoE`` all-sum), so each
+        # rank's replicated drafter consumes an identical hidden state
+        # and produces identical draft tokens / bonus samples under the
+        # shared ``mx.random.seed(seed)`` set at the top of this
+        # generation step.
         from exo.worker.engines.mlx.generator.coupled_drafter import (
             CoupledModelDrafter,
             Gemma4MTPTargetAdapter,
