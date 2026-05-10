@@ -6,7 +6,7 @@ import re
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, cast, final
@@ -698,6 +698,181 @@ def _drafter_preference() -> str:
     return raw
 
 
+# Drafter kinds the loader recognises. ``"standard"`` is the existing
+# external-drafter path (independent sibling LM via mlx-lm). ``"mtp"`` and
+# ``"dflash"`` are the coupled-drafter kinds shipped by mlx-vlm 0.5+ that
+# attach to the target architecturally (consume the target's hidden state /
+# KV cache every draft step) and only run on single-node placements.
+CoupledDrafterKind = Literal["mtp", "dflash"]
+_KNOWN_COUPLED_DRAFTER_KINDS: Final[frozenset[CoupledDrafterKind]] = frozenset(
+    {"mtp", "dflash"}
+)
+
+
+@final
+@dataclass(frozen=True, kw_only=True)
+class CoupledDrafter:
+    """A loaded MTP/DFlash-kind coupled drafter, ready for the generator.
+
+    Coupled drafters consume the target's hidden state every draft step and
+    (for ``kind="mtp"``) read the target's KV cache directly via
+    ``set_shared_kv``. They cannot decode independently the way standard
+    external drafters can, so this loader path runs only when the placement
+    collocates target + drafter on the same node (i.e. the target is not
+    asymmetrically split via ``DrafterPlacement`` and the runner is loading
+    both halves locally).
+
+    The model object is typed ``object`` because the concrete class
+    (``Gemma4AssistantDraftModel`` for ``mtp``, ``DFlashDraftModel`` for
+    ``dflash``) lives in mlx-vlm and importing it in the worker hot path
+    would force every linux/CPU build to drag mlx-vlm into the type
+    surface. Generator-side dispatch narrows the type at the use site.
+    """
+
+    model_id: ModelId
+    kind: CoupledDrafterKind
+    model: object
+
+
+def _coupled_drafter_weight_size_bytes(coupled_id: ModelId) -> int:
+    """Best-effort coupled-drafter on-disk size for the wired-memory bump.
+
+    Mirrors :func:`_drafter_weight_size_bytes`: walk the drafter directory
+    and sum file sizes; return 0 on any error. Coupled drafters are tiny
+    (~158MB for the Gemma 4 E2B assistant) so under-wiring here is cheap
+    even if the helper falls through; we just want a reasonable hint to
+    ``set_wired_limit_for_model`` so the OS doesn't page the drafter
+    weights out between requests.
+    """
+    drafter_path = resolve_existing_model(coupled_id)
+    if drafter_path is None:
+        return 0
+    try:
+        return sum(p.stat().st_size for p in drafter_path.rglob("*") if p.is_file())
+    except OSError:
+        return 0
+
+
+def _try_load_coupled_drafter(model_card: ModelCard) -> CoupledDrafter | None:
+    """Attempt to load the coupled drafter declared on ``model_card``.
+
+    Returns the loaded drafter on success, or ``None`` when:
+    - the card declares no ``coupled_drafter``,
+    - ``EXO_DISABLE_DRAFTER`` is set,
+    - mlx-vlm is unavailable (e.g. linux build without the speculative
+      drafters extra) or too old to expose ``load_drafter``,
+    - the drafter's weights are not on disk,
+    - mlx-vlm resolves an unknown / unsupported drafter kind, or
+    - the load itself raises.
+
+    Failures are logged at warning level and swallowed so that single-node
+    deployments degrade to the standard external-drafter list (or to plain
+    decoding) instead of crashing the runner. The caller is responsible
+    for that fallback.
+    """
+    coupled_id = model_card.coupled_drafter
+    if coupled_id is None:
+        return None
+    if _drafter_disabled_by_env():
+        logger.info(
+            f"Coupled drafter declared by {model_card.model_id} but "
+            f"{EXO_DISABLE_DRAFTER_ENV} is set; skipping coupled drafter load."
+        )
+        return None
+
+    # mlx-vlm's speculative-drafter API is partially typed (its
+    # ``load_drafter`` signature uses ``**kwargs`` with no annotation),
+    # so we cast at the import boundary to give the rest of this
+    # function a well-typed surface. ``KNOWN_DRAFTER_KINDS`` is an
+    # iterable of upstream kind strings -- declared as ``Iterable[str]``
+    # because mlx-vlm uses ``frozenset[str]`` today but a future
+    # release could swap it for a list without breaking us.
+    #
+    # Codex P2 (PR #23 round-(N+0), utils_mlx.py:809): we also catch
+    # ``AttributeError`` so a partial / mismatched mlx-vlm install (the
+    # ``speculative`` package imports cleanly but is missing
+    # ``load_drafter`` / ``KNOWN_DRAFTER_KINDS`` -- e.g. an old release
+    # with the namespace package but pre-drafter API, or a future
+    # release that renames the symbols) degrades to the standard
+    # drafter path instead of crashing the runner.
+    try:
+        from mlx_vlm.speculative import (  # pyright: ignore[reportMissingTypeStubs]
+            drafters as _mlxvlm_drafters,
+        )
+        load_drafter = cast(
+            Callable[..., tuple[object, str]],
+            _mlxvlm_drafters.load_drafter,
+        )
+        known_drafter_kinds = cast(
+            "Iterable[str]",
+            _mlxvlm_drafters.KNOWN_DRAFTER_KINDS,
+        )
+    except (ImportError, AttributeError) as exc:
+        logger.warning(
+            f"Coupled drafter declared by {model_card.model_id} requires "
+            f"mlx-vlm with speculative-drafter support (>=0.5.0) exposing "
+            f"``load_drafter`` and ``KNOWN_DRAFTER_KINDS``, but resolving "
+            f"those symbols failed ({type(exc).__name__}: {exc}); falling "
+            f"back to the standard drafter path."
+        )
+        return None
+
+    drafter_path = resolve_existing_model(coupled_id)
+    if drafter_path is None:
+        logger.warning(
+            f"Coupled drafter {coupled_id} declared by {model_card.model_id} "
+            "is not downloaded; pre-download it to enable coupled "
+            "speculative decoding. Falling back to the standard drafter "
+            "path for this load."
+        )
+        return None
+
+    drafter_start = time.perf_counter()
+    try:
+        loaded_model, resolved_kind = load_drafter(str(drafter_path), kind=None)
+    except Exception as exc:
+        logger.opt(exception=exc).warning(
+            f"Failed to load coupled drafter {coupled_id} via mlx-vlm; "
+            "falling back to the standard drafter path."
+        )
+        return None
+
+    if resolved_kind not in _KNOWN_COUPLED_DRAFTER_KINDS:
+        # mlx-vlm may evolve to recognise more kinds before exo's loader
+        # learns to dispatch them; refuse rather than load a model the
+        # generator cannot drive.
+        known_upstream: list[str] = sorted(known_drafter_kinds)
+        logger.warning(
+            f"Coupled drafter {coupled_id} resolved to kind "
+            f"{resolved_kind!r}, which exo's generator does not yet "
+            f"support (known kinds: {sorted(_KNOWN_COUPLED_DRAFTER_KINDS)}; "
+            f"mlx-vlm reports: {known_upstream}). Falling "
+            "back to the standard drafter path."
+        )
+        return None
+
+    # Phase 2a foundation: the coupled drafter loads cleanly here but
+    # the generator-side dispatch (``bind`` / ``set_shared_kv`` /
+    # ``draft_block`` round loop) lands in Phase 2b together with the
+    # mlx-lm gemma4_text fork additions (``rollback_speculative_cache``,
+    # extended forward kwargs). Surface that explicitly so operators
+    # don't conclude from the "Loaded coupled drafter" line that MTP
+    # is actively running yet.
+    logger.info(
+        f"Loaded coupled drafter {coupled_id} (kind={resolved_kind!r}) "
+        f"for {model_card.model_id} in "
+        f"{(time.perf_counter() - drafter_start):.2f}s "
+        f"[Phase 2a foundation: weights resident, generator dispatch "
+        f"lands in a follow-up; existing draft_model path still drives "
+        f"speculative decoding]"
+    )
+    return CoupledDrafter(
+        model_id=coupled_id,
+        kind=resolved_kind,
+        model=loaded_model,
+    )
+
+
 def _select_drafter_id(candidates: list[ModelId], preference: str) -> ModelId | None:
     """Pick a drafter id from a card's preference-ordered list.
 
@@ -803,6 +978,7 @@ def load_mlx_items(
         "VisionProcessor | None",
         Model | None,
         ModelId | None,
+        CoupledDrafter | None,
     ],
 ]:
     target_card = bound_instance.bound_shard.model_card
@@ -814,25 +990,44 @@ def load_mlx_items(
     # the limit once. Skip the bump for asymmetric placements: the drafter
     # weights live on a different node so they don't draw from this rank's
     # wired pool.
+    #
+    # When a card declares both ``coupled_drafter`` and ``drafter_model_ids``
+    # we budget for the LARGER of the two, not just the preferred one: the
+    # coupled load can fail at runtime (e.g. mlx-vlm missing on a stripped
+    # build, weights not on disk yet, unknown kind) and trigger the
+    # standard-drafter fallback. Under-wiring there would let the OS page
+    # the standard drafter back out between requests, undoing the whole
+    # point of ``set_wired_limit_for_model``. Over-wiring is cheap (the
+    # OS still uses the memory normally; the limit is only a *minimum*
+    # for wired-pool reservation), so ``max`` is the safe choice.
     combined_size = target_size
     if (
         group is None
         and bound_instance.instance.drafter_placement is None
         and not _drafter_disabled_by_env()
-        and target_card.drafter_model_ids
     ):
-        chosen = _select_drafter_id(
-            list(target_card.drafter_model_ids), _drafter_preference()
-        )
-        if chosen is not None:
-            drafter_bytes = _drafter_weight_size_bytes(chosen)
-            if drafter_bytes > 0:
-                combined_size = target_size + Memory.from_bytes(drafter_bytes)
+        candidate_bytes = 0
+        if target_card.coupled_drafter is not None:
+            candidate_bytes = max(
+                candidate_bytes,
+                _coupled_drafter_weight_size_bytes(target_card.coupled_drafter),
+            )
+        if target_card.drafter_model_ids:
+            chosen = _select_drafter_id(
+                list(target_card.drafter_model_ids), _drafter_preference()
+            )
+            if chosen is not None:
+                candidate_bytes = max(
+                    candidate_bytes, _drafter_weight_size_bytes(chosen)
+                )
+        if candidate_bytes > 0:
+            combined_size = target_size + Memory.from_bytes(candidate_bytes)
 
     set_wired_limit_for_model(combined_size)
 
     drafter_model: Model | None = None
     drafter_id: ModelId | None = None
+    coupled_drafter: CoupledDrafter | None = None
 
     if group is None:
         logger.info(f"Single device used for {bound_instance.instance}")
@@ -862,10 +1057,33 @@ def load_mlx_items(
         # ``RemoteTransport`` over the parent group, and loading a
         # second copy locally would just duplicate the weights and
         # confuse the spec-decode loop.
+        #
+        # Coupled-drafter precedence (Phase 2a foundation): when the
+        # card declares ``coupled_drafter`` we try it first because it's
+        # the path that will yield the ~2x MTP speedup on single-node
+        # placements once the generator-side dispatch lands in Phase 2b.
+        # Coupled drafters can't ride asymmetric placement (their wire
+        # would have to ship full hidden states / KV cache entries
+        # cross-node) so the surrounding ``drafter_placement is None``
+        # check covers this -- by the time we're here, we've already
+        # decided drafter + target collocate. If the coupled load fails
+        # (mlx-vlm missing, weights absent, kind unrecognised), we fall
+        # through to the standard external-drafter list so the user
+        # still gets *some* speculative decoding via the existing path.
+        #
+        # ``drafter_id`` (and therefore ``GenerationStats.drafter_model_id``)
+        # is intentionally NOT populated from a successful coupled load
+        # in Phase 2a: the generator does not yet dispatch through the
+        # coupled path, so any request "attributed" to the coupled
+        # drafter would be misleading -- the speculative decoding it
+        # promises is not yet running. Phase 2b adds the dispatch and
+        # the attribution at the same time.
         if bound_instance.instance.drafter_placement is None:
-            drafter_pair = _maybe_load_drafter(target_card)
-            if drafter_pair is not None:
-                drafter_id, drafter_model = drafter_pair
+            coupled_drafter = _try_load_coupled_drafter(target_card)
+            if coupled_drafter is None:
+                drafter_pair = _maybe_load_drafter(target_card)
+                if drafter_pair is not None:
+                    drafter_id, drafter_model = drafter_pair
         else:
             # Codex P2 (PR #20 round-(N+10), utils_mlx.py:578):
             # single-rank asymmetric target also has a remote drafter
@@ -925,7 +1143,14 @@ def load_mlx_items(
     else:
         vision_processor = None
 
-    return cast(Model, model), tokenizer, vision_processor, drafter_model, drafter_id
+    return (
+        cast(Model, model),
+        tokenizer,
+        vision_processor,
+        drafter_model,
+        drafter_id,
+        coupled_drafter,
+    )
 
 
 def shard_and_load(

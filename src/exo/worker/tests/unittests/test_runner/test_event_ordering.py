@@ -138,7 +138,7 @@ def patch_out_mlx(monkeypatch: pytest.MonkeyPatch):
 
     def lmi_gen():
         yield MockLoadOutput(1, 1)
-        return (1, MockTokenizer, None, None, None)
+        return (1, MockTokenizer, None, None, None, None)
 
     monkeypatch.setattr(mlx_builder, "load_mlx_items", make_nothin(lmi_gen()))
     monkeypatch.setattr(mlx_batch_generator, "warmup_inference", make_nothin(1))
