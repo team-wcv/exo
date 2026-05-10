@@ -446,9 +446,7 @@ def test_metrics_accepted_never_exceeds_proposed() -> None:
     metrics = coupled.metrics()
     proposed = metrics["proposed_draft_tokens"]
     accepted = metrics["accepted_draft_tokens"]
-    assert accepted >= 0, (
-        f"accepted_draft_tokens must be non-negative; got {accepted}"
-    )
+    assert accepted >= 0, f"accepted_draft_tokens must be non-negative; got {accepted}"
     assert accepted <= proposed, (
         f"accepted_draft_tokens ({accepted}) must not exceed "
         f"proposed_draft_tokens ({proposed}) -- pre-fix the verifier "
@@ -566,15 +564,19 @@ class TestResolveCoupledDrafterTelemetry:
     block in :func:`mlx_generate` previously gated coupled-drafter
     fields on the RESOURCE signal (``coupled_drafter_active`` --
     "we loaded a coupled drafter and the request resolved to
-    ``draft_mode='model'``"). When the loaded coupled drafter's
-    kind is one we don't yet drive (``"dflash"`` today), the
-    dispatch falls back to ``make_drafter(mode='none')`` and runs
-    no speculation, so the telemetry must reflect that fallback.
-    The helper extracted in this commit gates on the DISPATCH
-    signal (``coupled_dispatch_fired``) so a loaded-but-not-
-    dispatched coupled drafter never leaks ``drafter_model_id`` /
-    ``drafter_kind`` / ``num_draft_tokens`` onto a request that
-    actually ran with ``draft_mode='none'``.
+    ``draft_mode='model'``"). The helper extracted in this commit
+    gates on the DISPATCH signal (``coupled_dispatch_fired``) so a
+    loaded-but-not-dispatched coupled drafter never leaks
+    ``drafter_model_id`` / ``drafter_kind`` / ``num_draft_tokens``
+    onto a request that actually ran with ``draft_mode='none'``.
+
+    All currently dispatched kinds (``"mtp"``, ``"dflash"``) drive
+    speculation end-to-end, so the dispatch signal SHOULD fire for
+    them. The helper's ``coupled_dispatch_fired=False`` branch
+    remains the canonical fallback for any future kind that lands
+    on the loader before its dispatch wiring catches up, or any
+    runtime fallback (e.g. an attach-hook ``TypeError``) that
+    forces :func:`make_drafter` to take over.
     """
 
     @staticmethod
@@ -594,12 +596,10 @@ class TestResolveCoupledDrafterTelemetry:
         )
 
         coupled = self._make_coupled_drafter("mtp")
-        drafter_id, drafter_kind, num_draft_tokens = (
-            _resolve_coupled_drafter_telemetry(
-                coupled_dispatch_fired=True,
-                coupled_drafter=coupled,
-                effective_num_draft_tokens=4,
-            )
+        drafter_id, drafter_kind, num_draft_tokens = _resolve_coupled_drafter_telemetry(
+            coupled_dispatch_fired=True,
+            coupled_drafter=coupled,
+            effective_num_draft_tokens=4,
         )
         assert drafter_id == "mlx-community/coupled-test-drafter"
         assert drafter_kind == "mtp"
@@ -608,27 +608,29 @@ class TestResolveCoupledDrafterTelemetry:
     def test_dispatch_not_fired_zeros_telemetry_even_with_loaded_drafter(
         self,
     ) -> None:
-        """The fallback path: ``coupled_drafter`` is loaded (e.g.
-        the loader produced a ``"dflash"`` drafter), but dispatch
-        chose ``make_drafter(mode='none')`` because the kind is
-        unwired. Coupled telemetry must be zeroed so
+        """The fallback path: ``coupled_drafter`` is loaded but
+        dispatch chose ``make_drafter(mode='none')`` (e.g. an
+        attach-hook ``TypeError`` forced fallback, or the kind
+        landed on the loader before its dispatch wiring caught
+        up). Coupled telemetry must be zeroed so
         ``GenerationStats`` doesn't misattribute the request.
+
+        We use ``"dflash"`` as the loaded kind here as a
+        representative coupled kind; the helper itself doesn't
+        gate on kind, only on the dispatch signal.
         """
         from exo.worker.engines.mlx.generator.generate import (
             _resolve_coupled_drafter_telemetry,  # pyright: ignore[reportPrivateUsage]
         )
 
         coupled = self._make_coupled_drafter("dflash")
-        drafter_id, drafter_kind, num_draft_tokens = (
-            _resolve_coupled_drafter_telemetry(
-                coupled_dispatch_fired=False,
-                coupled_drafter=coupled,
-                effective_num_draft_tokens=4,
-            )
+        drafter_id, drafter_kind, num_draft_tokens = _resolve_coupled_drafter_telemetry(
+            coupled_dispatch_fired=False,
+            coupled_drafter=coupled,
+            effective_num_draft_tokens=4,
         )
         assert drafter_id is None, (
-            "coupled fallback (dispatch did not fire) must NOT stamp "
-            "drafter_model_id"
+            "coupled fallback (dispatch did not fire) must NOT stamp drafter_model_id"
         )
         assert drafter_kind is None, (
             "coupled fallback must NOT stamp drafter_kind -- pre-fix this "
@@ -726,9 +728,7 @@ class TestProcessorAwareSampler:
         captured_prev: list[list[int]] = []
 
         def proc(prev: mx.array, logits: mx.array) -> mx.array:
-            captured_prev.append(
-                [int(t) for t in cast(list[int], prev.tolist())]
-            )
+            captured_prev.append([int(t) for t in cast(list[int], prev.tolist())])
             return logits
 
         def base_sampler(logits: mx.array) -> mx.array:

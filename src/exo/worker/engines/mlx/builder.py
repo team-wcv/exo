@@ -285,10 +285,10 @@ class MlxBuilder(Builder):
         # ``BatchGenerator``:
         #
         #   * PR #19's single-device-only sequential gate: in-process
-        #     drafting (model + ngram via ``EXO_ALLOW_REQUEST_DRAFTING``)
-        #     can only run on single-device runners because
-        #     multi-device ``mlx_generate`` demotes ``draft_mode`` to
-        #     ``"none"`` (see ``generate.py``). The gate honours
+        #     standard / n-gram drafting can only run on single-device
+        #     runners because ``mlx_generate`` demotes ``draft_mode``
+        #     to ``"none"`` when no coupled drafter is loaded on the
+        #     multi-device branch. The gate honours
         #     ``EXO_DRAFT_MODE=none`` to avoid losing batching with
         #     zero speculative-decode benefit.
         #   * PR #20's asymmetric-pipelined gate: when the runner is
@@ -296,7 +296,14 @@ class MlxBuilder(Builder):
         #     incompatible with the drafter wire, so the sequential
         #     path is mandatory regardless of ``draft_model`` /
         #     ``EXO_DRAFT_MODE``.
-        drafting_can_run_here = is_single_device
+        #   * Coupled-drafter tensor-parallel gate: a coupled drafter
+        #     (MTP / DFlash) replicates per rank and consumes the
+        #     post-all-reduce hidden state in-process. ``mlx_generate``
+        #     accepts this for ``group is not None`` placements (see
+        #     ``coupled_drafter_eligible`` there), so we must force
+        #     ``SequentialGenerator`` on TP runners that load a coupled
+        #     drafter -- ``BatchGenerator`` has no spec-decoding hook.
+        drafting_can_run_here = is_single_device or coupled_drafter_dispatchable
         drafter_loaded_will_run = any_drafter_loaded and configured_draft_mode != "none"
         force_sequential_for_drafter = drafting_can_run_here and (
             drafter_loaded_will_run

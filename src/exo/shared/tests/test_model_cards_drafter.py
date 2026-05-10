@@ -258,9 +258,7 @@ def test_coupled_drafter_composes_with_standard_drafter_list() -> None:
 
 
 _GEMMA4_31B_MTP_DRAFTER = ModelId("mlx-community/gemma-4-31B-it-assistant-bf16")
-_GEMMA4_26B_A4B_MTP_DRAFTER = ModelId(
-    "mlx-community/gemma-4-26B-A4B-it-assistant-bf16"
-)
+_GEMMA4_26B_A4B_MTP_DRAFTER = ModelId("mlx-community/gemma-4-26B-A4B-it-assistant-bf16")
 
 
 @pytest.mark.asyncio
@@ -336,9 +334,7 @@ async def test_shipped_gemma4_cards_keep_standard_drafter_list_alongside_mtp() -
             assert target_id in cards, f"{target_id} card missing"
             card = cards[target_id]
             assert card.coupled_drafter == expected_drafter
-            assert card.drafter_model_ids == [
-                ModelId(d) for d in expected_drafters
-            ], (
+            assert card.drafter_model_ids == [ModelId(d) for d in expected_drafters], (
                 f"{target_id} drafter_model_ids mismatch: got "
                 f"{card.drafter_model_ids!r}"
             )
