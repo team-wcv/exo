@@ -308,6 +308,57 @@ class TestResolveDraftMode:
         )
         assert result == "ngram"
 
+    def test_coupled_drafter_promotes_default_to_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A loaded coupled drafter must drive the implicit default the
+        same way a standard drafter does -- otherwise single-node
+        Gemma 4 deployments would never auto-engage MTP without an
+        explicit ``EXO_DRAFT_MODE=model`` knob."""
+        monkeypatch.delenv(EXO_DRAFT_MODE_ENV, raising=False)
+        result = resolve_draft_mode(
+            has_drafter_model=False,
+            request_use_drafter=None,
+            request_draft_mode=None,
+            has_coupled_drafter=True,
+        )
+        assert result == "model"
+
+    def test_coupled_drafter_satisfies_required_drafter_for_model_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pre-fix, an explicit ``draft_mode="model"`` request would
+        have demoted to ``"none"`` whenever ``has_drafter_model`` was
+        ``False`` -- which is the post-Phase-2a state on coupled-only
+        runners. The coupled-drafter signal must short-circuit that
+        demotion so the dispatch can route to
+        :class:`CoupledModelDrafter`.
+        """
+        monkeypatch.delenv(EXO_DRAFT_MODE_ENV, raising=False)
+        result = resolve_draft_mode(
+            has_drafter_model=False,
+            request_use_drafter=None,
+            request_draft_mode="model",
+            has_coupled_drafter=True,
+        )
+        assert result == "model"
+
+    def test_coupled_drafter_use_drafter_true_promotes_to_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``use_drafter=True`` with only a coupled drafter loaded must
+        promote to ``"model"`` (the bucket :class:`CoupledModelDrafter`
+        runs under), not ``"ngram"`` -- the operator deliberately
+        loaded MTP weights and the opt-in should engage them."""
+        monkeypatch.setenv(EXO_DRAFT_MODE_ENV, "none")
+        result = resolve_draft_mode(
+            has_drafter_model=False,
+            request_use_drafter=True,
+            request_draft_mode=None,
+            has_coupled_drafter=True,
+        )
+        assert result == "model"
+
 
 class TestResolveAsymmetricDraftMode:
     """Codex P1 (PR #20 round-(N+1), generate.py:949): per-request

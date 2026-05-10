@@ -225,20 +225,23 @@ class MlxBuilder(Builder):
         # decode under BatchGenerator and the worker keeps full
         # batching throughput. Emit a warning when this condition
         # holds so operators know n-gram won't actually run.
-        # Phase 2a invariant: a loaded ``coupled_drafter`` must NOT
-        # influence builder-side gates. The generator does not yet
-        # dispatch through the coupled-drafter round loop, so treating
-        # the coupled load as "drafter loaded" would (a) flip the
-        # default draft_mode to "model" without delivering the speedup
-        # and (b) force ``SequentialGenerator`` on multi-request workers
-        # that would otherwise batch -- a strict throughput regression.
-        # Phase 2b lands the dispatch and re-enables both gates against
-        # ``coupled_drafter`` together, at which point the operator
-        # actually gets MTP speedup and the sequential fallback is
-        # justified.
+        # Phase 2c re-enables the coupled-drafter influence on builder-
+        # side gates: now that ``mlx_generate`` dispatches coupled
+        # (mtp/dflash) drafters through :class:`CoupledModelDrafter`,
+        # treating a loaded coupled drafter as "drafter loaded" both
+        # (a) flips the implicit ``draft_mode`` default to ``"model"``
+        # so single-node Gemma 4 deployments pick up the speedup
+        # automatically and (b) forces :class:`SequentialGenerator`
+        # over :class:`BatchGenerator` since the latter has no
+        # spec-decode hook. The coupled-drafter check is OR'd with
+        # ``draft_model`` everywhere downstream so the existing standard-
+        # drafter-only deployments are unaffected.
+        any_drafter_loaded = (
+            self.draft_model is not None or self.coupled_drafter is not None
+        )
         configured_draft_mode = parse_draft_mode(
             os.environ.get(EXO_DRAFT_MODE_ENV),
-            default="model" if self.draft_model is not None else "none",
+            default="model" if any_drafter_loaded else "none",
         )
         allow_request_drafting = os.environ.get(
             "EXO_ALLOW_REQUEST_DRAFTING", ""
@@ -278,9 +281,7 @@ class MlxBuilder(Builder):
         #     path is mandatory regardless of ``draft_model`` /
         #     ``EXO_DRAFT_MODE``.
         drafting_can_run_here = is_single_device
-        drafter_loaded_will_run = (
-            self.draft_model is not None and configured_draft_mode != "none"
-        )
+        drafter_loaded_will_run = any_drafter_loaded and configured_draft_mode != "none"
         force_sequential_for_drafter = drafting_can_run_here and (
             drafter_loaded_will_run
             or allow_request_drafting
@@ -293,7 +294,7 @@ class MlxBuilder(Builder):
         )
         drafter_loaded_but_explicitly_disabled = (
             drafting_can_run_here
-            and self.draft_model is not None
+            and any_drafter_loaded
             and configured_draft_mode == "none"
             and not allow_request_drafting
         )
@@ -342,11 +343,18 @@ class MlxBuilder(Builder):
                     "drafter lives on a separate MLX rank, pipelined+remote spec)"
                 )
             elif force_sequential_for_drafter:
-                if allow_request_drafting and self.draft_model is None:
+                if allow_request_drafting and not any_drafter_loaded:
                     logger.info(
                         "using SequentialGenerator (EXO_ALLOW_REQUEST_DRAFTING set; "
                         "BatchGenerator has no spec-decoding hook for request "
                         "overrides)"
+                    )
+                elif self.coupled_drafter is not None:
+                    logger.info(
+                        f"using SequentialGenerator (coupled drafter loaded: "
+                        f"{self.coupled_drafter.model_id} kind={self.coupled_drafter.kind!r}; "
+                        f"draft_mode={configured_draft_mode!r}; BatchGenerator "
+                        f"has no spec-decoding hook for coupled MTP/DFlash)"
                     )
                 else:
                     logger.info(
@@ -424,7 +432,7 @@ class MlxBuilder(Builder):
             # multi-device drafting-disabled path explicit so operators
             # don't silently observe missing speculative decoding.
             drafting_was_requested = (
-                self.draft_model is not None
+                any_drafter_loaded
                 or configured_draft_mode == "ngram"
                 or allow_request_drafting
             )
@@ -445,9 +453,14 @@ class MlxBuilder(Builder):
                 # BatchGenerator and surface the choice loudly so
                 # operators see why their loaded drafter weights
                 # appear inactive.
+                loaded_drafter_id: object = (
+                    self.coupled_drafter.model_id
+                    if self.coupled_drafter is not None
+                    else self.draft_model_id
+                )
                 logger.info(
                     f"using BatchGenerator (drafter weights loaded "
-                    f"({self.draft_model_id}) but EXO_DRAFT_MODE='none' "
+                    f"({loaded_drafter_id}) but EXO_DRAFT_MODE='none' "
                     f"explicitly disables speculation; keeping batching "
                     f"for throughput. Set EXO_DRAFT_MODE='model' or "
                     f"clear the env var to re-enable spec decode)"

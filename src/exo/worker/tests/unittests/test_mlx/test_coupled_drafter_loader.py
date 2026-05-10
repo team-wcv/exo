@@ -297,7 +297,9 @@ def test_wired_budget_uses_max_when_card_has_both_drafter_kinds(
     def fake_build_path(_id: ModelId) -> str:
         return "/tmp/fake"
 
-    def fake_load_model(*_args: object, **_kwargs: object) -> tuple[object, dict[str, object]]:
+    def fake_load_model(
+        *_args: object, **_kwargs: object
+    ) -> tuple[object, dict[str, object]]:
         return MagicMock(), {}
 
     def fake_inner(_m: object) -> object:

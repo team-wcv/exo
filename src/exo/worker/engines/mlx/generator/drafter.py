@@ -219,6 +219,7 @@ def resolve_draft_mode(
     has_drafter_model: bool,
     request_use_drafter: bool | None,
     request_draft_mode: DraftMode | None,
+    has_coupled_drafter: bool = False,
 ) -> DraftMode:
     """Compute the effective drafting mode for one request.
 
@@ -236,10 +237,21 @@ def resolve_draft_mode(
          (``"pipelined"``'s gain unlocks at remote-transport scale and
          ``"ngram"``'s win is workload-dependent).
 
+    ``has_coupled_drafter`` reports whether the loader produced a
+    coupled (mtp/dflash) drafter; the resolved mode for such a runner
+    is still ``"model"`` (the user-facing speculative-decoding bucket
+    that gets a sibling drafter), but the dispatch in ``mlx_generate``
+    routes through :class:`CoupledModelDrafter` instead of
+    :class:`ModelDrafter`. We treat coupled drafters as if a standard
+    drafter were loaded for the purpose of the implicit-default and
+    drafter-required gates so the user sees the same auto-promotion
+    behaviour they would with a sibling LM in ``drafter_model_ids``.
+
     A ``"model"`` or ``"pipelined"`` mode without a loaded drafter
     degrades to ``"none"`` with a warning, so misconfiguration fails
     loudly instead of silently producing the wrong throughput.
     """
+    drafter_available = has_drafter_model or has_coupled_drafter
     if request_draft_mode is not None:
         chosen: DraftMode = request_draft_mode
     elif request_use_drafter is False:
@@ -257,9 +269,9 @@ def resolve_draft_mode(
         # weights), else fall back to ``"ngram"`` (in-context suffix
         # lookup needs no extra weights). The ``"model"`` -> "none"
         # degradation guard below stays in force as a safety net.
-        chosen = "model" if has_drafter_model else "ngram"
+        chosen = "model" if drafter_available else "ngram"
     else:
-        env_default: DraftMode = "model" if has_drafter_model else "none"
+        env_default: DraftMode = "model" if drafter_available else "none"
         chosen = parse_draft_mode(os.environ.get(EXO_DRAFT_MODE_ENV), env_default)
 
     # Codex P1 (PR #20 round-(N+10), drafter.py:157): per-request
@@ -269,12 +281,12 @@ def resolve_draft_mode(
     # and crash inside the drafter's scaffolding ``stream()``. Apply
     # the same downgrade here so requests stay served.
     if chosen in _UNIMPLEMENTED_DRAFT_MODES:
-        request_default: DraftMode = "model" if has_drafter_model else "none"
+        request_default: DraftMode = "model" if drafter_available else "none"
         chosen = _warn_unimplemented_and_downgrade(
             mode=chosen, source="request", default=request_default
         )
 
-    if chosen in ("model", "pipelined") and not has_drafter_model:
+    if chosen in ("model", "pipelined") and not drafter_available:
         logger.warning(
             f"draft_mode={chosen!r} requested but no drafter model is "
             "loaded; falling back to 'none'."

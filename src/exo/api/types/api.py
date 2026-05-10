@@ -232,6 +232,22 @@ class GenerationStats(BaseModel):
     draft_mode: (
         Literal["model", "pipelined", "ngram", "eagle", "lookahead", "none"] | None
     ) = None
+    # Drafter architecture, when speculative decoding actually ran:
+    # ``"standard"`` -- external sibling LM via ``mlx_lm.stream_generate``
+    #   (the historical model-drafter / pipelined paths).
+    # ``"mtp"`` -- Multi-Token-Prediction coupled drafter (gemma4_assistant)
+    #   that consumes the target's last-layer hidden + per-layer-type shared
+    #   KV every round.
+    # ``"dflash"`` -- DFlash coupled drafter (qwen3_dflash) -- consumes a
+    #   concatenated multi-layer hidden tensor, no shared KV.
+    # ``None`` when ``draft_mode == "none"`` or the engine doesn't expose
+    # drafter telemetry. Surfaced separately from ``draft_mode`` so dashboards
+    # can disambiguate coupled vs. standard runs without re-shaping the
+    # ``DraftMode`` literal: the on-the-wire ``draft_mode`` for coupled runs
+    # remains ``"model"`` (the user-visible request mode) while ``drafter_kind``
+    # carries the architecture. ``"ngram"`` and ``"none"`` runs leave this
+    # ``None`` since there's no model-architecture distinction to surface.
+    drafter_kind: Literal["standard", "mtp", "dflash"] | None = None
 
     @property
     def drafter_acceptance_fraction(self) -> float | None:
