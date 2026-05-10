@@ -33,6 +33,7 @@ from .cache import KVPrefixCache
 from .generator.drafter import EXO_DRAFT_MODE_ENV, parse_draft_mode
 from .types import Model
 from .utils_mlx import (
+    CoupledDrafter,
     initialize_mlx,
     load_mlx_items,
 )
@@ -67,6 +68,20 @@ class MlxBuilder(Builder):
     vision_processor: VisionProcessor | None = None
     draft_model: Model | None = None
     draft_model_id: ModelId | None = None
+    # Coupled (mtp/dflash) drafter loaded via mlx-vlm. Mutually exclusive
+    # with ``draft_model`` at the loader level: ``load_mlx_items`` tries
+    # the coupled path first when the card declares ``coupled_drafter``
+    # and falls back to the standard external drafter only on coupled
+    # load failure (or when the card declares only the legacy list).
+    #
+    # Phase 2a foundation: this field is populated by the loader and
+    # forwarded into ``SequentialGenerator``, but neither the builder
+    # gate (BatchGenerator vs SequentialGenerator) nor ``mlx_generate``
+    # itself yet reads it -- they see it as if it were ``None``. The
+    # follow-up adds the round loop on top of vendored
+    # ``rollback_speculative_cache`` + extended forward kwargs in the
+    # mlx-lm fork's gemma4_text.py.
+    coupled_drafter: CoupledDrafter | None = None
 
     def connect(self, bound_instance: BoundInstance) -> None:
         split = initialize_mlx(bound_instance)
@@ -90,9 +105,23 @@ class MlxBuilder(Builder):
             self.vision_processor,
             self.draft_model,
             self.draft_model_id,
+            self.coupled_drafter,
         ) = yield from load_mlx_items(bound_instance, self.group)
 
     def close(self) -> None:
+        # Drop drafters BEFORE the target / tokenizer / group: coupled
+        # drafters bind to the target's input embeddings via mlx-vlm's
+        # ``bind`` so they hold a strong reference into the target;
+        # standard drafters can hold a weak reference into the target's
+        # mx.distributed.Group on multi-rank builds. Reordering this
+        # after ``del self.inference_model`` triggered an
+        # ``AttributeError`` chain in PR #20 round-(N+10) -- preserve
+        # that invariant here even though Phase 2a doesn't yet exercise
+        # the coupled path through the generator.
+        with contextlib.suppress(NameError, AttributeError):
+            del self.coupled_drafter
+        with contextlib.suppress(NameError, AttributeError):
+            del self.draft_model
         with contextlib.suppress(NameError, AttributeError):
             del self.inference_model
         with contextlib.suppress(NameError, AttributeError):
@@ -103,8 +132,6 @@ class MlxBuilder(Builder):
             with contextlib.suppress(OSError):
                 self.drafter_socket.close()
             self.drafter_socket = None
-        with contextlib.suppress(NameError, AttributeError):
-            del self.draft_model
 
     def build(
         self,
@@ -134,6 +161,13 @@ class MlxBuilder(Builder):
         # workloads don't repeatedly prefill the drafter on the same prefix.
         # Allocated only when a drafter is actually loaded; None means
         # mlx_generate falls back to the per-request drafter prefill.
+        #
+        # Coupled drafters (mtp/dflash) have no independent KV cache --
+        # ``mtp`` reads the target's KV via ``set_shared_kv`` and ``dflash``
+        # owns a tiny per-step cache that's reset every round -- so they
+        # need no KVPrefixCache. The generator-side dispatch handles that
+        # branch separately and never reads ``drafter_kv_prefix_cache``
+        # for coupled drafters.
         drafter_kv_prefix_cache: KVPrefixCache | None = (
             KVPrefixCache(self.group) if self.draft_model is not None else None
         )
@@ -191,6 +225,17 @@ class MlxBuilder(Builder):
         # decode under BatchGenerator and the worker keeps full
         # batching throughput. Emit a warning when this condition
         # holds so operators know n-gram won't actually run.
+        # Phase 2a invariant: a loaded ``coupled_drafter`` must NOT
+        # influence builder-side gates. The generator does not yet
+        # dispatch through the coupled-drafter round loop, so treating
+        # the coupled load as "drafter loaded" would (a) flip the
+        # default draft_mode to "model" without delivering the speedup
+        # and (b) force ``SequentialGenerator`` on multi-request workers
+        # that would otherwise batch -- a strict throughput regression.
+        # Phase 2b lands the dispatch and re-enables both gates against
+        # ``coupled_drafter`` together, at which point the operator
+        # actually gets MTP speedup and the sequential fallback is
+        # justified.
         configured_draft_mode = parse_draft_mode(
             os.environ.get(EXO_DRAFT_MODE_ENV),
             default="model" if self.draft_model is not None else "none",
@@ -364,6 +409,7 @@ class MlxBuilder(Builder):
                 vision_processor=vision_processor,
                 draft_model=self.draft_model,
                 draft_model_id=self.draft_model_id,
+                coupled_drafter=self.coupled_drafter,
                 drafter_kv_prefix_cache=drafter_kv_prefix_cache,
                 num_draft_tokens=num_draft_tokens,
                 drafter_min_output_tokens=drafter_min_output_tokens,

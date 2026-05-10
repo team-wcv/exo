@@ -86,9 +86,12 @@ def _make_single_target_bound_instance(
     )
 
 
+_LoadResult = tuple[object, object, object, object, object, object]
+
+
 def _consume_generator(
-    gen: Generator[object, None, tuple[object, object, object, object, object]],
-) -> tuple[object, object, object, object, object]:
+    gen: Generator[object, None, _LoadResult],
+) -> _LoadResult:
     """Run a generator until it returns its tuple.
 
     ``load_mlx_items`` is a generator that yields progress and returns
@@ -100,10 +103,7 @@ def _consume_generator(
         try:
             next(gen)
         except StopIteration as stop:
-            return cast(
-                tuple[object, object, object, object, object],
-                stop.value,
-            )
+            return cast(_LoadResult, stop.value)
 
 
 def _patch_loader(
@@ -195,19 +195,32 @@ class TestSingleTargetAsymmetricDrafterIdPropagation:
         )
         bound_instance = _make_single_target_bound_instance(drafter_placement)
 
-        # Cast to "loose" generator type for the consumer helper.
         gen = cast(
-            Generator[object, None, tuple[object, object, object, object, object]],
+            Generator[object, None, _LoadResult],
             utils_mlx.load_mlx_items(bound_instance, group=None),
         )
         result = _consume_generator(gen)
-        _model, _tokenizer, _vision, drafter_model, drafter_id = result
+        (
+            _model,
+            _tokenizer,
+            _vision,
+            drafter_model,
+            drafter_id,
+            coupled_drafter,
+        ) = result
 
         assert drafter_model is None, (
             "single-target asymmetric must NOT load drafter weights "
             "locally (the drafter rank is on a separate node); pre-"
             "fix this branch was already correct, the regression was "
             "in losing the drafter id."
+        )
+        assert coupled_drafter is None, (
+            "single-target asymmetric placement is incompatible with "
+            "coupled (mtp/dflash) drafters: their wire would have to "
+            "ship full hidden states / KV cache cross-node. Phase 2 "
+            "loader skips coupled-drafter entirely when drafter_placement "
+            "is set."
         )
         assert drafter_id == ModelId("mlx-community/test-drafter"), (
             "Codex P2 (PR #20 round-(N+10), utils_mlx.py:578): "
@@ -236,11 +249,18 @@ class TestSingleTargetAsymmetricDrafterIdPropagation:
         monkeypatch.setattr(utils_mlx, "_maybe_load_drafter", fake_maybe_load)
         bound_instance = _make_single_target_bound_instance(drafter_placement=None)
         gen = cast(
-            Generator[object, None, tuple[object, object, object, object, object]],
+            Generator[object, None, _LoadResult],
             utils_mlx.load_mlx_items(bound_instance, group=None),
         )
         result = _consume_generator(gen)
-        _model, _tokenizer, _vision, drafter_model, drafter_id = result
+        (
+            _model,
+            _tokenizer,
+            _vision,
+            drafter_model,
+            drafter_id,
+            coupled_drafter,
+        ) = result
 
         assert called["_maybe_load_drafter"], (
             "single-target without placement must still try to load "
@@ -249,3 +269,7 @@ class TestSingleTargetAsymmetricDrafterIdPropagation:
         )
         assert drafter_model is None
         assert drafter_id is None
+        assert coupled_drafter is None, (
+            "card has no coupled_drafter declared, so the new Phase 2 "
+            "coupled-drafter path must stay inactive."
+        )

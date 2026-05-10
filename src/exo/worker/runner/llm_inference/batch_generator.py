@@ -43,6 +43,7 @@ from exo.worker.engines.mlx.generator.generate import (
 from exo.worker.engines.mlx.generator.remote_drafter import RemoteTransport
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
+    CoupledDrafter,
     apply_chat_template,
     fix_unmatched_think_end_tokens,
     mx_all_gather_tasks,
@@ -225,6 +226,21 @@ class SequentialGenerator(Engine):
     # The chosen drafter's ModelId. Used for telemetry (GenerationStats) so
     # dashboards can attribute speedup to a specific drafter.
     draft_model_id: ModelId | None = None
+    # Coupled (mtp/dflash) drafter loaded via mlx-vlm. When set,
+    # ``draft_model`` is None (the loader picks one or the other).
+    # Single-device only -- the coupled wire would have to ship target
+    # hidden states / KV cache cross-node, which negates the speedup.
+    #
+    # Phase 2a invariant: the field is plumbed through the loader and
+    # stored here, but the generator does NOT yet dispatch through the
+    # coupled-drafter round loop. The follow-up that adds
+    # ``rollback_speculative_cache`` + extended forward kwargs to the
+    # mlx-lm fork's gemma4_text.py also wires this field into
+    # ``mlx_generate`` and only then does it actually drive speculative
+    # decoding. Until that lands, this field is read by ``close()``
+    # for cleanup ordering and by ``__post_init__``-style validation
+    # in tests.
+    coupled_drafter: CoupledDrafter | None = None
     # K (num_draft_tokens) for speculative_generate_step. None falls back to
     # the env var EXO_NUM_DRAFT_TOKENS, then DEFAULT_NUM_DRAFTER_TOKENS.
     num_draft_tokens: int | None = None
@@ -815,6 +831,14 @@ class SequentialGenerator(Engine):
         else:
             effective_num_draft_tokens = self.num_draft_tokens
 
+        # Phase 2a invariant: ``coupled_drafter`` is loaded but the
+        # generator does not yet dispatch through the coupled-drafter
+        # round loop -- that lands in Phase 2b alongside the target-side
+        # ``rollback_speculative_cache`` / ``return_hidden`` /
+        # ``return_shared_kv`` hooks vendored into our mlx-lm fork. Until
+        # then the field is plumbed but unused; we deliberately do NOT
+        # pass it to ``mlx_generate`` because the function has no
+        # parameter for it (would be a ``TypeError`` on every request).
         return mlx_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -857,6 +881,12 @@ class SequentialGenerator(Engine):
         # ``del self.model, self.tokenizer, self.group`` triggered an
         # ``AttributeError`` chain on multi-rank teardown when the
         # drafter held a weak reference into the target group.
+        # Coupled drafters bind to the target's input embeddings via
+        # ``bind`` so they hold a stronger reference than the standard
+        # drafter; release them first.
+        if self.coupled_drafter is not None:
+            del self.coupled_drafter
+            self.coupled_drafter = None
         if self.draft_model is not None:
             del self.draft_model
             self.draft_model = None
