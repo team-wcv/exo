@@ -286,11 +286,45 @@ def resolve_draft_mode(
             mode=chosen, source="request", default=request_default
         )
 
-    if chosen in ("model", "pipelined") and not drafter_available:
+    # Codex P1 (PR #25 round-(N+0), drafter.py:289): the prior gate
+    # treated ``has_coupled_drafter`` as satisfying both ``"model"`` AND
+    # ``"pipelined"`` availability. Coupled (MTP/DFlash) drafters share
+    # KV-state with the target via :class:`CoupledModelDrafter` and have
+    # neither a sibling LM nor a separate cache, but ``"pipelined"`` is
+    # implemented by :class:`PipelinedDrafter` which calls
+    # ``make_drafter(mode="pipelined", draft_model=..., draft_cache=...)``
+    # -- so a coupled-only deployment that picks ``"pipelined"`` (e.g.
+    # an explicit per-request override or a stale env default) hit
+    # ``ValueError`` inside ``make_drafter`` and failed the request,
+    # whereas the previous behaviour silently downgraded to ``"none"``.
+    # Split the availability check so each mode requires the resources
+    # it actually consumes:
+    #   * ``"model"``    -- any drafter (standard sibling LM OR coupled
+    #                       MTP/DFlash) is fine, since dispatch in
+    #                       ``mlx_generate`` routes through
+    #                       :class:`CoupledModelDrafter` for the latter.
+    #   * ``"pipelined"`` -- requires a STANDARD sibling drafter model
+    #                       (the pipelined transport runs the drafter
+    #                       independently of the target's KV cache).
+    if chosen == "model" and not drafter_available:
         logger.warning(
             f"draft_mode={chosen!r} requested but no drafter model is "
             "loaded; falling back to 'none'."
         )
+        return "none"
+    if chosen == "pipelined" and not has_drafter_model:
+        if has_coupled_drafter:
+            logger.warning(
+                "draft_mode='pipelined' requested but only a coupled "
+                "(mtp/dflash) drafter is loaded; pipelined needs a "
+                "standard sibling drafter with its own KV cache. Falling "
+                "back to 'none'."
+            )
+        else:
+            logger.warning(
+                "draft_mode='pipelined' requested but no drafter model "
+                "is loaded; falling back to 'none'."
+            )
         return "none"
     return chosen
 

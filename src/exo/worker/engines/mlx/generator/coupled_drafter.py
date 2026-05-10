@@ -454,12 +454,30 @@ class CoupledModelDrafter:
         """
         del model, prefill_step_size
         prompt_batch = prompt[None] if prompt.ndim == 1 else prompt
+        prompt_tail_size = int(prompt.size)
 
+        # Codex P2 (PR #25 round-(N+0), coupled_drafter.py:484): pre-fix
+        # the prompt-TPS timer was started AFTER prefill had already
+        # completed, so ``prompt_time`` was effectively zero and
+        # ``prompt_tps`` was massively inflated for coupled-drafter
+        # requests. ``GenerationStats`` then surfaced bogus telemetry,
+        # especially when the upstream ``prefill_tps`` source was
+        # unavailable and fell back to ``out.prompt_tps``. We now bracket
+        # the prefill call (``mx.eval`` materializes the lazy compute so
+        # the wall-clock window covers actual GPU work, mirroring the
+        # standard ``ModelDrafter`` flow which pays the prefill cost
+        # before its first iteration emit).
+        prefill_tic = time.perf_counter()
         prefill_output = self._target_adapter(
             prompt_batch,
             cache=cast("list[Any]", list(prompt_cache)),
             return_hidden=True,
             return_shared_kv=True,
+        )
+        mx.eval(prefill_output.logits)
+        prompt_time = max(time.perf_counter() - prefill_tic, 0.0)
+        prompt_tps = (
+            prompt_tail_size / prompt_time if prompt_time > 0 else 0.0
         )
 
         prev_tokens = (
@@ -478,11 +496,7 @@ class CoupledModelDrafter:
         detokenizer.reset()  # type: ignore[reportUnknownMemberType]
         eos_ids = _eos_ids_from_tokenizer(tokenizer)
 
-        prompt_tail_size = int(prompt.size)
-        tic = time.perf_counter()
-        prompt_time = max(time.perf_counter() - tic, 0.0)
-        prompt_tps = prompt_tail_size / prompt_time if prompt_time > 0 else 0.0
-        # Reset to mark the start of generation timing.
+        # Mark the start of generation timing.
         tic = time.perf_counter()
 
         emitted = 0

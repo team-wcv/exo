@@ -391,6 +391,63 @@ def test_metrics_returns_zeros_before_stream_runs() -> None:
     assert metrics["proposed_draft_tokens"] == 0
 
 
+def test_stream_prompt_tps_brackets_actual_prefill_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2 (PR #25 round-(N+0), coupled_drafter.py:484): pre-fix, the
+    prompt-TPS timer was started AFTER the prefill ``self._target_adapter(...)``
+    call had already returned, so ``prompt_time`` was effectively
+    zero and ``prompt_tps`` came out as a meaningless huge number
+    (or zero, when ``time.perf_counter()`` returned the same float
+    twice in a row). Downstream telemetry treated this as a real
+    measurement -- especially via the
+    ``prefill_tps`` fallback to ``out.prompt_tps`` -- and broke
+    coupled-vs-standard performance comparisons.
+
+    Pin the corrected behaviour: the prefill call must run INSIDE
+    the timed window. We monkeypatch ``time.perf_counter`` with a
+    deterministic clock that advances by a known amount across the
+    prefill call, then assert ``prompt_tps`` matches
+    ``prompt_tail_size / prefill_seconds`` -- i.e. the measurement
+    actually reflects the prefill cost.
+    """
+    target = _build_tiny_gemma4_with_hooks()
+    drafter = _StubGemma4Drafter()
+
+    timeline = iter([0.0, 0.5, 1.0, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0])
+    fallback = [4.0]
+
+    def _fake_perf_counter() -> float:
+        try:
+            return next(timeline)
+        except StopIteration:
+            fallback[0] += 0.001
+            return fallback[0]
+
+    import exo.worker.engines.mlx.generator.coupled_drafter as module_under_test
+
+    monkeypatch.setattr(module_under_test.time, "perf_counter", _fake_perf_counter)
+
+    responses, _ = _run_stream(
+        target=target,
+        drafter=drafter,
+        prompt_tokens=[1, 2, 3, 4],
+        max_tokens=4,
+    )
+
+    first = responses[0]
+    # prompt size = 2 (prefill-tail [3, 4]); the fake clock advanced by
+    # 0.5s across the prefill call (0.0 -> 0.5), so prompt_tps must be
+    # 2 / 0.5 = 4.0 tokens/second. Pre-fix this would have been 0.0
+    # (zero elapsed) or some huge garbage value depending on when
+    # ``perf_counter`` was sampled.
+    assert first.prompt_tokens == 2
+    assert abs(first.prompt_tps - 4.0) < 1e-6, (
+        f"prompt_tps must reflect prefill cost (expected 4.0 from "
+        f"prompt_tail=2 / prefill_dt=0.5s), got {first.prompt_tps}"
+    )
+
+
 def test_metrics_after_stream_reflects_round_count() -> None:
     """Each entry in ``drafter.accept_lens`` is a completed round; the
     drafter appends to it from inside ``_mtp_rounds``. After a stream

@@ -359,6 +359,50 @@ class TestResolveDraftMode:
         )
         assert result == "model"
 
+    def test_pipelined_request_with_coupled_only_demotes_to_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Codex P1 (PR #25 round-(N+0), drafter.py:289): pre-fix, a
+        coupled-only deployment that received an explicit
+        ``draft_mode="pipelined"`` (per-request override or stale
+        ``EXO_DRAFT_MODE=pipelined`` env default) propagated through
+        the resolver because ``has_coupled_drafter`` was wrongly
+        treated as satisfying ``"pipelined"`` availability. Pipelined
+        speculation runs on a STANDARD sibling drafter with its own
+        KV cache; coupled MTP/DFlash drafters share state with the
+        target via :class:`CoupledModelDrafter` and have no
+        independent cache. Without this gate, ``make_drafter`` later
+        raises ``ValueError`` and the request fails -- whereas the
+        documented contract is to downgrade to ``"none"`` with a
+        warning so misconfiguration stays observable but non-fatal.
+        """
+        monkeypatch.delenv(EXO_DRAFT_MODE_ENV, raising=False)
+        result = resolve_draft_mode(
+            has_drafter_model=False,
+            request_use_drafter=None,
+            request_draft_mode="pipelined",
+            has_coupled_drafter=True,
+        )
+        assert result == "none"
+
+    def test_pipelined_request_with_standard_drafter_passes_through_even_when_coupled_loaded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Counterpart to the demotion test: an asymmetric / sibling
+        deployment that ALSO loaded a coupled drafter (theoretical
+        future: dual-drafter card) must still honour an explicit
+        ``"pipelined"`` request, since ``has_drafter_model=True``
+        means there's a real sibling LM with its own cache.
+        """
+        monkeypatch.delenv(EXO_DRAFT_MODE_ENV, raising=False)
+        result = resolve_draft_mode(
+            has_drafter_model=True,
+            request_use_drafter=None,
+            request_draft_mode="pipelined",
+            has_coupled_drafter=True,
+        )
+        assert result == "pipelined"
+
 
 class TestResolveAsymmetricDraftMode:
     """Codex P1 (PR #20 round-(N+1), generate.py:949): per-request
