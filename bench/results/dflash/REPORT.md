@@ -6,6 +6,13 @@ three numerical validations of the DFlash dispatch path
 (`CoupledDrafterKind="dflash"`) on real hybrid Qwen targets
 (gated-delta-net + full-attention, `full_attention_interval=4`).
 
+Plus a companion target-only run of Qwen 3.5 122B-A10B with 2-node
+tensor-parallel JACCL over Thunderbolt-bridge RDMA, included to
+characterise the multi-node baseline that the next round of work
+needs to beat once we ship the coupled-drafter loader path for
+multi-device placements (currently single-device only — see "Coupled
+drafter + tensor parallel" below).
+
 ## Headlines across three targets
 
 | Target | Quant | Arch | host | Target gen_tps | DFlash gen_tps | Speedup | Accept |
@@ -13,6 +20,7 @@ three numerical validations of the DFlash dispatch path
 | Qwen3.5 4B           | 8bit | dense | wc-smbp  | 97.24 | 404.38 | **4.16x** | 93.2% |
 | Qwen3.6 27B          | 8bit | dense | wc-smbpt | 14.98 |  49.13 | **3.28x** | 92.6% |
 | Qwen3.6 35B-A3B      | 8bit | MoE   | wc-smbpt | 87.70 | 377.49 | **4.30x** | 92.6% |
+| Qwen3.5 122B-A10B (TP2) | 8bit | MoE | smbp+smbpt | 53.84 | (n/a) | --      | (n/a) |
 
 All medians are over 10 runs per A/B side (5 scenarios × 2 runs).
 The +316% Qwen 3.5 4B result was **not** a sweet spot — DFlash holds
@@ -113,6 +121,83 @@ raw JSON next to this report.
 | long_context_summary   |          94.28 |         396.04 |   4.20x |  93.2% |
 | **all-scenario median**|      **97.24** |     **404.38** | **4.16x** | **93.2%** |
 
+## Qwen 3.5 122B-A10B (MoE) — multi-node tensor parallel, target-only baseline
+
+Target: `mlx-community/Qwen3.5-122B-A10B-8bit` (130 GB on disk,
+48 layers, hidden_size 3072, 128 experts × 8 active per token,
+~10B active params / 122B total, `num_key_value_heads=2`,
+`full_attention_interval=4`).
+
+No DFlash measurement on this row — see "Coupled drafter + tensor
+parallel" below for the loader gap.
+
+Placement: `Sharding.Tensor` + `InstanceMeta.MlxJaccl`, 2 nodes
+(`wc-smbp` + `wc-smbpt`, both Apple M5 Max MacBook Pros, 128 GB
+unified memory each). The two machines auto-discovered each other
+via mDNS on the shared `192.168.1.0/24` LAN and established a direct
+RDMA edge over their thunderbolt-bridge interfaces
+(`rdma_en1 ⇌ rdma_en2`, ~4 ms ping). exo's JACCL backend used the
+RDMA edge for tensor-parallel all-reduces during decode.
+
+| Scenario               | Target gen_tps |
+|------------------------|---------------:|
+| short_repetitive       |          54.30 |
+| code_completion        |          54.26 |
+| creative_prose         |          53.84 |
+| factual_qa             |          53.04 |
+| long_context_summary   |          49.52 |
+| **all-scenario median**|      **53.84** |
+
+Remarkably tight band: 48.54-54.42 t/s across all 10 runs. The MoE
+sparsity (~10B active params per token) plus JACCL's RDMA all-reduce
+keep per-token wall time consistent regardless of prompt shape.
+TTFT was 786 ms for short prompts and 2200 ms for the
+2 K-token `long_context_summary` prompt — the all-reduce overhead
+on the prefill scales with prompt length but disappears once decode
+starts.
+
+For context against the single-node DFlash benches above:
+
+| Comparison row                    | Target gen_tps | Notes |
+|-----------------------------------|---------------:|-------|
+| 122B-A10B target-only TP2 (this)  |      **53.84** | 2 nodes |
+| 35B-A3B target-only single-node   |          87.70 | 1 node, smaller MoE |
+| 27B target-only single-node       |          14.98 | 1 node, dense |
+| 4B target-only single-node        |          97.24 | 1 node, dense |
+
+53.84 t/s steady-state on a **122B-class model running across two
+consumer MacBook Pros over RDMA** is the meaningful result, especially
+for a model that simply won't fit on a single 128 GB Mac (130 GB
+quantized weights + activations + KV cache > 128 GB unified memory).
+This is the number the future tensor-parallel DFlash dispatch path
+needs to beat.
+
+### Coupled drafter + tensor parallel
+
+The model card declares `coupled_drafter="z-lab/Qwen3.5-122B-A10B-DFlash"`
+and the drafter weights downloaded cleanly, but the runtime logs
+showed `"using BatchGenerator"` (target-only) rather than the
+coupled-drafter speculative path. Root cause is in
+`src/exo/worker/engines/mlx/utils_mlx.py:1078-1156`: the
+`_try_load_coupled_drafter` call is gated on `if group is None:`
+— i.e., **the coupled-drafter loader only runs for single-device
+placements**. The inline comment cites the original concern that
+"coupled drafters can't ride asymmetric placement (their wire would
+have to ship full hidden states / KV cache entries cross-node)".
+
+For tensor parallel specifically that concern is weaker than it
+sounds: each TP rank already holds the *same* hidden state after
+every all-reduce (TP shards within-layer matmuls, not the residual
+stream). A small replicated DFlash drafter (0.5B params, ~1 GB) on
+each rank would consume its local hidden state and produce the same
+draft block deterministically across ranks. The drafter's own
+KV / SSM cache would also be replicated. This is a future patch,
+not a hard architectural limit.
+
+For now, single-node DFlash works on every Qwen 3.5/3.6 hybrid target
+that fits on one box (4B, 27B, 35B-A3B all measured above);
+multi-node DFlash awaits the loader patch.
+
 ## Reading the numbers
 
 DFlash's speedup ratio holds remarkably steady across a **17.5x** target
@@ -181,9 +266,13 @@ implementation.
 ## Setup
 
 - Hosts:
-  - 4B bench: **wc-smbp** (Mac17,7, 128 GB unified memory)
-  - 27B + 35B-A3B benches: **wc-smbpt** (Mac17,7, 128 GB unified
-    memory, ~83 GB free vs ~13 GB on wc-smbp during the 4B run)
+  - 4B bench: **wc-smbp** (Apple M5 Max MacBook Pro, 128 GB unified memory)
+  - 27B + 35B-A3B benches: **wc-smbpt** (Apple M5 Max MacBook Pro, 128 GB
+    unified memory, ~83 GB free vs ~13 GB on wc-smbp during the 4B run)
+  - 122B-A10B TP2 bench: **wc-smbp + wc-smbpt** (both M5 Max, ~100 GB
+    free per node after `sudo purge`, JACCL RDMA over thunderbolt-bridge
+    `rdma_en1 ⇌ rdma_en2`, mDNS auto-discovery on shared 192.168.1.0/24
+    LAN, ~4 ms RTT)
 - Stack: MLX 0.32.0.dev, mlx_vlm 0.5.0, mlx_lm 0.31.3
 - exo branch: `team-wcv/bench/gemma4-mtp-coupled-results`,
   including the dtype + first-bonus shape fixes documented inline below
@@ -199,6 +288,8 @@ implementation.
   - `mlx-community--Qwen3.6-35B-A3B-8bit.toml`
 
 ## How to reproduce
+
+### Single-node DFlash A/B (4B / 27B / 35B-A3B)
 
 ```bash
 # 1. Download target + drafter pairs (first run only). Token required
@@ -226,6 +317,46 @@ for repo in [
 The bench script alternates `EXO_DRAFT_MODE=none` and
 `EXO_DRAFT_MODE=model`, restarting exo between scenarios, and writes
 per-request JSON to `bench/results/dflash/<label>.json`.
+
+### Multi-node tensor-parallel target-only (122B-A10B)
+
+```bash
+# Both nodes need ~100 GB free; `sudo purge` first if macOS caches
+# have built up. Both must be on the same LAN (mDNS) or have explicit
+# bootstrap-peer multiaddrs.
+
+# Start exo on the secondary node first (so it advertises early)
+ssh wc-smbpt 'cd ~/Development/Tooling/exo && uv run exo -v > /tmp/exo.log 2>&1 &'
+sleep 5
+
+# Then on the primary node (which will serve the API + drive the bench)
+ssh wc-smbp 'cd ~/Development/Tooling/exo && uv run exo -v > /tmp/exo.log 2>&1 &'
+
+# Wait ~30 s for libp2p mDNS discovery + RDMA edge probe, then place
+# the model with explicit Tensor + MlxJaccl + min_nodes=2:
+ssh wc-smbp 'curl -s -X POST http://127.0.0.1:52415/place_instance \
+    -H "Content-Type: application/json" \
+    -d "{\"model_id\":\"mlx-community/Qwen3.5-122B-A10B-8bit\",
+         \"sharding\":\"Tensor\",
+         \"instance_meta\":\"MlxJaccl\",
+         \"min_nodes\":2}"'
+
+# Wait for two RunnerReady states (~90 s on hot cache), then run
+# the bench:
+ssh wc-smbp 'cd ~/Development/Tooling/exo && uv run python bench/drafter_bench.py \
+    --host 127.0.0.1 --port 52415 \
+    --model mlx-community/Qwen3.5-122B-A10B-8bit \
+    --label qwen3.5-122b-a10b-mlx-8bit-tp2-jaccl-target-only \
+    --use-drafter false --draft-mode none \
+    --runs 2 --max-tokens 256 \
+    --out bench/results/dflash/qwen3.5-122b-a10b-mlx-8bit-tp2-jaccl-target-only.json'
+```
+
+The full automation lives in `/tmp/qwen35_122b_tensor_bench.sh` on
+the smbp host (set up to alternate target-only and DFlash modes; the
+DFlash side currently degrades to BatchGenerator at load time because
+of the loader gap described above, so it produces the same number
+twice until the multi-node coupled-drafter loader patch lands).
 
 ## Discovered bugs along the way (from the 4B bench)
 
@@ -293,16 +424,24 @@ Per-request JSON:
 
 ## Next steps
 
-1. Land the dispatch wiring + bench results upstream
+1. **Lift the multi-device coupled-drafter loader gate.** Today
+   `_try_load_coupled_drafter` in `utils_mlx.py:1138` is inside
+   `if group is None`. For `Sharding.Tensor` we can safely replicate
+   the DFlash drafter (~0.5-3 GB) on each rank, consume the
+   already-replicated post-all-reduce hidden state, and run draft
+   block generation independently per rank (deterministic given
+   identical inputs). That unblocks the 122B-A10B DFlash A/B that
+   today degrades to BatchGenerator on multi-node placement.
+2. Land the dispatch wiring + bench results upstream
    (target: `exo-explore/exo`, single aggregated PR).
-2. Bench bigger DFlash drafters as they ship:
-   - `z-lab/Qwen3.5-122B-A10B-DFlash` (10B active, larger MoE) —
-     would need wc-spark / wc-studio class memory for the 122B target.
+3. Bench bigger DFlash drafters as they ship and as memory permits:
+   - `z-lab/Qwen3.5-122B-A10B-DFlash` — drafter weights are already
+     downloaded to both nodes; just needs the loader patch above.
    - `z-lab/Qwen3-Coder-30B-A3B-DFlash` (specialised code drafter) —
      interesting because the existing 30B-A3B is the only DFlash drafter
      trained against a code-specialised target so far.
-3. Raise `--runs` to 5+ for publication-grade per-scenario means.
-4. Investigate the empty-response harness hiccups (3/30 runs) —
+4. Raise `--runs` to 5+ for publication-grade per-scenario means.
+5. Investigate the empty-response harness hiccups (3/30 runs) —
    likely a streaming-completion ordering bug in `drafter_bench.py`
    when the server cancels a connection mid-stream, since the requests
    adjacent to each hiccup completed normally.
