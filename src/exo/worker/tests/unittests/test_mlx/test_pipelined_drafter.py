@@ -748,7 +748,13 @@ class TestBroadcastDrafts:
             _broadcast_drafts,  # pyright: ignore[reportPrivateUsage]
         )
 
-        out = _broadcast_drafts([10, 20], k=4, target_group=None, is_root=True)
+        out: list[int] = _broadcast_drafts(
+            [10, 20],
+            k=4,
+            target_group=None,
+            target_peer_fanout=None,
+            is_root=True,
+        )
         assert out == [10, 20]
 
     def test_single_rank_short_circuit_consumer_rejected(self) -> None:
@@ -759,7 +765,13 @@ class TestBroadcastDrafts:
         )
 
         with pytest.raises(RuntimeError, match="non-root"):
-            _broadcast_drafts(None, k=4, target_group=None, is_root=False)
+            _broadcast_drafts(
+                None,
+                k=4,
+                target_group=None,
+                target_peer_fanout=None,
+                is_root=False,
+            )
 
     def test_single_rank_root_requires_drafts(self) -> None:
         from exo.worker.engines.mlx.generator.pipelined_drafter import (
@@ -770,7 +782,13 @@ class TestBroadcastDrafts:
         # caller bug (the runner never has a None drafts list when it
         # owns the wire).
         with pytest.raises(RuntimeError, match="non-root"):
-            _broadcast_drafts(None, k=4, target_group=None, is_root=False)
+            _broadcast_drafts(
+                None,
+                k=4,
+                target_group=None,
+                target_peer_fanout=None,
+                is_root=False,
+            )
 
 
 class TestBroadcastTargetTokens:
@@ -794,8 +812,13 @@ class TestBroadcastTargetTokens:
 
         # k_this + 1 == 3 tokens: the seed-bonus + drafts emitted per
         # round in a K=4, k_this=2 partial round.
-        out = _broadcast_target_tokens(
-            [10, 20, 30], k=4, k_this=2, target_group=None, is_root=True
+        out: list[int] = _broadcast_target_tokens(
+            [10, 20, 30],
+            k=4,
+            k_this=2,
+            target_group=None,
+            target_peer_fanout=None,
+            is_root=True,
         )
         assert out == [10, 20, 30]
 
@@ -806,7 +829,12 @@ class TestBroadcastTargetTokens:
 
         with pytest.raises(RuntimeError, match="non-root"):
             _broadcast_target_tokens(
-                None, k=4, k_this=2, target_group=None, is_root=False
+                None,
+                k=4,
+                k_this=2,
+                target_group=None,
+                target_peer_fanout=None,
+                is_root=False,
             )
 
     def test_root_rejects_wrong_length(self) -> None:
@@ -819,7 +847,12 @@ class TestBroadcastTargetTokens:
 
         with pytest.raises(RuntimeError, match="must equal k_this"):
             _broadcast_target_tokens(
-                [10, 20], k=4, k_this=2, target_group=None, is_root=True
+                [10, 20],
+                k=4,
+                k_this=2,
+                target_group=None,
+                target_peer_fanout=None,
+                is_root=True,
             )
 
 
@@ -849,3 +882,339 @@ def test_make_drafter_pipelined_root_rank_with_no_transport_rejected() -> None:
             target_group=_StubGroup(),
             is_target_root=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Drafter-death recovery: abort sentinel + wrap behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestDrafterAbortRecovery:
+    """Recovery contract when the drafter rank dies mid-generation.
+
+    Pre-fix failure mode: root's ``transport.forward`` raised
+    ``OSError`` and re-raised cleanly out of ``mlx_generate``, but
+    non-root target ranks blocked indefinitely on the next-round
+    draft broadcast (the sole inter-rank coordination channel for
+    spec decode). The abort sentinel + wrap + ``RemoteTransport``
+    failure flag together convert that hang into a fast, lockstep
+    exit on every rank, with the runner subprocess crashing so the
+    master's instance-deletion path can rebuild the placement.
+
+    The cluster bench covers the full multi-rank flow against real
+    ``mx.distributed``; these unit tests pin the single-rank
+    invariants that are reachable without spinning up a peer group.
+    """
+
+    def test_broadcast_abort_short_circuits_without_group(self) -> None:
+        # ``target_group is None`` (single-rank placement) means there
+        # are no peers to notify; the abort broadcast must be a no-op
+        # rather than raising or contacting any wire layer.
+        from exo.worker.engines.mlx.generator.pipelined_drafter import (
+            _broadcast_abort,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        # Should not raise; should not require any group machinery.
+        _broadcast_abort(k=4, target_group=None, target_peer_fanout=None)
+
+    def test_sentinel_value_is_in_validator_range(self) -> None:
+        # The sentinel must satisfy ``_validate_broadcast_values``
+        # (positive int32) so a real cluster broadcast doesn't reject
+        # it before non-root ranks have a chance to decode it.
+        from exo.worker.engines.mlx.generator.pipelined_drafter import (
+            DRAFT_ABORT_SENTINEL,
+        )
+        from exo.worker.engines.mlx.utils_mlx import (
+            _MX_BROADCAST_MAX_VALUE,  # pyright: ignore[reportPrivateUsage]
+            _validate_broadcast_values,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        assert 0 < DRAFT_ABORT_SENTINEL < _MX_BROADCAST_MAX_VALUE
+        # Must also exceed any plausible draft length so it can never
+        # collide with a legitimate length-prefix.
+        assert DRAFT_ABORT_SENTINEL > 1_000_000
+        # Validator round-trip with the wire payload root would emit.
+        _validate_broadcast_values([DRAFT_ABORT_SENTINEL] + [0] * 4)
+
+    def test_broadcast_drafts_decodes_sentinel_to_abort_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Multi-rank receive path: when ``mx_broadcast_int_list``
+        # returns a buffer whose length-prefix is the sentinel,
+        # ``_broadcast_drafts`` raises ``DrafterAbortedError`` so the
+        # spec loop can exit in lockstep with the dead root rank.
+        from exo.worker.engines.mlx.generator import pipelined_drafter
+        from exo.worker.engines.mlx.generator.pipelined_drafter import (
+            DRAFT_ABORT_SENTINEL,
+            DrafterAbortedError,
+            _broadcast_drafts,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        k = 4
+
+        def fake_broadcast(
+            values: list[int] | None,
+            length: int,
+            group: object,
+            *,
+            is_root: bool,
+        ) -> list[int]:
+            del values, group, is_root
+            assert length == k + 1
+            return [DRAFT_ABORT_SENTINEL] + [0] * k
+
+        monkeypatch.setattr(pipelined_drafter, "mx_broadcast_int_list", fake_broadcast)
+
+        sentinel_group = object()  # opaque; the fake never inspects
+        with pytest.raises(DrafterAbortedError, match="drafter aborted"):
+            _broadcast_drafts(
+                None,
+                k=k,
+                target_group=sentinel_group,  # pyright: ignore[reportArgumentType]
+                target_peer_fanout=None,
+                is_root=False,
+            )
+
+    def test_spec_step_wrap_root_broadcasts_abort_on_oserror(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Inject a body that immediately raises OSError; the wrap
+        # must call ``_broadcast_abort`` (root path) before re-raising
+        # so non-root ranks unblock their pending broadcast.
+        from exo.worker.engines.mlx.generator import pipelined_drafter
+
+        broadcast_calls: list[tuple[int, object]] = []
+
+        def fake_abort(
+            *, k: int, target_group: object, target_peer_fanout: object
+        ) -> None:
+            del target_peer_fanout
+            broadcast_calls.append((k, target_group))
+
+        def fake_body(**kwargs: object):
+            del kwargs
+            raise ConnectionError("drafter rank closed mid-frame")
+            yield  # pragma: no cover -- generator marker
+
+        monkeypatch.setattr(pipelined_drafter, "_broadcast_abort", fake_abort)
+        monkeypatch.setattr(
+            pipelined_drafter,
+            "_pipelined_speculative_step_body",
+            fake_body,
+        )
+
+        sentinel_group = object()
+        gen = pipelined_drafter._pipelined_speculative_step(  # pyright: ignore[reportPrivateUsage]
+            prompt=None,  # pyright: ignore[reportArgumentType]
+            model=None,  # pyright: ignore[reportArgumentType]
+            transport=None,
+            prompt_cache=None,  # pyright: ignore[reportArgumentType]
+            max_tokens=8,
+            sampler=lambda x: x,
+            logits_processors=[],
+            num_draft_tokens=4,
+            prefill_step_size=512,
+            prompt_token_count=0,
+            target_group=sentinel_group,  # pyright: ignore[reportArgumentType]
+            is_target_root=True,
+        )
+        with pytest.raises(ConnectionError, match="drafter rank closed"):
+            next(gen)
+        assert broadcast_calls == [(4, sentinel_group)]
+
+    def test_spec_step_wrap_non_root_does_not_broadcast(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Non-root has no transport to fail on; if a non-root somehow
+        # raises OSError (e.g. a peer-side issue surfaces this way),
+        # we must NOT issue an abort broadcast -- only root owns that
+        # signal. Re-raising preserves the original error for the
+        # caller's traceback without a phantom broadcast.
+        from exo.worker.engines.mlx.generator import pipelined_drafter
+
+        broadcast_calls: list[tuple[int, object]] = []
+
+        def fake_abort(
+            *, k: int, target_group: object, target_peer_fanout: object
+        ) -> None:
+            del target_peer_fanout
+            broadcast_calls.append((k, target_group))
+
+        def fake_body(**kwargs: object):
+            del kwargs
+            raise ConnectionError("non-root saw socket failure somehow")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(pipelined_drafter, "_broadcast_abort", fake_abort)
+        monkeypatch.setattr(
+            pipelined_drafter,
+            "_pipelined_speculative_step_body",
+            fake_body,
+        )
+
+        gen = pipelined_drafter._pipelined_speculative_step(  # pyright: ignore[reportPrivateUsage]
+            prompt=None,  # pyright: ignore[reportArgumentType]
+            model=None,  # pyright: ignore[reportArgumentType]
+            transport=None,
+            prompt_cache=None,  # pyright: ignore[reportArgumentType]
+            max_tokens=8,
+            sampler=lambda x: x,
+            logits_processors=[],
+            num_draft_tokens=4,
+            prefill_step_size=512,
+            prompt_token_count=0,
+            target_group=object(),  # pyright: ignore[reportArgumentType]
+            is_target_root=False,
+        )
+        with pytest.raises(ConnectionError):
+            next(gen)
+        assert broadcast_calls == []
+
+    def test_spec_step_wrap_swallows_abort_broadcast_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # If the abort broadcast itself fails (e.g. ``target_group``
+        # is also dead), the original transport error must still
+        # surface intact -- the master's instance-deletion path is
+        # the SIGKILL backstop, so swallowing the recovery error
+        # avoids masking the root cause in the caller's traceback.
+        from exo.worker.engines.mlx.generator import pipelined_drafter
+
+        def fake_abort(
+            *, k: int, target_group: object, target_peer_fanout: object
+        ) -> None:
+            del k, target_group, target_peer_fanout
+            raise RuntimeError("group is also dead")
+
+        def fake_body(**kwargs: object):
+            del kwargs
+            raise ConnectionError("primary failure")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(pipelined_drafter, "_broadcast_abort", fake_abort)
+        monkeypatch.setattr(
+            pipelined_drafter,
+            "_pipelined_speculative_step_body",
+            fake_body,
+        )
+
+        gen = pipelined_drafter._pipelined_speculative_step(  # pyright: ignore[reportPrivateUsage]
+            prompt=None,  # pyright: ignore[reportArgumentType]
+            model=None,  # pyright: ignore[reportArgumentType]
+            transport=None,
+            prompt_cache=None,  # pyright: ignore[reportArgumentType]
+            max_tokens=8,
+            sampler=lambda x: x,
+            logits_processors=[],
+            num_draft_tokens=4,
+            prefill_step_size=512,
+            prompt_token_count=0,
+            target_group=object(),  # pyright: ignore[reportArgumentType]
+            is_target_root=True,
+        )
+        with pytest.raises(ConnectionError, match="primary failure"):
+            next(gen)
+
+
+# ---------------------------------------------------------------------------
+# Tokenizer vocab-size helper
+# ---------------------------------------------------------------------------
+
+
+class TestGetTokenizerVocabSize:
+    """Regression coverage for ``_get_tokenizer_vocab_size``.
+
+    Codex flagged (P1, PR #21) that the helper returned the *base*
+    vocabulary size for HuggingFace fast tokenizers, which excludes
+    added tokens (chat templates, EOS, control). Any model that emits
+    such an added token therefore tripped the runtime "wire corruption"
+    guard and crashed valid generations. The helper now prefers
+    ``len(tokenizer)`` (full vocab) and falls back through
+    ``vocab_size + |added_vocab|`` and the explicit vocab map.
+    """
+
+    def _call(self, inner: object) -> int | None:
+        from exo.worker.engines.mlx.generator import pipelined_drafter
+
+        wrapper = type("Wrapper", (), {"_tokenizer": inner})()
+        return pipelined_drafter._get_tokenizer_vocab_size(wrapper)  # pyright: ignore[reportPrivateUsage,reportArgumentType]
+
+    def test_prefers_len_over_vocab_size_for_hf_fast_tokenizer(self) -> None:
+        """``len(tokenizer)`` is the canonical HF API for the full
+        vocabulary including added tokens. The helper must prefer it
+        over ``vocab_size`` (which excludes added tokens)."""
+
+        class _HFFastTokenizer:
+            vocab_size: int = 32000
+            added_count: int = 8
+
+            def __len__(self) -> int:
+                return self.vocab_size + self.added_count
+
+            def get_added_vocab(self) -> dict[str, int]:
+                return {f"<extra_{i}>": 32000 + i for i in range(self.added_count)}
+
+        assert self._call(_HFFastTokenizer()) == 32008
+
+    def test_added_vocab_bumps_size_when_len_is_missing(self) -> None:
+        """If the wrapper hides ``__len__`` (some custom tokenizers do),
+        we still want to add the added-vocab size to the base vocab so
+        the guard doesn't reject legitimate added tokens."""
+
+        class _NoLenTokenizer:
+            vocab_size: int = 4096
+
+            def get_added_vocab(self) -> dict[str, int]:
+                return {"<eos>": 4096, "<pad>": 4097}
+
+        assert self._call(_NoLenTokenizer()) == 4098
+
+    def test_falls_back_to_max_vocab_value_plus_one(self) -> None:
+        """When neither ``__len__`` nor ``vocab_size`` is exposed, the
+        scan over ``vocab.values()`` is the last reliable source."""
+
+        class _OnlyVocabMap:
+            vocab: dict[str, int] = {"a": 0, "b": 1, "<extra>": 7}
+
+        assert self._call(_OnlyVocabMap()) == 8
+
+    def test_falls_back_to_vocab_size_when_added_helper_raises(self) -> None:
+        """Some tokenizers raise from ``get_added_vocab`` (e.g. when the
+        added-tokens decoder isn't initialised). The helper must not
+        propagate that -- a missing added-vocab count is treated as zero
+        and we still return the base vocab size."""
+
+        class _BrokenAddedHelper:
+            vocab_size: int = 16
+
+            def get_added_vocab(self) -> dict[str, int]:
+                raise RuntimeError("added vocab not initialised")
+
+        assert self._call(_BrokenAddedHelper()) == 16
+
+    def test_returns_none_when_tokenizer_has_no_inner(self) -> None:
+        from exo.worker.engines.mlx.generator import pipelined_drafter
+
+        wrapper = type("Wrapper", (), {})()
+        assert (
+            pipelined_drafter._get_tokenizer_vocab_size(wrapper)  # pyright: ignore[reportPrivateUsage,reportArgumentType]
+            is None
+        )
+
+    def test_added_vocab_token_id_no_longer_triggers_corruption_guard(self) -> None:
+        """End-to-end semantics of the fix: an added-token id (between
+        ``vocab_size`` and ``vocab_size + |added_vocab|``) must satisfy
+        the spec-decode guard ``0 <= token < vocab_size``. Without the
+        fix this id falsely tripped the guard and crashed generations.
+        """
+
+        class _Tokenizer:
+            vocab_size: int = 32000
+
+            def __len__(self) -> int:
+                return self.vocab_size + 4
+
+        full_size = self._call(_Tokenizer())
+        assert full_size is not None
+        added_token_id = 32002  # within added-vocab range
+        assert 0 <= added_token_id < full_size

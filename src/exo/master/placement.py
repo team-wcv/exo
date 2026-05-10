@@ -60,7 +60,7 @@ from exo.shared.types.worker.instances import (
 )
 from exo.shared.types.worker.runners import RunnerId
 from exo.shared.types.worker.shards import Sharding
-from exo.utils.ports import random_ephemeral_port
+from exo.utils.ports import random_ephemeral_port, random_ephemeral_port_excluding
 
 ASYMMETRIC_TENSOR_AUTO_UPGRADE_ENV = "EXO_ENABLE_ASYMMETRIC_TP_AUTO_UPGRADE"
 
@@ -444,6 +444,16 @@ def place_instance(
     )
 
     instance_id = InstanceId()
+    # Codex P2 (PR #21 round 3): the drafter / target-peer ports must
+    # also avoid colliding with the per-meta listener port that the
+    # ``match instance_meta`` block below allocates on rank 0
+    # (``coordinator_port`` for MlxJaccl or ``ephemeral_port`` for
+    # MlxRing). Pre-allocate that port here and pass it as a
+    # ``reserved_ports`` set so ``_select_drafter_placement``'s draws
+    # exclude it; otherwise rank 0 occasionally hit ``EADDRINUSE``
+    # during runner bootstrap when the random draws happened to
+    # coincide.
+    pre_allocated_listener_port = random_ephemeral_port()
     drafter_placement = _select_drafter_placement(
         command=command,
         selected_cycle=selected_cycle,
@@ -452,6 +462,7 @@ def place_instance(
         node_memory=node_memory,
         node_network=node_network,
         instance_id=instance_id,
+        reserved_ports=frozenset({pre_allocated_listener_port}),
         on_drafter_placement_degraded=on_drafter_placement_degraded,
         download_status=download_status or {},
     )
@@ -501,7 +512,7 @@ def place_instance(
             )
             mlx_jaccl_coordinators = get_mlx_jaccl_coordinators(
                 coordinator=coordinator_node_id,
-                coordinator_port=random_ephemeral_port(),
+                coordinator_port=pre_allocated_listener_port,
                 cycle_digraph=cycle_digraph,
                 node_network=node_network,
             )
@@ -513,7 +524,7 @@ def place_instance(
                 drafter_placement=drafter_placement,
             )
         case InstanceMeta.MlxRing:
-            ephemeral_port = random_ephemeral_port()
+            ephemeral_port = pre_allocated_listener_port
             hosts_by_node = get_mlx_ring_hosts_by_node(
                 selected_cycle=Cycle(node_ids=nodes_for_group),
                 cycle_digraph=cycle_digraph,
@@ -559,6 +570,7 @@ def _select_drafter_placement(
     node_memory: Mapping[NodeId, MemoryUsage],
     node_network: Mapping[NodeId, NodeNetworkInfo],
     instance_id: InstanceId,
+    reserved_ports: frozenset[int],
     on_drafter_placement_degraded: (Callable[[DrafterPlacementDegraded], None] | None),
     download_status: Mapping[NodeId, Sequence[DownloadProgress]],
 ) -> DrafterPlacement | None:
@@ -805,7 +817,70 @@ def _select_drafter_placement(
     # protocol would close the cross-host gap entirely; that requires
     # changing ``DrafterPlacement``'s wire schema and is tracked for
     # a follow-up PR.
-    drafter_socket_port = random_ephemeral_port()
+    #
+    # Codex P2 (PR #21 round 3): both rank-0 listener ports must avoid
+    # each other AND the caller-supplied ``reserved_ports`` set, which
+    # carries the per-meta listener port (jaccl coordinator port or
+    # ring ephemeral port) that the placement entry point pre-allocates.
+    # Pre-fix the collision-avoidance loop only checked
+    # ``target_peer_socket_port != drafter_socket_port`` and missed
+    # those sibling listeners, so rank 0 occasionally hit
+    # ``EADDRINUSE`` during runner bootstrap (drafter accept loop in
+    # ``_maybe_accept_drafter_socket`` versus target peer fanout in
+    # ``_maybe_setup_target_peer_fanout``).
+    drafter_socket_port = random_ephemeral_port_excluding(reserved_ports)
+    # Inter-target-peer wire: target rank 0 binds a separate ephemeral
+    # port for the spec-decode int-broadcast fanout (drafts in / sampled
+    # tokens out). Decoupled from the drafter port because both bind on
+    # rank 0 and a single port can only accept one connection class
+    # cleanly. Each non-zero target rank dials the IP rank 0 advertises
+    # *to that peer* -- different peers may reach rank 0 over different
+    # interfaces (e.g. a Thunderbolt /30 mesh exposes a unique IP per
+    # node pair). The map below resolves those per-peer IPs once at
+    # placement time so workers don't re-do the topology dance at
+    # bootstrap.
+    target_peer_socket_port = random_ephemeral_port_excluding(
+        reserved_ports | {drafter_socket_port}
+    )
+    # Keys stored as strings so the dict round-trips through the
+    # event-router JSON wire (JSON has no int dict keys, and pydantic
+    # strict mode rejects str keys for a ``dict[int, _]`` field at
+    # re-validation). Consumers stringify the rank before lookup.
+    target_peer_hosts_by_rank: dict[str, str] = {}
+    for peer_rank, peer_node_id in enumerate(selected_cycle.node_ids):
+        if peer_rank == 0:
+            continue
+        peer_view_of_rank_zero = find_ip_prioritised(
+            peer_node_id,
+            target_rank_zero,
+            topology,
+            node_network,
+            ring=True,
+        )
+        if peer_view_of_rank_zero is None:
+            # Same fail-loud rationale as the drafter IP: target rank 0
+            # is unreachable from a peer in topology, so the spec-decode
+            # int-broadcast wire cannot be brought up. Falling back to
+            # the legacy ``mx.distributed`` broadcast would re-introduce
+            # the JACCL int/float wire-conflation bug. Degrade to no
+            # drafter so the user still gets generation, just at
+            # standard (non-speculative) speed.
+            _emit_drafter_degraded(
+                on_drafter_placement_degraded,
+                command=command,
+                instance_id=instance_id,
+                target_node_ids=target_node_ids,
+                eligible_nodes=eligible_nodes,
+                reason=DrafterPlacementDegradationReason.NoReachablePathFromTargetRankZero,
+                fallback=fallback,
+                detail=(
+                    f"Target rank 0 ({target_rank_zero}) has no IP address "
+                    f"reachable from peer target rank {peer_rank} "
+                    f"(node {peer_node_id}) in topology"
+                ),
+            )
+            return None
+        target_peer_hosts_by_rank[str(peer_rank)] = peer_view_of_rank_zero
     return DrafterPlacement(
         drafter_node_id=drafter_node_id,
         drafter_runner_id=drafter_runner_id,
@@ -813,6 +888,8 @@ def _select_drafter_placement(
         drafter_rank=drafter_rank,
         drafter_socket_host=drafter_socket_host,
         drafter_socket_port=drafter_socket_port,
+        target_peer_socket_port=target_peer_socket_port,
+        target_peer_hosts_by_rank=target_peer_hosts_by_rank,
     )
 
 

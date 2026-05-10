@@ -925,6 +925,7 @@ def make_drafter(
     target_subgroup_size: int = 1,
     pipelined_transport: object | None = None,
     target_group: object | None = None,
+    target_peer_fanout: object | None = None,
     is_target_root: bool = True,
 ) -> Drafter:
     """Build a :class:`Drafter` for the resolved mode.
@@ -988,6 +989,20 @@ def make_drafter(
         from exo.worker.engines.mlx.generator.pipelined_drafter import (
             PipelinedModelDrafter,
         )
+        from exo.worker.engines.mlx.utils_mlx import TargetPeerFanout
+
+        # Validate target_peer_fanout shape early so a malformed caller fails
+        # here, not deep inside the spec loop's broadcast helpers. ``None`` is
+        # fine on every path (single-rank / symmetric / test fakes); the
+        # broadcast helpers fall back to ``mx_broadcast_int_list`` in that
+        # case.
+        if target_peer_fanout is not None and not isinstance(
+            target_peer_fanout, TargetPeerFanout
+        ):
+            raise TypeError(
+                "target_peer_fanout must be TargetPeerFanout | None; "
+                f"got {type(target_peer_fanout).__name__}"
+            )
 
         # Multi-target asymmetric: non-root target ranks have no
         # transport (the socket is rank-0-only) but must still drive the
@@ -1016,6 +1031,7 @@ def make_drafter(
                 transport=None,
                 num_draft_tokens=num_draft_tokens,
                 target_group=cast("mx.distributed.Group | None", target_group),
+                target_peer_fanout=target_peer_fanout,
                 is_target_root=False,
             )
 
@@ -1040,6 +1056,9 @@ def make_drafter(
                 transport=pipelined_transport,
                 num_draft_tokens=num_draft_tokens,
                 target_group=cast("mx.distributed.Group | None", target_group)
+                if target_subgroup_size > 1
+                else None,
+                target_peer_fanout=target_peer_fanout
                 if target_subgroup_size > 1
                 else None,
                 is_target_root=True,

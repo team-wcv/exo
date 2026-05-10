@@ -300,6 +300,18 @@ class RemoteTransport:
             max_workers=1, thread_name_prefix="exo-drafter-ipc"
         )
         self._is_shutdown = False
+        # Sticky failure flag, set by the blocking wire helpers when a
+        # socket-level error escapes (drafter rank crashed, peer closed
+        # mid-frame, etc.). Once true, subsequent requests must not start
+        # a new spec session on this transport: the wire is unrecoverable
+        # until the runner is restarted (the master's instance-deletion
+        # path tears the placement down within ~5s of the drafter node
+        # leaving the topology). Callers consult :attr:`is_failed` before
+        # constructing a :class:`PipelinedModelDrafter`; the runner
+        # subprocess exits via the spec-loop exception if the failure
+        # happens mid-request (see ``_pipelined_speculative_step``'s
+        # abort sentinel).
+        self._is_failed = False
         # Monotonic session id allocator. ``itertools.count`` gives us a
         # thread-safe unsigned counter; we wrap it in a lock-free
         # ``next()`` call inside :meth:`open_session` (Python's GIL
@@ -311,6 +323,25 @@ class RemoteTransport:
     @property
     def num_draft_tokens(self) -> int:
         return self._num_draft_tokens
+
+    @property
+    def is_failed(self) -> bool:
+        """True once a wire-level failure has been observed on this transport.
+
+        Set by the blocking wire helpers when an :class:`OSError` escapes
+        (drafter rank crashed, peer closed mid-frame, etc.). Sticky:
+        there is no in-place recovery -- the runner must be torn down
+        (via the master's instance-deletion path) and a fresh transport
+        built. Callers consult this flag before constructing a
+        :class:`PipelinedModelDrafter`; if true the request degrades to
+        non-speculative decoding for the remaining lifetime of the
+        runner.
+        """
+        return self._is_failed
+
+    def _mark_failed(self) -> None:
+        """Internal: flip :attr:`is_failed` to True. Idempotent."""
+        self._is_failed = True
 
     def open_session(self) -> "_SessionHandle":
         """Allocate a fresh session and return a :class:`DrafterTransport` view.
@@ -326,6 +357,13 @@ class RemoteTransport:
             raise RuntimeError(
                 "RemoteTransport.open_session called after shutdown; the "
                 "drafter rank's serve loop has exited and won't respond"
+            )
+        if self._is_failed:
+            raise RuntimeError(
+                "RemoteTransport.open_session called after a wire-level "
+                "failure was observed; the underlying socket is dead and "
+                "the runner must be torn down (master-driven instance "
+                "deletion) before a fresh session can be opened"
             )
         with self._session_lock:
             session_id = next(self._session_id_counter)
@@ -417,10 +455,19 @@ class RemoteTransport:
             session_id=session_id,
             target_drafts_buffer_size=self._num_draft_tokens + 1,
         )
-        send_uint32_frame(self._sock, frame)
-        # Drafts buffer is fixed-size at K + 1 (the upper bound of any
-        # forward request); we slice to ``num_forwards`` here.
-        drafts = recv_uint32_frame(self._sock, self._num_draft_tokens + 1)
+        try:
+            send_uint32_frame(self._sock, frame)
+            # Drafts buffer is fixed-size at K + 1 (the upper bound of any
+            # forward request); we slice to ``num_forwards`` here.
+            drafts = recv_uint32_frame(self._sock, self._num_draft_tokens + 1)
+        except OSError:
+            # Drafter rank closed the socket / peer reset / broken pipe.
+            # Mark the transport so subsequent ``open_session`` calls
+            # fail fast and the runner can be torn down (master-driven
+            # instance deletion) instead of silently producing nothing
+            # on every speculative round.
+            self._mark_failed()
+            raise
         return drafts[:num_forwards]
 
     def _trim_blocking(self, session_id: int, n_positions: int) -> None:
@@ -433,8 +480,12 @@ class RemoteTransport:
             session_id=session_id,
             target_drafts_buffer_size=self._num_draft_tokens + 1,
         )
-        send_uint32_frame(self._sock, frame)
-        ack = recv_uint32_frame(self._sock, ACK_FRAME_SIZE)
+        try:
+            send_uint32_frame(self._sock, frame)
+            ack = recv_uint32_frame(self._sock, ACK_FRAME_SIZE)
+        except OSError:
+            self._mark_failed()
+            raise
         if ack[0] != ACK_OK:
             raise RuntimeError(
                 f"Drafter rank reported error code {ack[0]} "
@@ -477,10 +528,14 @@ class RemoteTransport:
             session_id=session_id,
             target_drafts_buffer_size=self._num_draft_tokens + 1,
         )
-        send_uint32_frame(self._sock, frame)
-        if num_prompt_tokens > 0:
-            send_variable_uint32_payload(self._sock, prompt_tokens)
-        ack = recv_uint32_frame(self._sock, ACK_FRAME_SIZE)
+        try:
+            send_uint32_frame(self._sock, frame)
+            if num_prompt_tokens > 0:
+                send_variable_uint32_payload(self._sock, prompt_tokens)
+            ack = recv_uint32_frame(self._sock, ACK_FRAME_SIZE)
+        except OSError:
+            self._mark_failed()
+            raise
         if ack[0] != ACK_OK:
             raise RuntimeError(
                 f"Drafter rank reported error code {ack[0]} "
@@ -498,8 +553,12 @@ class RemoteTransport:
             session_id=session_id,
             target_drafts_buffer_size=self._num_draft_tokens + 1,
         )
-        send_uint32_frame(self._sock, frame)
-        ack = recv_uint32_frame(self._sock, ACK_FRAME_SIZE)
+        try:
+            send_uint32_frame(self._sock, frame)
+            ack = recv_uint32_frame(self._sock, ACK_FRAME_SIZE)
+        except OSError:
+            self._mark_failed()
+            raise
         if ack[0] != ACK_OK:
             raise RuntimeError(
                 f"Drafter rank reported error code {ack[0]} "

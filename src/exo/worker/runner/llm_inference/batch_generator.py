@@ -1,3 +1,4 @@
+import contextlib
 import itertools
 import os
 import time
@@ -251,6 +252,15 @@ class SequentialGenerator(Engine):
     # the actual ``DrafterTransport`` consumed by the spec loop. Closed
     # in :meth:`close` (sends ``OP_SHUTDOWN`` to the drafter rank).
     remote_drafter_transport: RemoteTransport | None = None
+    # Inter-target-rank TCP fanout for spec-decode int broadcasts.
+    # Allocated alongside the drafter wire on multi-target asymmetric
+    # placements (see :class:`TargetPeerFanout`); ``None`` for
+    # single-target / symmetric instances. The runner stores it so the
+    # spec-decode loop can sidestep ``mx.distributed.send`` / ``recv``
+    # for inter-target int broadcasts -- those collide with the
+    # model's TP ``all_sum`` collectives on the JACCL backend and
+    # silently corrupt the int wire.
+    target_peer_fanout: object | None = None
     check_for_cancel_every: int = 50
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
@@ -424,16 +434,51 @@ class SequentialGenerator(Engine):
                 del self._active_tasks[task_id]
 
             except Exception as e:
-                # Send error chunk to the client and mark the task finished,
-                # but DO NOT re-raise. Re-raising here propagates through
-                # ``handle_generation_tasks`` and triggers ``RunnerFailed``
-                # on the supervisor, which currently leaves a respawned
-                # target rank stuck in ``RunnerIdle`` because its drafter
-                # peer is still ``RunnerRunning`` (see
-                # ``_init_distributed_backend``). A single malformed
-                # request must never permanently brick a multi-rank
-                # instance, and with ``max_concurrent_tasks > 1`` it must
-                # not affect the *other* in-flight tasks either.
+                # ALWAYS log first. Without this, an exception silently
+                # swallowed on a non-root target rank presents to the
+                # operator as "rank 1 returned ready in 0.4 s with no
+                # tokens"; the actual error -- which may be a master
+                # divergence, an MLX collective desync, or a bad model
+                # weights load -- is invisible. Logging is unconditional
+                # because the multi-rank re-raise path below also relies
+                # on it (the supervisor records the message but not the
+                # traceback).
+                logger.opt(exception=True).error(
+                    "generator.step raised; "
+                    f"task_id={task_id} "
+                    f"command_id={task.command_id} "
+                    f"device_rank={self.device_rank} "
+                    f"group_size={self.group.size() if self.group is not None else 1} "
+                    f"exc={type(e).__name__}: {e}"
+                )
+
+                # Multi-rank targets MUST re-raise. Any exception here
+                # (whether a request-level bug or a system-level MLX
+                # error) means this rank exited the generator without
+                # participating in the verify-forward TP collective the
+                # peer rank is now waiting on. Swallowing leaves the
+                # peer hung indefinitely; raising hands control to
+                # ``handle_generation_tasks`` -> supervisor ->
+                # ``RunnerFailed``. The peer's ``_kill_runner`` rule
+                # then tears down its own runner via the
+                # ``RunnerFailed``-on-peer trigger (see
+                # ``worker/plan.py``), the master rebuilds the instance
+                # via ``CreateRunner``, and the next request sees a
+                # fresh group. Total recovery is bounded by the
+                # supervisor escalation chain (~25 s), not "manual
+                # operator restart".
+                #
+                # Single-rank runners keep the legacy swallow path: a
+                # malformed request shouldn't crash the (only) runner
+                # and break unrelated concurrent tasks sharing the
+                # process. With ``max_concurrent_tasks > 1`` a
+                # malformed request also must not affect the *other*
+                # in-flight tasks sharing this generator.
+                if self.group is not None and self.group.size() > 1:
+                    self._send_error(task, e)
+                    del self._active_tasks[task_id]
+                    raise
+
                 self._send_error(task, e)
                 del self._active_tasks[task_id]
                 output.append((task_id, FinishedResponse()))
@@ -788,6 +833,7 @@ class SequentialGenerator(Engine):
             drafter_min_output_tokens=self.drafter_min_output_tokens,
             asymmetric_drafter_rank=self.drafter_rank_in_parent,
             asymmetric_drafter_transport=self.remote_drafter_transport,
+            target_peer_fanout=self.target_peer_fanout,
             precomputed_target_cache=precomputed_target_cache,
         )
 
@@ -805,9 +851,36 @@ class SequentialGenerator(Engine):
                     "Drafter rank shutdown failed; continuing close"
                 )
             self.remote_drafter_transport = None
+        # Codex P2 (PR #20): drop the drafter model BEFORE the target
+        # model so the drafter's KV cache / weights are released while
+        # the target group is still alive. Reordering this after
+        # ``del self.model, self.tokenizer, self.group`` triggered an
+        # ``AttributeError`` chain on multi-rank teardown when the
+        # drafter held a weak reference into the target group.
         if self.draft_model is not None:
             del self.draft_model
             self.draft_model = None
+        # Close every TCP socket the target-peer fanout owns (one per
+        # peer on rank 0, single rank-zero socket on peers). Inline
+        # the socket import + isinstance check to keep this module's
+        # top-level imports thin. ``OSError`` here is benign -- the
+        # peer may already have closed (e.g. supervisor SIGKILL chain)
+        # and we just want to free the local FDs before the runner
+        # exits.
+        if self.target_peer_fanout is not None:
+            from exo.worker.engines.mlx.utils_mlx import TargetPeerFanout as _Fanout
+
+            if isinstance(self.target_peer_fanout, _Fanout):
+                import socket as _socket
+
+                for sock in self.target_peer_fanout.peer_sockets.values():
+                    if isinstance(sock, _socket.socket):
+                        with contextlib.suppress(OSError):
+                            sock.close()
+                if isinstance(self.target_peer_fanout.rank_zero_socket, _socket.socket):
+                    with contextlib.suppress(OSError):
+                        self.target_peer_fanout.rank_zero_socket.close()
+            self.target_peer_fanout = None
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:

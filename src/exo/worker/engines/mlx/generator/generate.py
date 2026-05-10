@@ -64,6 +64,15 @@ from exo.worker.engines.mlx.generator.drafter import (
     resolve_asymmetric_draft_mode,
     resolve_draft_mode,
 )
+
+# Reuse the same env-gated diagnostic helper as ``pipelined_drafter`` so
+# spec-diag INFO logs are off by default (Codex P2, PR #21 round 3).
+# Kept private (underscore) to advertise that this is a runner-internal
+# debug surface, not a public API; the cross-module import is the
+# pragmatic shape because the helper lives at the same engine layer.
+from exo.worker.engines.mlx.generator.pipelined_drafter import (
+    _spec_diag,  # pyright: ignore[reportPrivateUsage]
+)
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
@@ -81,12 +90,6 @@ from exo.worker.engines.mlx.vision import (
     prepare_vision,
 )
 from exo.worker.runner.bootstrap import logger
-
-REMOTE_PREFILL_MIN_TOKENS = 1000
-
-generation_stream = mx.new_stream(mx.default_device())
-
-_MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
 
 
 def _broadcast_clamped_num_draft_tokens(
@@ -138,6 +141,13 @@ def _broadcast_clamped_num_draft_tokens(
             f"(local pre-broadcast={effective_num_draft_tokens})"
         )
     return consensus_k
+
+
+REMOTE_PREFILL_MIN_TOKENS = 1000
+
+generation_stream = mx.new_stream(mx.default_device())
+
+_MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
 
 
 @contextlib.contextmanager
@@ -901,6 +911,7 @@ def mlx_generate(
     drafter_min_output_tokens: int | None = None,
     asymmetric_drafter_rank: int | None = None,
     asymmetric_drafter_transport: object | None = None,
+    target_peer_fanout: object | None = None,
     precomputed_target_cache: KVCacheType | None = None,
 ) -> Generator[GenerationResponse]:
     """Generate tokens for ``task``.
@@ -973,6 +984,22 @@ def mlx_generate(
         else num_draft_tokens
     ) or 0
     max_tokens = task.max_output_tokens or MAX_TOKENS
+    # ``asymmetric_drafter_rank`` is set on every target rank in an
+    # asymmetric placement (it's a property of the placement, not of
+    # any one rank). ``asymmetric_drafter_transport`` is set only on
+    # the target root rank (rank 0 of the target subgroup), which owns
+    # the socket to the drafter. Both ranks must enter the pipelined
+    # branch because they need to make matching TP collectives every
+    # round; the non-root rank consumes drafts via a rank-0 broadcast
+    # on the target subgroup (see :class:`PipelinedModelDrafter`).
+    # Codex P1 (PR #20 round-(N+10), generate.py:949): per-request
+    # ``draft_mode`` overrides MUST flow through to the asymmetric
+    # path. Pre-fix the asymmetric branch hard-coded ``"pipelined"``,
+    # so a client asking for ``draft_mode="none"`` (warmup, A/B
+    # opt-out) silently got pipelined spec decoding anyway.
+    # ``resolve_asymmetric_draft_mode`` honors the same precedence as
+    # ``resolve_draft_mode`` but uses ``"pipelined"`` as the implicit
+    # default for an asymmetric placement.
     has_asymmetric_drafter = asymmetric_drafter_rank is not None
     if has_asymmetric_drafter:
         draft_mode: DraftMode = resolve_asymmetric_draft_mode(
@@ -988,6 +1015,11 @@ def mlx_generate(
             request_use_drafter=request_use_drafter,
             request_draft_mode=request_draft_mode,
         )
+    # Provisional gate -- re-narrowed after the short-output and
+    # ngram-greedy demotions below so a per-request opt-out (or any
+    # demotion that flips ``draft_mode`` to ``"none"``) reliably
+    # disables the wire. The final ``asymmetric_drafter_active`` is
+    # computed once both demotions have run.
     asymmetric_drafter_requested = has_asymmetric_drafter and draft_mode == "pipelined"
     # Item 8: short-output skip applies to drafter-model paths
     # (``"model"`` and ``"pipelined"``) where the drafter prefill cost
@@ -1024,6 +1056,21 @@ def mlx_generate(
             f"under greedy decoding"
         )
         draft_mode = "none"
+
+    # The remote-transport setup paths below (session opening,
+    # PipelinedModelDrafter wiring, drafter-rank lifecycle tasks) only
+    # make sense when the resolved mode actually uses the remote
+    # drafter. Codex P2 (PR #20 round-(N+1)): pre-fix, the setup ran
+    # whenever an asymmetric drafter was *configured*, even after
+    # ``draft_mode`` was demoted to ``"none"`` (short-output skip,
+    # n-gram-greedy-only demotion, or per-request override). That
+    # defeated the demotion path by adding a socket round-trip and a
+    # drafter ``reset_and_prefill`` call to every "skip the drafter"
+    # request. Compute ``asymmetric_drafter_active`` AFTER the
+    # short-output skip and the ngram-greedy demotion so both
+    # demotions flow through correctly; we AND with the earlier
+    # rank/use-drafter gate (``asymmetric_drafter_requested``) so a
+    # per-request opt-out still disables the wire.
     asymmetric_drafter_active = (
         asymmetric_drafter_requested and draft_mode == "pipelined"
     )
@@ -1056,16 +1103,18 @@ def mlx_generate(
         # above the transport budget would have desynchronized the
         # spec-decode collectives (Codex P1, PR #20 round 3).
         #
-        # The clamp helper now accepts ``HasNumDraftTokens``, so it
-        # works on both :class:`DrafterTransport` (in-process path:
-        # the transport itself is the session) and
+        # The clamp helper accepts the ``HasNumDraftTokens`` Protocol,
+        # so it works on both :class:`DrafterTransport` (in-process
+        # path: the transport itself is the session) and
         # :class:`RemoteTransport` (production asymmetric path: the
         # session factory). Pre-fix the call site only invoked the
         # clamp for ``DrafterTransport``, so production
         # ``RemoteTransport`` placements silently skipped the clamp
         # and oversized per-request K landed in ``forward(...)``,
         # raising ``ValueError`` and killing the request (Codex P1,
-        # PR #20 round 5, generate.py:1025).
+        # PR #20 round 5 / PR #21 round-(N+10)). Both transport
+        # kinds share the same ``num_draft_tokens`` property so the
+        # Protocol-based helper works for either.
         from exo.worker.engines.mlx.generator.drafter_transport import (
             HasNumDraftTokens,
             clamp_num_draft_tokens_to_transport,
@@ -1085,6 +1134,11 @@ def mlx_generate(
                 )
             effective_num_draft_tokens = clamped_k
 
+    # Codex P1 (PR #20 round 3, generate.py): only the root target rank
+    # holds the transport (and therefore the only rank that can clamp);
+    # non-root ranks must adopt the (potentially-clamped) value via a
+    # broadcast so all target ranks agree on the wire-format slot count
+    # used by ``_broadcast_drafts`` / ``_broadcast_target_tokens``.
     if asymmetric_drafter_active and group is not None and group.size() > 1:
         effective_num_draft_tokens = _broadcast_clamped_num_draft_tokens(
             effective_num_draft_tokens=effective_num_draft_tokens,
@@ -1396,12 +1450,27 @@ def mlx_generate(
             # with prompt[:-2] (matching ``_spec_drafter_prefill``'s
             # invariant: align the drafter's offset to ``len(prompt) - 2``
             # so the spec loop's first OP_FORWARD seeds from prompt[-2]).
+            _diag_t0 = time.perf_counter()
+            _spec_diag(
+                f"rank 0: about to materialize prefill_prompt "
+                f"via tolist() ({all_prompt_tokens.size} prompt tokens total)"
+            )
             prefill_prompt: list[int] = [
                 int(t) for t in cast(list[int], all_prompt_tokens[:-2].tolist())
             ]
+            _spec_diag(
+                f"rank 0: prefill_prompt materialized in "
+                f"{(time.perf_counter() - _diag_t0) * 1000:.1f}ms "
+                f"(len={len(prefill_prompt)}); about to send OP_PREFILL"
+            )
             try:
+                _diag_t1 = time.perf_counter()
                 cast(_DrafterTransport, session_transport).reset_and_prefill(
                     prefill_prompt
+                )
+                _spec_diag(
+                    f"rank 0: OP_PREFILL ACK received in "
+                    f"{(time.perf_counter() - _diag_t1) * 1000:.1f}ms"
                 )
                 drafter = make_drafter(
                     mode=draft_mode,
@@ -1411,6 +1480,7 @@ def mlx_generate(
                     target_subgroup_size=target_subgroup_size,
                     pipelined_transport=session_transport,
                     target_group=group,
+                    target_peer_fanout=target_peer_fanout,
                     is_target_root=True,
                 )
             except BaseException:
@@ -1447,6 +1517,7 @@ def mlx_generate(
                 target_subgroup_size=target_subgroup_size,
                 pipelined_transport=None,
                 target_group=group,
+                target_peer_fanout=target_peer_fanout,
                 is_target_root=False,
             )
     else:
@@ -1479,6 +1550,12 @@ def mlx_generate(
         ]
     else:
         full_context_tokens = []
+    _spec_diag_rank = group.rank() if group is not None else 0
+    _spec_diag(
+        f"rank {_spec_diag_rank}: about to enter drafter.stream() "
+        f"(decode_prompt size={int(decode_prompt.size)}, "
+        f"max_tokens={max_tokens}, mode={draft_mode})"
+    )
 
     try:
         for completion_tokens, out in enumerate(
@@ -1544,6 +1621,24 @@ def mlx_generate(
                 elif drafter.mode == "ngram":
                     telemetry_k = effective_num_draft_tokens
 
+                # Pull per-round counters from the drafter when it
+                # surfaces them. Only the pipelined drafter does today;
+                # ``getattr(..., None)`` keeps this future-proof for
+                # drafter implementations that grow a ``metrics()``
+                # method later. ``mlx_lm``'s built-in spec loop doesn't
+                # expose proposal counts, so the ``"model"`` mode
+                # surfaces only ``accepted_draft_tokens`` (from the
+                # ``from_draft`` flag on each yielded token).
+                drafter_metrics_fn = cast(
+                    "Callable[[], dict[str, int]] | None",
+                    getattr(drafter, "metrics", None),
+                )
+                drafter_metrics: dict[str, int] = (
+                    drafter_metrics_fn() if drafter_metrics_fn is not None else {}
+                )
+                proposed = int(drafter_metrics.get("proposed_draft_tokens", 0))
+                spec_rounds = int(drafter_metrics.get("spec_decode_rounds", 0))
+
                 stats = GenerationStats(
                     prompt_tps=float(prefill_tps or out.prompt_tps),
                     generation_tps=float(out.generation_tps),
@@ -1552,6 +1647,8 @@ def mlx_generate(
                     peak_memory_usage=Memory.from_gb(out.peak_memory),
                     drafter_model_id=telemetry_drafter_id,
                     accepted_draft_tokens=from_draft_count,
+                    proposed_draft_tokens=proposed,
+                    spec_decode_rounds=spec_rounds,
                     num_draft_tokens=telemetry_k,
                     draft_mode=drafter.mode,
                 )
@@ -1560,6 +1657,18 @@ def mlx_generate(
                         f"Model generated unexpected finish_reason: {out.finish_reason}"
                     )
 
+                # OpenAI-compatible surface for spec-decode telemetry.
+                # ``accepted_prediction_tokens`` is OpenAI's term for
+                # tokens supplied by a Predicted Output that ended up in
+                # the completion -- semantically equivalent to our
+                # ``accepted_draft_tokens``. ``rejected_prediction_tokens``
+                # is the count of predicted tokens that didn't make it,
+                # i.e. drafts that the verifier rejected. We can only
+                # populate this when the drafter surfaces a proposal
+                # count; otherwise leave it at 0 rather than guess.
+                rejected_prediction_tokens = (
+                    max(0, proposed - from_draft_count) if proposed > 0 else 0
+                )
                 total_prompt_tokens = len(all_prompt_tokens)
                 usage = Usage(
                     prompt_tokens=total_prompt_tokens,
@@ -1569,7 +1678,9 @@ def mlx_generate(
                         cached_tokens=prefix_hit_length
                     ),
                     completion_tokens_details=CompletionTokensDetails(
-                        reasoning_tokens=0
+                        reasoning_tokens=0,
+                        accepted_prediction_tokens=from_draft_count,
+                        rejected_prediction_tokens=rejected_prediction_tokens,
                     ),
                 )
 
@@ -1586,7 +1697,13 @@ def mlx_generate(
                     )
 
             if is_done:
-                # Log generation stats
+                # Per-request generation summary. INFO level because it's
+                # one line per completed request -- bounded volume, and
+                # the operator absolutely needs visibility into drafter
+                # effectiveness without flipping ``-vv``. When the
+                # drafter ran, surface acceptance fraction + per-position
+                # acceptance rate (when proposal count is available) +
+                # rounds + K.
                 generation_elapsed = time.perf_counter() - generation_start_time
                 generated_tokens = len(generated_text_parts)
                 generation_tps = (
@@ -1594,11 +1711,29 @@ def mlx_generate(
                     if generation_elapsed > 0
                     else 0.0
                 )
-                logger.debug(
+                base_msg = (
                     f"Generation complete: prefill {prompt_tokens} tokens @ "
-                    f"{prefill_tps:.1f} tok/s, generated {generated_tokens} tokens @ "
-                    f"{generation_tps:.1f} tok/s"
+                    f"{prefill_tps:.1f} tok/s, generated {generated_tokens} "
+                    f"tokens @ {generation_tps:.1f} tok/s"
                 )
+                if stats is not None and stats.drafter_model_id is not None:
+                    fraction = stats.drafter_acceptance_fraction
+                    rate = stats.drafter_acceptance_rate
+                    fraction_str = f"{fraction:.1%}" if fraction is not None else "n/a"
+                    rate_str = f"{rate:.1%}" if rate is not None else "n/a"
+                    drafter_msg = (
+                        f", drafter={stats.draft_mode}/"
+                        f"{stats.drafter_model_id} "
+                        f"K={stats.num_draft_tokens} "
+                        f"rounds={stats.spec_decode_rounds} "
+                        f"accepted={stats.accepted_draft_tokens}/"
+                        f"{stats.proposed_draft_tokens or 'n/a'} "
+                        f"(rate={rate_str}, "
+                        f"fraction_of_emitted={fraction_str})"
+                    )
+                else:
+                    drafter_msg = ""
+                logger.info(base_msg + drafter_msg)
             if on_generation_token is not None:
                 on_generation_token()
 

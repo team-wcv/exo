@@ -63,6 +63,46 @@ class DrafterPlacement(FrozenModel):
                              drafter wire ops. Allocated at placement
                              time; the runner bootstrap binds that
                              specific port (failure is a hard error).
+        target_peer_socket_port: TCP port target rank 0 binds on for
+                             *inter-target-rank* spec-decode int
+                             broadcasts. Distinct from
+                             ``drafter_socket_port`` because the drafter
+                             dials in over a different IP than the
+                             other target ranks; sharing a port would
+                             collide. ``None`` for single-target
+                             instances (no peer to broadcast to) and
+                             for legacy/historical wire payloads
+                             produced before the field existed.
+
+                             Codex P1 (PR #21 round-(N+9),
+                             instances.py:97): this MUST stay optional
+                             with a safe default so older
+                             ``DrafterPlacement`` JSON (rolling-upgrade
+                             peers, replayed historical events) still
+                             round-trips through pubsub
+                             ``model_validate_json`` -- making it
+                             required broke instance/state replay any
+                             time a mixed-version cluster or a stored
+                             event stream lacks the field. The fanout
+                             helper (`_maybe_setup_target_peer_fanout`)
+                             treats ``None`` as "no peer wire", which
+                             matches the legacy single-rank-target
+                             behavior.
+        target_peer_hosts_by_rank: For each non-zero target rank,
+                             the IP that rank uses to dial target rank
+                             0 over the inter-target socket wire.
+                             Resolved at placement time via
+                             :func:`find_ip_prioritised`; differs
+                             per peer because Thunderbolt /30 meshes
+                             expose a unique IP per node pair. Keys
+                             are device ranks **stored as strings**
+                             so the type round-trips cleanly through
+                             JSON (the wire format used by
+                             :mod:`event_router`); ``dict[int, str]``
+                             would fail strict re-validation because
+                             JSON has no int dict keys. Convert to
+                             int at the consumer (see
+                             :func:`_maybe_setup_target_peer_fanout`).
     """
 
     drafter_node_id: NodeId
@@ -71,6 +111,8 @@ class DrafterPlacement(FrozenModel):
     drafter_rank: int = Field(ge=0)
     drafter_socket_host: str
     drafter_socket_port: int = Field(ge=1, le=65535)
+    target_peer_socket_port: int | None = Field(default=None, ge=1, le=65535)
+    target_peer_hosts_by_rank: dict[str, str] = Field(default_factory=dict)
 
 
 class BaseInstance(TaggedModel):

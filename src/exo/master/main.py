@@ -554,10 +554,27 @@ class Master:
             # kill broken instances
             connected_node_ids = set(self.state.topology.list_nodes())
             for instance_id, instance in self.state.instances.items():
-                for node_id in instance.shard_assignments.node_to_runner:
+                # ``all_node_to_runner`` includes the drafter node for
+                # asymmetric placements, so a drafter-node disconnect
+                # tears the instance down on the same path as a target
+                # rank disconnect. Without this, the surviving target
+                # ranks would keep the instance alive but block on
+                # ``transport.forward()`` against a dead socket -- the
+                # drafter rank will not come back without a full
+                # placement rebuild, so deletion is the only consistent
+                # recovery path. ``shard_assignments.node_to_runner`` is
+                # a strict subset, so the symmetric (drafter-less) path
+                # behaves identically.
+                for node_id in instance.all_node_to_runner:
                     if node_id not in connected_node_ids:
+                        is_drafter_node = (
+                            instance.drafter_placement is not None
+                            and node_id == instance.drafter_placement.drafter_node_id
+                        )
+                        node_role = "drafter" if is_drafter_node else "shard"
                         logger.warning(
-                            "Deleting instance because a shard node is disconnected "
+                            f"Deleting instance because a {node_role} "
+                            f"node is disconnected "
                             f"instance_id={instance_id} "
                             f"model_id={instance.shard_assignments.model_id} "
                             f"missing_node={node_id} "

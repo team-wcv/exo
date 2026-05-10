@@ -1257,3 +1257,310 @@ class TestDrafterReachabilityDirectional:
             "no socket edge in either direction must produce "
             "NoReachablePathFromTargetRankZero degradation"
         )
+
+
+def test_asymmetric_all_node_to_runner_includes_drafter_for_disconnect_check() -> None:
+    """``all_node_to_runner`` must list the drafter node so the master's
+    instance-deletion loop tears the placement down when the drafter node
+    leaves the topology.
+
+    This pins the contract that the master's ``connected_node_ids``
+    check at ``master/main.py`` relies on. Iterating
+    ``shard_assignments.node_to_runner`` (target ranks only) would
+    leave the surviving target runners blocked indefinitely on
+    ``transport.forward`` against a dead socket when the drafter node
+    disconnects -- the dead-wire ``RemoteTransport.is_failed`` flag
+    is set on root only, and non-root has no out-of-band signal that
+    the spec loop should abort. Tearing the instance down on drafter-
+    node disconnect is the only consistent recovery path.
+    """
+    target_node, drafter_node = NodeId(), NodeId()
+    topology = Topology()
+    topology.add_node(target_node)
+    topology.add_node(drafter_node)
+    _bidi_socket(topology, target_node, drafter_node, ip=2)
+    _bidi_rdma(topology, target_node, drafter_node, iface=4)
+
+    card = _drafter_aware_card(
+        storage_bytes=20_000_000_000, eligible_nodes=[drafter_node]
+    )
+    command = PlaceInstance(
+        sharding=Sharding.Pipeline,
+        instance_meta=InstanceMeta.MlxRing,
+        command_id=CommandId(),
+        model_card=card,
+        min_nodes=1,
+    )
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        {
+            target_node: create_node_memory(64_000_000_000),
+            drafter_node: create_node_memory(32_000_000_000),
+        },
+        {
+            target_node: create_node_network(),
+            drafter_node: create_node_network(),
+        },
+    )
+    assert len(placements) == 1
+    instance = next(iter(placements.values()))
+    assert instance.drafter_placement is not None
+
+    # Both nodes must appear in ``all_node_to_runner`` so the master's
+    # disconnect check fires for either one.
+    assert target_node in instance.all_node_to_runner
+    assert drafter_node in instance.all_node_to_runner
+    assert (
+        instance.all_node_to_runner[drafter_node]
+        == instance.drafter_placement.drafter_runner_id
+    )
+
+    # The legacy mapping (target shards only) intentionally excludes
+    # the drafter; this is the bug the master fix addresses by
+    # iterating ``all_node_to_runner`` instead.
+    assert target_node in instance.shard_assignments.node_to_runner
+    assert drafter_node not in instance.shard_assignments.node_to_runner
+
+
+def test_asymmetric_drafter_and_target_peer_ports_are_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``drafter_socket_port`` and ``target_peer_socket_port`` must
+    never be allocated to the same port.
+
+    Both ports are drawn from the same ~13K-wide ephemeral range
+    (49153-65535 minus the master API port 52415), so two independent
+    random draws can occasionally collide -- on collision, one of the
+    two listener binds fails with EADDRINUSE during runner bootstrap
+    (drafter accept loop in ``_maybe_accept_drafter_socket`` versus
+    target peer fanout in ``_maybe_setup_target_peer_fanout``),
+    causing a nondeterministic instance failure under asymmetric
+    multi-target placements.
+
+    Test deterministically forces a collision: ``random.randint`` is
+    monkeypatched to return the same port the first two times it's
+    called, then a different port on the third call. The placement
+    code must observe the collision and re-roll, producing two
+    distinct ports.
+    """
+    # Placement allocates ports in this order:
+    #   1. ``pre_allocated_listener_port`` (jaccl coordinator port) --
+    #      first ``random_ephemeral_port`` call.
+    #   2. ``drafter_socket_port`` -- via ``random_ephemeral_port_excluding``
+    #      (which calls ``random_ephemeral_port`` until it finds a
+    #      port outside ``reserved_ports``).
+    #   3. ``target_peer_socket_port`` -- ditto, also avoiding
+    #      ``drafter_socket_port``.
+    #
+    # Force a collision between drafter and target peer: drafter and
+    # target peer both draw 60001 first; target peer's exclusion loop
+    # re-rolls to 60002.
+    sequence: list[int] = [
+        59000,  # pre_allocated_listener_port (jaccl coordinator)
+        60001,  # drafter_socket_port
+        60001,  # target_peer_socket_port -- COLLISION with drafter
+        60002,  # target_peer re-roll, distinct
+    ]
+    # Pad with distinct values for any further calls.
+    sequence.extend(50000 + i for i in range(1, 20))
+    drawn_ports = iter(sequence)
+
+    def fake_random_ephemeral_port() -> int:
+        return next(drawn_ports)
+
+    # Patch at the source module so ``random_ephemeral_port_excluding``
+    # (which lives in ``exo.utils.ports`` and calls its own local
+    # ``random_ephemeral_port``) also sees the patched sequence.
+    monkeypatch.setattr(
+        "exo.utils.ports.random_ephemeral_port",
+        fake_random_ephemeral_port,
+    )
+    monkeypatch.setattr(
+        "exo.master.placement.random_ephemeral_port",
+        fake_random_ephemeral_port,
+    )
+
+    target_a, target_b, drafter_node = NodeId(), NodeId(), NodeId()
+    topology = Topology()
+    for n in (target_a, target_b, drafter_node):
+        topology.add_node(n)
+    _bidi_rdma(topology, target_a, target_b, iface=10)
+    _bidi_socket(topology, target_a, target_b, ip=12)
+    _bidi_rdma(topology, target_a, drafter_node, iface=20)
+    _bidi_rdma(topology, target_b, drafter_node, iface=22)
+    _bidi_socket(topology, target_a, drafter_node, ip=14)
+    _bidi_socket(topology, target_b, drafter_node, ip=16)
+
+    card = _drafter_aware_card(
+        storage_bytes=40_000_000_000,
+        eligible_nodes=[drafter_node],
+        family="qwen",
+        base_model="Qwen3 30B",
+        model_id="mlx-community/Qwen3-30B-A3B-4bit",
+    )
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=card,
+        min_nodes=2,
+    )
+    memory = {
+        target_a: create_node_memory(32_000_000_000),
+        target_b: create_node_memory(32_000_000_000),
+        drafter_node: create_node_memory(32_000_000_000),
+    }
+    network = {
+        target_a: create_node_network(),
+        target_b: create_node_network(),
+        drafter_node: create_node_network(),
+    }
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        memory,
+        network,
+        node_rdma_ctl={
+            target_a: NodeRdmaCtlStatus(enabled=True),
+            target_b: NodeRdmaCtlStatus(enabled=True),
+            drafter_node: NodeRdmaCtlStatus(enabled=True),
+        },
+    )
+
+    assert len(placements) == 1
+    instance = next(iter(placements.values()))
+    assert instance.drafter_placement is not None
+    placement = instance.drafter_placement
+
+    # The collision was observed and re-rolled.
+    assert placement.drafter_socket_port == 60001
+    assert placement.target_peer_socket_port == 60002
+    assert placement.drafter_socket_port != placement.target_peer_socket_port
+
+
+def test_drafter_and_target_peer_avoid_jaccl_coordinator_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2 (PR #21 round 3): the original collision-avoidance loop
+    only checked ``target_peer_socket_port != drafter_socket_port``,
+    so a draw that happened to coincide with the jaccl coordinator
+    port (or the ring ephemeral port) would slip through and fail at
+    bind with ``EADDRINUSE`` during runner bootstrap. The fix
+    pre-allocates the per-meta listener port and threads it as a
+    ``reserved_ports`` set into ``_select_drafter_placement`` so all
+    rank-0 listener ports are drawn distinct.
+
+    Test deterministically forces ``drafter_socket_port`` to collide
+    with the pre-allocated jaccl coordinator port. The fix must
+    re-roll until distinct.
+    """
+    # Allocation order (with the fix in place):
+    #   1. pre_allocated_listener_port -> 60100 (becomes the jaccl
+    #      coordinator port)
+    #   2. drafter_socket_port via random_ephemeral_port_excluding
+    #      (reserved={60100}) -- first draw 60100 collides, re-roll
+    #      to 60101
+    #   3. target_peer_socket_port via random_ephemeral_port_excluding
+    #      (reserved={60100, 60101}) -- first draw 60101 collides,
+    #      re-roll to 60100 collides, re-roll to 60102
+    sequence: list[int] = [
+        60100,  # pre_allocated_listener_port (becomes jaccl coordinator)
+        60100,  # drafter draw 1 -- collides with reserved {60100}
+        60101,  # drafter draw 2 -- accepted
+        60101,  # target_peer draw 1 -- collides with drafter
+        60100,  # target_peer draw 2 -- collides with reserved
+        60102,  # target_peer draw 3 -- accepted
+    ]
+    sequence.extend(50000 + i for i in range(1, 20))
+    drawn_ports = iter(sequence)
+
+    def fake_random_ephemeral_port() -> int:
+        return next(drawn_ports)
+
+    monkeypatch.setattr(
+        "exo.utils.ports.random_ephemeral_port",
+        fake_random_ephemeral_port,
+    )
+    monkeypatch.setattr(
+        "exo.master.placement.random_ephemeral_port",
+        fake_random_ephemeral_port,
+    )
+
+    target_a, target_b, drafter_node = NodeId(), NodeId(), NodeId()
+    topology = Topology()
+    for n in (target_a, target_b, drafter_node):
+        topology.add_node(n)
+    _bidi_rdma(topology, target_a, target_b, iface=10)
+    _bidi_socket(topology, target_a, target_b, ip=12)
+    _bidi_rdma(topology, target_a, drafter_node, iface=20)
+    _bidi_rdma(topology, target_b, drafter_node, iface=22)
+    _bidi_socket(topology, target_a, drafter_node, ip=14)
+    _bidi_socket(topology, target_b, drafter_node, ip=16)
+
+    card = _drafter_aware_card(
+        storage_bytes=40_000_000_000,
+        eligible_nodes=[drafter_node],
+        family="qwen",
+        base_model="Qwen3 30B",
+        model_id="mlx-community/Qwen3-30B-A3B-4bit",
+    )
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=card,
+        min_nodes=2,
+    )
+    memory = {
+        target_a: create_node_memory(32_000_000_000),
+        target_b: create_node_memory(32_000_000_000),
+        drafter_node: create_node_memory(32_000_000_000),
+    }
+    network = {
+        target_a: create_node_network(),
+        target_b: create_node_network(),
+        drafter_node: create_node_network(),
+    }
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        memory,
+        network,
+        node_rdma_ctl={
+            target_a: NodeRdmaCtlStatus(enabled=True),
+            target_b: NodeRdmaCtlStatus(enabled=True),
+            drafter_node: NodeRdmaCtlStatus(enabled=True),
+        },
+    )
+
+    assert len(placements) == 1
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxJacclInstance)
+    assert instance.drafter_placement is not None
+    placement = instance.drafter_placement
+
+    # All three rank-0 listener ports are mutually distinct.
+    # ``jaccl_coordinators`` values are ``"host:port"`` strings.
+    coordinator_ports = {
+        int(addr.rsplit(":", 1)[1]) for addr in instance.jaccl_coordinators.values()
+    }
+    assert coordinator_ports == {60100}
+    assert placement.drafter_socket_port == 60101
+    assert placement.target_peer_socket_port == 60102
+    listener_ports = (
+        coordinator_ports
+        | {placement.drafter_socket_port}
+        | {placement.target_peer_socket_port}
+    )
+    assert len(listener_ports) == 3, (
+        "all rank-0 listener ports (jaccl coordinator, drafter accept, "
+        "target-peer fanout) must be mutually distinct to avoid "
+        "EADDRINUSE during runner bootstrap; got "
+        f"{listener_ports!r}"
+    )

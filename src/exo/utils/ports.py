@@ -1,5 +1,6 @@
 import random
 import socket
+from collections.abc import Iterable
 from contextlib import closing
 from typing import Final, cast
 
@@ -90,3 +91,28 @@ def random_ephemeral_port() -> int:
     # when the kernel's free-port pool is pathologically narrow.
     port = random.randint(49153, 65535)
     return port - 1 if port <= DEFAULT_API_PORT else port
+
+
+def random_ephemeral_port_excluding(reserved: Iterable[int]) -> int:
+    """Draw an ephemeral port that does not collide with any value in
+    ``reserved``.
+
+    Used by placement bookkeeping when multiple listener ports must be
+    bound on the same node (e.g., target rank 0 binds the drafter
+    accept socket, the target-peer fanout socket, AND either the
+    JACCL coordinator port or the MLX ring port). A naive
+    ``random_ephemeral_port`` for each draw can occasionally produce
+    a duplicate, leading to nondeterministic ``EADDRINUSE`` bind
+    failures during runner bootstrap. The ephemeral range is wide
+    enough (~13K ports) that this loop almost never iterates.
+
+    Codex P2 (PR #21 round 3): the original collision-avoidance loop
+    only checked ``target_peer_socket_port != drafter_socket_port``
+    and missed sibling listener ports (jaccl coordinator port,
+    ring ephemeral port) that bind on the same node.
+    """
+    reserved_set = set(reserved)
+    port = random_ephemeral_port()
+    while port in reserved_set:
+        port = random_ephemeral_port()
+    return port
