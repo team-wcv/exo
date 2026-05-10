@@ -50,19 +50,21 @@ Vendor source: mlx-vlm 0.5.0
 
 Status
 ------
-Vendor functions compile + type-check, but
+Vendor functions are dispatched end-to-end:
 :data:`exo.worker.engines.mlx.generator.coupled_drafter.DISPATCHABLE_COUPLED_DRAFTER_KINDS`
-intentionally still excludes ``"dflash"``. Flipping that frozenset is
-the explicit follow-up gated on:
+includes ``"dflash"`` and
+:class:`~exo.worker.engines.mlx.generator.coupled_drafter.Qwen3_5DFlashTargetAdapter`
+delegates ``forward_with_capture`` /
+``rollback_speculative_cache`` to the functions in this module.
 
-1. Having a real hybrid Qwen 3.5 target on hand to bench against (the
-   MoE Qwen 3.5 variants currently cached on wc-smbp use dense
-   attention, not the gated-delta hybrid DFlash targets).
-2. Wiring a sibling ``Qwen3_5DFlashTargetAdapter`` in
-   :mod:`exo.worker.engines.mlx.generator.coupled_drafter` that
-   delegates ``forward_with_capture`` and
-   ``rollback_speculative_cache`` to the functions in this module
-   (mirror of the existing ``Gemma4MTPTargetAdapter`` pattern).
+Numerical validation against a real hybrid Qwen 3.5 target
+(gated-delta + attention) is the next operational follow-up, gated
+on a hybrid-checkpoint download landing on the bench machine. The
+unit test surface
+(:mod:`exo.worker.tests.unittests.test_mlx.test_qwen3_5_dflash_hooks`)
+exercises the hooks against synthetic models on every run, so
+loader / adapter drift surfaces immediately without requiring the
+production checkpoint.
 """
 
 from __future__ import annotations
@@ -469,18 +471,27 @@ def qwen3_5_dflash_forward(
     *,
     cache: list[Any] | None = None,
     capture_layer_ids: list[int] | None = None,
-    capture_gdn_states: bool = False,
+    capture_gdn_states: bool | None = None,
     input_embeddings: mx.array | None = None,
 ) -> Qwen3DFlashForwardOutput:
     """Captured forward over a Qwen 3.5 target.
 
     Vendor of mlx-vlm's ``Qwen3_5Model.__call__`` plus the surrounding
     ``LanguageModel`` LM head. Returns logits + per-layer hidden
-    captures + per-SSM-layer ``GdnState`` tuples. The capture flags
-    follow mlx-vlm's ``hidden_sink``/``gdn_sink`` semantics: passing
-    ``None`` (or ``False``) for the corresponding flag returns an empty
-    list rather than allocating one, matching mlx-vlm's behaviour
-    byte-for-byte.
+    captures + per-SSM-layer ``GdnState`` tuples.
+
+    Capture flag semantics mirror mlx-vlm's ``LanguageModel.__call__``
+    in ``mlx_vlm.models.qwen3_5.language``: when ``capture_layer_ids``
+    is non-empty mlx-vlm allocates BOTH ``hidden_sink`` and ``gdn_sink``
+    unconditionally, because the round-loop driver
+    (:func:`mlx_vlm.generate._dflash_rounds`) reads
+    ``verify_out.gdn_states`` immediately after every verify forward
+    to drive ``rollback_speculative_cache``. We mirror that contract:
+    if ``capture_gdn_states`` is left at its default ``None``, gdn
+    capture is enabled whenever ``capture_layer_ids`` is non-empty.
+    Tests that want to check the flag independently can still pass
+    ``capture_gdn_states=False`` explicitly to suppress the sink
+    allocation.
 
     Raises:
         TypeError: ``target`` is not (and does not wrap) a Qwen 3.5
@@ -515,7 +526,16 @@ def qwen3_5_dflash_forward(
         set(capture_layer_ids) if capture_layer_ids is not None else set()
     )
     hidden_states_out: list[mx.array] = []
-    gdn_sink: list[GdnState] | None = [] if capture_gdn_states else None
+    # Mirror mlx-vlm's ``LanguageModel.__call__``: when
+    # ``capture_layer_ids`` is provided it allocates both sinks because
+    # the round-loop driver reads ``verify_out.gdn_states`` after every
+    # verify forward. ``capture_gdn_states=None`` (the default) follows
+    # that contract; explicit ``False`` overrides it for tests that want
+    # to verify the suppression path.
+    gdn_capture_enabled: bool = (
+        capture_gdn_states if capture_gdn_states is not None else capture_set != set()
+    )
+    gdn_sink: list[GdnState] | None = [] if gdn_capture_enabled else None
 
     for layer_index, layer in enumerate(layers):
         layer_cache: object = cast(object, layer_caches[layer_index])

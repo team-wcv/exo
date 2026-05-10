@@ -19,9 +19,13 @@ gives the layer-types pattern ``[linear, attn, linear, attn]`` so the
 mixed-cache rollback is genuinely covered.
 
 Status note: the dispatch frozenset (``DISPATCHABLE_COUPLED_DRAFTER_KINDS``)
-intentionally still excludes ``"dflash"`` -- these tests prove the
-vendored hooks compile, attach, and produce shape-correct outputs, so
-the eventual flip-the-switch PR has a green starting point.
+now includes ``"dflash"`` -- these tests prove the vendored hooks
+compile, attach, and produce shape-correct outputs against a
+synthetic Qwen 3.5 target, so production drift between
+:mod:`exo.worker.engines.mlx.vendor.qwen3_5_dflash_hooks`,
+:class:`~exo.worker.engines.mlx.generator.coupled_drafter.Qwen3_5DFlashTargetAdapter`,
+and the loader's ``attach_dflash_hooks`` gate surfaces immediately
+without needing a real hybrid Qwen 3.5 checkpoint on the test box.
 """
 
 from __future__ import annotations

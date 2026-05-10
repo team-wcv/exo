@@ -258,7 +258,7 @@ def test_round_loop_terminates_when_max_tokens_reached() -> None:
 
     yielded: list[int] = list(
         run_coupled_round_loop(
-            target=target,
+            adapter=Gemma4MTPTargetAdapter(target),
             drafter=drafter,
             prompt_cache=cache,
             prefill_output=prefill,
@@ -298,7 +298,7 @@ def test_round_loop_calls_drafter_bind_via_reset() -> None:
 
     list(
         run_coupled_round_loop(
-            target=target,
+            adapter=Gemma4MTPTargetAdapter(target),
             drafter=drafter,
             prompt_cache=cache,
             prefill_output=prefill,
@@ -332,7 +332,7 @@ def test_round_loop_rejects_missing_hidden_capture() -> None:
     with pytest.raises(RuntimeError, match="captured hidden state"):
         list(
             run_coupled_round_loop(
-                target=target,
+                adapter=Gemma4MTPTargetAdapter(target),
                 drafter=drafter,
                 prompt_cache=cache,
                 prefill_output=prefill,

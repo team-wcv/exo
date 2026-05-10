@@ -54,6 +54,25 @@ Median generation tokens/s across 2 runs per scenario.
 
 Raw JSON: `bench/results/mtp/gemma-4-31b-it-4bit-{target-only,mtp-coupled}.json`.
 
+## Headline numbers vs scenario peaks
+
+The all-scenario medians above (-1.6% for 26B-A4B, +5.4% for 31B)
+include the long-context summary regression that drags the aggregate
+toward zero. The strong gains on tight, repetitive, code-shaped output
+are real and consistent with prior runs:
+
+- 26B-A4B (MoE): peak speedup +22.1% on `code_completion` (the
+  "~+25% on code" figure observed in earlier private benches).
+- 31B (dense): peak speedup +13.2% on `code_completion`, with three of
+  five scenarios above +7%.
+
+The **right way to read these numbers**: the all-scenario median is a
+worst-case proxy that mixes a pathological long-context case with the
+favourable scenarios. A per-prompt routing heuristic (recommended
+below) would let the dispatch keep MTP on for the high-accept
+scenarios and fall back to plain decoding for the low-accept ones,
+converting the headline median much closer to the per-scenario peak.
+
 ## Interpretation
 
 1. **MTP dispatch is wired correctly on both targets.** Every MTP request

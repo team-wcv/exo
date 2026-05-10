@@ -35,10 +35,15 @@ This module provides:
   :func:`run_coupled_round_loop` and yields ``mlx_lm.GenerationResponse``-
   shaped tokens identically to :class:`ModelDrafter`.
 
-DFlash forward-compat: the adapter is Gemma 4-specific because that's
-the only target type the vendored hooks support today. Adding DFlash
-will introduce a sibling adapter (``Qwen3DFlashTargetAdapter``) that
-mirrors this surface against a different vendor module.
+DFlash dispatch (Qwen 3.5): mirrored from the MTP wiring above.
+:class:`Qwen3_5DFlashTargetAdapter` is the sibling adapter against the
+vendored DFlash hooks (:mod:`exo.worker.engines.mlx.vendor.qwen3_5_dflash_hooks`),
+and :func:`run_coupled_round_loop` dispatches between
+:func:`mlx_vlm.generate._mtp_rounds` and
+:func:`mlx_vlm.generate._dflash_rounds` based on the adapter type.
+:class:`CoupledModelDrafter` selects the prefill capture flags
+(MTP: ``return_hidden`` + ``return_shared_kv``;
+DFlash: ``capture_layer_ids=draft.config.target_layer_ids``) per kind.
 """
 
 from __future__ import annotations
@@ -51,6 +56,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.generate import GenerationResponse
 from mlx_lm.models.gemma4_text import Model as Gemma4Model
+from mlx_lm.models.qwen3_5 import Qwen3_5TextModel
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.worker.engines.mlx.types import KVCacheType, Model
@@ -60,6 +66,14 @@ from exo.worker.engines.mlx.vendor.gemma4_mtp_hooks import (
     gemma4_rollback_speculative_cache,
     has_mtp_hooks,
     resolve_gemma4_text_model,
+)
+from exo.worker.engines.mlx.vendor.qwen3_5_dflash_hooks import (
+    GdnState,
+    Qwen3DFlashForwardOutput,
+    has_dflash_hooks,
+    qwen3_5_dflash_forward,
+    qwen3_5_rollback_speculative_cache,
+    resolve_qwen3_5_text_model,
 )
 
 if TYPE_CHECKING:
@@ -73,20 +87,22 @@ if TYPE_CHECKING:
 CoupledDrafterKind = Literal["mtp", "dflash"]
 
 
-# Codex P2 (PR #25 round-(N+3), builder.py:241): the set of coupled-
-# drafter kinds the generator dispatch can actually drive end-to-end.
-# Today only ``"mtp"`` is wired through :class:`CoupledModelDrafter` /
-# :class:`Gemma4MTPTargetAdapter`; ``"dflash"`` lands in a follow-up
-# but the loader already accepts it, so a dflash drafter can sit on
-# the runner without a dispatchable code path. Builder-side gates that
-# decide "is a coupled drafter usable for this request" must consult
-# this set rather than treating ``coupled_drafter is not None`` as
-# proof of dispatchability -- otherwise a dflash-only setup would
-# force :class:`SequentialGenerator` (losing batch throughput) while
-# the actual request still falls back to ``make_drafter(mode="none")``
-# inside :func:`mlx_generate`.
+# The set of coupled-drafter kinds the generator dispatch can actually
+# drive end-to-end. Both ``"mtp"`` (Gemma 4 + assistant drafter) and
+# ``"dflash"`` (Qwen 3.5 + DFlash drafter) are wired through
+# :class:`CoupledModelDrafter` against the architecture-specific
+# adapter (:class:`Gemma4MTPTargetAdapter` /
+# :class:`Qwen3_5DFlashTargetAdapter`) and round-loop driver
+# (:func:`mlx_vlm.generate._mtp_rounds` /
+# :func:`mlx_vlm.generate._dflash_rounds`).
+#
+# Builder-side gates that decide "is a coupled drafter usable for this
+# request" consult this set rather than treating
+# ``coupled_drafter is not None`` as proof of dispatchability -- a
+# future kind would otherwise be forced through :class:`SequentialGenerator`
+# (losing batch throughput) before the dispatch is wired.
 DISPATCHABLE_COUPLED_DRAFTER_KINDS: frozenset[CoupledDrafterKind] = frozenset(
-    {"mtp"}
+    {"mtp", "dflash"}
 )
 
 
@@ -101,11 +117,12 @@ def is_coupled_drafter_dispatchable(kind: CoupledDrafterKind) -> bool:
     return kind in DISPATCHABLE_COUPLED_DRAFTER_KINDS
 
 
-# mlx-vlm's ``_mtp_rounds`` is a private module-level helper without a
-# typed stub; resolve it lazily through ``importlib`` so the
-# type-check narrowing happens at the import boundary instead of every
-# call site. The eager-import path would force every coupled-drafter
-# call site to ride a multi-line ``pyright: ignore`` block.
+# mlx-vlm's ``_mtp_rounds`` and ``_dflash_rounds`` are private
+# module-level helpers without typed stubs; resolve them lazily through
+# ``importlib`` so the type-check narrowing happens at the import
+# boundary instead of every call site. The eager-import path would
+# force every coupled-drafter call site to ride a multi-line
+# ``pyright: ignore`` block.
 def _resolve_mtp_rounds_fn() -> Callable[..., Generator[tuple[int, None], None, None]]:
     import importlib
 
@@ -113,6 +130,18 @@ def _resolve_mtp_rounds_fn() -> Callable[..., Generator[tuple[int, None], None, 
     return cast(
         "Callable[..., Generator[tuple[int, None], None, None]]",
         module._mtp_rounds,
+    )
+
+
+def _resolve_dflash_rounds_fn() -> Callable[
+    ..., Generator[tuple[int, None], None, None]
+]:
+    import importlib
+
+    module: Any = importlib.import_module("mlx_vlm.generate")
+    return cast(
+        "Callable[..., Generator[tuple[int, None], None, None]]",
+        module._dflash_rounds,
     )
 
 
@@ -237,25 +266,151 @@ class Gemma4MTPTargetAdapter:
         )
 
 
+@final
+class Qwen3_5DFlashTargetAdapter:  # noqa: N801 -- mirrors mlx-lm's "Qwen3_5" naming (version pinned with underscore separator); renaming here would diverge from upstream type naming and obscure the binding.
+    """Adapter that exposes the ``_dflash_rounds`` target contract.
+
+    mlx-vlm's :func:`mlx_vlm.generate._dflash_rounds` does three things
+    with the target it receives:
+
+    1. ``lm = model.language_model if hasattr(model, "language_model") else model``
+       and then walks ``lm.embed_tokens`` etc. via the drafter's
+       ``reset(model)`` step.
+    2. ``lm.rollback_speculative_cache(prompt_cache, verify_out.gdn_states, accepted, bs)``.
+    3. ``lm(verify_input, cache=prompt_cache, capture_layer_ids=target_layer_ids)``
+       returning an object with ``.logits``, ``.hidden_states`` (a
+       ``list[mx.array]`` indexed by ``capture_layer_ids``), and
+       ``.gdn_states`` (a list of ``GdnState`` 11-tuples populated by
+       every gated-delta layer touched in the forward).
+
+    Mirrors :class:`Gemma4MTPTargetAdapter` exactly except for the
+    capture flag set: where MTP wants ``return_hidden=True,
+    return_shared_kv=True``, DFlash wants ``capture_layer_ids=[...]``.
+    The underlying contract -- a plain class (NOT an ``nn.Module``)
+    holding no parameters of its own, exposing the inner LM through
+    ``model`` for drafter binding -- is identical.
+
+    The adapter is Qwen 3.5-specific because that's the only target
+    type the vendored DFlash hooks support today.
+    """
+
+    def __init__(self, target_model: object) -> None:
+        # Accept either ``mlx_lm.models.qwen3_5.Model`` directly (the
+        # text-only LM with lm_head) or a multimodal wrapper exposing
+        # it via ``.language_model``. The vendored hooks operate on
+        # the inner LM either way; we resolve once at construction.
+        inner = resolve_qwen3_5_text_model(target_model)
+        if inner is None:
+            raise TypeError(
+                "Qwen3_5DFlashTargetAdapter expected a Qwen 3.5 target "
+                "(``mlx_lm.models.qwen3_5.Model`` directly, or a "
+                "multimodal wrapper exposing it via ``.language_model``); "
+                f"got {type(target_model).__name__!r}."
+            )
+        if not has_dflash_hooks(inner):
+            # Same loader/dispatch drift guard as the MTP adapter:
+            # the hook attach is gated by ``utils_mlx.load_mlx_items``,
+            # so reaching this code path without the marker means the
+            # post-load wiring drifted from this dispatch.
+            raise RuntimeError(
+                "Qwen3_5DFlashTargetAdapter requires a target with attached "
+                "DFlash hooks; call attach_dflash_hooks(target) at load time. "
+                "This is a runtime guard against loader/dispatch drift."
+            )
+        self._target: Qwen3_5TextModel = inner
+
+    @property
+    def target(self) -> Qwen3_5TextModel:
+        """The underlying mlx-lm Qwen 3.5 text model (escape hatch for tests)."""
+        return self._target
+
+    @property
+    def model(self) -> nn.Module:
+        """Inner-model passthrough used by the drafter's ``reset`` step.
+
+        mlx-vlm's DFlash drafter walks ``model.embed_tokens`` (et al.)
+        during ``reset``; exposing the underlying text model directly
+        keeps the drafter binding to the SAME parameter instances it
+        would bind to without the adapter -- no weight duplication.
+        Mirrors :meth:`Gemma4MTPTargetAdapter.model` (which exposes
+        ``self._target.model``); for Qwen 3.5 the resolved text model
+        IS the layer walker the drafter needs, so we surface it as-is.
+        """
+        return self._target
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        *,
+        cache: list[Any] | None = None,
+        capture_layer_ids: list[int] | None = None,
+    ) -> Qwen3DFlashForwardOutput:
+        """Forward pass returning the DFlash-flavoured capture tuple.
+
+        ``_dflash_rounds`` always passes ``capture_layer_ids=target_layer_ids``
+        (a non-empty list configured on the drafter) in its verify
+        forward. The adapter mirrors mlx-vlm's
+        ``LanguageModel.__call__`` semantics: when ``capture_layer_ids``
+        is non-empty BOTH ``hidden_states`` and ``gdn_states`` are
+        captured automatically (the round loop reads
+        ``verify_out.gdn_states`` immediately after every verify to
+        drive ``rollback_speculative_cache``).
+
+        The structural shape of the return -- ``.logits``,
+        ``.hidden_states``, ``.gdn_states`` -- matches mlx-vlm's
+        ``LanguageModelOutput`` so ``_dflash_rounds`` can read those
+        attributes directly without an unwrap step.
+        """
+        return qwen3_5_dflash_forward(
+            self._target,
+            inputs,
+            cache=cache,
+            capture_layer_ids=capture_layer_ids,
+        )
+
+    def rollback_speculative_cache(
+        self,
+        caches: list[Any],
+        gdn_states: list[GdnState],
+        accepted: int | mx.array,
+        block_size: int,
+    ) -> int:
+        """Trim target KV caches and rewind SSM state after partial-acceptance.
+
+        Unlike Gemma 4 MTP (where rollback only trims KV), the Qwen 3.5
+        DFlash rollback ALSO replays SSM (gated-delta) state because
+        the recurrence pollutes those caches with rejected drafts.
+        Delegated to :func:`qwen3_5_rollback_speculative_cache`.
+        """
+        return qwen3_5_rollback_speculative_cache(
+            self._target,
+            caches=caches,
+            gdn_states=gdn_states,
+            accepted=accepted,
+            block_size=block_size,
+        )
+
+
 def run_coupled_round_loop(
     *,
-    target: Gemma4Model,
+    adapter: Gemma4MTPTargetAdapter | Qwen3_5DFlashTargetAdapter,
     drafter: nn.Module,
     prompt_cache: list[Any],
-    prefill_output: Gemma4MTPForwardOutput,
+    prefill_output: Gemma4MTPForwardOutput | Qwen3DFlashForwardOutput,
     first_bonus: int,
     max_tokens: int,
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: int | None,
     token_dtype: mx.Dtype = mx.int32,
 ) -> Generator[int, None, None]:
-    """Drive mlx-vlm's MTP round loop and yield decoded token ids.
+    """Drive mlx-vlm's MTP / DFlash round loop and yield decoded token ids.
 
-    The caller (``mlx_generate``'s coupled-drafter dispatch) is
-    responsible for:
+    The caller (``CoupledModelDrafter.stream``) is responsible for:
 
-    - encoding the prompt + prefilling ``prompt_cache`` via
-      :func:`gemma4_mtp_forward` to obtain ``prefill_output``;
+    - building the right ``adapter`` (Gemma 4 MTP or Qwen 3.5 DFlash);
+    - prefilling ``prompt_cache`` via the adapter's ``__call__`` to
+      obtain ``prefill_output`` carrying the hidden capture the round
+      loop needs as round-1 input;
     - sampling the first bonus token from ``prefill_output.logits[:, -1:, :]``
       and emitting it as the first decode token (this function does
       NOT yield the first bonus -- it picks up from round 1);
@@ -264,40 +419,83 @@ def run_coupled_round_loop(
       construction, usage accounting).
 
     Why split the loop driver from the surrounding I/O contract: the
-    round loop's correctness (rollback, accept-walk, set_shared_kv
+    round loop's correctness (accept-walk, rollback, KV / SSM
     sequencing) is independent of how exo emits tokens. Keeping the
     driver narrow means tests can mock target + drafter and exercise
     the loop without instantiating the full ``GenerationResponse``
     pipeline.
 
+    Why the adapter, not the bare target: mlx-vlm's round loops walk
+    ``adapter.rollback_speculative_cache`` and forward the adapter
+    through to its ``__call__`` for verifies. The adapter holds the
+    architecture-specific contract; this function is just the
+    architecture dispatch.
+
     Implementation note: we delegate the actual round logic to
-    mlx-vlm's :func:`mlx_vlm.generate._mtp_rounds` rather than
-    re-implement it. mlx-vlm owns the canonical accept-walk +
-    rollback semantics, and re-implementing them would create a
-    silent-divergence risk every time mlx-vlm tightens the loop.
+    mlx-vlm's :func:`mlx_vlm.generate._mtp_rounds` /
+    :func:`mlx_vlm.generate._dflash_rounds` rather than re-implement
+    them. mlx-vlm owns the canonical accept-walk + rollback semantics,
+    and re-implementing them would create a silent-divergence risk
+    every time mlx-vlm tightens the loop.
     """
     if not prefill_output.hidden_states:
         # Should be unreachable: callers MUST request hidden capture
         # in the prefill forward (otherwise the drafter has nothing
         # to consume on round 1). Surface as a clear error rather
-        # than letting ``_mtp_rounds`` index into an empty list.
+        # than letting the round loop index into an empty list.
         raise RuntimeError(
             "run_coupled_round_loop requires the prefill_output to "
-            "carry a captured hidden state. Call gemma4_mtp_forward "
-            "with return_hidden=True before entering the round loop."
+            "carry a captured hidden state. Configure the adapter's "
+            "prefill call to request hidden capture before entering "
+            "the round loop."
         )
 
-    adapter = Gemma4MTPTargetAdapter(target)
-    last_hidden = prefill_output.hidden_states[-1]
-    shared_kv = prefill_output.shared_kv_states
-    mtp_rounds = _resolve_mtp_rounds_fn()
+    if isinstance(adapter, Gemma4MTPTargetAdapter):
+        # MTP-flavoured prefill: ``Gemma4MTPForwardOutput`` exposes
+        # ``hidden_states`` (list per layer; round loop wants the
+        # last) and ``shared_kv_states`` (per-layer-type shared KV
+        # the assistant drafter consumes every round).
+        if not isinstance(prefill_output, Gemma4MTPForwardOutput):
+            raise TypeError(
+                "Gemma4MTPTargetAdapter requires a Gemma4MTPForwardOutput "
+                f"prefill; got {type(prefill_output).__name__!r}."
+            )
+        last_hidden = prefill_output.hidden_states[-1]
+        shared_kv = prefill_output.shared_kv_states
+        mtp_rounds = _resolve_mtp_rounds_fn()
+        for token, _unused in mtp_rounds(
+            adapter,
+            drafter,
+            prompt_cache,
+            last_hidden,
+            shared_kv,
+            first_bonus=first_bonus,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            draft_block_size=draft_block_size,
+            token_dtype=token_dtype,
+        ):
+            yield token
+        return
 
-    for token, _unused in mtp_rounds(
+    # DFlash-flavoured prefill: ``Qwen3DFlashForwardOutput.hidden_states``
+    # is a list captured at ``capture_layer_ids`` (one entry per id).
+    # mlx-vlm's :func:`_dflash_rounds` consumes a SINGLE ``hidden``
+    # tensor formed by feature-axis concatenation of those captures,
+    # mirroring what its own ``generate_step`` does at prefill exit
+    # (``hidden = mx.concatenate(out.hidden_states, axis=-1)``).
+    if not isinstance(prefill_output, Qwen3DFlashForwardOutput):
+        raise TypeError(
+            "Qwen3_5DFlashTargetAdapter requires a Qwen3DFlashForwardOutput "
+            f"prefill; got {type(prefill_output).__name__!r}."
+        )
+    hidden = mx.concatenate(prefill_output.hidden_states, axis=-1)
+    dflash_rounds = _resolve_dflash_rounds_fn()
+    for token, _unused in dflash_rounds(
         adapter,
         drafter,
         prompt_cache,
-        last_hidden,
-        shared_kv,
+        hidden,
         first_bonus=first_bonus,
         max_tokens=max_tokens,
         sampler=sampler,
@@ -350,6 +548,20 @@ def _make_processor_aware_sampler(
         return sampler(adjusted)
 
     return _wrapped
+
+
+def _coerce_int_list(values: list[Any]) -> list[int]:
+    """Narrow a ``list[Any]`` to ``list[int]`` via per-element ``int(...)``.
+
+    The DFlash drafter exposes ``config.target_layer_ids`` as an
+    untyped attribute on an ``nn.Module``, so :func:`getattr` round-
+    trips to ``object`` and the contained list to ``list[Any]``.
+    Containing the ``Any`` propagation in this single helper keeps
+    the comprehension out of the call site (where the formatter
+    splits it across lines and breaks the ``# pyright: ignore``
+    placement).
+    """
+    return [int(item) for item in values]  # pyright: ignore[reportAny]
 
 
 def _select_first_bonus(
@@ -433,7 +645,7 @@ class CoupledModelDrafter:
     def __init__(
         self,
         *,
-        target_adapter: Gemma4MTPTargetAdapter,
+        target_adapter: Gemma4MTPTargetAdapter | Qwen3_5DFlashTargetAdapter,
         drafter: nn.Module,
         kind: CoupledDrafterKind,
         num_draft_tokens: int,
@@ -441,7 +653,24 @@ class CoupledModelDrafter:
     ) -> None:
         if num_draft_tokens < 1:
             raise ValueError(f"num_draft_tokens must be >= 1, got {num_draft_tokens}")
-        self._target_adapter: Gemma4MTPTargetAdapter = target_adapter
+        # Cross-validate kind vs adapter type so a misrouted dispatch
+        # surfaces a clear error here instead of an opaque ``AttributeError``
+        # deep inside the round-loop driver.
+        if kind == "mtp" and not isinstance(target_adapter, Gemma4MTPTargetAdapter):
+            raise TypeError(
+                f"CoupledModelDrafter(kind='mtp') requires a "
+                f"Gemma4MTPTargetAdapter; got {type(target_adapter).__name__!r}."
+            )
+        if kind == "dflash" and not isinstance(
+            target_adapter, Qwen3_5DFlashTargetAdapter
+        ):
+            raise TypeError(
+                f"CoupledModelDrafter(kind='dflash') requires a "
+                f"Qwen3_5DFlashTargetAdapter; got {type(target_adapter).__name__!r}."
+            )
+        self._target_adapter: Gemma4MTPTargetAdapter | Qwen3_5DFlashTargetAdapter = (
+            target_adapter
+        )
         self._drafter: nn.Module = drafter
         self._kind: CoupledDrafterKind = kind
         self._num_draft_tokens: int = num_draft_tokens
@@ -512,6 +741,68 @@ class CoupledModelDrafter:
             "accepted_draft_tokens": accepted,
         }
 
+    def _prefill(
+        self,
+        prompt_batch: mx.array,
+        prompt_cache: list[Any],
+    ) -> Gemma4MTPForwardOutput | Qwen3DFlashForwardOutput:
+        """Run the architecture-specific prefill capture.
+
+        MTP and DFlash differ in what the round loop reads off the
+        prefill output:
+
+        - MTP (Gemma 4) reads ``prefill_output.hidden_states[-1]`` and
+          ``prefill_output.shared_kv_states``; both are populated by
+          calling ``adapter(..., return_hidden=True, return_shared_kv=True)``.
+        - DFlash (Qwen 3.5) reads ``prefill_output.hidden_states`` (the
+          full per-layer capture, concatenated feature-axis-wise) and
+          relies on every gated-delta layer pushing its
+          :class:`GdnState` to ``prefill_output.gdn_states`` so the
+          first ``rollback_speculative_cache`` after partial-acceptance
+          can rewind the SSM state. Both sinks are populated when the
+          prefill call passes ``capture_layer_ids=draft_model.config.target_layer_ids``.
+
+        The drafter's ``target_layer_ids`` is the canonical source for
+        the DFlash capture set; mlx-vlm's :func:`_dflash_rounds` reads
+        the same field on every verify forward, so mirroring it here
+        keeps prefill and round-loop captures aligned.
+        """
+        if isinstance(self._target_adapter, Gemma4MTPTargetAdapter):
+            return self._target_adapter(
+                prompt_batch,
+                cache=prompt_cache,
+                return_hidden=True,
+                return_shared_kv=True,
+            )
+        # mlx-vlm's DFlash drafter is an untyped ``nn.Module`` subclass
+        # whose ``config.target_layer_ids`` is the canonical source for
+        # the round-loop's per-verify capture set. ``getattr``
+        # round-trips through ``object`` so we narrow with isinstance
+        # before consuming. The two ``pyright: ignore`` comments
+        # contain the ``Any`` propagation from the upstream untyped
+        # ``config`` slot to a single line each.
+        config_obj: object = getattr(self._drafter, "config", None)
+        target_layer_ids_obj: object = getattr(config_obj, "target_layer_ids", None)
+        if not isinstance(target_layer_ids_obj, list):
+            raise RuntimeError(
+                "DFlash drafter is missing config.target_layer_ids; "
+                "the round-loop driver requires this list to size the "
+                "hidden-state capture and the prefill helper mirrors "
+                "that contract."
+            )
+        # ``list[Any]`` cast → ``int(...)`` per-element. The per-element
+        # ``Any`` is unavoidable here (the upstream drafter config is
+        # an untyped ``nn.Module`` slot) so we contain it to one line
+        # via a helper rather than a multi-line comprehension that the
+        # formatter would split into a per-element pyright ignore.
+        target_layer_ids_any: list[Any] = cast("list[Any]", target_layer_ids_obj)
+        target_layer_ids: list[int] = _coerce_int_list(target_layer_ids_any)
+        return self._target_adapter(
+            prompt_batch,
+            cache=prompt_cache,
+            capture_layer_ids=target_layer_ids,
+        )
+
     def _resolve_block_size(self) -> int:
         """Block size used by :func:`_mtp_rounds` for proposal sizing.
 
@@ -577,17 +868,12 @@ class CoupledModelDrafter:
         # standard ``ModelDrafter`` flow which pays the prefill cost
         # before its first iteration emit).
         prefill_tic = time.perf_counter()
-        prefill_output = self._target_adapter(
-            prompt_batch,
-            cache=cast("list[Any]", list(prompt_cache)),
-            return_hidden=True,
-            return_shared_kv=True,
+        prefill_output: Gemma4MTPForwardOutput | Qwen3DFlashForwardOutput = (
+            self._prefill(prompt_batch, list(prompt_cache))
         )
         mx.eval(prefill_output.logits)
         prompt_time = max(time.perf_counter() - prefill_tic, 0.0)
-        prompt_tps = (
-            prompt_tail_size / prompt_time if prompt_time > 0 else 0.0
-        )
+        prompt_tps = prompt_tail_size / prompt_time if prompt_time > 0 else 0.0
 
         # Codex P1 (PR #25 round-(N+3), coupled_drafter.py:566): the
         # round loop must keep request-level logits processors
@@ -607,9 +893,11 @@ class CoupledModelDrafter:
         # been accepted yet -- you want repetition penalty to react to
         # COMMITTED tokens, not speculative drafts that might be
         # rejected.
-        running_tokens: list[int] = list(context_tokens) if context_tokens else [
-            int(t) for t in cast(list[int], prompt.tolist())
-        ]
+        running_tokens: list[int] = (
+            list(context_tokens)
+            if context_tokens
+            else [int(t) for t in cast(list[int], prompt.tolist())]
+        )
         processors_list: list[Callable[[mx.array, mx.array], mx.array]] = list(
             logits_processors
         )
@@ -671,7 +959,7 @@ class CoupledModelDrafter:
 
         if finish_reason is None:
             for token in run_coupled_round_loop(
-                target=self._target_adapter.target,
+                adapter=self._target_adapter,
                 drafter=self._drafter,
                 prompt_cache=cast("list[Any]", list(prompt_cache)),
                 prefill_output=prefill_output,
@@ -768,8 +1056,11 @@ def _eos_ids_from_tokenizer(tokenizer: TokenizerWrapper) -> list[int]:
 
 
 __all__ = [
+    "DISPATCHABLE_COUPLED_DRAFTER_KINDS",
     "CoupledDrafterKind",
     "CoupledModelDrafter",
     "Gemma4MTPTargetAdapter",
+    "Qwen3_5DFlashTargetAdapter",
+    "is_coupled_drafter_dispatchable",
     "run_coupled_round_loop",
 ]

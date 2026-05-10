@@ -1608,11 +1608,16 @@ def mlx_generate(
         from exo.worker.engines.mlx.generator.coupled_drafter import (
             CoupledModelDrafter,
             Gemma4MTPTargetAdapter,
+            Qwen3_5DFlashTargetAdapter,
         )
         from exo.worker.engines.mlx.vendor.gemma4_mtp_hooks import (
             resolve_gemma4_text_model,
         )
+        from exo.worker.engines.mlx.vendor.qwen3_5_dflash_hooks import (
+            resolve_qwen3_5_text_model,
+        )
 
+        target_adapter: Gemma4MTPTargetAdapter | Qwen3_5DFlashTargetAdapter
         if coupled_drafter.kind == "mtp":
             # The loader's ``attach_mtp_hooks`` already enforced that
             # ``model`` is a Gemma 4 ``Model`` when a coupled drafter
@@ -1633,35 +1638,27 @@ def mlx_generate(
                     "attach_mtp_hooks gate should have caught this."
                 )
             target_adapter = Gemma4MTPTargetAdapter(model)
-            drafter = CoupledModelDrafter(
-                target_adapter=target_adapter,
-                drafter=cast("nn.Module", coupled_drafter.model),
-                kind=coupled_drafter.kind,
-                num_draft_tokens=effective_num_draft_tokens,
-            )
-            coupled_dispatch_fired = True
         else:
-            # DFlash dispatch lands in a follow-up; if the loader
-            # surfaces a kind we don't yet drive, fall back loudly so
-            # the operator sees the gap instead of silently running
-            # with no drafter (which would just match the
-            # non-coupled-drafter path's behaviour).
-            logger.warning(
-                f"Coupled drafter kind={coupled_drafter.kind!r} is not yet "
-                "wired into the generator dispatch; falling back to plain "
-                "decoding for this request."
-            )
-            # ``coupled_dispatch_fired`` stays ``False`` (initialized
-            # above) on this fallback path -- the dispatch routes
-            # through ``make_drafter(mode="none")`` and no
-            # speculative work runs, so coupled telemetry must NOT
-            # be stamped on ``GenerationStats`` for this request.
-            drafter = make_drafter(
-                mode="none",
-                num_draft_tokens=effective_num_draft_tokens,
-                draft_model=None,
-                draft_cache=None,
-            )
+            # DFlash branch -- mirrors the MTP branch but resolves a
+            # Qwen 3.5 target instead of Gemma 4. The loader's
+            # ``attach_dflash_hooks`` is the upstream gate; this
+            # check is a defence-in-depth guard against a card
+            # declaring ``coupled_drafter.kind='dflash'`` against a
+            # non-Qwen 3.5 target slipping through.
+            if resolve_qwen3_5_text_model(model) is None:
+                raise TypeError(
+                    f"coupled_drafter.kind='dflash' requires a Qwen 3.5 target; "
+                    f"got {type(model).__name__!r}. The loader's "
+                    "attach_dflash_hooks gate should have caught this."
+                )
+            target_adapter = Qwen3_5DFlashTargetAdapter(model)
+        drafter = CoupledModelDrafter(
+            target_adapter=target_adapter,
+            drafter=cast("nn.Module", coupled_drafter.model),
+            kind=coupled_drafter.kind,
+            num_draft_tokens=effective_num_draft_tokens,
+        )
+        coupled_dispatch_fired = True
     else:
         drafter = make_drafter(
             mode=draft_mode,
