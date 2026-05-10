@@ -167,6 +167,40 @@ def test_load_drafter_failure_returns_none(
     assert utils_mlx._try_load_coupled_drafter(card) is None
 
 
+def test_partial_mlxvlm_install_falls_back_without_attribute_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2 (PR #23 round-(N+0), utils_mlx.py:809): a partial / drifted
+    ``mlx-vlm`` install where ``mlx_vlm.speculative.drafters`` imports
+    cleanly but is missing ``load_drafter`` / ``KNOWN_DRAFTER_KINDS``
+    must degrade to the standard drafter path -- not raise
+    ``AttributeError`` and abort the runner.
+
+    Reproduces the failure mode where ``except ImportError`` alone is
+    insufficient: the import itself succeeds, but the symbol resolution
+    (or ``cast()`` site that touches the attribute) blows up.
+    """
+    monkeypatch.delenv(utils_mlx.EXO_DISABLE_DRAFTER_ENV, raising=False)
+    card = _card(coupled_id=ModelId("mlx-community/coupled"), standard_ids=[])
+
+    fake_speculative = types.ModuleType("mlx_vlm.speculative")
+    # Module imports successfully but the drafters submodule is empty
+    # -- e.g. an old mlx-vlm release that namespaces ``speculative``
+    # without having shipped the drafter API yet, or a future release
+    # that renames the symbols. Either way, we must not crash the
+    # caller; we must degrade.
+    fake_drafters = types.ModuleType("mlx_vlm.speculative.drafters")
+    fake_speculative.drafters = fake_drafters  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "mlx_vlm.speculative", fake_speculative)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.speculative.drafters", fake_drafters)
+    monkeypatch.setattr(
+        utils_mlx, "resolve_existing_model", _resolve_to(Path("/tmp/should-not-matter"))
+    )
+
+    assert utils_mlx._try_load_coupled_drafter(card) is None
+
+
 def test_unknown_kind_returns_none(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

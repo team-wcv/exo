@@ -787,27 +787,35 @@ def _try_load_coupled_drafter(model_card: ModelCard) -> CoupledDrafter | None:
     # iterable of upstream kind strings -- declared as ``Iterable[str]``
     # because mlx-vlm uses ``frozenset[str]`` today but a future
     # release could swap it for a list without breaking us.
+    #
+    # Codex P2 (PR #23 round-(N+0), utils_mlx.py:809): we also catch
+    # ``AttributeError`` so a partial / mismatched mlx-vlm install (the
+    # ``speculative`` package imports cleanly but is missing
+    # ``load_drafter`` / ``KNOWN_DRAFTER_KINDS`` -- e.g. an old release
+    # with the namespace package but pre-drafter API, or a future
+    # release that renames the symbols) degrades to the standard
+    # drafter path instead of crashing the runner.
     try:
         from mlx_vlm.speculative import (  # pyright: ignore[reportMissingTypeStubs]
             drafters as _mlxvlm_drafters,
         )
-    except ImportError as exc:
+        load_drafter = cast(
+            Callable[..., tuple[object, str]],
+            _mlxvlm_drafters.load_drafter,
+        )
+        known_drafter_kinds = cast(
+            "Iterable[str]",
+            _mlxvlm_drafters.KNOWN_DRAFTER_KINDS,
+        )
+    except (ImportError, AttributeError) as exc:
         logger.warning(
             f"Coupled drafter declared by {model_card.model_id} requires "
-            f"mlx-vlm with speculative-drafter support (>=0.5.0), but the "
-            f"import failed ({exc}); falling back to the standard drafter "
-            f"path."
+            f"mlx-vlm with speculative-drafter support (>=0.5.0) exposing "
+            f"``load_drafter`` and ``KNOWN_DRAFTER_KINDS``, but resolving "
+            f"those symbols failed ({type(exc).__name__}: {exc}); falling "
+            f"back to the standard drafter path."
         )
         return None
-
-    load_drafter = cast(
-        Callable[..., tuple[object, str]],
-        _mlxvlm_drafters.load_drafter,
-    )
-    known_drafter_kinds = cast(
-        "Iterable[str]",
-        _mlxvlm_drafters.KNOWN_DRAFTER_KINDS,
-    )
 
     drafter_path = resolve_existing_model(coupled_id)
     if drafter_path is None:
