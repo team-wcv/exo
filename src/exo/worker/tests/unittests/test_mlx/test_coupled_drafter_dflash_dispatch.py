@@ -241,6 +241,62 @@ def test_dflash_adapter_call_returns_dflash_forward_output() -> None:
     )
 
 
+def test_dflash_adapter_preserves_lm_head_owner_on_untied_target() -> None:
+    """Adapter must thread the wrapper through to ``qwen3_5_dflash_forward``.
+
+    The forward routes through ``lm_head(h)`` vs
+    ``embed_tokens.as_linear(h)`` based on the wrapper's
+    ``args.tie_word_embeddings`` (via
+    :func:`_resolve_lm_head_owner`). The wrapper-resolution step needs
+    the *wrapper* in hand -- the inner ``Qwen3_5TextModel`` doesn't
+    own ``lm_head`` or ``args``. Pre-fix the adapter stored only the
+    inner and silently forced the tied-embeddings path on untied-head
+    checkpoints (``tie_word_embeddings=False`` is common for Qwen 3.5
+    / 3.6), corrupting verifier logits and therefore accept / reject
+    decisions in coupled decoding.
+
+    Asserts ``adapter(inputs) is byte-equivalent to`` the wrapper-routed
+    forward and **distinct** from the inner-routed forward whenever
+    ``lm_head`` and ``embed_tokens`` carry different weights.
+    """
+    target = _build_tiny_qwen3_5_with_hooks()
+    assert target.args.tie_word_embeddings is False, (
+        "fixture must be untied-head to exercise the lm_head path"
+    )
+    # Force ``lm_head.weight`` to a distinguishable value so the two
+    # code paths (``lm_head(h)`` vs ``embed_tokens.as_linear(h)``)
+    # produce visibly different logits. Without this the test would
+    # pass trivially on init noise convergence.
+    target.lm_head.weight = mx.ones_like(target.lm_head.weight)
+
+    adapter = Qwen3_5DFlashTargetAdapter(target)
+    cache_adapter = cast("list[Any]", target.make_cache())
+    cache_wrapper = cast("list[Any]", target.make_cache())
+    cache_inner = cast("list[Any]", target.make_cache())
+    prompt = mx.array([[1, 2, 3]])
+
+    # Adapter route (post-fix: routes through wrapper).
+    adapter_out = adapter(prompt, cache=cache_adapter, capture_layer_ids=[0])
+    # Direct wrapper route -- the post-fix adapter must match this.
+    wrapper_out = qwen3_5_dflash_forward(
+        target, prompt, cache=cache_wrapper, capture_layer_ids=[0]
+    )
+    # Direct inner route -- pre-fix adapter degraded to this path.
+    inner_out = qwen3_5_dflash_forward(
+        target.model, prompt, cache=cache_inner, capture_layer_ids=[0]
+    )
+
+    assert mx.allclose(adapter_out.logits, wrapper_out.logits, atol=1e-5).item(), (
+        "adapter forward must route through the wrapper-aware path so "
+        "untied lm_head logits match the wrapper-routed forward"
+    )
+    assert not mx.allclose(adapter_out.logits, inner_out.logits, atol=1e-5).item(), (
+        "adapter forward must NOT degrade to embed_tokens.as_linear; "
+        "if it does, untied-head Qwen targets are scored with the wrong "
+        "LM head and accept / reject decisions diverge from upstream"
+    )
+
+
 def test_dflash_adapter_rollback_passes_through() -> None:
     """``rollback_speculative_cache`` returns ``max(accepted)`` per the contract.
 

@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
 
+import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
@@ -332,6 +333,140 @@ def test_builder_force_sequential_includes_coupled_dispatchable() -> None:
 # --------------------------------------------------------------------------- #
 # Behaviour assertions that don't require an actual MLX distributed group
 # --------------------------------------------------------------------------- #
+
+
+def test_multi_device_wired_bump_includes_coupled_drafter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TP wired-memory limit must reserve the full coupled-drafter size.
+
+    Pre-fix the wired-memory bump was gated on ``group is None``, so a
+    multi-device runner that lifted the loader / dispatch gates would
+    load a coupled drafter into wired pool sized for the target shard
+    alone. Under macOS' wired-memory policy the OS is then free to
+    page the drafter out between requests -- exactly when speculative
+    decoding's per-round latency is what makes the coupled path
+    worthwhile. The helper must bump by the full coupled-drafter on-
+    disk size for any TP placement that will load one.
+
+    Distinct from the standard-drafter case below: TP runs pass
+    ``allow_standard_drafter_fallback=False`` to the loader, so the
+    standard drafter size is intentionally excluded from the bump to
+    keep the wired pool minimal on already-memory-tight TP ranks.
+    """
+    coupled_id = ModelId("z-lab/Qwen3.5-122B-A10B-DFlash")
+    standard_id = ModelId("mlx-community/some-standard-drafter")
+    card = _card(coupled_id=coupled_id, standard_ids=[standard_id])
+
+    sizes: dict[ModelId, int] = {coupled_id: 3_000_000_000, standard_id: 5_000_000_000}
+
+    def fake_coupled_size(model_id: ModelId) -> int:
+        return sizes[model_id]
+
+    def fake_standard_size(model_id: ModelId) -> int:
+        return sizes[model_id]
+
+    monkeypatch.setattr(
+        utils_mlx, "_coupled_drafter_weight_size_bytes", fake_coupled_size
+    )
+    monkeypatch.setattr(utils_mlx, "_drafter_weight_size_bytes", fake_standard_size)
+    monkeypatch.delenv(utils_mlx.EXO_DISABLE_DRAFTER_ENV, raising=False)
+
+    # Multi-device: ``group`` is a sentinel, ``drafter_placement`` is
+    # None (symmetric TP). Helper must reserve the COUPLED size and
+    # ignore the (larger) standard one.
+    fake_group = cast(mx.distributed.Group, MagicMock(name="mlx_distributed_group"))
+    bump_tp = utils_mlx._collocated_drafter_wired_bytes(
+        target_card=card,
+        group=fake_group,
+        drafter_placement=None,
+    )
+    assert bump_tp.in_bytes == sizes[coupled_id], (
+        f"TP wired bump must equal the coupled-drafter size "
+        f"({sizes[coupled_id]} bytes); got {bump_tp.in_bytes} bytes. "
+        "Including the larger standard-drafter size here would over-"
+        "wire the TP rank; excluding the coupled size paged the "
+        "drafter out under load."
+    )
+
+    # Single-device: the legacy max-of-both rule survives because the
+    # standard-drafter fallback can still fire if the coupled load fails.
+    bump_single = utils_mlx._collocated_drafter_wired_bytes(
+        target_card=card,
+        group=None,
+        drafter_placement=None,
+    )
+    assert bump_single.in_bytes == sizes[standard_id], (
+        f"single-device wired bump must reserve max(coupled, standard) "
+        f"({sizes[standard_id]} bytes); got {bump_single.in_bytes} bytes"
+    )
+
+
+def test_wired_bump_skipped_for_asymmetric_drafter_placement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Asymmetric remote drafters live on a different node, so this rank
+    must not reserve any wired bytes for them.
+
+    Pre-existing behaviour pinned here so a future refactor that
+    centralises the wired-bump logic can't accidentally drop this
+    guard. Without it, an asymmetric placement would over-reserve
+    wired memory for a drafter whose weights never enter this rank's
+    address space, starving the target's KV cache.
+    """
+    coupled_id = ModelId("z-lab/some-coupled")
+    standard_id = ModelId("mlx-community/some-standard")
+    card = _card(coupled_id=coupled_id, standard_ids=[standard_id])
+
+    def fake_size_two_gb(_id: ModelId) -> int:
+        return 2_000_000_000
+
+    monkeypatch.setattr(
+        utils_mlx, "_coupled_drafter_weight_size_bytes", fake_size_two_gb
+    )
+    monkeypatch.setattr(utils_mlx, "_drafter_weight_size_bytes", fake_size_two_gb)
+    monkeypatch.delenv(utils_mlx.EXO_DISABLE_DRAFTER_ENV, raising=False)
+
+    sentinel_placement = object()
+    bump = utils_mlx._collocated_drafter_wired_bytes(
+        target_card=card,
+        group=None,
+        drafter_placement=sentinel_placement,
+    )
+    assert bump.in_bytes == 0, (
+        f"asymmetric drafter placement must contribute 0 wired bytes; "
+        f"got {bump.in_bytes}. The drafter weights live on a different "
+        "node and never enter this rank's address space."
+    )
+
+
+def test_wired_bump_skipped_when_drafter_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``EXO_DISABLE_DRAFTER=1`` short-circuits the loader before any
+    drafter weights enter memory, so the wired-bump helper must also
+    return zero. Otherwise a user disabling drafting via env still
+    pays the wired-pool reservation."""
+    coupled_id = ModelId("z-lab/some-coupled")
+    card = _card(coupled_id=coupled_id, standard_ids=[])
+
+    def fake_size_one_point_five_gb(_id: ModelId) -> int:
+        return 1_500_000_000
+
+    monkeypatch.setattr(
+        utils_mlx,
+        "_coupled_drafter_weight_size_bytes",
+        fake_size_one_point_five_gb,
+    )
+    monkeypatch.setenv(utils_mlx.EXO_DISABLE_DRAFTER_ENV, "1")
+
+    fake_group = cast(mx.distributed.Group, MagicMock(name="group"))
+    bump = utils_mlx._collocated_drafter_wired_bytes(
+        target_card=card,
+        group=fake_group,
+        drafter_placement=None,
+    )
+    assert bump.in_bytes == 0
 
 
 def test_coupled_drafter_kind_is_literal_friendly() -> None:

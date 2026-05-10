@@ -318,6 +318,18 @@ class Qwen3_5DFlashTargetAdapter:  # noqa: N801 -- mirrors mlx-lm's "Qwen3_5" na
                 "This is a runtime guard against loader/dispatch drift."
             )
         self._target: Qwen3_5TextModel = inner
+        # Preserve the original wrapper so :func:`qwen3_5_dflash_forward`
+        # can locate ``lm_head`` / ``args.tie_word_embeddings`` via
+        # ``_resolve_lm_head_owner``. The inner ``Qwen3_5TextModel`` is
+        # the layer walker; ``lm_head`` lives on the enclosing
+        # ``TextModel`` / ``Model`` wrapper. Passing the inner alone to
+        # the forward would silently force the tied-embeddings code
+        # path on untied-head checkpoints (``tie_word_embeddings=False``
+        # is common for Qwen 3.5/3.6), corrupting verifier logits and
+        # therefore accept / reject decisions in coupled decoding.
+        # ``rollback_speculative_cache`` ignores its ``target`` argument
+        # but accepts the wrapper for API parity with the forward.
+        self._lm_head_owner: object = target_model
 
     @property
     def target(self) -> Qwen3_5TextModel:
@@ -360,9 +372,14 @@ class Qwen3_5DFlashTargetAdapter:  # noqa: N801 -- mirrors mlx-lm's "Qwen3_5" na
         ``.hidden_states``, ``.gdn_states`` -- matches mlx-vlm's
         ``LanguageModelOutput`` so ``_dflash_rounds`` can read those
         attributes directly without an unwrap step.
+
+        ``self._lm_head_owner`` (the wrapper, not the inner walker)
+        is forwarded so :func:`qwen3_5_dflash_forward` can route
+        through the real ``lm_head`` on untied-head checkpoints. See
+        :meth:`__init__` for the rationale.
         """
         return qwen3_5_dflash_forward(
-            self._target,
+            self._lm_head_owner,
             inputs,
             cache=cache,
             capture_layer_ids=capture_layer_ids,
@@ -381,9 +398,13 @@ class Qwen3_5DFlashTargetAdapter:  # noqa: N801 -- mirrors mlx-lm's "Qwen3_5" na
         DFlash rollback ALSO replays SSM (gated-delta) state because
         the recurrence pollutes those caches with rejected drafts.
         Delegated to :func:`qwen3_5_rollback_speculative_cache`.
+
+        Passes ``self._lm_head_owner`` (the wrapper) for API parity
+        with :meth:`__call__` -- the rollback function ignores its
+        ``target`` argument but accepts whatever the forward passes.
         """
         return qwen3_5_rollback_speculative_cache(
-            self._target,
+            self._lm_head_owner,
             caches=caches,
             gdn_states=gdn_states,
             accepted=accepted,

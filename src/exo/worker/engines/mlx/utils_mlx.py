@@ -1099,6 +1099,76 @@ def _drafter_weight_size_bytes(drafter_id: ModelId) -> int:
         return 0
 
 
+def _collocated_drafter_wired_bytes(
+    *,
+    target_card: ModelCard,
+    group: mx.distributed.Group | None,
+    drafter_placement: object,
+) -> Memory:
+    """Bytes to add to the wired-memory limit for a collocated drafter.
+
+    Mirrors :func:`_try_load_collocated_drafter`'s "will any drafter
+    weights end up in this rank's address space?" decision exactly, so
+    the wired bump matches what actually gets loaded:
+
+    - ``drafter_placement is not None`` (asymmetric remote drafter) →
+      0. The drafter lives on another node; its weights never enter
+      this rank's wired pool.
+    - ``EXO_DISABLE_DRAFTER=1`` → 0. The loader returns early before
+      pulling any drafter weights.
+    - ``group is None`` (single-device): tries coupled first then
+      standard. The wired bump is the LARGER of the two on-disk sizes
+      because the coupled load can fail at runtime (mlx-vlm missing,
+      weights absent, unknown kind) and fall through to the standard
+      drafter -- under-wiring there would page out the standard
+      drafter between requests and undo the whole speedup. Over-wiring
+      is cheap (the limit is a *minimum* on the wired pool, not a cap
+      on total usage), so :func:`max` is the safe choice.
+    - ``group is not None`` (symmetric tensor-parallel): only the
+      coupled load runs (:func:`_try_load_collocated_drafter` is
+      called with ``allow_standard_drafter_fallback=False``), so only
+      the coupled size feeds the bump. The standard-drafter on-disk
+      size is excluded to keep the wired limit minimal on the TP
+      rank, which is already memory-tight for the 122B-class targets
+      that motivate multi-device coupled dispatch in the first place.
+
+    Note that the coupled drafter REPLICATES per TP rank rather than
+    sharding: each rank loads the full drafter weights, KV cache, and
+    SSM state in-process so it can consume its post-all-reduce hidden
+    state without any cross-rank routing. The bump on a TP rank
+    therefore reserves the *full* coupled-drafter size, not a shard
+    of it.
+
+    Args:
+        target_card: The target model card.
+        group: The MLX distributed group, or ``None`` for single-device.
+        drafter_placement: ``bound_instance.instance.drafter_placement``,
+            an asymmetric ``DrafterPlacement`` or ``None``. Typed
+            ``object`` here to keep the import surface narrow at the
+            sizing layer.
+
+    Returns:
+        ``Memory.from_bytes(0)`` when no bump is needed; otherwise the
+        bytes to add to ``target_size`` before calling
+        :func:`set_wired_limit_for_model`.
+    """
+    if drafter_placement is not None or _drafter_disabled_by_env():
+        return Memory.from_bytes(0)
+    candidate_bytes = 0
+    if target_card.coupled_drafter is not None:
+        candidate_bytes = max(
+            candidate_bytes,
+            _coupled_drafter_weight_size_bytes(target_card.coupled_drafter),
+        )
+    if group is None and target_card.drafter_model_ids:
+        chosen = _select_drafter_id(
+            list(target_card.drafter_model_ids), _drafter_preference()
+        )
+        if chosen is not None:
+            candidate_bytes = max(candidate_bytes, _drafter_weight_size_bytes(chosen))
+    return Memory.from_bytes(candidate_bytes)
+
+
 def load_mlx_items(
     bound_instance: BoundInstance,
     group: mx.distributed.Group | None,
@@ -1123,38 +1193,11 @@ def load_mlx_items(
     # the limit once. Skip the bump for asymmetric placements: the drafter
     # weights live on a different node so they don't draw from this rank's
     # wired pool.
-    #
-    # When a card declares both ``coupled_drafter`` and ``drafter_model_ids``
-    # we budget for the LARGER of the two, not just the preferred one: the
-    # coupled load can fail at runtime (e.g. mlx-vlm missing on a stripped
-    # build, weights not on disk yet, unknown kind) and trigger the
-    # standard-drafter fallback. Under-wiring there would let the OS page
-    # the standard drafter back out between requests, undoing the whole
-    # point of ``set_wired_limit_for_model``. Over-wiring is cheap (the
-    # OS still uses the memory normally; the limit is only a *minimum*
-    # for wired-pool reservation), so ``max`` is the safe choice.
-    combined_size = target_size
-    if (
-        group is None
-        and bound_instance.instance.drafter_placement is None
-        and not _drafter_disabled_by_env()
-    ):
-        candidate_bytes = 0
-        if target_card.coupled_drafter is not None:
-            candidate_bytes = max(
-                candidate_bytes,
-                _coupled_drafter_weight_size_bytes(target_card.coupled_drafter),
-            )
-        if target_card.drafter_model_ids:
-            chosen = _select_drafter_id(
-                list(target_card.drafter_model_ids), _drafter_preference()
-            )
-            if chosen is not None:
-                candidate_bytes = max(
-                    candidate_bytes, _drafter_weight_size_bytes(chosen)
-                )
-        if candidate_bytes > 0:
-            combined_size = target_size + Memory.from_bytes(candidate_bytes)
+    combined_size = target_size + _collocated_drafter_wired_bytes(
+        target_card=target_card,
+        group=group,
+        drafter_placement=bound_instance.instance.drafter_placement,
+    )
 
     set_wired_limit_for_model(combined_size)
 
