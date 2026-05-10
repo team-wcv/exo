@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import ipaddress
 import json
@@ -367,10 +368,10 @@ def _maybe_accept_drafter_socket(
         # available on the host, ``bind_target_listener`` will raise
         # and the failure is loud rather than silent.
         bind_host = "::"
-    listener = _bind_drafter_listener_with_retry(
+    listener = _bind_drafter_listener_same_port_retry(
         bind_host=bind_host,
         bind_target_listener=bind_target_listener,
-        initial_port=placement.drafter_socket_port,
+        port=placement.drafter_socket_port,
         advertised_host=placement.drafter_socket_host,
     )
     try:
@@ -393,70 +394,76 @@ def _maybe_accept_drafter_socket(
 _DRAFTER_BIND_RETRY_BUDGET: Final[int] = 8
 """Number of bind attempts tolerated before giving up on the drafter listener.
 
-Codex P1.2 (PR #20): the master allocates ``drafter_socket_port`` via
-:func:`exo.utils.ports.random_ephemeral_port`, which kernel-vets the
-port on the master's host. In cross-host deploys (master and target
-rank 0 on different hosts) the master cannot vet the target's port
-allocations, so ``bind_target_listener`` may still hit ``EADDRINUSE``.
-Eight re-rolls give the runtime a generous chance to find a free port
-on the target's kernel before surfacing a placement-time failure.
+Codex P1.2 (PR #20, round-2 fix): the master allocates
+``drafter_socket_port`` via :func:`exo.utils.ports.random_ephemeral_port`,
+which kernel-vets the port on the master's host. In cross-host deploys
+the master cannot vet the target's port allocations, so
+``bind_target_listener`` may still hit ``EADDRINUSE``; the most common
+cause is a TIME_WAIT residue from a previous instance on the same port,
+which clears within ~100 ms. Eight same-port retries with brief sleeps
+absorb that without breaking the placement contract (the drafter is
+told to dial ``placement.drafter_socket_port`` and retry must keep
+listening on that exact port).
 """
 
+_DRAFTER_BIND_RETRY_SLEEP_SECONDS: Final[float] = 0.1
 
-def _bind_drafter_listener_with_retry(
+
+def _bind_drafter_listener_same_port_retry(
     *,
     bind_host: str,
     bind_target_listener: Callable[[str, int], "_socket_module.socket"],
-    initial_port: int,
+    port: int,
     advertised_host: str,
 ) -> "_socket_module.socket":
-    """Bind the drafter listener, re-rolling the port on ``EADDRINUSE``.
+    """Bind the drafter listener on ``port``, retrying transient EADDRINUSE.
 
-    Codex P1.2 (PR #20, placement.py:800): the master picks
-    ``drafter_socket_port`` via
-    :func:`exo.utils.ports.random_ephemeral_port`, kernel-vetted on
-    the master's host but not across hosts. When master and target
-    rank 0 sit on different hosts a transient race against the
-    target's kernel can leave the master-picked port in use locally,
-    so :func:`bind_target_listener` raises ``OSError(EADDRINUSE)``.
-    Re-rolling via :func:`random_ephemeral_port` and retrying a small
-    number of times turns that into a self-healing bind step instead
-    of an immediate runner failure. The drafter dials the placement's
-    original port, so a re-rolled port leaves accept blocked until
-    its 180s timeout (after which the runner re-places); that's
-    strictly better than the pre-fix immediate-fail behavior because
-    most ``EADDRINUSE`` events on a target host are transient and
-    the very next ``random_ephemeral_port`` returns the same kernel-
-    free port the master originally picked.
+    Round-1 (Codex P1.2 PR #20) attempted to re-roll the port on
+    ``EADDRINUSE``, but that broke the placement contract: the drafter
+    dials ``DrafterPlacement.drafter_socket_port`` (master-announced),
+    so a re-rolled listener accepts on a port the drafter never tries
+    and the connection stalls until ``accept_drafter``'s 180 s timeout
+    (Codex P1, round-2). We instead retry the SAME port with short
+    backoff: a TIME_WAIT residue from a previous generator on the same
+    port (the realistic ``EADDRINUSE`` case in cross-host deploys)
+    clears within ~100 ms, and persistent collisions surface a clean
+    ``EADDRINUSE`` to the runner so the master can re-place with a
+    new port.
+
+    Non-``EADDRINUSE`` ``OSError`` (Codex P2 round-2: e.g.
+    ``EAFNOSUPPORT`` for an IPv6 wildcard on an IPv4-only host,
+    ``EACCES`` for a privileged port) is surfaced immediately so the
+    operator sees the actual root cause instead of a misleading
+    "port range exhausted" message after the retry budget.
     """
-    from exo.utils.ports import random_ephemeral_port
-
-    current_port = initial_port
-    attempts = 0
     last_error: OSError | None = None
-    while attempts < _DRAFTER_BIND_RETRY_BUDGET:
+    for attempt in range(1, _DRAFTER_BIND_RETRY_BUDGET + 1):
         try:
-            return bind_target_listener(bind_host, current_port)
+            return bind_target_listener(bind_host, port)
         except OSError as bind_error:
+            if bind_error.errno != errno.EADDRINUSE:
+                # Non-collision error: surface immediately. Retrying an
+                # ``EAFNOSUPPORT`` or ``EACCES`` would just hide the
+                # root cause behind a misleading retry log.
+                raise
             last_error = bind_error
-            attempts += 1
-            if attempts >= _DRAFTER_BIND_RETRY_BUDGET:
+            if attempt >= _DRAFTER_BIND_RETRY_BUDGET:
                 break
-            new_port = random_ephemeral_port()
             logger.warning(
-                f"bind_target_listener({bind_host}, {current_port}) raised "
-                f"{bind_error!r}; re-rolling to port {new_port} "
-                f"(attempt {attempts}/{_DRAFTER_BIND_RETRY_BUDGET}, "
-                f"advertised host {advertised_host})"
+                f"bind_target_listener({bind_host}, {port}) raised "
+                f"{bind_error!r} (attempt {attempt}/"
+                f"{_DRAFTER_BIND_RETRY_BUDGET}, advertised host "
+                f"{advertised_host}); retrying same port after "
+                f"{_DRAFTER_BIND_RETRY_SLEEP_SECONDS}s"
             )
-            current_port = new_port
+            time.sleep(_DRAFTER_BIND_RETRY_SLEEP_SECONDS)
     raise OSError(
-        last_error.errno if last_error is not None else None,
-        f"failed to bind drafter listener on {bind_host} after "
-        f"{_DRAFTER_BIND_RETRY_BUDGET} attempts (last error: "
-        f"{last_error!r}); re-rolling did not yield a free port. "
-        f"Operator should check whether another process on this host "
-        f"is monopolising the ephemeral port range.",
+        last_error.errno if last_error is not None else errno.EADDRINUSE,
+        f"failed to bind drafter listener on {bind_host}:{port} after "
+        f"{_DRAFTER_BIND_RETRY_BUDGET} same-port retries (last error: "
+        f"{last_error!r}). The placement-announced port is held by "
+        f"another process on this host; re-place the instance to "
+        f"draw a fresh port.",
     ) from last_error
 
 
