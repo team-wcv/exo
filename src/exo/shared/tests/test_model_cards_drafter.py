@@ -173,3 +173,110 @@ def test_drafter_eligible_nodes_round_trip() -> None:
     assert dump["drafter_eligible_nodes"] == eligible
     rehydrated = ModelCard.model_validate(dump)
     assert rehydrated.drafter_eligible_nodes == eligible
+
+
+def test_coupled_drafter_defaults_to_none() -> None:
+    """Cards that don't declare a coupled drafter retain legacy behaviour.
+
+    Phase-1 invariant: the field is purely additive. Existing cards that omit
+    ``coupled_drafter`` must validate and serialise as if the field weren't
+    there (``model_dump(exclude_none=True)`` drops the ``None`` so the TOML
+    on disk stays untouched for the steady-state of cards that haven't been
+    updated).
+    """
+    card = ModelCard(
+        model_id=ModelId("mlx-community/test-target-no-coupled"),
+        storage_size=Memory.from_gb(1.0),
+        n_layers=12,
+        hidden_size=768,
+        supports_tensor=True,
+        tasks=["TextGeneration"],  # pyright: ignore[reportArgumentType]
+    )
+    assert card.coupled_drafter is None
+    dump = card.model_dump(exclude_none=True)
+    assert "coupled_drafter" not in dump
+
+
+def test_coupled_drafter_round_trip() -> None:
+    """``coupled_drafter`` accepts a ModelId and round-trips through dump/validate.
+
+    Drafter-kind resolution happens at *load* time (Phase 2) via
+    ``mlx_vlm.speculative.drafters.resolve_drafter_kind`` reading the
+    drafter's HF ``config.json``; the card stores only the model id so it
+    stays decoupled from the mlx-vlm runtime API surface.
+    """
+    coupled = ModelId("mlx-community/gemma-4-E2B-it-assistant-bf16")
+    card = ModelCard(
+        model_id=ModelId("mlx-community/test-target-coupled"),
+        storage_size=Memory.from_gb(1.0),
+        n_layers=12,
+        hidden_size=768,
+        supports_tensor=True,
+        tasks=["TextGeneration"],  # pyright: ignore[reportArgumentType]
+        coupled_drafter=coupled,
+    )
+    assert card.coupled_drafter == coupled
+    dump = card.model_dump(exclude_none=True)
+    assert dump["coupled_drafter"] == coupled
+    rehydrated = ModelCard.model_validate(dump)
+    assert rehydrated.coupled_drafter == coupled
+
+
+def test_coupled_drafter_composes_with_standard_drafter_list() -> None:
+    """A card may declare both a coupled drafter AND a standard sibling list.
+
+    The two fields are not mutually exclusive: placement chooses between them
+    based on topology (asymmetric placement → standard list; single-node →
+    coupled). The card schema must accept both side-by-side without
+    validation error so a single Gemma 4 31B card can serve every deployment
+    shape from "one Mac" to "asymmetric pipeline across a Thunderbolt RDMA
+    cluster."
+    """
+    standard_list = [
+        ModelId("mlx-community/gemma-4-e2b-it-4bit"),
+        ModelId("mlx-community/gemma-4-e4b-it-4bit"),
+    ]
+    coupled = ModelId("mlx-community/gemma-4-E2B-it-assistant-bf16")
+    card = ModelCard(
+        model_id=ModelId("mlx-community/test-target-hybrid"),
+        storage_size=Memory.from_gb(1.0),
+        n_layers=12,
+        hidden_size=768,
+        supports_tensor=True,
+        tasks=["TextGeneration"],  # pyright: ignore[reportArgumentType]
+        drafter_model_ids=standard_list,
+        coupled_drafter=coupled,
+    )
+    assert card.drafter_model_ids == standard_list
+    assert card.coupled_drafter == coupled
+    dump = card.model_dump(exclude_none=True)
+    assert dump["drafter_model_ids"] == standard_list
+    assert dump["coupled_drafter"] == coupled
+    rehydrated = ModelCard.model_validate(dump)
+    assert rehydrated.drafter_model_ids == standard_list
+    assert rehydrated.coupled_drafter == coupled
+
+
+@pytest.mark.asyncio
+async def test_shipped_gemma4_cards_omit_coupled_drafter_in_phase1() -> None:
+    """Gate against accidentally landing card updates in the Phase-1 PR.
+
+    Updating shipped Gemma 4 cards to declare ``coupled_drafter`` is the job
+    of Phase 3 (cards + placement + smoke), once the loader (Phase 2) can
+    actually consume the field. Landing the card update earlier would cause
+    the loader to silently ignore the field on every Phase-1 deployment,
+    masking real bugs in the Phase-2 dispatch logic when it eventually ships.
+    This test removes itself in Phase 3.
+    """
+    cards = {card.model_id: card for card in await get_model_cards()}
+    for target_str in {
+        *_gemma4_31b_expectations(),
+        *_gemma4_26b_expectations(),
+    }:
+        target_id = ModelId(target_str)
+        if target_id not in cards:
+            continue
+        assert cards[target_id].coupled_drafter is None, (
+            f"{target_id} declares coupled_drafter in shipped TOML; that "
+            "should land in the Phase 3 PR after the loader can consume it."
+        )

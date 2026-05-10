@@ -166,8 +166,42 @@ class ModelCard(FrozenModel):
     # listed drafters MUST share a tokenizer with the target. Conventionally
     # the list is quant-aligned with the target (e.g. `gemma-4-31b-it-4bit`
     # declares `[gemma-4-e2b-it-4bit, gemma-4-e4b-it-4bit]`), but cross-quant
-    # drafters are allowed for advanced tuning.
+    # drafters are allowed for advanced tuning. These are *standard external*
+    # drafters: independent small LMs that decode autoregressively from their
+    # own KV cache and ship only token ids over the wire. They compose with
+    # asymmetric placement (``drafter_eligible_nodes``) because token-only
+    # transport is bandwidth-cheap.
     drafter_model_ids: list[ModelId] = Field(default_factory=list)
+    # Optional MTP-style "coupled" drafter for this target. Coupled drafters
+    # (e.g. Google's Gemma 4 assistant ``gemma4_assistant`` model_type, or
+    # Z-Lab's Qwen3 ``dflash`` drafters) attach to the target architecturally:
+    # they consume the target's hidden state every draft step and -- for the
+    # MTP variant -- read the target's KV cache directly instead of building
+    # their own. This couples them tightly to the target but yields the
+    # ~2x speedup Apple/Google reported for MLX-native MTP.
+    #
+    # The kind (``"mtp"`` for Gemma 4 assistant drafters, ``"dflash"`` for
+    # Qwen3 DFlash) is auto-detected from the drafter's HF ``model_type`` at
+    # load time via ``mlx_vlm.speculative.drafters.resolve_drafter_kind``. The
+    # drafter is loaded through ``mlx_vlm`` (not ``mlx_lm``) because the
+    # speculative-drafter loader and architecture live there.
+    #
+    # Composition with ``drafter_model_ids`` and ``drafter_eligible_nodes``:
+    # - When ``drafter_eligible_nodes`` is non-empty AND ``drafter_model_ids``
+    #   is non-empty, asymmetric placement (PR #20's pipeline) wins because
+    #   the coupled drafter's wire protocol would have to ship full hidden
+    #   states / KV cache entries cross-node, which negates its speedup over
+    #   any practical link.
+    # - Otherwise (single-node placement), if ``coupled_drafter`` is set the
+    #   runner loads it via ``mlx_vlm`` and the generator routes through
+    #   ``draft_block`` instead of the standard external-drafter loop.
+    # - If neither asymmetric nor coupled applies, the legacy single-device
+    #   standard-drafter path runs as before.
+    #
+    # Empty / ``None`` (the default) preserves legacy behaviour. This field
+    # is purely additive: cards that don't declare a coupled drafter are
+    # functionally unchanged.
+    coupled_drafter: ModelId | None = None
     # Nodes the operator has designated as eligible drafter hosts. When this
     # list is non-empty AND the model has at least one declared drafter, the
     # placement layer attempts asymmetric placement: target ranks land on the
