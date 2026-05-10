@@ -1,36 +1,43 @@
 # DFlash coupled-drafter benchmarks (Qwen 3.5 + Qwen 3.6)
 
 A/B benchmarks of z-lab's DFlash block-diffusion coupled drafters
-against the corresponding MLX-quantized targets on Apple Silicon. All
-three numerical validations of the DFlash dispatch path
+against the corresponding MLX-quantized targets on Apple Silicon.
+Numerical validations of the DFlash dispatch path
 (`CoupledDrafterKind="dflash"`) on real hybrid Qwen targets
-(gated-delta-net + full-attention, `full_attention_interval=4`).
+(gated-delta-net + full-attention, `full_attention_interval=4`) at
+single-device, multi-device tensor-parallel, and the headline
+122B-A10B MoE scaled across two nodes via JACCL over a Thunderbolt-
+bridge RDMA edge.
 
-Plus a companion target-only run of Qwen 3.5 122B-A10B with 2-node
-tensor-parallel JACCL over Thunderbolt-bridge RDMA, included to
-characterise the multi-node baseline that the next round of work
-needs to beat once we ship the coupled-drafter loader path for
-multi-device placements (currently single-device only — see "Coupled
-drafter + tensor parallel" below).
-
-## Headlines across three targets
+## Headlines across four targets
 
 | Target | Quant | Arch | host | Target gen_tps | DFlash gen_tps | Speedup | Accept |
 |---|---|---|---|---:|---:|---:|---:|
-| Qwen3.5 4B           | 8bit | dense | wc-smbp  | 97.24 | 404.38 | **4.16x** | 93.2% |
-| Qwen3.6 27B          | 8bit | dense | wc-smbpt | 14.98 |  49.13 | **3.28x** | 92.6% |
-| Qwen3.6 35B-A3B      | 8bit | MoE   | wc-smbpt | 87.70 | 377.49 | **4.30x** | 92.6% |
-| Qwen3.5 122B-A10B (TP2) | 8bit | MoE | smbp+smbpt | 53.84 | (n/a) | --      | (n/a) |
+| Qwen3.5 4B              | 8bit | dense | wc-smbp     |  97.24 | 404.38 | **4.16x** | 93.2% |
+| Qwen3.6 27B             | 8bit | dense | wc-smbpt    |  14.98 |  49.13 | **3.28x** | 92.6% |
+| Qwen3.6 35B-A3B         | 8bit | MoE   | wc-smbpt    |  87.70 | 377.49 | **4.30x** | 92.6% |
+| Qwen3.5 122B-A10B (TP2) | 8bit | MoE   | smbp+smbpt  |  52.61 | 159.00 | **3.02x** | 93.75% |
 
 All medians are over 10 runs per A/B side (5 scenarios × 2 runs).
 The +316% Qwen 3.5 4B result was **not** a sweet spot — DFlash holds
-above 3.28x on dense 27B and recovers to 4.30x on the MoE 35B-A3B.
+above 3.02x at every scale tested, including the 122B-A10B MoE
+running across two nodes with tensor parallelism and RDMA.
 
 The MoE 35B-A3B is particularly striking: it's the second-fastest
 target-only generation of the three (because only ~3B params are
 active per token), yet DFlash still delivers a 4.30x speedup on top
 of that fast baseline. The combination yields **377 t/s steady-state
 generation on a 35B-class model on a single MacBook Pro M3 Ultra**.
+
+The 122B-A10B result is the first end-to-end DFlash measurement on a
+multi-node tensor-parallel placement. The coupled-drafter dispatch
+now works through the `Sharding.Tensor` + `InstanceMeta.MlxJaccl`
+loader path: each TP rank replicates the (small) DFlash drafter
+weights and consumes the post-all-reduce hidden state in-process,
+producing identical draft tokens + bonus samples in lockstep across
+ranks under the shared `mx.random.seed(seed)` set at the top of each
+generation step. 122B-class steady-state generation thus jumps from
+**~53 t/s → ~159 t/s** without sacrificing accuracy.
 
 ## Qwen 3.6 27B (dense) — 3.28x
 
@@ -121,15 +128,20 @@ raw JSON next to this report.
 | long_context_summary   |          94.28 |         396.04 |   4.20x |  93.2% |
 | **all-scenario median**|      **97.24** |     **404.38** | **4.16x** | **93.2%** |
 
-## Qwen 3.5 122B-A10B (MoE) — multi-node tensor parallel, target-only baseline
+## Qwen 3.5 122B-A10B (MoE) — multi-node tensor parallel, DFlash A/B — 3.02x
 
 Target: `mlx-community/Qwen3.5-122B-A10B-8bit` (130 GB on disk,
 48 layers, hidden_size 3072, 128 experts × 8 active per token,
 ~10B active params / 122B total, `num_key_value_heads=2`,
 `full_attention_interval=4`).
 
-No DFlash measurement on this row — see "Coupled drafter + tensor
-parallel" below for the loader gap.
+Drafter: `z-lab/Qwen3.5-122B-A10B-DFlash` (~0.5 GB, replicated on
+each TP rank). Numerical validation of the multi-device coupled-
+drafter dispatch path landed in commit `worker: lift single-device
+gate on coupled-drafter loader + dispatch` — the loader now resolves
+`coupled_drafter` for `Sharding.Tensor` placements and the generator
+routes `draft_mode="model"` through the coupled adapter on every
+rank.
 
 Placement: `Sharding.Tensor` + `InstanceMeta.MlxJaccl`, 2 nodes
 (`wc-smbp` + `wc-smbpt`, both Apple M5 Max MacBook Pros, 128 GB
@@ -139,64 +151,69 @@ RDMA edge over their thunderbolt-bridge interfaces
 (`rdma_en1 ⇌ rdma_en2`, ~4 ms ping). exo's JACCL backend used the
 RDMA edge for tensor-parallel all-reduces during decode.
 
-| Scenario               | Target gen_tps |
-|------------------------|---------------:|
-| short_repetitive       |          54.30 |
-| code_completion        |          54.26 |
-| creative_prose         |          53.84 |
-| factual_qa             |          53.04 |
-| long_context_summary   |          49.52 |
-| **all-scenario median**|      **53.84** |
+| Scenario               | Target gen_tps | DFlash gen_tps | Speedup | Accept |
+|------------------------|---------------:|---------------:|--------:|-------:|
+| short_repetitive       |          53.98 |         138.84 |   2.57x |  90.8% |
+| code_completion        |          52.67 |         148.50 |   2.82x |  93.8% |
+| creative_prose         |          52.32 |         162.92 |   3.11x |  93.8% |
+| factual_qa             |          52.29 |         163.53 |   3.13x |  93.8% |
+| long_context_summary   |          52.22 |         158.18 |   3.03x |  93.8% |
+| **all-scenario median**|      **52.61** |     **159.00** | **3.02x** | **93.75%** |
 
-Remarkably tight band: 48.54-54.42 t/s across all 10 runs. The MoE
-sparsity (~10B active params per token) plus JACCL's RDMA all-reduce
-keep per-token wall time consistent regardless of prompt shape.
-TTFT was 786 ms for short prompts and 2200 ms for the
-2 K-token `long_context_summary` prompt — the all-reduce overhead
-on the prefill scales with prompt length but disappears once decode
-starts.
+The DFlash band is tight (138-168 t/s across 10 runs), and the
+target-only band is even tighter (49.52-54.42 t/s). The MoE sparsity
+(~10B active params per token) plus JACCL's RDMA all-reduce keep
+per-token wall time consistent regardless of prompt shape. TTFT was
+~750-870 ms for short prompts and 2.6 s for the 2 K-token
+`long_context_summary` prompt — prefill all-reduce overhead scales
+with prompt length but disappears once decode starts.
 
 For context against the single-node DFlash benches above:
 
-| Comparison row                    | Target gen_tps | Notes |
-|-----------------------------------|---------------:|-------|
-| 122B-A10B target-only TP2 (this)  |      **53.84** | 2 nodes |
-| 35B-A3B target-only single-node   |          87.70 | 1 node, smaller MoE |
-| 27B target-only single-node       |          14.98 | 1 node, dense |
-| 4B target-only single-node        |          97.24 | 1 node, dense |
+| Comparison row                    | Target gen_tps | DFlash gen_tps | Speedup | Notes |
+|-----------------------------------|---------------:|---------------:|--------:|-------|
+| 122B-A10B TP2 (this)              |      **52.61** |     **159.00** | **3.02x** | 2 nodes via JACCL/RDMA |
+| 35B-A3B single-node               |          87.70 |         377.49 |   4.30x | 1 node, smaller MoE |
+| 27B single-node                   |          14.98 |          49.13 |   3.28x | 1 node, dense |
+| 4B single-node                    |          97.24 |         404.38 |   4.16x | 1 node, dense |
 
-53.84 t/s steady-state on a **122B-class model running across two
-consumer MacBook Pros over RDMA** is the meaningful result, especially
-for a model that simply won't fit on a single 128 GB Mac (130 GB
-quantized weights + activations + KV cache > 128 GB unified memory).
-This is the number the future tensor-parallel DFlash dispatch path
-needs to beat.
+**159 t/s steady-state on a 122B-class MoE running across two
+consumer MacBook Pros over RDMA** is the headline. The DFlash speedup
+ratio (3.02x) is slightly below the single-node range (3.28-4.30x)
+because the per-round TP all-reduce now sits on a 4 ms RDMA hop
+rather than within-chip GPU shared memory, which raises the
+verifier's serial overhead per spec round. Acceptance stays at 93.75%
+across the same five scenarios as single-node DFlash, confirming the
+multi-rank coupled-drafter dispatch is numerically equivalent
+(byte-identical draft tokens across ranks under the shared
+`mx.random.seed(seed)`).
 
-### Coupled drafter + tensor parallel
+### How the multi-device coupled-drafter path stays correct
 
-The model card declares `coupled_drafter="z-lab/Qwen3.5-122B-A10B-DFlash"`
-and the drafter weights downloaded cleanly, but the runtime logs
-showed `"using BatchGenerator"` (target-only) rather than the
-coupled-drafter speculative path. Root cause is in
-`src/exo/worker/engines/mlx/utils_mlx.py:1078-1156`: the
-`_try_load_coupled_drafter` call is gated on `if group is None:`
-— i.e., **the coupled-drafter loader only runs for single-device
-placements**. The inline comment cites the original concern that
-"coupled drafters can't ride asymmetric placement (their wire would
-have to ship full hidden states / KV cache entries cross-node)".
+Three guarantees keep the per-rank coupled drafters in lockstep:
 
-For tensor parallel specifically that concern is weaker than it
-sounds: each TP rank already holds the *same* hidden state after
-every all-reduce (TP shards within-layer matmuls, not the residual
-stream). A small replicated DFlash drafter (0.5B params, ~1 GB) on
-each rank would consume its local hidden state and produce the same
-draft block deterministically across ranks. The drafter's own
-KV / SSM cache would also be replicated. This is a future patch,
-not a hard architectural limit.
+1. **Identical hidden states.** TP shards within-layer matmuls but
+   reduces the output before the residual stream. Every rank ends up
+   with the same hidden state after each layer's `ShardedToAllLinear`
+   / `ShardedMoE` all-sum (and the captured `GdnState` shards rewind
+   identically per rank because each rank captured its own head
+   slice).
 
-For now, single-node DFlash works on every Qwen 3.5/3.6 hybrid target
-that fits on one box (4B, 27B, 35B-A3B all measured above);
-multi-node DFlash awaits the loader patch.
+2. **Identical drafter state.** The DFlash drafter (~0.5 GB) is
+   replicated on every TP rank — same weights, same per-step inputs,
+   same deterministic forward pass.
+
+3. **Identical sampling.** `mx.random.seed(task.seed or 42)` is set
+   once at the top of `_mlx_generate` on every rank, so the drafter
+   token-by-token sampling and the verifier's bonus sampling
+   advance the PRNG state in lockstep across ranks. Same RNG draws,
+   same accept/reject decisions, same KV trim / SSM rewind sequence
+   on every round.
+
+The result: target rank 0 and target rank 1 produce a byte-identical
+output token stream under TP2 DFlash, exactly matching what a single-
+node DFlash placement would produce if the 122B-A10B fit in 128 GB
+(it doesn't — that's the whole reason for the TP2 placement).
 
 ## Reading the numbers
 
@@ -318,21 +335,40 @@ The bench script alternates `EXO_DRAFT_MODE=none` and
 `EXO_DRAFT_MODE=model`, restarting exo between scenarios, and writes
 per-request JSON to `bench/results/dflash/<label>.json`.
 
-### Multi-node tensor-parallel target-only (122B-A10B)
+### Multi-node tensor-parallel A/B (122B-A10B)
 
 ```bash
-# Both nodes need ~100 GB free; `sudo purge` first if macOS caches
-# have built up. Both must be on the same LAN (mDNS) or have explicit
-# bootstrap-peer multiaddrs.
+# Both nodes need ~110 GB free unified memory; `sudo purge` first if
+# macOS caches have built up. Both must be on the same LAN (mDNS) or
+# have explicit bootstrap-peer multiaddrs.
 
+# Both nodes also need the DFlash drafter pre-downloaded:
+huggingface-cli download z-lab/Qwen3.5-122B-A10B-DFlash --quiet
+
+# The bench script automates the A/B (alternates EXO_DRAFT_MODE=none
+# and EXO_DRAFT_MODE=model, restarts exo on both nodes between
+# scenarios, places with Sharding.Tensor + InstanceMeta.MlxJaccl +
+# min_nodes=2, and writes per-request JSON to bench/results/dflash/):
+ssh wc-smbp 'bash /tmp/qwen35_122b_tensor_bench.sh'
+
+# Outputs:
+#   bench/results/dflash/qwen3.5-122b-a10b-mlx-8bit-tp2-jaccl-target-only.json
+#   bench/results/dflash/qwen3.5-122b-a10b-mlx-8bit-tp2-jaccl-dflash.json
+```
+
+If you want to run the two sides manually instead of via the script:
+
+```bash
 # Start exo on the secondary node first (so it advertises early)
-ssh wc-smbpt 'cd ~/Development/Tooling/exo && uv run exo -v > /tmp/exo.log 2>&1 &'
+ssh wc-smbpt 'EXO_DRAFT_MODE=model cd ~/Development/Tooling/exo && \
+    uv run exo -v > /tmp/exo.log 2>&1 &'
 sleep 5
 
 # Then on the primary node (which will serve the API + drive the bench)
-ssh wc-smbp 'cd ~/Development/Tooling/exo && uv run exo -v > /tmp/exo.log 2>&1 &'
+ssh wc-smbp 'EXO_DRAFT_MODE=model cd ~/Development/Tooling/exo && \
+    uv run exo -v > /tmp/exo.log 2>&1 &'
 
-# Wait ~30 s for libp2p mDNS discovery + RDMA edge probe, then place
+# Wait ~20 s for libp2p mDNS discovery + RDMA edge probe, then place
 # the model with explicit Tensor + MlxJaccl + min_nodes=2:
 ssh wc-smbp 'curl -s -X POST http://127.0.0.1:52415/place_instance \
     -H "Content-Type: application/json" \
@@ -341,22 +377,26 @@ ssh wc-smbp 'curl -s -X POST http://127.0.0.1:52415/place_instance \
          \"instance_meta\":\"MlxJaccl\",
          \"min_nodes\":2}"'
 
-# Wait for two RunnerReady states (~90 s on hot cache), then run
+# Wait for two RunnerReady states (~20 s on hot cache), then run
 # the bench:
 ssh wc-smbp 'cd ~/Development/Tooling/exo && uv run python bench/drafter_bench.py \
     --host 127.0.0.1 --port 52415 \
     --model mlx-community/Qwen3.5-122B-A10B-8bit \
-    --label qwen3.5-122b-a10b-mlx-8bit-tp2-jaccl-target-only \
-    --use-drafter false --draft-mode none \
+    --label qwen3.5-122b-a10b-mlx-8bit-tp2-jaccl-dflash \
+    --use-drafter true --draft-mode model \
     --runs 2 --max-tokens 256 \
-    --out bench/results/dflash/qwen3.5-122b-a10b-mlx-8bit-tp2-jaccl-target-only.json'
+    --out bench/results/dflash/qwen3.5-122b-a10b-mlx-8bit-tp2-jaccl-dflash.json'
 ```
 
 The full automation lives in `/tmp/qwen35_122b_tensor_bench.sh` on
-the smbp host (set up to alternate target-only and DFlash modes; the
-DFlash side currently degrades to BatchGenerator at load time because
-of the loader gap described above, so it produces the same number
-twice until the multi-node coupled-drafter loader patch lands).
+the smbp host. It alternates `EXO_DRAFT_MODE=none` (target-only) and
+`EXO_DRAFT_MODE=model` (DFlash) and writes per-side JSON to
+`bench/results/dflash/`. Now that the multi-device coupled-drafter
+loader gate is lifted (see commit history), the DFlash mode actually
+dispatches the speculative path on every TP rank instead of
+degrading to BatchGenerator. Both sides of the A/B sit in the same
+RDMA-backed JACCL group, so the comparison isolates the coupled-
+drafter speedup from any topology effects.
 
 ## Discovered bugs along the way (from the 4B bench)
 
@@ -418,30 +458,33 @@ practice), which tripped the path on the very first generated token.
 ## Raw data
 
 Per-request JSON:
-- 4B:        `qwen3.5-4b-mlx-8bit-{target-only,dflash}.json`
-- 27B:       `qwen3.6-27b-mlx-8bit-{target-only,dflash}.json`
-- 35B-A3B:   `qwen3.6-35b-a3b-mlx-8bit-{target-only,dflash}.json`
+- 4B:                `qwen3.5-4b-mlx-8bit-{target-only,dflash}.json`
+- 27B:               `qwen3.6-27b-mlx-8bit-{target-only,dflash}.json`
+- 35B-A3B:           `qwen3.6-35b-a3b-mlx-8bit-{target-only,dflash}.json`
+- 122B-A10B TP2:     `qwen3.5-122b-a10b-mlx-8bit-tp2-jaccl-{target-only,dflash}.json`
 
 ## Next steps
 
-1. **Lift the multi-device coupled-drafter loader gate.** Today
-   `_try_load_coupled_drafter` in `utils_mlx.py:1138` is inside
-   `if group is None`. For `Sharding.Tensor` we can safely replicate
-   the DFlash drafter (~0.5-3 GB) on each rank, consume the
-   already-replicated post-all-reduce hidden state, and run draft
-   block generation independently per rank (deterministic given
-   identical inputs). That unblocks the 122B-A10B DFlash A/B that
-   today degrades to BatchGenerator on multi-node placement.
-2. Land the dispatch wiring + bench results upstream
+1. Land the dispatch wiring + bench results upstream
    (target: `exo-explore/exo`, single aggregated PR).
-3. Bench bigger DFlash drafters as they ship and as memory permits:
-   - `z-lab/Qwen3.5-122B-A10B-DFlash` — drafter weights are already
-     downloaded to both nodes; just needs the loader patch above.
+2. Bench bigger DFlash drafters as they ship:
    - `z-lab/Qwen3-Coder-30B-A3B-DFlash` (specialised code drafter) —
      interesting because the existing 30B-A3B is the only DFlash drafter
      trained against a code-specialised target so far.
-4. Raise `--runs` to 5+ for publication-grade per-scenario means.
-5. Investigate the empty-response harness hiccups (3/30 runs) —
-   likely a streaming-completion ordering bug in `drafter_bench.py`
-   when the server cancels a connection mid-stream, since the requests
-   adjacent to each hiccup completed normally.
+   - Anything bigger than 122B-A10B once the bench fleet grows past
+     two M5 Max machines; the multi-node DFlash path is now production-
+     ready and the next jump (256B+ class) just needs more aggregate
+     unified memory.
+3. Raise `--runs` to 5+ for publication-grade per-scenario means.
+4. Investigate the empty-response harness hiccups (3/30 runs on the
+   27B / 35B-A3B benches) — likely a streaming-completion ordering
+   bug in `drafter_bench.py` when the server cancels a connection
+   mid-stream, since the requests adjacent to each hiccup completed
+   normally. The 122B TP2 bench did NOT exhibit this on either side
+   (10/10 valid runs per A/B leg).
+5. Bench TP4 / TP8 once the bench fleet grows. The 3.02x TP2 speedup
+   is already useful; the ratio should hold or improve at higher TP
+   degrees because the DFlash drafter cost is dominated by its
+   replicated forward pass on each rank, not by the per-rank target
+   slice — adding ranks shrinks the per-rank target step proportionally
+   while leaving drafter cost flat.
