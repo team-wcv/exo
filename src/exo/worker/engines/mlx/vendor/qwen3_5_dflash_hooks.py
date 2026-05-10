@@ -358,12 +358,21 @@ def _gated_delta_net_forward_with_capture(
     state: mx.array | None = cast(
         "mx.array | None", cache_[1] if cache_ is not None else None
     )
-    # ``k.shape[-1]`` is typed ``int``; ``int ** -0.5`` collapses to
-    # ``Any`` in basedpyright's stub, but the runtime is fine. Routing
-    # the scale through an explicit ``mx.array`` keeps the
-    # subsequent ``inv_scale * q * mx.rsqrt(...)`` chain typed as
-    # ``mx.array``.
-    inv_scale = mx.array(k.shape[-1] ** -0.5)  # pyright: ignore[reportAny]
+    # CRITICAL: keep ``inv_scale`` a plain Python float (NOT
+    # ``mx.array(...)``), mirroring mlx-lm's upstream
+    # ``GatedDeltaNet.__call__`` exactly. ``mx.array(scalar)`` is a
+    # float32 0-D array, which promotes the subsequent
+    # ``inv_scale * q`` to float32 even when ``q`` is bf16, and the
+    # promoted dtype cascades into the next full-attention layer's
+    # SDPA call. On Apple Silicon the float32 SDPA kernel for
+    # ``head_dim=256, bq=32`` (Qwen 3.5's hybrid layout with a
+    # 16-token block-diffusion drafter verify) exceeds Metal's 32 KB
+    # threadgroup memory and raises ``Unable to load kernel
+    # steel_attention_float32_bq32_bk16_bd256_...``. A plain scalar
+    # preserves the operand's dtype under MLX's promotion rules and
+    # keeps the bf16 attention kernel reachable.
+    head_k_dim: int = k.shape[-1]
+    inv_scale = cast(float, head_k_dim**-0.5)
     q = inv_scale * q * mx.rsqrt((q * q).sum(axis=-1, keepdims=True) + 1e-6)
     k = k * mx.rsqrt((k * k).sum(axis=-1, keepdims=True) + 1e-6)
 
