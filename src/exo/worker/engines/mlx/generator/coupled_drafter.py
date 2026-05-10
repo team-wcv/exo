@@ -590,14 +590,30 @@ def _select_first_bonus(
     caller forwards it to ``mlx_lm.GenerationResponse`` so OpenAI-style
     ``logprobs`` requests still see real numbers on the first emitted
     token.
+
+    Shape contract: ``mlx_lm.sample_utils`` logits processors (used by
+    ``repetition_penalty``, ``presence_penalty``, ``frequency_penalty``,
+    and ``logit_bias``) all index logits as ``[:, tokens]``, i.e. they
+    require a 2D ``(batch=1, vocab)`` array; squeezing to 1D before
+    running them raises ``ValueError: Too many indices for array with
+    1 dimensions``. We therefore normalise the prefill logits to
+    ``(1, vocab)`` for the processor pipeline (mirroring what
+    ``mlx_lm.generate.generate_step`` does), then squeeze back to
+    ``(vocab,)`` at return so ``GenerationResponse.logprobs`` keeps
+    the vocab-vector shape the rest of the coupled-drafter loop
+    assumes (see ``zero_logprobs`` reset in ``stream``).
     """
-    raw = last_logits.squeeze(0).squeeze(0)
+    raw = last_logits
+    while raw.ndim > 2:
+        raw = raw.squeeze(0)
+    if raw.ndim == 1:
+        raw = raw[None, :]
     for proc in logits_processors:
         raw = proc(prev_tokens, raw)
     logprobs = raw - mx.logsumexp(raw, axis=-1, keepdims=True)
     sampled = sampler(logprobs)
     mx.eval(sampled)
-    return int(sampled.item()), logprobs
+    return int(sampled.item()), logprobs.squeeze(0)
 
 
 @final
