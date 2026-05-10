@@ -35,7 +35,10 @@ import mlx.nn as nn
 import pytest
 
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
+from exo.shared.types.common import NodeId
 from exo.shared.types.memory import Memory
+from exo.shared.types.worker.instances import DrafterPlacement
+from exo.shared.types.worker.runners import RunnerId
 from exo.worker.engines.mlx import utils_mlx
 from exo.worker.engines.mlx.utils_mlx import CoupledDrafter
 
@@ -427,11 +430,18 @@ def test_wired_bump_skipped_for_asymmetric_drafter_placement(
     monkeypatch.setattr(utils_mlx, "_drafter_weight_size_bytes", fake_size_two_gb)
     monkeypatch.delenv(utils_mlx.EXO_DISABLE_DRAFTER_ENV, raising=False)
 
-    sentinel_placement = object()
+    asymmetric_placement = DrafterPlacement(
+        drafter_node_id=NodeId(),
+        drafter_runner_id=RunnerId(),
+        drafter_model_id=standard_id,
+        drafter_rank=1,
+        drafter_socket_host="127.0.0.1",
+        drafter_socket_port=60001,
+    )
     bump = utils_mlx._collocated_drafter_wired_bytes(
         target_card=card,
         group=None,
-        drafter_placement=sentinel_placement,
+        drafter_placement=asymmetric_placement,
     )
     assert bump.in_bytes == 0, (
         f"asymmetric drafter placement must contribute 0 wired bytes; "

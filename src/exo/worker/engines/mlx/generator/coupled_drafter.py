@@ -56,7 +56,9 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.generate import GenerationResponse
 from mlx_lm.models.gemma4_text import Model as Gemma4Model
+from mlx_lm.models.qwen3_5 import Model as Qwen3_5Model
 from mlx_lm.models.qwen3_5 import Qwen3_5TextModel
+from mlx_lm.models.qwen3_5 import TextModel as Qwen3_5LanguageModel
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.worker.engines.mlx.types import KVCacheType, Model
@@ -329,7 +331,19 @@ class Qwen3_5DFlashTargetAdapter:  # noqa: N801 -- mirrors mlx-lm's "Qwen3_5" na
         # therefore accept / reject decisions in coupled decoding.
         # ``rollback_speculative_cache`` ignores its ``target`` argument
         # but accepts the wrapper for API parity with the forward.
-        self._lm_head_owner: object = target_model
+        # The union covers the three shapes the loader can hand us:
+        # the inner walker (no wrapper present → tied-only path), the
+        # mid wrapper ``TextModel`` (owns ``lm_head`` + ``args``), or
+        # the multimodal ``Model`` wrapper (exposes the LM via
+        # ``.language_model``). All three are accepted by
+        # :func:`qwen3_5_dflash_forward` and
+        # :func:`_resolve_lm_head_owner`.
+        self._lm_head_owner: Qwen3_5Model | Qwen3_5LanguageModel | Qwen3_5TextModel = (
+            cast(
+                "Qwen3_5Model | Qwen3_5LanguageModel | Qwen3_5TextModel",
+                target_model,
+            )
+        )
 
     @property
     def target(self) -> Qwen3_5TextModel:

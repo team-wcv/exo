@@ -53,6 +53,7 @@ from exo.shared.types.tasks import TextGeneration
 from exo.shared.types.text_generation import ChatTemplateValue, TextGenerationTaskParams
 from exo.shared.types.worker.instances import (
     BoundInstance,
+    DrafterPlacement,
     MlxJacclInstance,
     MlxRingInstance,
 )
@@ -1103,7 +1104,7 @@ def _collocated_drafter_wired_bytes(
     *,
     target_card: ModelCard,
     group: mx.distributed.Group | None,
-    drafter_placement: object,
+    drafter_placement: DrafterPlacement | None,
 ) -> Memory:
     """Bytes to add to the wired-memory limit for a collocated drafter.
 
@@ -1143,9 +1144,7 @@ def _collocated_drafter_wired_bytes(
         target_card: The target model card.
         group: The MLX distributed group, or ``None`` for single-device.
         drafter_placement: ``bound_instance.instance.drafter_placement``,
-            an asymmetric ``DrafterPlacement`` or ``None``. Typed
-            ``object`` here to keep the import surface narrow at the
-            sizing layer.
+            an asymmetric :class:`DrafterPlacement` or ``None``.
 
     Returns:
         ``Memory.from_bytes(0)`` when no bump is needed; otherwise the
