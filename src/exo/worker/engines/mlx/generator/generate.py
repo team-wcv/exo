@@ -1784,13 +1784,28 @@ def mlx_generate(
                     telemetry_k = effective_num_draft_tokens
 
                 # Pull per-round counters from the drafter when it
-                # surfaces them. Only the pipelined drafter does today;
-                # ``getattr(..., None)`` keeps this future-proof for
-                # drafter implementations that grow a ``metrics()``
-                # method later. ``mlx_lm``'s built-in spec loop doesn't
-                # expose proposal counts, so the ``"model"`` mode
-                # surfaces only ``accepted_draft_tokens`` (from the
-                # ``from_draft`` flag on each yielded token).
+                # surfaces them. Only the pipelined and coupled drafters
+                # do today; ``getattr(..., None)`` keeps this future-
+                # proof for drafter implementations that grow a
+                # ``metrics()`` method later. ``mlx_lm``'s built-in spec
+                # loop doesn't expose proposal counts, so the standard
+                # ``"model"`` mode surfaces only ``accepted_draft_tokens``
+                # (from the ``from_draft`` flag on each yielded token).
+                #
+                # Codex P2 (PR #25 round-(N+2), coupled_drafter.py:569):
+                # the coupled path emits both accepted drafts AND a
+                # verifier bonus token per round but yields a flat token
+                # stream with no per-token provenance, so flagging every
+                # round-loop emission as ``from_draft=True`` produced
+                # ``accepted > proposed`` on high-acceptance runs (full-
+                # acceptance round of K drafts emits K+1 tokens, all
+                # marked accepted, while proposed counts only K).
+                # :class:`CoupledModelDrafter` now reports
+                # ``accepted_draft_tokens`` directly (sum of
+                # ``drafter.accept_lens``) and emits ``from_draft=False``
+                # on every round-loop response, so we prefer the
+                # metric over the per-emit tally when the drafter
+                # surfaces it.
                 drafter_metrics_fn = cast(
                     "Callable[[], dict[str, int]] | None",
                     getattr(drafter, "metrics", None),
@@ -1800,6 +1815,16 @@ def mlx_generate(
                 )
                 proposed = int(drafter_metrics.get("proposed_draft_tokens", 0))
                 spec_rounds = int(drafter_metrics.get("spec_decode_rounds", 0))
+                accepted_from_metrics: int | None = (
+                    int(drafter_metrics["accepted_draft_tokens"])
+                    if "accepted_draft_tokens" in drafter_metrics
+                    else None
+                )
+                accepted = (
+                    accepted_from_metrics
+                    if accepted_from_metrics is not None
+                    else from_draft_count
+                )
 
                 stats = GenerationStats(
                     prompt_tps=float(prefill_tps or out.prompt_tps),
@@ -1808,7 +1833,7 @@ def mlx_generate(
                     generation_tokens=int(out.generation_tokens),
                     peak_memory_usage=Memory.from_gb(out.peak_memory),
                     drafter_model_id=telemetry_drafter_id,
-                    accepted_draft_tokens=from_draft_count,
+                    accepted_draft_tokens=accepted,
                     proposed_draft_tokens=proposed,
                     spec_decode_rounds=spec_rounds,
                     num_draft_tokens=telemetry_k,
@@ -1830,7 +1855,7 @@ def mlx_generate(
                 # populate this when the drafter surfaces a proposal
                 # count; otherwise leave it at 0 rather than guess.
                 rejected_prediction_tokens = (
-                    max(0, proposed - from_draft_count) if proposed > 0 else 0
+                    max(0, proposed - accepted) if proposed > 0 else 0
                 )
                 total_prompt_tokens = len(all_prompt_tokens)
                 usage = Usage(
@@ -1842,7 +1867,7 @@ def mlx_generate(
                     ),
                     completion_tokens_details=CompletionTokensDetails(
                         reasoning_tokens=0,
-                        accepted_prediction_tokens=from_draft_count,
+                        accepted_prediction_tokens=accepted,
                         rejected_prediction_tokens=rejected_prediction_tokens,
                     ),
                 )

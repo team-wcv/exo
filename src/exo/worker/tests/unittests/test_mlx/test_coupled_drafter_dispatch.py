@@ -296,11 +296,24 @@ def test_stream_yields_first_bonus_with_finish_reason_none() -> None:
     assert first.generation_tokens == 1
 
 
-def test_stream_marks_round_loop_tokens_as_from_draft() -> None:
-    """Round-loop tokens carry ``from_draft=True`` so the existing
-    ``accepted_draft_tokens`` accumulator in :func:`mlx_generate`
-    counts them; without this the coupled path would zero out
-    acceptance metrics."""
+def test_stream_does_not_flag_round_loop_tokens_as_from_draft() -> None:
+    """Codex P2 (PR #25 round-(N+2), coupled_drafter.py:569): every
+    ``_mtp_rounds`` round emits ``accept_lens[i] + 1`` tokens (the
+    accepted drafts plus one verifier bonus), but the coupled path
+    receives them as a flat token stream without per-token
+    provenance. Pre-fix every round-loop emission was tagged
+    ``from_draft=True``, which let ``from_draft_count`` exceed
+    ``proposed_draft_tokens`` on high-acceptance runs and corrupted
+    acceptance-rate dashboards.
+
+    The corrected contract: round-loop emissions carry
+    ``from_draft=False`` (because we cannot honestly attribute each
+    token), and the authoritative acceptance count is surfaced via
+    :meth:`CoupledModelDrafter.metrics` (sum of
+    ``drafter.accept_lens``). ``mlx_generate`` prefers the metric
+    over the per-emit tally, so acceptance ratios stay bounded in
+    ``[0, 1]``.
+    """
     target = _build_tiny_gemma4_with_hooks()
     drafter = _StubGemma4Drafter()
     responses, _ = _run_stream(
@@ -310,15 +323,12 @@ def test_stream_marks_round_loop_tokens_as_from_draft() -> None:
         max_tokens=4,
     )
 
-    # Strip the closing chunk; only mid-stream chunks carry the
-    # per-token from_draft flag (the closing chunk's flag is a
-    # convenience summary).
-    mid_stream = [r for r in responses[:-1] if r.finish_reason is None]
-    if len(mid_stream) > 1:
-        round_loop_tokens = mid_stream[1:]
-        assert all(r.from_draft for r in round_loop_tokens), (
-            "round-loop tokens must be flagged as drafter-accepted"
-        )
+    assert all(not r.from_draft for r in responses), (
+        "no coupled emission should claim from_draft attribution; "
+        "the round-loop yields a flat stream of accepted-drafts + "
+        "verifier-bonus mixed without per-token provenance, so the "
+        "authoritative acceptance count comes from drafter.metrics()"
+    )
 
 
 def test_stream_respects_max_tokens() -> None:
@@ -390,6 +400,60 @@ def test_metrics_returns_zeros_before_stream_runs() -> None:
     metrics = coupled.metrics()
     assert metrics["spec_decode_rounds"] == 0
     assert metrics["proposed_draft_tokens"] == 0
+    assert metrics["accepted_draft_tokens"] == 0
+
+
+def test_metrics_accepted_never_exceeds_proposed() -> None:
+    """Codex P2 (PR #25 round-(N+2), coupled_drafter.py:569): the
+    acceptance ratio (``accepted / proposed``) MUST stay bounded in
+    ``[0, 1]``. Pre-fix every round-loop emit was tagged
+    ``from_draft=True`` and the per-round verifier bonus was counted
+    as a draft, so a full-acceptance round of K drafts produced K+1
+    "accepted" tokens against K proposed, inflating the ratio above
+    1.0 and corrupting acceptance dashboards.
+
+    The corrected accounting sources ``accepted_draft_tokens`` from
+    ``sum(drafter.accept_lens)`` (the canonical mlx-vlm tally of
+    actual drafts the verifier accepted), which is bounded by
+    ``rounds * (block_size - 1) == proposed_draft_tokens`` because
+    each round can accept at most ``block_size - 1`` drafts.
+    """
+    target = _build_tiny_gemma4_with_hooks()
+    drafter = _StubGemma4Drafter()
+    coupled = CoupledModelDrafter(
+        target_adapter=Gemma4MTPTargetAdapter(target),
+        drafter=cast("nn.Module", drafter),
+        kind="mtp",
+        num_draft_tokens=2,
+    )
+    tokenizer = _StubTokenizer()
+
+    cache: list[Any] = cast("list[Any]", target.make_cache())
+    _ = target(mx.array([[1, 2]]), cache=cache)
+    _ = list(
+        coupled.stream(
+            model=cast("Model", cast("object", target)),
+            tokenizer=cast("TokenizerWrapper", cast("object", tokenizer)),
+            prompt=mx.array([3, 4]),
+            context_tokens=[1, 2, 3, 4],
+            prompt_cache=cast("KVCacheType", cache),
+            max_tokens=8,
+            sampler=_greedy_sampler,
+            logits_processors=[],
+        )
+    )
+
+    metrics = coupled.metrics()
+    proposed = metrics["proposed_draft_tokens"]
+    accepted = metrics["accepted_draft_tokens"]
+    assert accepted >= 0, (
+        f"accepted_draft_tokens must be non-negative; got {accepted}"
+    )
+    assert accepted <= proposed, (
+        f"accepted_draft_tokens ({accepted}) must not exceed "
+        f"proposed_draft_tokens ({proposed}) -- pre-fix the verifier "
+        f"bonus was double-counted into the acceptance tally"
+    )
 
 
 def test_stream_prompt_tps_brackets_actual_prefill_call(

@@ -383,11 +383,30 @@ class CoupledModelDrafter:
 
         mlx-vlm's ``_mtp_rounds`` appends one entry to
         ``drafter.accept_lens`` per round, so ``len(accept_lens)`` is
-        the round count. Each round proposes ``block_size - 1`` drafts;
-        the round loop reduces the block when it would overrun
-        ``max_tokens``, but we don't have visibility into per-round
-        sizing, so we use the configured block as an upper bound on
-        proposals. Acceptance arithmetic uses ``accept_lens`` directly.
+        the round count and ``accept_lens[i]`` is the number of
+        proposed drafts the verifier accepted in round ``i``. Each
+        round emits ``accept_lens[i] + 1`` tokens total: the accepted
+        drafts plus one verifier bonus. Each round proposes
+        ``block_size - 1`` drafts (mlx-vlm's round loop reduces the
+        block when it would overrun ``max_tokens``, but we don't have
+        per-round sizing so we use the configured block as an upper
+        bound on proposals).
+
+        Codex P2 (PR #25 round-(N+2), coupled_drafter.py:569):
+        ``accepted_draft_tokens`` MUST be surfaced authoritatively
+        here rather than inferred from ``GenerationResponse.from_draft``
+        downstream. The round loop emits both accepted drafts AND the
+        verifier bonus per round; without per-token provenance we
+        cannot tell which a given emission is, so the
+        ``GenerationResponse.from_draft`` flag is set to ``False`` on
+        every coupled emission and ``GenerationStats.accepted_draft_tokens``
+        is sourced from this metric instead. Pre-fix the code marked
+        every round-loop emit as ``from_draft=True``, which produced
+        ``accepted_draft_tokens > proposed_draft_tokens`` on
+        high-acceptance runs (full-acceptance round of K drafts emits
+        K+1 tokens, all flagged accepted, while proposed counts only
+        K). The corrected accounting keeps acceptance ratios bounded
+        in [0, 1].
         """
         accept_lens_obj: object = getattr(self._drafter, "accept_lens", [])
         accept_lens: list[int] = (
@@ -398,9 +417,11 @@ class CoupledModelDrafter:
         rounds = len(accept_lens)
         block_size = self._resolve_block_size()
         proposed = rounds * max(0, block_size - 1)
+        accepted = sum(accept_lens)
         return {
             "spec_decode_rounds": rounds,
             "proposed_draft_tokens": proposed,
+            "accepted_draft_tokens": accepted,
         }
 
     def _resolve_block_size(self) -> int:
@@ -559,14 +580,24 @@ class CoupledModelDrafter:
                     text=detokenizer.last_segment,
                     token=token,
                     logprobs=zero_logprobs,
-                    # mlx-vlm's _mtp_rounds counts ALL post-bonus tokens
-                    # as drafter-accepted (the round emits drafts the
-                    # target validated PLUS one bonus). Without per-token
-                    # provenance from the loop we can't separate them, so
-                    # we conservatively flag every round-loop token as
-                    # ``from_draft=True`` -- this matches mlx-vlm's own
-                    # accounting and keeps acceptance metrics meaningful.
-                    from_draft=True,
+                    # Codex P2 (PR #25 round-(N+2), coupled_drafter.py:569):
+                    # each ``_mtp_rounds`` round emits both the accepted
+                    # draft tokens AND one verifier bonus, but we only
+                    # see a flat token stream out of the round loop
+                    # without per-token provenance. Pre-fix every
+                    # round-loop emission was flagged ``from_draft=True``,
+                    # which let ``from_draft_count`` exceed
+                    # ``proposed_draft_tokens`` on high-acceptance runs
+                    # (full-acceptance round of K drafts produces K+1
+                    # emits, all marked accepted, while proposed counts
+                    # only K) and corrupted acceptance-rate dashboards.
+                    # We now set ``from_draft=False`` for every coupled
+                    # emission and surface the authoritative acceptance
+                    # count via :meth:`metrics`'s
+                    # ``accepted_draft_tokens`` (sum of
+                    # ``drafter.accept_lens``). ``mlx_generate`` prefers
+                    # the metric over the per-emit flag.
+                    from_draft=False,
                     prompt_tokens=prompt_tail_size,
                     prompt_tps=prompt_tps,
                     generation_tokens=emitted,
@@ -581,7 +612,14 @@ class CoupledModelDrafter:
             text=detokenizer.last_segment,
             token=last_token,
             logprobs=last_logprobs,
-            from_draft=emitted > 1,
+            # Codex P2 (PR #25 round-(N+2), coupled_drafter.py:569):
+            # the closing chunk also avoids claiming draft attribution.
+            # Pre-fix this used ``emitted > 1`` as a heuristic ("any
+            # round-loop activity counted as drafted"), which double-
+            # counted alongside per-emit flags. ``GenerationStats``
+            # now sources the acceptance count from :meth:`metrics`
+            # exclusively.
+            from_draft=False,
             prompt_tokens=prompt_tail_size,
             prompt_tps=prompt_tps,
             generation_tokens=emitted,
