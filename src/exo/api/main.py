@@ -677,7 +677,17 @@ class API:
         instance = payload.instance
         model_card = await ModelCard.load(instance.shard_assignments.model_id)
         required_memory = model_card.storage_size
-        placement_node_ids = [nid for nid, _, _ in instance.shard_assignments.shards]
+        # Preserve the legacy admission semantics by deduplicating node
+        # IDs the way the old ``node_to_runner`` dict did. PR #2058's
+        # new ``shards`` sequence can in principle carry multiple shards
+        # per node; admitting on raw shard count would route us through
+        # the multi-node memory path when the placement is actually
+        # single-node, oversubscribing the host (Codex P2). ``dict.fromkeys``
+        # keeps the first occurrence order so the rest of the function
+        # observes the same node ordering as before.
+        placement_node_ids = list(
+            dict.fromkeys(nid for nid, _, _ in instance.shard_assignments.shards)
+        )
 
         if len(placement_node_ids) == 1:
             node_id = placement_node_ids[0]
@@ -834,7 +844,12 @@ class API:
 
             instance = new_instances[0]
             shard_assignments = instance.shard_assignments
-            placement_node_ids = list(s.node_id for s in shard_assignments.shards)
+            # Dedupe node IDs to preserve the legacy ``node_to_runner``
+            # admission semantics (one entry per node). See the
+            # ``create_instance`` site above for the same Codex P2 fix.
+            placement_node_ids = list(
+                dict.fromkeys(s.node_id for s in shard_assignments.shards)
+            )
 
             memory_delta_by_node: dict[str, int] = {}
             if placement_node_ids:
@@ -1874,10 +1889,24 @@ class API:
         return JSONResponse(content="Ollama is running")
 
     async def ollama_chat(
-        self, request: OllamaChatRequest
+        self, request: Request
     ) -> OllamaChatResponse | StreamingResponse:
-        """Ollama Chat API — accepts JSON regardless of Content-Type."""
-        task_params = ollama_request_to_text_generation(request)
+        """Ollama Chat API — accepts JSON regardless of Content-Type.
+
+        Parses the body manually rather than declaring an
+        ``OllamaChatRequest`` typed parameter. FastAPI's typed-body
+        path delegates to its JSON dispatcher, which can reject
+        requests with missing or non-JSON ``Content-Type`` headers
+        with 422. Several Ollama-compatible clients omit the header
+        entirely, so the contract is to read the raw body and let
+        Pydantic enforce the schema. Upstream PR #2058 unconditionally
+        switched this signature to the typed body model alongside the
+        shard refactor; we keep the manual parsing here to preserve
+        Ollama compatibility (Codex P1).
+        """
+        body = await request.body()
+        payload = OllamaChatRequest.model_validate_json(body)
+        task_params = ollama_request_to_text_generation(payload)
         resolved_model = await self._resolve_and_validate_text_model(
             ModelId(task_params.model)
         )
@@ -1885,7 +1914,7 @@ class API:
 
         command = await self._send_text_generation_with_images(task_params)
 
-        if request.stream:
+        if payload.stream:
             return StreamingResponse(
                 generate_ollama_chat_stream(
                     command.command_id,
@@ -1908,10 +1937,16 @@ class API:
             )
 
     async def ollama_generate(
-        self, request: OllamaGenerateRequest
+        self, request: Request
     ) -> OllamaGenerateResponse | StreamingResponse:
-        """Ollama Generate API — accepts JSON regardless of Content-Type."""
-        task_params = ollama_generate_request_to_text_generation(request)
+        """Ollama Generate API — accepts JSON regardless of Content-Type.
+
+        See ``ollama_chat`` for the rationale; same Content-Type
+        compatibility concern (Codex P1, PR #2058 inheritance).
+        """
+        body = await request.body()
+        payload = OllamaGenerateRequest.model_validate_json(body)
+        task_params = ollama_generate_request_to_text_generation(payload)
         resolved_model = await self._resolve_and_validate_text_model(
             ModelId(task_params.model)
         )
@@ -1919,7 +1954,7 @@ class API:
 
         command = await self._send_text_generation_with_images(task_params)
 
-        if request.stream:
+        if payload.stream:
             return StreamingResponse(
                 generate_ollama_generate_stream(
                     command.command_id,
@@ -1975,9 +2010,15 @@ class API:
             ]
         )
 
-    async def ollama_show(self, request: OllamaShowRequest) -> OllamaShowResponse:
-        """Returns model information in Ollama show format."""
-        model_name = request.name or request.model
+    async def ollama_show(self, request: Request) -> OllamaShowResponse:
+        """Returns model information in Ollama show format.
+
+        See ``ollama_chat`` for the rationale; same Content-Type
+        compatibility concern (Codex P1, PR #2058 inheritance).
+        """
+        body = await request.body()
+        payload = OllamaShowRequest.model_validate_json(body)
+        model_name = payload.name or payload.model
         if not model_name:
             raise HTTPException(status_code=400, detail="name or model is required")
         try:
