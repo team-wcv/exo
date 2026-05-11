@@ -394,6 +394,7 @@ class Master:
                                 self.state.node_network,
                                 download_status=self.state.downloads,
                                 node_rdma_ctl=self.state.node_rdma_ctl,
+                                node_identities=self.state.node_identities,
                                 on_drafter_placement_degraded=drafter_degradation_events.append,
                             )
 

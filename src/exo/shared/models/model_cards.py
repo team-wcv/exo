@@ -215,7 +215,30 @@ class ModelCard(FrozenModel):
     # request still completes, the operator just doesn't get the asymmetric
     # speedup until they fix the eligibility list. Empty (the default) preserves
     # legacy single-device drafter behaviour.
+    #
+    # **Stability**: A node's ``NodeId`` is a libp2p peer ID derived from the
+    # node's persistent keypair. It survives normal reboots and re-elections,
+    # but regenerates if the operator wipes the keypair (e.g. ``rm -rf
+    # ~/.exo``). If that happens, this list goes stale and placement degrades
+    # until the operator re-pins the new NodeIds. For deployments that
+    # routinely wipe state, prefer ``drafter_eligible_friendly_names`` below,
+    # which is resolved against the live topology at placement time.
     drafter_eligible_nodes: list[NodeId] = Field(default_factory=list)
+    # Same operator-controlled eligibility list as ``drafter_eligible_nodes``,
+    # but identifying nodes by their human-readable ``friendly_name`` (the
+    # hostname-derived label exposed in ``state.node_identities``, e.g.
+    # ``"wc-bmbp"``). At placement time these names are resolved against the
+    # live ``node_identities`` map and merged with ``drafter_eligible_nodes``;
+    # a friendly name that doesn't match any currently-known node is
+    # silently dropped (placement falls back exactly as if the entry weren't
+    # there, emitting ``DrafterPlacementDegraded`` only if the merged set is
+    # empty). Use this field instead of ``drafter_eligible_nodes`` whenever
+    # the override config needs to survive operator state wipes / NodeId
+    # regeneration / cross-deployment portability. The two fields compose:
+    # an override can pin some nodes by NodeId (for cross-friendly-name
+    # ambiguity) and others by friendly name. Empty (the default) preserves
+    # legacy behaviour.
+    drafter_eligible_friendly_names: list[str] = Field(default_factory=list)
     # Nodes the operator has designated as eligible *prefill-only* hosts for
     # this model. When non-empty, placement auto-creates a single-rank
     # prefill-only sibling instance on each viable node (sufficient RAM,
