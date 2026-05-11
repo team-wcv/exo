@@ -72,6 +72,34 @@ async def _get_interface_types_from_networksetup() -> dict[str, InterfaceType]:
     for line in result.stdout.decode().splitlines():
         if line.startswith("Hardware Port:"):
             port_name = line.split(":", 1)[1].strip()
+            # Classification by hardware-port name. Order matters because
+            # several macOS port names overlap in keywords.
+            #
+            # Examples observed on the team-wcv cluster:
+            #
+            #   "Wi-Fi"                                  -> wifi
+            #   "USB 10/100/1G/2.5G/5G/10G LAN"          -> ethernet (dongle)
+            #   "Thunderbolt Ethernet Slot 1, Port 1"    -> ethernet (TB
+            #       dock NIC: a wired NIC sitting BEHIND a TB-attached
+            #       dock; carries real wired LAN, NOT a peer-cable TB
+            #       bridge)
+            #   "Ethernet Adapter (en3)"                 -> ethernet
+            #       (macOS-internal stubs; later filtered out because
+            #       they have no usable IPv4)
+            #   "Thunderbolt 1" / "Thunderbolt 2" / "Thunderbolt 3"
+            #   "Thunderbolt Bridge"                     -> thunderbolt
+            #       (peer-to-peer TB bridge cable between two Macs,
+            #       carrying the 192.168.0.x /30 subnets)
+            #
+            # The presence of "Ethernet" or "LAN" in the hardware-port
+            # name is the authoritative signal that an actual wired NIC
+            # sits behind the port -- regardless of whether the NIC is
+            # plumbed in via USB, PCIe, or a TB dock. The earlier
+            # "Thunderbolt prefix wins" rule was wrong: it swept
+            # TB-dock NICs into the thunderbolt bucket, which deranks
+            # them under MlxJaccl coordinator selection (where
+            # ring=False puts thunderbolt LAST) and prevents real
+            # wired LAN from winning the control-plane wire.
             if "Wi-Fi" in port_name:
                 current_type = "wifi"
             elif "Ethernet" in port_name or "LAN" in port_name:
@@ -82,9 +110,11 @@ async def _get_interface_types_from_networksetup() -> dict[str, InterfaceType]:
                 current_type = "unknown"
         elif line.startswith("Device:"):
             device = line.split(":", 1)[1].strip()
-            # enX is ethernet adapters or thunderbolt - these must be deprioritised
-            if device.startswith("en") and device not in ["en0", "en1"]:
-                current_type = "maybe_ethernet"
+            # The hardware-port name is authoritative; no device-name
+            # downgrade. Macs label TB peer-cable ports as "Thunderbolt N"
+            # without "Ethernet" in them, so the port-name pass above
+            # already distinguishes those from the TB dock NICs whose
+            # names contain "Ethernet".
             types[device] = current_type
 
     return types
