@@ -19,11 +19,15 @@ End-to-end correctness with real MLX weights is exercised by the smoke
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import pytest
+
+if TYPE_CHECKING:
+    import mlx.core as mx
 
 from exo.worker.engines.mlx.generator.drafter_transport import (
     ALL_TRANSPORT_KINDS,
@@ -1218,3 +1222,210 @@ class TestGetTokenizerVocabSize:
         assert full_size is not None
         added_token_id = 32002  # within added-vocab range
         assert 0 <= added_token_id < full_size
+
+
+class TestProcessLogitsForPositionShapeContract:
+    """Regression cover for the asymmetric+pipelined drafter crash:
+    ``mlx_lm.sample_utils.repetition_penalty_processor`` (and the
+    presence/frequency processors) indexes logits as ``logits[:, tokens]``,
+    so it requires ``[batch, vocab]`` shape. ``_process_logits_for_position``
+    is invoked once per draft position with 1D ``[vocab]`` logits in the
+    pipelined+remote spec loop. Pre-fix the call sequence
+    ``mlx_generate -> pipelined_drafter._pipelined_speculative_step_body
+    -> _process_logits_for_position -> repetition_penalty_processor`` crashed
+    the runner with ``ValueError: Too many indices for array with 1
+    dimensions`` whenever the model card declared a non-zero
+    ``repetition_penalty`` (Qwen 3.5 397B's thinking defaults of 1.0 hit
+    this; so do most card defaults). The fix expands to 2D for the
+    processor loop and squeezes back before logsumexp, so a single-position
+    1D call now survives the processor chain.
+    """
+
+    @staticmethod
+    def _process(
+        raw_logits: "mx.array",
+        prev_tokens: "mx.array",
+        processors: "list[Callable[[mx.array, mx.array], mx.array]]",
+    ) -> "mx.array":
+        from exo.worker.engines.mlx.generator import pipelined_drafter
+
+        return pipelined_drafter._process_logits_for_position(  # pyright: ignore[reportPrivateUsage]
+            raw_logits,
+            prev_tokens,
+            processors,
+        )
+
+    def test_1d_logits_survive_mlx_lm_style_processor(self) -> None:
+        """An ``mlx-lm``-style processor that does ``logits[:, tokens]``
+        used to crash on 1D inputs. After the fix, the processor sees
+        the expanded ``[1, vocab]`` view and the per-position output
+        stays 1D ``[vocab]``."""
+        import mlx.core as mx
+
+        vocab = 8
+        prev = mx.array([1, 3, 5], dtype=mx.int32)
+        raw = mx.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
+
+        def mlx_lm_style_repetition_penalty(
+            tokens: mx.array, logits: mx.array
+        ) -> mx.array:
+            # Mirrors the failing slice in
+            # ``mlx_lm.sample_utils.repetition_penalty_processor``.
+            selected = logits[:, tokens]
+            scaled = mx.where(selected < 0, selected * 1.1, selected / 1.1)
+            logits[:, tokens] = scaled
+            return logits
+
+        out = self._process(raw, prev, [mlx_lm_style_repetition_penalty])
+        assert isinstance(out, mx.array)
+        assert out.shape == (vocab,)
+        # Logsumexp normalisation produces a valid log-prob distribution
+        # regardless of the processor; check the invariant explicitly.
+        assert float(mx.exp(out).sum().item()) == pytest.approx(  # pyright: ignore[reportUnknownMemberType]
+            1.0, rel=1e-4
+        )
+
+    def test_2d_logits_pass_through_unchanged(self) -> None:
+        """When upstream already passes ``[batch, vocab]`` (e.g. future
+        callers that don't squeeze), the helper must not re-expand."""
+        import mlx.core as mx
+
+        raw_2d = mx.array([[0.1, 0.2, 0.3, 0.4]])
+        out = self._process(raw_2d, mx.array([], dtype=mx.int32), [])
+        assert isinstance(out, mx.array)
+        assert out.shape == (1, 4)
+
+    def test_empty_processor_list_is_noop_modulo_logsumexp(self) -> None:
+        """No processors means the only transformation is the
+        normalisation. The 1D-fix path must not corrupt shape for the
+        no-processor case (common when ``temperature == 0`` and no
+        penalties are configured)."""
+        import mlx.core as mx
+
+        raw = mx.array([1.0, 2.0, 3.0, 4.0])
+        out = self._process(raw, mx.array([], dtype=mx.int32), [])
+        assert isinstance(out, mx.array)
+        assert out.shape == (4,)
+        assert float(mx.exp(out).sum().item()) == pytest.approx(  # pyright: ignore[reportUnknownMemberType]
+            1.0, rel=1e-4
+        )
+
+
+class TestRemoteTransportSubmitEndSessionShutdownRace:
+    """Regression cover for the executor-shutdown race in
+    ``RemoteTransport._submit_end_session``.
+
+    Python's ``concurrent.futures.thread.ThreadPoolExecutor.submit``
+    raises ``RuntimeError`` on two distinct shutdown paths that both
+    show up during ``mlx_generate``'s ``GeneratorExit`` cleanup:
+
+      * "cannot schedule new futures after shutdown" -- this executor
+        was shut down by ``RemoteTransport.shutdown()`` on a sibling
+        thread.
+      * "cannot schedule new futures after interpreter shutdown" --
+        ``concurrent.futures.thread._python_exit`` (the atexit handler)
+        set the module-level ``_shutdown`` flag during process
+        teardown.
+
+    The wire is dead in both cases; ``_submit_end_session`` must
+    swallow both message variants. An earlier fix only matched the
+    first message, so the atexit variant still leaked
+    ``WARNING: asymmetric drafter session shutdown raised`` and
+    blocked clean task teardown. Genuine ``RuntimeError`` (anything
+    else) must still propagate.
+    """
+
+    @staticmethod
+    def _build_transport(
+        submit_error: Exception | None,
+        *,
+        is_shutdown: bool = False,
+        explode_on_submit: bool = False,
+    ) -> object:
+        """Construct a ``RemoteTransport`` with stubbed-out executor.
+
+        Uses ``__new__`` so we never touch the real socket /
+        ThreadPoolExecutor; ``_submit_end_session`` only reads
+        ``_is_shutdown`` and ``_executor`` so those are all we need to
+        populate. Returns as ``object`` to avoid lying about the
+        attribute being a real ``ThreadPoolExecutor`` -- the call
+        sites cast via ``getattr`` to keep basedpyright happy without
+        loosening the attribute typing on ``RemoteTransport`` itself.
+        """
+
+        from exo.worker.engines.mlx.generator import remote_drafter
+
+        class _StubExecutor:
+            def submit(self, *_args: object, **_kwargs: object) -> object:
+                if explode_on_submit:
+                    raise AssertionError(
+                        "submit must not be called when _is_shutdown=True"
+                    )
+                if submit_error is not None:
+                    raise submit_error
+                fut: Future[None] = Future()
+                fut.set_result(None)
+                return fut
+
+        transport: object = remote_drafter.RemoteTransport.__new__(
+            remote_drafter.RemoteTransport
+        )
+        # Set up the two attributes the SUT reads. ``setattr`` keeps
+        # the assignment off the strict attribute-type checker.
+        setattr(transport, "_is_shutdown", is_shutdown)  # noqa: B010
+        setattr(transport, "_executor", _StubExecutor())  # noqa: B010
+        return transport
+
+    @staticmethod
+    def _call_submit_end_session(transport: object, session_id: int) -> None:
+        """Invoke the private method via ``getattr`` so basedpyright
+        doesn't need ``transport`` to be the concrete RemoteTransport
+        type (the stub-executor attribute setup above already makes
+        that impossible without lying)."""
+
+        getattr(transport, "_submit_end_session")(session_id)  # noqa: B009
+
+    def test_executor_shutdown_message_is_swallowed(self) -> None:
+        """The classic ``RemoteTransport.shutdown()``-during-cleanup
+        race. Submit raises with the executor-level message and
+        ``_submit_end_session`` must return cleanly."""
+
+        err = RuntimeError("cannot schedule new futures after shutdown")
+        transport = self._build_transport(err)
+        self._call_submit_end_session(transport, 123)
+
+    def test_interpreter_shutdown_message_is_swallowed(self) -> None:
+        """The atexit-driven ``_python_exit`` race -- the variant the
+        first iteration of this guard missed. Submit raises with the
+        interpreter-level message and ``_submit_end_session`` must
+        return cleanly."""
+
+        err = RuntimeError(
+            "cannot schedule new futures after interpreter shutdown"
+        )
+        transport = self._build_transport(err)
+        self._call_submit_end_session(transport, 123)
+
+    def test_unrelated_runtime_error_propagates(self) -> None:
+        """Any ``RuntimeError`` whose message isn't one of the two
+        well-defined shutdown races is a genuine bug and must surface.
+        Pre-fix that was the desired behaviour for everything;
+        post-fix it must still be the behaviour for non-shutdown
+        errors."""
+
+        err = RuntimeError("something else entirely")
+        transport = self._build_transport(err)
+        with pytest.raises(RuntimeError, match="something else entirely"):
+            self._call_submit_end_session(transport, 123)
+
+    def test_already_shutdown_short_circuits_without_submit(self) -> None:
+        """The first guard in ``_submit_end_session`` is
+        ``if self._is_shutdown: return``; submit must never be called
+        in that case, including when the executor is itself broken.
+        Locks in the precondition so future refactors don't
+        accidentally reverse it."""
+
+        transport = self._build_transport(
+            None, is_shutdown=True, explode_on_submit=True
+        )
+        self._call_submit_end_session(transport, 123)

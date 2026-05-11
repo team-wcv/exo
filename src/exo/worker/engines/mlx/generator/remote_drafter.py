@@ -439,7 +439,35 @@ class RemoteTransport:
         # by process death anyway.
         if self._is_shutdown:
             return
-        self._executor.submit(self._end_session_blocking, session_id).result()
+        try:
+            self._executor.submit(self._end_session_blocking, session_id).result()
+        except RuntimeError as err:
+            # The executor was shut down out from under us while a
+            # ``GeneratorExit`` cleanup path in ``mlx_generate`` called
+            # us. Two distinct messages can surface here depending on
+            # *which* shutdown path won the race:
+            #
+            #   * "cannot schedule new futures after shutdown" --
+            #     raised when this specific ``ThreadPoolExecutor`` was
+            #     shut down (its ``_shutdown`` flag set), which is the
+            #     common case when ``RemoteTransport.shutdown()``
+            #     happens concurrently with cleanup on a sibling
+            #     thread.
+            #   * "cannot schedule new futures after interpreter
+            #     shutdown" -- raised when ``concurrent.futures.thread.
+            #     _python_exit`` (the atexit handler) has set the
+            #     module-level ``_shutdown`` flag during process
+            #     teardown.
+            #
+            # The wire is dead in either case and the drafter rank's
+            # session cache is freed by process death, so log at debug
+            # and continue rather than crashing the cleanup (which
+            # currently surfaces as ``WARNING: asymmetric drafter
+            # session shutdown raised`` and prevents a clean task
+            # teardown). Re-raise anything other than these two
+            # well-defined races so genuine bugs still surface.
+            if "cannot schedule new futures" not in str(err):
+                raise
 
     # -- internals --------------------------------------------------------
 

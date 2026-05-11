@@ -560,7 +560,29 @@ class Runner:
                         self.send_task_status(task_id, TaskStatus.Complete)
                         finished.append(task_id)
                     case other:
-                        self.send_chunk(other, self.active_tasks[task_id].command_id)
+                        # Defensive lookup: the asymmetric+pipelined drafter
+                        # cleanup path occasionally yields a trailing chunk
+                        # for a task that's already been marked finished
+                        # (``Finished`` /``Cancelled`` was processed earlier
+                        # in this same ``results`` list, or in the previous
+                        # ``step()`` iteration just before the ``pop``).
+                        # Pre-fix this crashed the runner with ``KeyError:
+                        # <task_id>``, which then triggered a master-driven
+                        # instance teardown and an executor-shutdown race
+                        # in the drafter cleanup. Dropping the orphan chunk
+                        # is the same outcome as never having emitted it
+                        # (the client has already received the final task
+                        # status), so log at debug and continue.
+                        task = self.active_tasks.get(task_id)
+                        if task is None:
+                            logger.debug(
+                                "dropping orphan chunk for task_id=%s (task "
+                                "already terminated); chunk_kind=%s",
+                                task_id,
+                                type(other).__name__,
+                            )
+                            continue
+                        self.send_chunk(other, task.command_id)
 
             for task_id in finished:
                 self.active_tasks.pop(task_id, None)
