@@ -141,8 +141,14 @@ def instance_id_from_instance(instance: dict[str, Any]) -> str:
 
 
 def nodes_used_in_instance(instance: dict[str, Any]) -> int:
+    # Count distinct nodes, not shard entries. PR #2058's new
+    # ``shards`` sequence can in principle carry multiple shards on
+    # the same node; ``len(shards)`` would misclassify such a
+    # placement as multi-node and break the
+    # ``min_nodes``/``max_nodes`` filter as well as the single-node
+    # skip logic in ``fetch_and_filter_placements`` (Codex P2).
     inner = unwrap_instance(instance)
-    return len(inner["shardAssignments"]["shards"])
+    return len({n for (n, _, _) in inner["shardAssignments"]["shards"]})
 
 
 def runner_ids_from_instance(instance: dict[str, Any]) -> list[str]:
