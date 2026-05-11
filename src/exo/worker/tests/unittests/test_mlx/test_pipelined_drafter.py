@@ -19,11 +19,15 @@ End-to-end correctness with real MLX weights is exercised by the smoke
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import pytest
+
+if TYPE_CHECKING:
+    import mlx.core as mx
 
 from exo.worker.engines.mlx.generator.drafter_transport import (
     ALL_TRANSPORT_KINDS,
@@ -1239,13 +1243,13 @@ class TestProcessLogitsForPositionShapeContract:
 
     @staticmethod
     def _process(
-        raw_logits: object,
-        prev_tokens: object,
-        processors: object,
-    ) -> object:
+        raw_logits: "mx.array",
+        prev_tokens: "mx.array",
+        processors: "list[Callable[[mx.array, mx.array], mx.array]]",
+    ) -> "mx.array":
         from exo.worker.engines.mlx.generator import pipelined_drafter
 
-        return pipelined_drafter._process_logits_for_position(  # pyright: ignore[reportPrivateUsage,reportArgumentType]
+        return pipelined_drafter._process_logits_for_position(  # pyright: ignore[reportPrivateUsage]
             raw_logits,
             prev_tokens,
             processors,
@@ -1277,7 +1281,9 @@ class TestProcessLogitsForPositionShapeContract:
         assert out.shape == (vocab,)
         # Logsumexp normalisation produces a valid log-prob distribution
         # regardless of the processor; check the invariant explicitly.
-        assert float(mx.exp(out).sum().item()) == pytest.approx(1.0, rel=1e-4)
+        assert float(mx.exp(out).sum().item()) == pytest.approx(  # pyright: ignore[reportUnknownMemberType]
+            1.0, rel=1e-4
+        )
 
     def test_2d_logits_pass_through_unchanged(self) -> None:
         """When upstream already passes ``[batch, vocab]`` (e.g. future
@@ -1300,4 +1306,6 @@ class TestProcessLogitsForPositionShapeContract:
         out = self._process(raw, mx.array([], dtype=mx.int32), [])
         assert isinstance(out, mx.array)
         assert out.shape == (4,)
-        assert float(mx.exp(out).sum().item()) == pytest.approx(1.0, rel=1e-4)
+        assert float(mx.exp(out).sum().item()) == pytest.approx(  # pyright: ignore[reportUnknownMemberType]
+            1.0, rel=1e-4
+        )
