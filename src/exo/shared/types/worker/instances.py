@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from enum import Enum
 from typing import final
 
@@ -128,20 +129,27 @@ class BaseInstance(TaggedModel):
     drafter_placement: DrafterPlacement | None = None
 
     def shard(self, runner_id: RunnerId) -> ShardMetadata | None:
-        return self.shard_assignments.runner_to_shard.get(runner_id, None)
+        for _, rid, shard in self.shard_assignments.shards:
+            if rid == runner_id:
+                return shard
+
+    def runners_for(self, node_id: NodeId) -> Iterable[RunnerId]:
+        for nid, rid, _ in self.shard_assignments.shards:
+            if nid == node_id:
+                yield rid
 
     @property
     def parent_group_size(self) -> int:
         """Size of the target ranks' ``mx.distributed`` group.
 
-        Always equals ``len(shard_assignments.runner_to_shard)``: in
-        the v3+ asymmetric wire the drafter rank does NOT join the
-        target ``mx.distributed.Group`` (it talks to target rank 0 via
-        a direct TCP socket). Symmetric and asymmetric placement
+        Always equals ``len(shard_assignments.shards)``: in the v3+
+        asymmetric wire the drafter rank does NOT join the target
+        ``mx.distributed.Group`` (it talks to target rank 0 via a
+        direct TCP socket). Symmetric and asymmetric placement
         therefore both report the same size here, equal to the number
         of target shards.
         """
-        return len(self.shard_assignments.runner_to_shard)
+        return len(self.shard_assignments.shards)
 
     def is_drafter_runner(self, runner_id: RunnerId) -> bool:
         return (
@@ -156,10 +164,9 @@ class BaseInstance(TaggedModel):
         Lifecycle barriers (ConnectToGroup, LoadModel, StartWarmup,
         Ready) wait on the *whole* parent group, so plan-time readiness
         checks iterate this list. Generation tasks themselves are
-        target-only and iterate ``shard_assignments.runner_to_shard``
-        directly.
+        target-only and iterate ``shard_assignments.shards`` directly.
         """
-        runners = list(self.shard_assignments.runner_to_shard.keys())
+        runners: list[RunnerId] = [rid for _, rid, _ in self.shard_assignments.shards]
         if self.drafter_placement is not None:
             runners.append(self.drafter_placement.drafter_runner_id)
         return runners
@@ -169,10 +176,18 @@ class BaseInstance(TaggedModel):
         """Per-node runner id including the drafter rank when asymmetric.
 
         Worker plan iterates this when deciding which node should spawn
-        which runner. Symmetric placement returns the legacy
-        ``shard_assignments.node_to_runner`` mapping unchanged.
+        which runner. Symmetric placement returns the legacy mapping
+        derived from ``shard_assignments.shards`` unchanged.
+
+        Note: with the new sequence-based ``ShardAssignments`` (PR
+        #2058 upstream refactor), this collapses any duplicates if a
+        single node holds multiple shards. That has never been used in
+        symmetric placement (one shard per node) but the legacy dict
+        also collapsed duplicates, so the behaviour is identical.
         """
-        result = dict(self.shard_assignments.node_to_runner)
+        result: dict[NodeId, RunnerId] = {
+            nid: rid for nid, rid, _ in self.shard_assignments.shards
+        }
         if self.drafter_placement is not None:
             result[self.drafter_placement.drafter_node_id] = (
                 self.drafter_placement.drafter_runner_id
@@ -247,7 +262,10 @@ class BoundInstance(FrozenModel):
 
     @model_validator(mode="after")
     def validate_runner_known(self) -> "BoundInstance":
-        if self.bound_runner_id in self.instance.shard_assignments.runner_to_shard:
+        if any(
+            rid == self.bound_runner_id
+            for (_, rid, _) in self.instance.shard_assignments.shards
+        ):
             return self
         if self.instance.is_drafter_runner(self.bound_runner_id):
             placement = self.instance.drafter_placement

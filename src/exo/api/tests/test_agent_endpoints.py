@@ -23,7 +23,7 @@ from exo.shared.types.text_generation import (
     TextGenerationTaskParams,
 )
 from exo.shared.types.worker.instances import InstanceId, MlxRingInstance
-from exo.shared.types.worker.runners import RunnerId, ShardAssignments
+from exo.shared.types.worker.runners import RunnerId, ShardAssignments, ShardWithId
 from exo.shared.types.worker.shards import PipelineShardMetadata
 
 
@@ -57,8 +57,8 @@ def _instance(model_id: ModelId, instance_id: InstanceId) -> MlxRingInstance:
         instance_id=instance_id,
         shard_assignments=ShardAssignments(
             model_id=model_id,
-            runner_to_shard={runner_id: shard},
-            node_to_runner={node_id: runner_id},
+            shards=[ShardWithId(node_id, runner_id, shard)],
+            primary_output_node=0,
         ),
         hosts_by_node={node_id: [Host(ip="127.0.0.1", port=1)]},
         ephemeral_port=1,

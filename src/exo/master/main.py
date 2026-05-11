@@ -85,9 +85,9 @@ def _prefill_endpoint_for(state: State, decode_instance_id: InstanceId) -> str |
     decode = state.instances.get(decode_instance_id)
     if decode is None:
         return None
-    decode_node = next(iter(decode.shard_assignments.node_to_runner.keys()), None)
-    if decode_node is None:
-        return None
+    decode_node = decode.shard_assignments.shards[
+        decode.shard_assignments.primary_output_node
+    ].node_id
 
     sources: set[InstanceId] = set()
     for link in state.instance_links.values():
@@ -108,7 +108,7 @@ def _prefill_endpoint_for(state: State, decode_instance_id: InstanceId) -> str |
         instance = state.instances.get(src_id)
         if instance is None:
             continue
-        for node_id, runner_id in instance.shard_assignments.node_to_runner.items():
+        for node_id, runner_id, _ in instance.shard_assignments.shards:
             port = state.prefill_server_ports.get(runner_id)
             if port is None:
                 continue
@@ -153,7 +153,7 @@ class Master:
             event_log_root / "master" / _session_log_dir_name(session_id)
         )
         self._pending_traces: dict[TaskId, dict[int, list[TraceEventData]]] = {}
-        self._expected_ranks: dict[TaskId, set[int]] = {}
+        self._world_sizes: dict[TaskId, int] = {}
 
     async def run(self):
         logger.info("Starting Master")
@@ -311,11 +311,9 @@ class Master:
                                     selected_instance_id
                                 )
                                 if selected_instance:
-                                    ranks = set(
-                                        shard.device_rank
-                                        for shard in selected_instance.shard_assignments.runner_to_shard.values()
+                                    self._world_sizes[task_id] = len(
+                                        selected_instance.shard_assignments.shards
                                     )
-                                    self._expected_ranks[task_id] = ranks
                         case ImageEdits():
                             for instance in self.state.instances.values():
                                 if (
@@ -367,11 +365,9 @@ class Master:
                                     selected_instance_id
                                 )
                                 if selected_instance:
-                                    ranks = set(
-                                        shard.device_rank
-                                        for shard in selected_instance.shard_assignments.runner_to_shard.values()
+                                    self._world_sizes[task_id] = len(
+                                        selected_instance.shard_assignments.shards
                                     )
-                                    self._expected_ranks[task_id] = ranks
                         case DeleteInstance():
                             placement = delete_instance(command, self.state.instances)
                             transition_events = get_transition_events(
@@ -562,9 +558,9 @@ class Master:
                 # ``transport.forward()`` against a dead socket -- the
                 # drafter rank will not come back without a full
                 # placement rebuild, so deletion is the only consistent
-                # recovery path. ``shard_assignments.node_to_runner`` is
-                # a strict subset, so the symmetric (drafter-less) path
-                # behaves identically.
+                # recovery path. The target-only node set derived from
+                # ``shard_assignments.shards`` is a strict subset, so
+                # the symmetric (drafter-less) path behaves identically.
                 for node_id in instance.all_node_to_runner:
                     if node_id not in connected_node_ids:
                         is_drafter_node = (
@@ -593,7 +589,10 @@ class Master:
                     impacted_instances = [
                         str(instance_id)
                         for instance_id, instance in self.state.instances.items()
-                        if node_id in instance.shard_assignments.node_to_runner
+                        if any(
+                            nid == node_id
+                            for nid, _, _ in instance.shard_assignments.shards
+                        )
                     ]
                     logger.warning(
                         "Timing out inactive node "
@@ -668,9 +667,8 @@ class Master:
         self._pending_traces[task_id][event.rank] = event.traces
 
         if (
-            task_id in self._expected_ranks
-            and set(self._pending_traces[task_id].keys())
-            >= self._expected_ranks[task_id]
+            task_id in self._world_sizes
+            and len(self._pending_traces[task_id]) >= self._world_sizes[task_id]
         ):
             await self._merge_and_save_traces(task_id)
 
@@ -683,8 +681,8 @@ class Master:
             TracesMerged(task_id=task_id, traces=all_trace_data)
         )
         del self._pending_traces[task_id]
-        if task_id in self._expected_ranks:
-            del self._expected_ranks[task_id]
+        if task_id in self._world_sizes:
+            del self._world_sizes[task_id]
 
 
 def _session_log_dir_name(session_id: SessionId) -> str:

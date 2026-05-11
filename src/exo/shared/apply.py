@@ -237,7 +237,9 @@ def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
             update={"instances": new_instances, "instance_links": new_links}
         )
 
-    deleted_runner_ids = set(deleted_instance.shard_assignments.runner_to_shard)
+    deleted_runner_ids = {
+        rid for _, rid, _ in deleted_instance.shard_assignments.shards
+    }
     new_runners: Mapping[RunnerId, RunnerStatus] = {
         runner_id: runner_status
         for runner_id, runner_status in state.runners.items()

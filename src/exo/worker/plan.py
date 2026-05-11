@@ -252,9 +252,10 @@ def _init_distributed_backend(
 
         # Target-only barrier: drafter ranks are dispatched in the
         # branch above and are NOT members of any ``mx.distributed``
-        # group under the v3+ wire. Iterate ``shard_assignments`` so
-        # we get the target ranks alone.
-        target_runner_ids = list(instance.shard_assignments.runner_to_shard.keys())
+        # group under the v3+ wire. Iterate ``shard_assignments.shards``
+        # so we get the target ranks alone (drafter lives on
+        # ``instance.drafter_placement``, not in shard_assignments).
+        target_runner_ids = [rid for _, rid, _ in instance.shard_assignments.shards]
         all_target_connecting = all(
             isinstance(
                 all_runners.get(target_runner_id),
@@ -317,7 +318,7 @@ def _load_model(
                 and dp.shard_metadata.model_card.model_id == shard_assignments.model_id
                 for dp in global_download_status[nid]
             )
-            for nid in shard_assignments.node_to_runner
+            for nid, _, _ in shard_assignments.shards
         )
         if not all_local_downloads_complete:
             continue
@@ -394,7 +395,7 @@ def _ready_to_warmup(
         assert parent_rank < parent_size
         assert parent_rank >= 0
 
-        target_runner_ids = list(instance.shard_assignments.runner_to_shard.keys())
+        target_runner_ids = [rid for _, rid, _ in instance.shard_assignments.shards]
 
         accepting_ranks_ready = parent_rank > 0 and all(
             isinstance(

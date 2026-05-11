@@ -435,36 +435,51 @@ class Worker:
             logger.warning("Timed out waiting for Worker shutdown")
 
     async def _start_runner_task(self, task: Task):
-        if (instance := self.state.instances.get(task.instance_id)) is None:
+        instance = self.state.instances.get(task.instance_id)
+        if instance is None:
             return
-        # ``all_node_to_runner`` resolves both target and drafter ranks
-        # for asymmetric placement; ``node_to_runner`` alone misses the
-        # drafter rank because it lives on ``instance.drafter_placement``,
-        # not on ``shard_assignments``.
-        runner_id = instance.all_node_to_runner[self.node_id]
-        if _should_drop_generation_task_at_drafter(
-            task=task,
-            runner_id=runner_id,
-            drafter_placement=instance.drafter_placement,
-            node_id=self.node_id,
+
+        # Collect every runner on this node that participates in the
+        # instance: the target runners from ``shard_assignments.shards``
+        # (yielded by ``instance.runners_for(node_id)``) plus the
+        # optional drafter runner. The drafter rank lives on
+        # ``instance.drafter_placement``, not in ``shard_assignments``,
+        # so ``runners_for`` does not yield it -- append it
+        # explicitly when this node is the drafter node. PR #2058
+        # upstream allows multiple target runners per node, so this
+        # path now iterates instead of doing a single dict lookup.
+        runner_ids: list[RunnerId] = list(instance.runners_for(self.node_id))
+        if (
+            instance.drafter_placement is not None
+            and instance.drafter_placement.drafter_node_id == self.node_id
         ):
-            logger.debug(
-                f"Dropping {task.__class__.__name__} task "
-                f"{task.task_id} on drafter node {self.node_id} "
-                f"(instance {task.instance_id}); drafter runner only "
-                f"accepts lifecycle tasks."
-            )
-            # Record the drop in the runner's local completion set so
-            # the planner does not re-select the same task on every
-            # 100ms tick. Otherwise the worker keeps re-emitting
-            # ``TaskCreated`` events and re-running this drop path
-            # for the lifetime of the request, which is pure
-            # control-plane churn under streaming or long-running
-            # generations. The target runner remains the authority
-            # for the *global* task lifecycle (Codex P2, PR #20).
-            self.runners[runner_id].mark_task_dropped_locally(task.task_id)
-            return
-        await self.runners[runner_id].start_task(task)
+            runner_ids.append(instance.drafter_placement.drafter_runner_id)
+
+        for runner_id in runner_ids:
+            if _should_drop_generation_task_at_drafter(
+                task=task,
+                runner_id=runner_id,
+                drafter_placement=instance.drafter_placement,
+                node_id=self.node_id,
+            ):
+                logger.debug(
+                    f"Dropping {task.__class__.__name__} task "
+                    f"{task.task_id} on drafter node {self.node_id} "
+                    f"(instance {task.instance_id}); drafter runner only "
+                    f"accepts lifecycle tasks."
+                )
+                # Record the drop in the runner's local completion set
+                # so the planner does not re-select the same task on
+                # every 100ms tick. Otherwise the worker keeps re-
+                # emitting ``TaskCreated`` events and re-running this
+                # drop path for the lifetime of the request, which is
+                # pure control-plane churn under streaming or long-
+                # running generations. The target runner remains the
+                # authority for the *global* task lifecycle (Codex P2,
+                # PR #20).
+                self.runners[runner_id].mark_task_dropped_locally(task.task_id)
+                continue
+            await self.runners[runner_id].start_task(task)
 
     def _create_supervisor(self, task: CreateRunner) -> RunnerSupervisor:
         """Creates and stores a new AssignedRunner with initial downloading status."""

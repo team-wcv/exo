@@ -48,7 +48,7 @@ from exo.shared.types.worker.instances import (
     MlxJacclInstance,
     MlxRingInstance,
 )
-from exo.shared.types.worker.runners import ShardAssignments
+from exo.shared.types.worker.runners import RunnerId, ShardAssignments, ShardWithId
 from exo.shared.types.worker.shards import (
     AsymmetricTensorShardMetadata,
     PipelineShardMetadata,
@@ -78,10 +78,39 @@ def create_jaccl_node_network(
 
 @pytest.fixture
 def instance() -> Instance:
+    # Single-rank placeholder fixture used by transition-event tests
+    # that do not exercise shard contents. PR #2058 made
+    # ``ShardAssignments`` reject empty shard sequences (the new
+    # validator dereferences ``shards[primary_output_node]``), so the
+    # fixture now carries one minimal shard whose ``is_primary_output``
+    # is True for ``device_rank=0, world_size=1``.
+    placeholder_runner_id = RunnerId()
+    placeholder_node_id = NodeId("placeholder-node")
+    placeholder_shard = PipelineShardMetadata(
+        model_card=ModelCard(
+            model_id=ModelId("test-model"),
+            storage_size=Memory.from_kb(1000),
+            n_layers=1,
+            hidden_size=1,
+            supports_tensor=False,
+            tasks=[ModelTask.TextGeneration],
+        ),
+        device_rank=0,
+        world_size=1,
+        start_layer=0,
+        end_layer=1,
+        n_layers=1,
+    )
     return MlxRingInstance(
         instance_id=InstanceId(),
         shard_assignments=ShardAssignments(
-            model_id=ModelId("test-model"), runner_to_shard={}, node_to_runner={}
+            model_id=ModelId("test-model"),
+            shards=[
+                ShardWithId(
+                    placeholder_node_id, placeholder_runner_id, placeholder_shard
+                )
+            ],
+            primary_output_node=0,
         ),
         hosts_by_node={},
         ephemeral_port=50000,

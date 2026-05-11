@@ -564,7 +564,7 @@ class API:
             instance = self.state.instances.get(agent_endpoint.target_instance_id)
             if instance is None:
                 return None
-            for shard in instance.shard_assignments.runner_to_shard.values():
+            for _, _, shard in instance.shard_assignments.shards:
                 return shard.model_card
             return None
 
@@ -573,7 +573,7 @@ class API:
         for instance in self.state.instances.values():
             if instance.shard_assignments.model_id != agent_endpoint.model_id:
                 continue
-            for shard in instance.shard_assignments.runner_to_shard.values():
+            for _, _, shard in instance.shard_assignments.shards:
                 return shard.model_card
         return None
 
@@ -677,7 +677,7 @@ class API:
         instance = payload.instance
         model_card = await ModelCard.load(instance.shard_assignments.model_id)
         required_memory = model_card.storage_size
-        placement_node_ids = list(instance.shard_assignments.node_to_runner)
+        placement_node_ids = [nid for nid, _, _ in instance.shard_assignments.shards]
 
         if len(placement_node_ids) == 1:
             node_id = placement_node_ids[0]
@@ -834,17 +834,13 @@ class API:
 
             instance = new_instances[0]
             shard_assignments = instance.shard_assignments
-            placement_node_ids = list(shard_assignments.node_to_runner.keys())
+            placement_node_ids = list(s.node_id for s in shard_assignments.shards)
 
             memory_delta_by_node: dict[str, int] = {}
             if placement_node_ids:
                 total_bytes = model_card.storage_size.in_bytes
                 asymmetric_shards: dict[NodeId, AsymmetricTensorShardMetadata] = {}
-                for (
-                    node_id,
-                    runner_id,
-                ) in shard_assignments.node_to_runner.items():
-                    shard_metadata = shard_assignments.runner_to_shard[runner_id]
+                for node_id, _, shard_metadata in shard_assignments.shards:
                     if isinstance(shard_metadata, AsymmetricTensorShardMetadata):
                         asymmetric_shards[node_id] = shard_metadata
                 if asymmetric_shards:
@@ -1878,12 +1874,10 @@ class API:
         return JSONResponse(content="Ollama is running")
 
     async def ollama_chat(
-        self, request: Request
+        self, request: OllamaChatRequest
     ) -> OllamaChatResponse | StreamingResponse:
         """Ollama Chat API — accepts JSON regardless of Content-Type."""
-        body = await request.body()
-        payload = OllamaChatRequest.model_validate_json(body)
-        task_params = ollama_request_to_text_generation(payload)
+        task_params = ollama_request_to_text_generation(request)
         resolved_model = await self._resolve_and_validate_text_model(
             ModelId(task_params.model)
         )
@@ -1891,7 +1885,7 @@ class API:
 
         command = await self._send_text_generation_with_images(task_params)
 
-        if payload.stream:
+        if request.stream:
             return StreamingResponse(
                 generate_ollama_chat_stream(
                     command.command_id,
@@ -1914,12 +1908,10 @@ class API:
             )
 
     async def ollama_generate(
-        self, request: Request
+        self, request: OllamaGenerateRequest
     ) -> OllamaGenerateResponse | StreamingResponse:
         """Ollama Generate API — accepts JSON regardless of Content-Type."""
-        body = await request.body()
-        payload = OllamaGenerateRequest.model_validate_json(body)
-        task_params = ollama_generate_request_to_text_generation(payload)
+        task_params = ollama_generate_request_to_text_generation(request)
         resolved_model = await self._resolve_and_validate_text_model(
             ModelId(task_params.model)
         )
@@ -1927,7 +1919,7 @@ class API:
 
         command = await self._send_text_generation_with_images(task_params)
 
-        if payload.stream:
+        if request.stream:
             return StreamingResponse(
                 generate_ollama_generate_stream(
                     command.command_id,
@@ -1983,11 +1975,9 @@ class API:
             ]
         )
 
-    async def ollama_show(self, request: Request) -> OllamaShowResponse:
+    async def ollama_show(self, request: OllamaShowRequest) -> OllamaShowResponse:
         """Returns model information in Ollama show format."""
-        body = await request.body()
-        payload = OllamaShowRequest.model_validate_json(body)
-        model_name = payload.name or payload.model
+        model_name = request.name or request.model
         if not model_name:
             raise HTTPException(status_code=400, detail="name or model is required")
         try:
