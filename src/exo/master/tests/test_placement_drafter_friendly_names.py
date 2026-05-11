@@ -153,6 +153,52 @@ def test_resolve_preserves_first_appearance_order() -> None:
     assert result == [raw_node, friendly_node]
 
 
+def test_resolve_returns_all_nodes_sharing_a_friendly_name() -> None:
+    """A friendly name matching multiple nodes resolves to ALL of them.
+
+    Fresh nodes report ``friendly_name = "Unknown"`` until the info
+    gatherer reports, and operators can deliberately reuse a friendly
+    name as a candidate-pool tag (e.g. ``"worker"`` across several
+    workers). Collapsing to one node via dict insertion order would
+    make drafter placement nondeterministic and silently drop viable
+    candidates -- the resolver must instead return every match.
+    """
+    first_match = NodeId()
+    second_match = NodeId()
+    unrelated = NodeId()
+    identities = {
+        first_match: _identity("worker"),
+        second_match: _identity("worker"),
+        unrelated: _identity("wc-smbp"),
+    }
+    card = _drafter_card(eligible_friendly_names=["worker"])
+
+    result = resolve_drafter_eligible_nodes(card, identities)
+
+    assert set(result) == {first_match, second_match}
+    assert unrelated not in result
+
+
+def test_resolve_multi_match_dedupes_with_raw_pin() -> None:
+    """A node listed both raw and via a shared friendly name appears once."""
+    first_match = NodeId()
+    second_match = NodeId()
+    identities = {
+        first_match: _identity("worker"),
+        second_match: _identity("worker"),
+    }
+    card = _drafter_card(
+        eligible_nodes=[first_match],
+        eligible_friendly_names=["worker"],
+    )
+
+    result = resolve_drafter_eligible_nodes(card, identities)
+
+    assert result[0] == first_match
+    assert set(result) == {first_match, second_match}
+    assert len(result) == 2
+
+
 def test_place_instance_resolves_friendly_name_end_to_end() -> None:
     """Friendly-name-only card produces an asymmetric drafter placement.
 

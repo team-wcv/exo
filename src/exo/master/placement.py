@@ -97,15 +97,24 @@ def resolve_drafter_eligible_nodes(
             resolved.append(raw_node_id)
             seen.add(raw_node_id)
     if node_identities and model_card.drafter_eligible_friendly_names:
-        name_to_node = {
-            identity.friendly_name: node_id
-            for node_id, identity in node_identities.items()
-        }
+        # A friendly name is not guaranteed unique: fresh nodes report
+        # ``friendly_name = "Unknown"`` until the info gatherer publishes,
+        # and operators can intentionally tag multiple nodes the same
+        # (e.g. ``"worker"``) to expand the candidate pool. We therefore
+        # collect ALL node_ids per name and append each one, leaving
+        # tie-breaking and reachability filtering to
+        # ``_select_drafter_placement`` -- which already iterates
+        # candidates in order and picks the first reachable. This avoids
+        # the placement-determinism trap of letting dict insertion order
+        # silently drop viable nodes from eligibility.
+        name_to_nodes: dict[str, list[NodeId]] = {}
+        for node_id, identity in node_identities.items():
+            name_to_nodes.setdefault(identity.friendly_name, []).append(node_id)
         for friendly_name in model_card.drafter_eligible_friendly_names:
-            resolved_node_id = name_to_node.get(friendly_name)
-            if resolved_node_id is not None and resolved_node_id not in seen:
-                resolved.append(resolved_node_id)
-                seen.add(resolved_node_id)
+            for resolved_node_id in name_to_nodes.get(friendly_name, []):
+                if resolved_node_id not in seen:
+                    resolved.append(resolved_node_id)
+                    seen.add(resolved_node_id)
     return resolved
 
 
