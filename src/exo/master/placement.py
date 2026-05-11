@@ -38,6 +38,7 @@ from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import (
     MemoryUsage,
     NetworkInterfaceInfo,
+    NodeIdentity,
     NodeNetworkInfo,
     NodeRdmaCtlStatus,
 )
@@ -63,6 +64,58 @@ from exo.shared.types.worker.shards import Sharding
 from exo.utils.ports import random_ephemeral_port, random_ephemeral_port_excluding
 
 ASYMMETRIC_TENSOR_AUTO_UPGRADE_ENV = "EXO_ENABLE_ASYMMETRIC_TP_AUTO_UPGRADE"
+
+
+def resolve_drafter_eligible_nodes(
+    model_card: ModelCard,
+    node_identities: Mapping[NodeId, NodeIdentity] | None,
+) -> list[NodeId]:
+    """Resolve the model card's drafter eligibility list to concrete NodeIds.
+
+    Returns the union of:
+      * ``model_card.drafter_eligible_nodes`` (raw NodeIds, used as-is)
+      * ``model_card.drafter_eligible_friendly_names`` resolved against the
+        provided ``node_identities`` map (entries that don't match any
+        known friendly name are silently dropped)
+
+    The result preserves the order in which entries first appear and
+    contains no duplicates. When ``node_identities`` is ``None`` (e.g.
+    callers that don't have a state handle yet, like the placement
+    sub-call from prefill auto-placement), friendly-name resolution is
+    skipped and only the raw NodeIds are returned -- the operator gets
+    legacy behaviour for that placement path.
+
+    Resolution is intentionally case-sensitive and exact-match: friendly
+    names already come from a controlled source (``sysctl
+    kern.hostname`` via the info gatherer) so fuzzy matching would
+    introduce more failure modes than it solves.
+    """
+    resolved: list[NodeId] = []
+    seen: set[NodeId] = set()
+    for raw_node_id in model_card.drafter_eligible_nodes:
+        if raw_node_id not in seen:
+            resolved.append(raw_node_id)
+            seen.add(raw_node_id)
+    if node_identities and model_card.drafter_eligible_friendly_names:
+        # A friendly name is not guaranteed unique: fresh nodes report
+        # ``friendly_name = "Unknown"`` until the info gatherer publishes,
+        # and operators can intentionally tag multiple nodes the same
+        # (e.g. ``"worker"``) to expand the candidate pool. We therefore
+        # collect ALL node_ids per name and append each one, leaving
+        # tie-breaking and reachability filtering to
+        # ``_select_drafter_placement`` -- which already iterates
+        # candidates in order and picks the first reachable. This avoids
+        # the placement-determinism trap of letting dict insertion order
+        # silently drop viable nodes from eligibility.
+        name_to_nodes: dict[str, list[NodeId]] = {}
+        for node_id, identity in node_identities.items():
+            name_to_nodes.setdefault(identity.friendly_name, []).append(node_id)
+        for friendly_name in model_card.drafter_eligible_friendly_names:
+            for resolved_node_id in name_to_nodes.get(friendly_name, []):
+                if resolved_node_id not in seen:
+                    resolved.append(resolved_node_id)
+                    seen.add(resolved_node_id)
+    return resolved
 
 
 def _supports_asymmetric_tensor_parallel(model_card: ModelCard) -> bool:
@@ -143,6 +196,7 @@ def place_instance(
     allow_single_node_total_memory: bool = False,
     download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
     node_rdma_ctl: Mapping[NodeId, NodeRdmaCtlStatus] | None = None,
+    node_identities: Mapping[NodeId, NodeIdentity] | None = None,
     on_drafter_placement_degraded: (
         Callable[[DrafterPlacementDegraded], None] | None
     ) = None,
@@ -187,7 +241,10 @@ def place_instance(
     # fall back to the unfiltered set so the instance still lands.
     # ``_select_drafter_placement`` emits ``AllEligibleNodesInTargetCycle``
     # downstream so the operator sees the asymmetric drafter degradation.
-    eligible_drafter_set = set(command.model_card.drafter_eligible_nodes)
+    resolved_eligible_nodes = resolve_drafter_eligible_nodes(
+        command.model_card, node_identities
+    )
+    eligible_drafter_set = set(resolved_eligible_nodes)
     cycles_with_sufficient_memory = filter_cycles_by_memory(
         candidate_cycles,
         node_memory,
@@ -465,6 +522,7 @@ def place_instance(
         reserved_ports=frozenset({pre_allocated_listener_port}),
         on_drafter_placement_degraded=on_drafter_placement_degraded,
         download_status=download_status or {},
+        resolved_eligible_nodes=resolved_eligible_nodes,
     )
 
     # Codex P1.4: under the V3+ wire, single-rank target cycles always
@@ -560,13 +618,17 @@ def _select_drafter_placement(
     reserved_ports: frozenset[int],
     on_drafter_placement_degraded: (Callable[[DrafterPlacementDegraded], None] | None),
     download_status: Mapping[NodeId, Sequence[DownloadProgress]],
+    resolved_eligible_nodes: list[NodeId] | None = None,
 ) -> DrafterPlacement | None:
     """Pick a drafter-eligible node for asymmetric drafter placement.
 
     A drafter rank is appended to the parent ``mx.distributed`` group when
     *all* of the following hold:
 
-      * The model card lists ``drafter_eligible_nodes``.
+      * The model card lists ``drafter_eligible_nodes`` and/or
+        ``drafter_eligible_friendly_names`` (the two are merged at the
+        ``place_instance`` entry-point and passed in as
+        ``resolved_eligible_nodes``).
       * The card lists ``drafter_model_ids`` (otherwise there's nothing to
         run on the drafter rank).
       * At least one eligible node is alive in topology, NOT already a
@@ -586,7 +648,11 @@ def _select_drafter_placement(
     (``len(selected_cycle)``). Target ranks split off into a subgroup at
     runtime via ``mx.distributed.Group.split``.
     """
-    eligible_nodes = list(command.model_card.drafter_eligible_nodes)
+    eligible_nodes = (
+        list(resolved_eligible_nodes)
+        if resolved_eligible_nodes is not None
+        else list(command.model_card.drafter_eligible_nodes)
+    )
     drafter_candidates = list(command.model_card.drafter_model_ids)
     if not eligible_nodes or not drafter_candidates:
         return None
