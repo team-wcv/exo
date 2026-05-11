@@ -1309,3 +1309,123 @@ class TestProcessLogitsForPositionShapeContract:
         assert float(mx.exp(out).sum().item()) == pytest.approx(  # pyright: ignore[reportUnknownMemberType]
             1.0, rel=1e-4
         )
+
+
+class TestRemoteTransportSubmitEndSessionShutdownRace:
+    """Regression cover for the executor-shutdown race in
+    ``RemoteTransport._submit_end_session``.
+
+    Python's ``concurrent.futures.thread.ThreadPoolExecutor.submit``
+    raises ``RuntimeError`` on two distinct shutdown paths that both
+    show up during ``mlx_generate``'s ``GeneratorExit`` cleanup:
+
+      * "cannot schedule new futures after shutdown" -- this executor
+        was shut down by ``RemoteTransport.shutdown()`` on a sibling
+        thread.
+      * "cannot schedule new futures after interpreter shutdown" --
+        ``concurrent.futures.thread._python_exit`` (the atexit handler)
+        set the module-level ``_shutdown`` flag during process
+        teardown.
+
+    The wire is dead in both cases; ``_submit_end_session`` must
+    swallow both message variants. An earlier fix only matched the
+    first message, so the atexit variant still leaked
+    ``WARNING: asymmetric drafter session shutdown raised`` and
+    blocked clean task teardown. Genuine ``RuntimeError`` (anything
+    else) must still propagate.
+    """
+
+    @staticmethod
+    def _build_transport(
+        submit_error: Exception | None,
+        *,
+        is_shutdown: bool = False,
+        explode_on_submit: bool = False,
+    ) -> object:
+        """Construct a ``RemoteTransport`` with stubbed-out executor.
+
+        Uses ``__new__`` so we never touch the real socket /
+        ThreadPoolExecutor; ``_submit_end_session`` only reads
+        ``_is_shutdown`` and ``_executor`` so those are all we need to
+        populate. Returns as ``object`` to avoid lying about the
+        attribute being a real ``ThreadPoolExecutor`` -- the call
+        sites cast via ``getattr`` to keep basedpyright happy without
+        loosening the attribute typing on ``RemoteTransport`` itself.
+        """
+
+        from exo.worker.engines.mlx.generator import remote_drafter
+
+        class _StubExecutor:
+            def submit(self, *_args: object, **_kwargs: object) -> object:
+                if explode_on_submit:
+                    raise AssertionError(
+                        "submit must not be called when _is_shutdown=True"
+                    )
+                if submit_error is not None:
+                    raise submit_error
+                fut: Future[None] = Future()
+                fut.set_result(None)
+                return fut
+
+        transport: object = remote_drafter.RemoteTransport.__new__(
+            remote_drafter.RemoteTransport
+        )
+        # Set up the two attributes the SUT reads. ``setattr`` keeps
+        # the assignment off the strict attribute-type checker.
+        setattr(transport, "_is_shutdown", is_shutdown)  # noqa: B010
+        setattr(transport, "_executor", _StubExecutor())  # noqa: B010
+        return transport
+
+    @staticmethod
+    def _call_submit_end_session(transport: object, session_id: int) -> None:
+        """Invoke the private method via ``getattr`` so basedpyright
+        doesn't need ``transport`` to be the concrete RemoteTransport
+        type (the stub-executor attribute setup above already makes
+        that impossible without lying)."""
+
+        getattr(transport, "_submit_end_session")(session_id)  # noqa: B009
+
+    def test_executor_shutdown_message_is_swallowed(self) -> None:
+        """The classic ``RemoteTransport.shutdown()``-during-cleanup
+        race. Submit raises with the executor-level message and
+        ``_submit_end_session`` must return cleanly."""
+
+        err = RuntimeError("cannot schedule new futures after shutdown")
+        transport = self._build_transport(err)
+        self._call_submit_end_session(transport, 123)
+
+    def test_interpreter_shutdown_message_is_swallowed(self) -> None:
+        """The atexit-driven ``_python_exit`` race -- the variant the
+        first iteration of this guard missed. Submit raises with the
+        interpreter-level message and ``_submit_end_session`` must
+        return cleanly."""
+
+        err = RuntimeError(
+            "cannot schedule new futures after interpreter shutdown"
+        )
+        transport = self._build_transport(err)
+        self._call_submit_end_session(transport, 123)
+
+    def test_unrelated_runtime_error_propagates(self) -> None:
+        """Any ``RuntimeError`` whose message isn't one of the two
+        well-defined shutdown races is a genuine bug and must surface.
+        Pre-fix that was the desired behaviour for everything;
+        post-fix it must still be the behaviour for non-shutdown
+        errors."""
+
+        err = RuntimeError("something else entirely")
+        transport = self._build_transport(err)
+        with pytest.raises(RuntimeError, match="something else entirely"):
+            self._call_submit_end_session(transport, 123)
+
+    def test_already_shutdown_short_circuits_without_submit(self) -> None:
+        """The first guard in ``_submit_end_session`` is
+        ``if self._is_shutdown: return``; submit must never be called
+        in that case, including when the executor is itself broken.
+        Locks in the precondition so future refactors don't
+        accidentally reverse it."""
+
+        transport = self._build_transport(
+            None, is_shutdown=True, explode_on_submit=True
+        )
+        self._call_submit_end_session(transport, 123)
