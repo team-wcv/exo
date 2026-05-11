@@ -395,7 +395,7 @@ class Node:
             (
                 f"{instance_id}:"
                 f"{instance.shard_assignments.model_id}:"
-                f"{len(instance.shard_assignments.node_to_runner)}-node"
+                f"{len({nid for nid, _, _ in instance.shard_assignments.shards})}-node"
             )
             for instance_id, instance in state.instances.items()
         ]

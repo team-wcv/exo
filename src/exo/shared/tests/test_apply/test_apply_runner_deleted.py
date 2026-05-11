@@ -10,6 +10,7 @@ from exo.shared.types.worker.runners import (
     RunnerIdle,
     RunnerShutdown,
     ShardAssignments,
+    ShardWithId,
 )
 from exo.shared.types.worker.shards import PipelineShardMetadata
 
@@ -52,17 +53,21 @@ def test_apply_instance_deleted_removes_owned_runners():
         instance_id=instance_id,
         shard_assignments=ShardAssignments(
             model_id=model_card.model_id,
-            runner_to_shard={
-                runner_id: PipelineShardMetadata(
-                    model_card=model_card,
-                    device_rank=0,
-                    world_size=1,
-                    start_layer=0,
-                    end_layer=1,
-                    n_layers=1,
+            shards=[
+                ShardWithId(
+                    NodeId(),
+                    runner_id,
+                    PipelineShardMetadata(
+                        model_card=model_card,
+                        device_rank=0,
+                        world_size=1,
+                        start_layer=0,
+                        end_layer=1,
+                        n_layers=1,
+                    ),
                 )
-            },
-            node_to_runner={NodeId(): runner_id},
+            ],
+            primary_output_node=0,
         ),
         hosts_by_node={},
         ephemeral_port=50000,

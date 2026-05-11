@@ -35,6 +35,7 @@ from exo.shared.types.worker.instances import (
 from exo.shared.types.worker.runners import (
     RunnerId,
     ShardAssignments,
+    ShardWithId,
 )
 from exo.shared.types.worker.shards import (
     PipelineShardMetadata,
@@ -78,8 +79,10 @@ def _make_single_target_bound_instance(
         instance_id=InstanceId(),
         shard_assignments=ShardAssignments(
             model_id=ModelId("mlx-community/test-target"),
-            runner_to_shard={target_runner_id: cast(ShardMetadata, shard)},
-            node_to_runner={target_node: target_runner_id},
+            shards=[
+                ShardWithId(target_node, target_runner_id, cast(ShardMetadata, shard))
+            ],
+            primary_output_node=0,
         ),
         hosts_by_node={target_node: []},
         ephemeral_port=60000,

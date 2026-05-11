@@ -1,4 +1,5 @@
-from collections.abc import Mapping
+from collections.abc import Sequence
+from typing import NamedTuple
 
 from pydantic import model_validator
 
@@ -81,16 +82,48 @@ RunnerStatus = (
 )
 
 
+class ShardWithId(NamedTuple):
+    node_id: NodeId
+    runner_id: RunnerId
+    shard: ShardMetadata
+
+
 class ShardAssignments(FrozenModel):
     model_id: ModelId
-    runner_to_shard: Mapping[RunnerId, ShardMetadata]
-    node_to_runner: Mapping[NodeId, RunnerId]
+    shards: Sequence[ShardWithId]
+    # this node needs to be connected to the API node for the stream to be considered ready
+    # (this is a device rank)
+    primary_output_node: int
 
     @model_validator(mode="after")
     def validate_runners_exist(self) -> "ShardAssignments":
-        for runner_id in self.node_to_runner.values():
-            if runner_id not in self.runner_to_shard:
-                raise ValueError(
-                    f"Runner {runner_id} in node_to_runner does not exist in runner_to_shard"
-                )
+        if not self.shards[self.primary_output_node].shard.is_primary_output():
+            raise ValueError("primary output node does not correspond to primary shard")
+
         return self
+
+    @property
+    def runner_to_shard(self) -> dict[RunnerId, ShardMetadata]:
+        """Backwards-compatible mapping derived from ``self.shards``.
+
+        The canonical storage is now ``shards: Sequence[ShardWithId]``
+        per the upstream PR #2058 refactor. This property preserves the
+        legacy dict accessor so existing fork callers (tests, drafter
+        bookkeeping, asymmetric-TP helpers) keep working without
+        touching every call site at once. New code SHOULD iterate
+        ``shards`` directly. Treat this dict as read-only; mutating it
+        does not write through to the underlying sequence.
+        """
+        return {rid: shard for _, rid, shard in self.shards}
+
+    @property
+    def node_to_runner(self) -> dict[NodeId, RunnerId]:
+        """Backwards-compatible mapping derived from ``self.shards``.
+
+        See ``runner_to_shard`` for the rationale. When multiple shards
+        share a node (theoretically possible under the new sequence
+        format but not exercised by current placements) the last shard
+        wins, matching the dict-collapse behaviour of the legacy
+        mapping that this property replaces.
+        """
+        return {nid: rid for nid, rid, _ in self.shards}

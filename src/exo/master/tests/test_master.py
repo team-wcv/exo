@@ -47,7 +47,7 @@ from exo.shared.types.worker.instances import (
     MlxRingInstance,
     ShardAssignments,
 )
-from exo.shared.types.worker.runners import RunnerId
+from exo.shared.types.worker.runners import RunnerId, ShardWithId
 from exo.shared.types.worker.shards import PipelineShardMetadata, Sharding
 from exo.utils.channels import channel
 from exo.utils.disk_event_log import DiskEventLog
@@ -193,28 +193,32 @@ async def test_master():
         assert isinstance(events[1].event, InstanceCreated)
         created_instance = events[1].event.instance
         assert isinstance(created_instance, MlxRingInstance)
-        runner_id = list(created_instance.shard_assignments.runner_to_shard.keys())[0]
+        runner_id = created_instance.shard_assignments.shards[0].runner_id
         # Validate the shard assignments
         expected_shard_assignments = ShardAssignments(
             model_id=ModelId("llama-3.2-1b"),
-            runner_to_shard={
-                (runner_id): PipelineShardMetadata(
-                    start_layer=0,
-                    end_layer=16,
-                    n_layers=16,
-                    model_card=ModelCard(
-                        model_id=ModelId("llama-3.2-1b"),
+            shards=[
+                ShardWithId(
+                    node_id,
+                    runner_id,
+                    PipelineShardMetadata(
+                        start_layer=0,
+                        end_layer=16,
                         n_layers=16,
-                        storage_size=Memory.from_bytes(678948),
-                        hidden_size=7168,
-                        supports_tensor=True,
-                        tasks=[ModelTask.TextGeneration],
+                        model_card=ModelCard(
+                            model_id=ModelId("llama-3.2-1b"),
+                            n_layers=16,
+                            storage_size=Memory.from_bytes(678948),
+                            hidden_size=7168,
+                            supports_tensor=True,
+                            tasks=[ModelTask.TextGeneration],
+                        ),
+                        device_rank=0,
+                        world_size=1,
                     ),
-                    device_rank=0,
-                    world_size=1,
                 )
-            },
-            node_to_runner={node_id: runner_id},
+            ],
+            primary_output_node=0,
         )
         assert created_instance.shard_assignments == expected_shard_assignments
         # For single-node, hosts_by_node should have one entry with self-binding
@@ -342,17 +346,21 @@ def _test_instance(model_id: ModelId, instance_id: InstanceId) -> MlxRingInstanc
         instance_id=instance_id,
         shard_assignments=ShardAssignments(
             model_id=model_id,
-            runner_to_shard={
-                runner_id: PipelineShardMetadata(
-                    start_layer=0,
-                    end_layer=1,
-                    n_layers=1,
-                    model_card=_test_model_card(model_id),
-                    device_rank=0,
-                    world_size=1,
+            shards=[
+                ShardWithId(
+                    node_id,
+                    runner_id,
+                    PipelineShardMetadata(
+                        start_layer=0,
+                        end_layer=1,
+                        n_layers=1,
+                        model_card=_test_model_card(model_id),
+                        device_rank=0,
+                        world_size=1,
+                    ),
                 )
-            },
-            node_to_runner={node_id: runner_id},
+            ],
+            primary_output_node=0,
         ),
         hosts_by_node={node_id: [Host(ip="127.0.0.1", port=1)]},
         ephemeral_port=1,
