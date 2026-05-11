@@ -1218,3 +1218,86 @@ class TestGetTokenizerVocabSize:
         assert full_size is not None
         added_token_id = 32002  # within added-vocab range
         assert 0 <= added_token_id < full_size
+
+
+class TestProcessLogitsForPositionShapeContract:
+    """Regression cover for the asymmetric+pipelined drafter crash:
+    ``mlx_lm.sample_utils.repetition_penalty_processor`` (and the
+    presence/frequency processors) indexes logits as ``logits[:, tokens]``,
+    so it requires ``[batch, vocab]`` shape. ``_process_logits_for_position``
+    is invoked once per draft position with 1D ``[vocab]`` logits in the
+    pipelined+remote spec loop. Pre-fix the call sequence
+    ``mlx_generate -> pipelined_drafter._pipelined_speculative_step_body
+    -> _process_logits_for_position -> repetition_penalty_processor`` crashed
+    the runner with ``ValueError: Too many indices for array with 1
+    dimensions`` whenever the model card declared a non-zero
+    ``repetition_penalty`` (Qwen 3.5 397B's thinking defaults of 1.0 hit
+    this; so do most card defaults). The fix expands to 2D for the
+    processor loop and squeezes back before logsumexp, so a single-position
+    1D call now survives the processor chain.
+    """
+
+    @staticmethod
+    def _process(
+        raw_logits: object,
+        prev_tokens: object,
+        processors: object,
+    ) -> object:
+        from exo.worker.engines.mlx.generator import pipelined_drafter
+
+        return pipelined_drafter._process_logits_for_position(  # pyright: ignore[reportPrivateUsage,reportArgumentType]
+            raw_logits,
+            prev_tokens,
+            processors,
+        )
+
+    def test_1d_logits_survive_mlx_lm_style_processor(self) -> None:
+        """An ``mlx-lm``-style processor that does ``logits[:, tokens]``
+        used to crash on 1D inputs. After the fix, the processor sees
+        the expanded ``[1, vocab]`` view and the per-position output
+        stays 1D ``[vocab]``."""
+        import mlx.core as mx
+
+        vocab = 8
+        prev = mx.array([1, 3, 5], dtype=mx.int32)
+        raw = mx.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
+
+        def mlx_lm_style_repetition_penalty(
+            tokens: mx.array, logits: mx.array
+        ) -> mx.array:
+            # Mirrors the failing slice in
+            # ``mlx_lm.sample_utils.repetition_penalty_processor``.
+            selected = logits[:, tokens]
+            scaled = mx.where(selected < 0, selected * 1.1, selected / 1.1)
+            logits[:, tokens] = scaled
+            return logits
+
+        out = self._process(raw, prev, [mlx_lm_style_repetition_penalty])
+        assert isinstance(out, mx.array)
+        assert out.shape == (vocab,)
+        # Logsumexp normalisation produces a valid log-prob distribution
+        # regardless of the processor; check the invariant explicitly.
+        assert float(mx.exp(out).sum().item()) == pytest.approx(1.0, rel=1e-4)
+
+    def test_2d_logits_pass_through_unchanged(self) -> None:
+        """When upstream already passes ``[batch, vocab]`` (e.g. future
+        callers that don't squeeze), the helper must not re-expand."""
+        import mlx.core as mx
+
+        raw_2d = mx.array([[0.1, 0.2, 0.3, 0.4]])
+        out = self._process(raw_2d, mx.array([], dtype=mx.int32), [])
+        assert isinstance(out, mx.array)
+        assert out.shape == (1, 4)
+
+    def test_empty_processor_list_is_noop_modulo_logsumexp(self) -> None:
+        """No processors means the only transformation is the
+        normalisation. The 1D-fix path must not corrupt shape for the
+        no-processor case (common when ``temperature == 0`` and no
+        penalties are configured)."""
+        import mlx.core as mx
+
+        raw = mx.array([1.0, 2.0, 3.0, 4.0])
+        out = self._process(raw, mx.array([], dtype=mx.int32), [])
+        assert isinstance(out, mx.array)
+        assert out.shape == (4,)
+        assert float(mx.exp(out).sum().item()) == pytest.approx(1.0, rel=1e-4)

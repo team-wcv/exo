@@ -301,10 +301,26 @@ def _process_logits_for_position(
     prev_tokens: mx.array,
     logits_processors: list[Callable[[mx.array, mx.array], mx.array]],
 ) -> mx.array:
-    """Apply logits processors and convert to logprobs (single position)."""
-    out = raw_logits
+    """Apply logits processors and convert to logprobs (single position).
+
+    mlx-lm's processors (``repetition_penalty_processor``, the presence/
+    frequency penalty processors) expect ``[batch, vocab]`` because they
+    do ``logits[:, tokens]``. The pipelined+remote spec loop calls us
+    once per draft position with already-squeezed 1D ``[vocab]`` logits,
+    which crashes the processor with ``ValueError: Too many indices for
+    array with 1 dimensions``. We expand to 2D for the processor loop
+    and squeeze back before the logsumexp normalisation so the rest of
+    the loop is unchanged.
+
+    Operates on a single position regardless of input dimensionality;
+    the (de)expansion is invariant when ``raw_logits`` is already 2D.
+    """
+    is_one_d = raw_logits.ndim == 1
+    out = mx.expand_dims(raw_logits, 0) if is_one_d else raw_logits
     for proc in logits_processors:
         out = proc(prev_tokens, out)
+    if is_one_d:
+        out = out.squeeze(0)
     return out - mx.logsumexp(out, axis=-1, keepdims=True)
 
 
