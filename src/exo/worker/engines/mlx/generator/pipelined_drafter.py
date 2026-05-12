@@ -895,8 +895,15 @@ def _pipelined_speculative_step_body(
 
     # Mirror mlx_lm._prefill: caller has aligned ``prompt_cache`` to
     # ``context_tokens[:-2]`` via ``exo.prefill`` + ``trim(2)``; this loop
-    # advances the cache by one more token, leaving ``y`` (length 1) as
-    # the seed for the spec loop.
+    # advances the *target* cache by one more token (``prompt[-2]``),
+    # leaving ``y`` (length 1) as the seed for the spec loop. The drafter
+    # cache is opaque to this loop -- ``mlx_generate`` is responsible for
+    # placing the drafter at offset ``len(prompt) - 1`` BEFORE the body
+    # is entered (asymmetric: via ``OP_PREFILL`` over ``prompt[:-1]``;
+    # in-process pipelined: via ``_spec_drafter_prefill`` over
+    # ``prompt[:-1]``). That way the drafter's first ``forward([seed], k)``
+    # in round 0 lands ``prompt[-1]``'s K/V at offset ``len(prompt) - 1``
+    # rather than overwriting the ``prompt[-2]`` slot.
     _diag_prefill_iters = 0
     while y.size > 1:
         _diag_prefill_t0 = time.perf_counter()

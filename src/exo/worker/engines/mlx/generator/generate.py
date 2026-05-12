@@ -1370,14 +1370,41 @@ def mlx_generate(
                 distributed_prompt_progress_callback,
             )
         # On the spec path we mirror exo's prefill on the drafter so its
-        # cache reaches the same offset as the target's (prompt - 2 after
-        # the trim(2) inside exo.prefill). mlx_lm's
-        # speculative_generate_step._prefill then advances both caches by
-        # 1 (decode_prompt size = 2 -> processes 1 token), arriving at
-        # prompt - 1 with ``y = decode_prompt[-1:]`` -- the canonical
-        # entry state for the spec loop.
+        # cache reaches the same offset as the target's *at the entry
+        # point of the spec loop*. Two regimes:
+        #
+        # * ``draft_mode == "model"``: dispatch routes through
+        #   :func:`mlx_lm.speculative_generate_step`, whose internal
+        #   ``_prefill`` runs over ``decode_prompt = prompt[-2:]`` on BOTH
+        #   target and drafter caches, advancing each by 1 token
+        #   (``prompt[-2]``) so the spec loop seeds from ``prompt[-1]``
+        #   with both caches at offset ``len(prompt) - 1``. To set this
+        #   up we prefill the drafter to offset ``len(prompt) - 2``
+        #   (= target's post-``exo.prefill`` offset) and let mlx_lm
+        #   advance both caches in lockstep.
+        #
+        # * ``draft_mode == "pipelined"``: dispatch routes through
+        #   :func:`_pipelined_speculative_step_body`, whose entry-state
+        #   prefill loop (``while y.size > 1: model(...)``) only advances
+        #   the *target* cache by one token; the drafter cache is opaque
+        #   to that loop (the in-process drafter would have to be invoked
+        #   explicitly here, and the remote drafter only receives the
+        #   first OP_FORWARD when the spec loop starts). To match the
+        #   "model" regime's invariant (both caches at ``len(prompt) - 1``
+        #   at spec-loop entry) we have to bake ``prompt[-2]`` into the
+        #   drafter prefill itself rather than rely on a subsequent
+        #   advance step. Pre-fix we sent ``prompt[:-2]`` for both
+        #   regimes, leaving the drafter one token short (its K/V slot
+        #   at offset ``len(prompt) - 2`` ended up populated by the
+        #   round-0 ``forward([prompt[-1]], k)`` input instead of by
+        #   ``prompt[-2]``); the drafter's subsequent proposals
+        #   attended over a context with ``prompt[-2]`` replaced by
+        #   ``prompt[-1]``, corrupting acceptance rate and emitted text.
         if spec_active and effective_draft_model is not None:
-            drafter_prefill_tokens = prompt_tokens[:-2]
+            if draft_mode == "pipelined":
+                drafter_prefill_tokens = prompt_tokens[:-1]
+            else:
+                drafter_prefill_tokens = prompt_tokens[:-2]
             if drafter_prefill_tokens.size > 0:
                 _spec_drafter_prefill(
                     effective_draft_model,
@@ -1534,16 +1561,32 @@ def mlx_generate(
                 )
             # Sync this request's drafter cache against the prompt before
             # constructing the drafter wrapper. The session sends OP_PREFILL
-            # with prompt[:-2] (matching ``_spec_drafter_prefill``'s
-            # invariant: align the drafter's offset to ``len(prompt) - 2``
-            # so the spec loop's first OP_FORWARD seeds from prompt[-2]).
+            # with prompt[:-1] so the drafter's offset lands at
+            # ``len(prompt) - 1``, matching the target's offset at the
+            # entry point of :func:`_pipelined_speculative_step_body`
+            # (the target's ``while y.size > 1`` prefill loop advances
+            # the target cache by one token, but does NOT touch the
+            # drafter cache -- the drafter is remote and only learns
+            # of new tokens via OP_FORWARD / OP_PREFILL). The pipelined
+            # spec loop then issues its round-0 ``transport.forward(
+            # [prompt[-1]], k)`` from this aligned state, with the
+            # drafter's K/V slot at offset ``len(prompt) - 1``
+            # correctly populated by ``prompt[-1]`` (and the K/V at
+            # offset ``len(prompt) - 2`` correctly populated by
+            # ``prompt[-2]`` from this OP_PREFILL). Pre-fix we sent
+            # ``prompt[:-2]``, leaving the drafter at offset
+            # ``len(prompt) - 2`` and forcing the round-0 OP_FORWARD
+            # to overwrite the ``prompt[-2]`` slot with ``prompt[-1]``;
+            # the drafter then attended over a context with
+            # ``prompt[-2]`` replaced by ``prompt[-1]``, corrupting
+            # every subsequent draft and tanking acceptance rate.
             _diag_t0 = time.perf_counter()
             _spec_diag(
                 f"rank 0: about to materialize prefill_prompt "
                 f"via tolist() ({all_prompt_tokens.size} prompt tokens total)"
             )
             prefill_prompt: list[int] = [
-                int(t) for t in cast(list[int], all_prompt_tokens[:-2].tolist())
+                int(t) for t in cast(list[int], all_prompt_tokens[:-1].tolist())
             ]
             _spec_diag(
                 f"rank 0: prefill_prompt materialized in "
