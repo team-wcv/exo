@@ -75,6 +75,7 @@ from exo.worker.engines.mlx.generator.pipelined_drafter import (
     _spec_diag,  # pyright: ignore[reportPrivateUsage]
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
+from exo.worker.engines.mlx.generator.ssm_rollback import supports_ssm_rollback
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     CoupledDrafter,
@@ -1279,8 +1280,26 @@ def mlx_generate(
     # row), now fixed in
     # :func:`qwen3_5_rollback_speculative_cache` by replaying each
     # SSM layer individually. The dispatch surface is re-enabled.
+    #
+    # The asymmetric / in-process pipelined path is ALSO excluded when
+    # the target advertises captured-forward + SSM rollback support
+    # (:func:`exo.worker.engines.mlx.generator.ssm_rollback.supports_ssm_rollback`):
+    # the pipelined verify loop swaps the standard forward +
+    # ``mlx_trim_prompt_cache`` pair for the architecture-specific
+    # captured-forward + replay-rollback that runs identical math to
+    # the DFlash coupled path. Qwen 3.5 hybrids (122B-A10B / 397B-A17B
+    # /  35B-A3B) take this branch when paired with an asymmetric
+    # drafter (e.g. Qwen3.5-4B-MLX-8bit) without any DFlash drafter
+    # being loaded.
+    pipelined_ssm_aware = (
+        draft_mode == "pipelined"
+        and has_non_kv_caches(caches)
+        and supports_ssm_rollback(model)
+    )
     if draft_mode in ("model", "pipelined") and (
-        has_non_kv_caches(caches) and not coupled_drafter_active
+        has_non_kv_caches(caches)
+        and not coupled_drafter_active
+        and not pipelined_ssm_aware
     ):
         logger.warning(
             f"draft_mode demoted from {draft_mode!r} to 'none' for "
@@ -1296,6 +1315,7 @@ def mlx_generate(
         effective_draft_model = None
         asymmetric_drafter_active = False
         asymmetric_drafter_is_root = False
+        pipelined_ssm_aware = False
 
     # Drafter cache lookup. We mirror the target's prefix-cache contract on
     # the drafter so multi-turn workloads don't pay the drafter's prefill
@@ -1661,6 +1681,7 @@ def mlx_generate(
                     target_group=group,
                     target_peer_fanout=target_peer_fanout,
                     is_target_root=True,
+                    ssm_aware=pipelined_ssm_aware,
                 )
             except BaseException:
                 # ``make_drafter`` or ``reset_and_prefill`` raised;
@@ -1698,6 +1719,7 @@ def mlx_generate(
                 target_group=group,
                 target_peer_fanout=target_peer_fanout,
                 is_target_root=False,
+                ssm_aware=pipelined_ssm_aware,
             )
     elif coupled_drafter_active and coupled_drafter is not None:
         # Coupled-drafter dispatch: build the adapter +
@@ -1777,6 +1799,7 @@ def mlx_generate(
             num_draft_tokens=effective_num_draft_tokens,
             draft_model=effective_draft_model if spec_active else None,
             draft_cache=drafter_caches if spec_active else None,
+            ssm_aware=pipelined_ssm_aware,
         )
 
     # ``decode_prompt`` is the prefill-tail (last two tokens of the

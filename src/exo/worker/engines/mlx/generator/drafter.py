@@ -973,6 +973,7 @@ def make_drafter(
     target_group: object | None = None,
     target_peer_fanout: object | None = None,
     is_target_root: bool = True,
+    ssm_aware: bool = False,
 ) -> Drafter:
     """Build a :class:`Drafter` for the resolved mode.
 
@@ -1079,6 +1080,7 @@ def make_drafter(
                 target_group=cast("mx.distributed.Group | None", target_group),
                 target_peer_fanout=target_peer_fanout,
                 is_target_root=False,
+                ssm_aware=ssm_aware,
             )
 
         if pipelined_transport is not None:
@@ -1108,6 +1110,7 @@ def make_drafter(
                 if target_subgroup_size > 1
                 else None,
                 is_target_root=True,
+                ssm_aware=ssm_aware,
             )
 
         # No builder-supplied transport, single target rank: in-process
@@ -1128,6 +1131,7 @@ def make_drafter(
         return PipelinedModelDrafter(
             transport=constructed,
             num_draft_tokens=num_draft_tokens,
+            ssm_aware=ssm_aware,
         )
     # Exhaustiveness: DraftMode is a closed Literal. Any other value is a
     # programming error at the call site, so raise loudly.
