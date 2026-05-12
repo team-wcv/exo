@@ -45,6 +45,7 @@ from mlx_lm.models.qwen3_5 import (
 from exo.worker.engines.mlx.generator.ssm_rollback import (
     SSMCaptureHandle,
     captured_verify,
+    is_target_ssm_trim_unsafe,
     rollback_after_verify,
     supports_ssm_rollback,
 )
@@ -121,6 +122,65 @@ def test_supports_ssm_rollback_false_for_plain_object() -> None:
         """Sentinel: shape-compatible with ``object``, no Qwen 3.5 ancestor."""
 
     assert not supports_ssm_rollback(_NotAModel())
+
+
+def test_is_target_ssm_trim_unsafe_when_target_overshoots_drafter() -> None:
+    """Pipelined-SSM-aware path with warm target + cold drafter => unsafe trim.
+
+    Codex P1 (PR #31, ``generate.py:1303``): ``mlx_trim_prompt_cache`` is
+    a no-op for non-trimmable cache entries. Trimming the target SSM
+    cache to align with a colder drafter would silently leave the SSM
+    state at the original offset and rewrite ``prompt_tokens`` /
+    ``prefix_hit_length`` as if the trim succeeded -- corrupting
+    verify/propose. The helper must flag this case so the generator
+    demotes the request to ``draft_mode='none'``.
+    """
+    assert is_target_ssm_trim_unsafe(
+        pipelined_ssm_aware=True, target_hit=128, drafter_hit=0
+    )
+    assert is_target_ssm_trim_unsafe(
+        pipelined_ssm_aware=True, target_hit=64, drafter_hit=32
+    )
+
+
+def test_is_target_ssm_trim_unsafe_when_drafter_overshoots_target() -> None:
+    """Drafter overshooting the target is safe to trim (drafter is KV-only).
+
+    The drafter is a regular MLX target without SSM caches, so
+    ``mlx_trim_prompt_cache`` does what it says on the drafter side.
+    Only the target side is unsafe under SSM-aware dispatch.
+    """
+    assert not is_target_ssm_trim_unsafe(
+        pipelined_ssm_aware=True, target_hit=32, drafter_hit=64
+    )
+    assert not is_target_ssm_trim_unsafe(
+        pipelined_ssm_aware=True, target_hit=0, drafter_hit=128
+    )
+
+
+def test_is_target_ssm_trim_unsafe_when_hits_aligned() -> None:
+    """Equal hits => no trim needed; never flagged as unsafe."""
+    assert not is_target_ssm_trim_unsafe(
+        pipelined_ssm_aware=True, target_hit=64, drafter_hit=64
+    )
+    assert not is_target_ssm_trim_unsafe(
+        pipelined_ssm_aware=True, target_hit=0, drafter_hit=0
+    )
+
+
+def test_is_target_ssm_trim_unsafe_when_pipelined_ssm_aware_disabled() -> None:
+    """When the pipelined SSM-aware bypass didn't fire, target trim is safe.
+
+    Either the target was already demoted to ``draft_mode='none'`` (no
+    drafter caches loaded, no alignment needed) or the target uses a
+    coupled DFlash drafter (which manages its own SSM state). In both
+    cases ``mlx_trim_prompt_cache`` over the target is either a no-op
+    on a trim-only-KV cache or never reached at all, so the helper
+    must NOT flag the trim as unsafe and force a spurious demotion.
+    """
+    assert not is_target_ssm_trim_unsafe(
+        pipelined_ssm_aware=False, target_hit=128, drafter_hit=0
+    )
 
 
 def test_captured_verify_matches_standard_forward_logits() -> None:

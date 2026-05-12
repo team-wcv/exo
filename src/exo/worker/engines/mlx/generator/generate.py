@@ -75,7 +75,10 @@ from exo.worker.engines.mlx.generator.pipelined_drafter import (
     _spec_diag,  # pyright: ignore[reportPrivateUsage]
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
-from exo.worker.engines.mlx.generator.ssm_rollback import supports_ssm_rollback
+from exo.worker.engines.mlx.generator.ssm_rollback import (
+    is_target_ssm_trim_unsafe,
+    supports_ssm_rollback,
+)
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     CoupledDrafter,
@@ -1342,23 +1345,75 @@ def mlx_generate(
         target_hit = prefix_hit_length
         drafter_hit = len(all_prompt_tokens) - len(drafter_remaining)
         aligned_hit = min(target_hit, drafter_hit)
-        # Trim whichever cache overshoots so both start at ``aligned_hit``.
-        if target_hit > aligned_hit:
-            mlx_trim_prompt_cache(cast(list[object], caches), target_hit - aligned_hit)  # type: ignore[reportArgumentType]
-            prompt_tokens = all_prompt_tokens[aligned_hit:]
-            prefix_hit_length = aligned_hit
-            if matched_index is not None and aligned_hit < target_hit:
-                # Trimming below the prior match invalidates the
-                # update-in-place path; treat as a fresh add.
-                matched_index = None
-                is_exact_hit = False
-        if drafter_hit > aligned_hit:
-            mlx_trim_prompt_cache(
-                cast("list[Any]", drafter_caches),
-                drafter_hit - aligned_hit,
+        # Codex P1 (PR #31, generate.py:1303): when ``pipelined_ssm_aware``
+        # bypasses the demotion gate above, ``caches`` may include
+        # ``ArraysCache`` entries (Qwen 3.5 GatedDeltaNet SSM state).
+        # ``mlx_trim_prompt_cache`` is a NO-OP for non-trimmable cache
+        # entries -- it silently returns without rewinding the SSM state.
+        # If we proceeded to rewrite ``prompt_tokens`` /
+        # ``prefix_hit_length`` as if the trim succeeded, the SSM state
+        # would still hold the original offset and verify/propose would
+        # run from divergent contexts -- the same poison pattern the
+        # rest of this PR exists to fix, just at cache-alignment time
+        # instead of post-verify rollback time.
+        #
+        # The verify-loop captured-forward + replay-rollback path
+        # (:func:`captured_verify` + :func:`rollback_after_verify`) only
+        # rewinds SSM state by N tokens *during speculation* using the
+        # captured GDN states from the same forward pass. It cannot
+        # safely rewind an arbitrary warm SSM cache to match a colder
+        # drafter cache without those captured states.
+        #
+        # Defensive fallback: when ``pipelined_ssm_aware`` is set AND
+        # the target prefix-cache hit overshoots the drafter's, demote
+        # this single request to ``draft_mode='none'``. The user's
+        # request still completes (target-only generation); the next
+        # request with a warm drafter cache will spec normally.
+        ssm_target_trim_unsafe = is_target_ssm_trim_unsafe(
+            pipelined_ssm_aware=pipelined_ssm_aware,
+            target_hit=target_hit,
+            drafter_hit=drafter_hit,
+        )
+        if ssm_target_trim_unsafe:
+            logger.warning(
+                "draft_mode demoted from %r to 'none' for this request: "
+                "target prefix-cache hit (%d) overshoots drafter hit (%d) "
+                "and the target cache contains non-trimmable SSM entries "
+                "(ArraysCache, e.g. Qwen 3.5 GatedDeltaNet). Trimming the "
+                "target via mlx_trim_prompt_cache would silently leave the "
+                "SSM state at the original offset and corrupt verify/propose. "
+                "Subsequent requests with a warm drafter prefix cache will "
+                "speculate normally.",
+                draft_mode,
+                target_hit,
+                drafter_hit,
             )
-            if drafter_matched_index is not None and aligned_hit < drafter_hit:
-                drafter_matched_index = None
+            draft_mode = "none"
+            spec_active = False
+            effective_draft_model = None
+            asymmetric_drafter_active = False
+            asymmetric_drafter_is_root = False
+            pipelined_ssm_aware = False
+            drafter_caches = []
+            drafter_matched_index = None
+        else:
+            # Trim whichever cache overshoots so both start at ``aligned_hit``.
+            if target_hit > aligned_hit:
+                mlx_trim_prompt_cache(cast(list[object], caches), target_hit - aligned_hit)  # type: ignore[reportArgumentType]
+                prompt_tokens = all_prompt_tokens[aligned_hit:]
+                prefix_hit_length = aligned_hit
+                if matched_index is not None and aligned_hit < target_hit:
+                    # Trimming below the prior match invalidates the
+                    # update-in-place path; treat as a fresh add.
+                    matched_index = None
+                    is_exact_hit = False
+            if drafter_hit > aligned_hit:
+                mlx_trim_prompt_cache(
+                    cast("list[Any]", drafter_caches),
+                    drafter_hit - aligned_hit,
+                )
+                if drafter_matched_index is not None and aligned_hit < drafter_hit:
+                    drafter_matched_index = None
 
     logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
         make_logits_processors(

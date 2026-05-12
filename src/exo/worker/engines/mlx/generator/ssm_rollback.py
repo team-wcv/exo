@@ -105,6 +105,43 @@ def supports_ssm_rollback(model: object) -> bool:
     return resolve_qwen3_5_text_model(model) is not None
 
 
+def is_target_ssm_trim_unsafe(
+    *,
+    pipelined_ssm_aware: bool,
+    target_hit: int,
+    drafter_hit: int,
+) -> bool:
+    """True iff the pre-spec cache-alignment trim of the target cache is unsafe.
+
+    ``mlx_trim_prompt_cache`` is a NO-OP for non-trimmable cache entries
+    (``ArraysCache``, e.g. Qwen 3.5 GatedDeltaNet SSM state). When the
+    pipelined-SSM-aware path bypasses the demotion gate AND the target
+    prefix-cache hit overshoots the drafter's, the caller would otherwise
+    rewrite ``prompt_tokens`` / ``prefix_hit_length`` as if the trim
+    succeeded while the underlying SSM state remained at the original
+    offset -- silently corrupting verify/propose. The verify-loop
+    captured-forward + replay-rollback path
+    (:func:`captured_verify` / :func:`rollback_after_verify`) only rewinds
+    SSM state by N tokens *during speculation* using GDN states from the
+    same forward pass; it cannot retroactively rewind an arbitrary warm
+    SSM cache to match a colder drafter cache.
+
+    Returning True signals the caller should demote this single request to
+    ``draft_mode='none'`` so target-only generation runs on the warm
+    target cache without an unsafe trim. The next request with a warm
+    drafter prefix cache will speculate normally.
+
+    Args:
+        pipelined_ssm_aware: ``True`` iff the request is on the
+            pipelined SSM-aware path (i.e. the demotion gate at
+            ``generate.py`` was bypassed because the model has the
+            captured-forward + replay-rollback contract).
+        target_hit: Tokens already in the target prefix cache.
+        drafter_hit: Tokens already in the drafter prefix cache.
+    """
+    return pipelined_ssm_aware and target_hit > drafter_hit
+
+
 def captured_verify(
     model: object,
     inputs: mx.array,
