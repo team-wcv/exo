@@ -1248,6 +1248,46 @@ def mlx_generate(
                 f"KV cache hit: {prefix_hit_length}/{len(all_prompt_tokens)} tokens cached ({100 * prefix_hit_length / len(all_prompt_tokens):.1f}%)"
             )
 
+    # SSM-hybrid demotion: ``draft_mode in ("model", "pipelined")`` both
+    # rely on ``mlx_trim_prompt_cache`` to discard rejected drafts'
+    # K/V after each verify round. That helper is gated by
+    # ``can_trim_prompt_cache`` (= all entries trimmable) and is a
+    # silent no-op when ANY cache entry is non-trimmable -- e.g.
+    # ``ArraysCache`` for GatedDeltaNet/SSM layers in Qwen 3.5,
+    # ``RotatingKVCache``, ``DeepseekV4Cache``. Without trim, the
+    # target's K/V at rejected positions stays populated with the
+    # drafter's wrong tokens, poisoning every subsequent round and
+    # silently corrupting output (target argmax diverges within ~15
+    # tokens). ``mlx_lm.speculative_generate_step`` raises rather
+    # than producing garbage; we mirror that defensive stance by
+    # demoting to ``"none"`` here so the request still completes
+    # correctly via the non-spec path.
+    #
+    # Coupled drafters (DFlash for Qwen 3.5, MTP for Gemma 4) are
+    # the exception: they carry per-model rollback hooks
+    # (``qwen3_5_rollback_speculative_cache`` /
+    # ``gemma4_rollback_speculative_cache``) that snapshot+replay
+    # the SSM state correctly, so the coupled path stays active
+    # when the loader produced one.
+    if (
+        draft_mode in ("model", "pipelined")
+        and not coupled_drafter_active
+        and has_non_kv_caches(caches)
+    ):
+        logger.warning(
+            f"draft_mode demoted from {draft_mode!r} to 'none' for "
+            f"target model with non-trimmable cache entries "
+            f"(SSM/ArraysCache, e.g. Qwen 3.5 GatedDeltaNet). "
+            f"Speculative decoding requires trimmable caches; only "
+            f"coupled drafters (DFlash/MTP) handle SSM-hybrid targets "
+            f"via per-model snapshot-restore rollback."
+        )
+        draft_mode = "none"
+        spec_active = False
+        effective_draft_model = None
+        asymmetric_drafter_active = False
+        asymmetric_drafter_is_root = False
+
     # Drafter cache lookup. We mirror the target's prefix-cache contract on
     # the drafter so multi-turn workloads don't pay the drafter's prefill
     # cost on every request (item 6). The aligned_hit logic below ensures
