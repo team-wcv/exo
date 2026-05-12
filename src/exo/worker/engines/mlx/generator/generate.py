@@ -1263,30 +1263,39 @@ def mlx_generate(
     # demoting to ``"none"`` here so the request still completes
     # correctly via the non-spec path.
     #
-    # Coupled drafters (DFlash for Qwen 3.5, MTP for Gemma 4) are
-    # the exception: they carry per-model rollback hooks
-    # (``qwen3_5_rollback_speculative_cache`` /
-    # ``gemma4_rollback_speculative_cache``) that snapshot+replay
-    # the SSM state correctly, so the coupled path stays active
-    # when the loader produced one.
-    if (
-        draft_mode in ("model", "pipelined")
-        and not coupled_drafter_active
-        and has_non_kv_caches(caches)
-    ):
+    # The coupled-drafter path (DFlash for Qwen 3.5, MTP for Gemma 4)
+    # is *also* demoted here when the target has SSM/non-KV caches.
+    # The DFlash rollback hooks
+    # (:func:`qwen3_5_rollback_speculative_cache`) are theoretically
+    # capable of snapshot+replay for the SSM state, but empirically
+    # the dispatch produces all-``!`` garbage on Qwen 3.5 SSM-hybrid
+    # targets (35B-A3B/122B-A10B): both drafter and target accept the
+    # same garbage token at high rate, suggesting a still-unresolved
+    # bug in the captured-forward / rollback contract. The vendor
+    # surface (``qwen3_5_dflash_hooks``, ``Qwen3_5DFlashTargetAdapter``,
+    # ``CoupledModelDrafter``) is preserved unchanged so we can light
+    # it back up once the regression is root-caused, but the dispatch
+    # gate is closed for SSM-hybrid targets so production traffic gets
+    # correct (target-only) output. MTP on Gemma 4 has no SSM cache,
+    # so ``has_non_kv_caches(caches)`` returns False for it and the
+    # MTP path stays active.
+    if draft_mode in ("model", "pipelined") and has_non_kv_caches(caches):
         logger.warning(
             f"draft_mode demoted from {draft_mode!r} to 'none' for "
             f"target model with non-trimmable cache entries "
-            f"(SSM/ArraysCache, e.g. Qwen 3.5 GatedDeltaNet). "
-            f"Speculative decoding requires trimmable caches; only "
-            f"coupled drafters (DFlash/MTP) handle SSM-hybrid targets "
-            f"via per-model snapshot-restore rollback."
+            f"(SSM/ArraysCache, e.g. Qwen 3.5 GatedDeltaNet); "
+            f"coupled_drafter_active={coupled_drafter_active}. "
+            f"Speculative decoding requires trimmable caches; "
+            f"coupled drafters (DFlash) also disabled pending "
+            f"resolution of the Qwen 3.5 dispatch regression "
+            f"(produces all-``!`` output with high accept rate)."
         )
         draft_mode = "none"
         spec_active = False
         effective_draft_model = None
         asymmetric_drafter_active = False
         asymmetric_drafter_is_root = False
+        coupled_drafter_active = False
 
     # Drafter cache lookup. We mirror the target's prefix-cache contract on
     # the drafter so multi-turn workloads don't pay the drafter's prefill
