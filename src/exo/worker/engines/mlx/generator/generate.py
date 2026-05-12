@@ -1248,9 +1248,9 @@ def mlx_generate(
                 f"KV cache hit: {prefix_hit_length}/{len(all_prompt_tokens)} tokens cached ({100 * prefix_hit_length / len(all_prompt_tokens):.1f}%)"
             )
 
-    # SSM-hybrid demotion: ``draft_mode in ("model", "pipelined")`` both
-    # rely on ``mlx_trim_prompt_cache`` to discard rejected drafts'
-    # K/V after each verify round. That helper is gated by
+    # SSM-hybrid demotion for the GENERIC (pipelined / model) drafter
+    # paths. Both rely on ``mlx_trim_prompt_cache`` to discard rejected
+    # drafts' K/V after each verify round. That helper is gated by
     # ``can_trim_prompt_cache`` (= all entries trimmable) and is a
     # silent no-op when ANY cache entry is non-trimmable -- e.g.
     # ``ArraysCache`` for GatedDeltaNet/SSM layers in Qwen 3.5,
@@ -1264,38 +1264,38 @@ def mlx_generate(
     # correctly via the non-spec path.
     #
     # The coupled-drafter path (DFlash for Qwen 3.5, MTP for Gemma 4)
-    # is *also* demoted here when the target has SSM/non-KV caches.
-    # The DFlash rollback hooks
-    # (:func:`qwen3_5_rollback_speculative_cache`) are theoretically
-    # capable of snapshot+replay for the SSM state, but empirically
-    # the dispatch produces all-``!`` garbage on Qwen 3.5 SSM-hybrid
-    # targets (35B-A3B/122B-A10B): both drafter and target accept the
-    # same garbage token at high rate, suggesting a still-unresolved
-    # bug in the captured-forward / rollback contract. The vendor
-    # surface (``qwen3_5_dflash_hooks``, ``Qwen3_5DFlashTargetAdapter``,
-    # ``CoupledModelDrafter``) is preserved unchanged so we can light
-    # it back up once the regression is root-caused, but the dispatch
-    # gate is closed for SSM-hybrid targets so production traffic gets
-    # correct (target-only) output. MTP on Gemma 4 has no SSM cache,
-    # so ``has_non_kv_caches(caches)`` returns False for it and the
-    # MTP path stays active.
-    if draft_mode in ("model", "pipelined") and has_non_kv_caches(caches):
+    # is intentionally EXCLUDED from this demotion: it bypasses
+    # ``mlx_trim_prompt_cache`` entirely and runs its own per-target
+    # rollback (:func:`qwen3_5_rollback_speculative_cache` for DFlash,
+    # :func:`gemma4_rollback_speculative_cache` for MTP) that knows
+    # how to rewind both KV trim and SSM-state replay correctly.
+    # Earlier this exclusion was widened to ALSO demote DFlash because
+    # the dispatch was empirically producing all-``!`` output on
+    # Qwen 3.5 SSM-hybrid targets; the root cause was a kernel-contract
+    # bug in mlx-vlm's batched SSM rollback (the Metal gated-delta
+    # kernel reads ``A_log``/``dt_bias`` by ``hv_idx`` only, with no
+    # ``b_idx``, so a flatten-then-launch over multiple layers'
+    # parameters silently used layer 0's ``A_log`` for every batched
+    # row), now fixed in
+    # :func:`qwen3_5_rollback_speculative_cache` by replaying each
+    # SSM layer individually. The dispatch surface is re-enabled.
+    if draft_mode in ("model", "pipelined") and (
+        has_non_kv_caches(caches) and not coupled_drafter_active
+    ):
         logger.warning(
             f"draft_mode demoted from {draft_mode!r} to 'none' for "
             f"target model with non-trimmable cache entries "
-            f"(SSM/ArraysCache, e.g. Qwen 3.5 GatedDeltaNet); "
-            f"coupled_drafter_active={coupled_drafter_active}. "
-            f"Speculative decoding requires trimmable caches; "
-            f"coupled drafters (DFlash) also disabled pending "
-            f"resolution of the Qwen 3.5 dispatch regression "
-            f"(produces all-``!`` output with high accept rate)."
+            f"(SSM/ArraysCache, e.g. Qwen 3.5 GatedDeltaNet) "
+            f"and no coupled drafter loaded. "
+            f"Speculative decoding via the generic path requires "
+            f"trimmable caches; load a coupled drafter (DFlash for "
+            f"Qwen 3.5, MTP for Gemma 4) to recover speculative speedup."
         )
         draft_mode = "none"
         spec_active = False
         effective_draft_model = None
         asymmetric_drafter_active = False
         asymmetric_drafter_is_root = False
-        coupled_drafter_active = False
 
     # Drafter cache lookup. We mirror the target's prefix-cache contract on
     # the drafter so multi-turn workloads don't pay the drafter's prefill
