@@ -75,6 +75,10 @@ from exo.worker.engines.mlx.generator.pipelined_drafter import (
     _spec_diag,  # pyright: ignore[reportPrivateUsage]
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
+from exo.worker.engines.mlx.generator.ssm_rollback import (
+    is_target_ssm_trim_unsafe,
+    supports_ssm_rollback,
+)
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     CoupledDrafter,
@@ -1248,6 +1252,74 @@ def mlx_generate(
                 f"KV cache hit: {prefix_hit_length}/{len(all_prompt_tokens)} tokens cached ({100 * prefix_hit_length / len(all_prompt_tokens):.1f}%)"
             )
 
+    # SSM-hybrid demotion for the GENERIC (pipelined / model) drafter
+    # paths. Both rely on ``mlx_trim_prompt_cache`` to discard rejected
+    # drafts' K/V after each verify round. That helper is gated by
+    # ``can_trim_prompt_cache`` (= all entries trimmable) and is a
+    # silent no-op when ANY cache entry is non-trimmable -- e.g.
+    # ``ArraysCache`` for GatedDeltaNet/SSM layers in Qwen 3.5,
+    # ``RotatingKVCache``, ``DeepseekV4Cache``. Without trim, the
+    # target's K/V at rejected positions stays populated with the
+    # drafter's wrong tokens, poisoning every subsequent round and
+    # silently corrupting output (target argmax diverges within ~15
+    # tokens). ``mlx_lm.speculative_generate_step`` raises rather
+    # than producing garbage; we mirror that defensive stance by
+    # demoting to ``"none"`` here so the request still completes
+    # correctly via the non-spec path.
+    #
+    # The coupled-drafter path (DFlash for Qwen 3.5, MTP for Gemma 4)
+    # is intentionally EXCLUDED from this demotion: it bypasses
+    # ``mlx_trim_prompt_cache`` entirely and runs its own per-target
+    # rollback (:func:`qwen3_5_rollback_speculative_cache` for DFlash,
+    # :func:`gemma4_rollback_speculative_cache` for MTP) that knows
+    # how to rewind both KV trim and SSM-state replay correctly.
+    # Earlier this exclusion was widened to ALSO demote DFlash because
+    # the dispatch was empirically producing all-``!`` output on
+    # Qwen 3.5 SSM-hybrid targets; the root cause was a kernel-contract
+    # bug in mlx-vlm's batched SSM rollback (the Metal gated-delta
+    # kernel reads ``A_log``/``dt_bias`` by ``hv_idx`` only, with no
+    # ``b_idx``, so a flatten-then-launch over multiple layers'
+    # parameters silently used layer 0's ``A_log`` for every batched
+    # row), now fixed in
+    # :func:`qwen3_5_rollback_speculative_cache` by replaying each
+    # SSM layer individually. The dispatch surface is re-enabled.
+    #
+    # The asymmetric / in-process pipelined path is ALSO excluded when
+    # the target advertises captured-forward + SSM rollback support
+    # (:func:`exo.worker.engines.mlx.generator.ssm_rollback.supports_ssm_rollback`):
+    # the pipelined verify loop swaps the standard forward +
+    # ``mlx_trim_prompt_cache`` pair for the architecture-specific
+    # captured-forward + replay-rollback that runs identical math to
+    # the DFlash coupled path. Qwen 3.5 hybrids (122B-A10B / 397B-A17B
+    # /  35B-A3B) take this branch when paired with an asymmetric
+    # drafter (e.g. Qwen3.5-4B-MLX-8bit) without any DFlash drafter
+    # being loaded.
+    pipelined_ssm_aware = (
+        draft_mode == "pipelined"
+        and has_non_kv_caches(caches)
+        and supports_ssm_rollback(model)
+    )
+    if draft_mode in ("model", "pipelined") and (
+        has_non_kv_caches(caches)
+        and not coupled_drafter_active
+        and not pipelined_ssm_aware
+    ):
+        logger.warning(
+            f"draft_mode demoted from {draft_mode!r} to 'none' for "
+            f"target model with non-trimmable cache entries "
+            f"(SSM/ArraysCache, e.g. Qwen 3.5 GatedDeltaNet) "
+            f"and no coupled drafter loaded. "
+            f"Speculative decoding via the generic path requires "
+            f"trimmable caches; load a coupled drafter (DFlash for "
+            f"Qwen 3.5, MTP for Gemma 4) to recover speculative speedup."
+        )
+        draft_mode = "none"
+        spec_active = False
+        effective_draft_model = None
+        asymmetric_drafter_active = False
+        asymmetric_drafter_is_root = False
+        pipelined_ssm_aware = False
+
     # Drafter cache lookup. We mirror the target's prefix-cache contract on
     # the drafter so multi-turn workloads don't pay the drafter's prefill
     # cost on every request (item 6). The aligned_hit logic below ensures
@@ -1273,23 +1345,124 @@ def mlx_generate(
         target_hit = prefix_hit_length
         drafter_hit = len(all_prompt_tokens) - len(drafter_remaining)
         aligned_hit = min(target_hit, drafter_hit)
-        # Trim whichever cache overshoots so both start at ``aligned_hit``.
-        if target_hit > aligned_hit:
-            mlx_trim_prompt_cache(cast(list[object], caches), target_hit - aligned_hit)  # type: ignore[reportArgumentType]
-            prompt_tokens = all_prompt_tokens[aligned_hit:]
-            prefix_hit_length = aligned_hit
-            if matched_index is not None and aligned_hit < target_hit:
-                # Trimming below the prior match invalidates the
-                # update-in-place path; treat as a fresh add.
-                matched_index = None
-                is_exact_hit = False
-        if drafter_hit > aligned_hit:
-            mlx_trim_prompt_cache(
-                cast("list[Any]", drafter_caches),
-                drafter_hit - aligned_hit,
+        # Codex P1 (PR #31, generate.py:1303): when ``pipelined_ssm_aware``
+        # bypasses the demotion gate above, ``caches`` may include
+        # ``ArraysCache`` entries (Qwen 3.5 GatedDeltaNet SSM state).
+        # ``mlx_trim_prompt_cache`` is a NO-OP for non-trimmable cache
+        # entries -- it silently returns without rewinding the SSM state.
+        # If we proceeded to rewrite ``prompt_tokens`` /
+        # ``prefix_hit_length`` as if the trim succeeded, the SSM state
+        # would still hold the original offset and verify/propose would
+        # run from divergent contexts -- the same poison pattern the
+        # rest of this PR exists to fix, just at cache-alignment time
+        # instead of post-verify rollback time.
+        #
+        # The verify-loop captured-forward + replay-rollback path
+        # (:func:`captured_verify` + :func:`rollback_after_verify`) only
+        # rewinds SSM state by N tokens *during speculation* using the
+        # captured GDN states from the same forward pass. It cannot
+        # safely rewind an arbitrary warm SSM cache to match a colder
+        # drafter cache without those captured states.
+        #
+        # Defensive fallback: when ``pipelined_ssm_aware`` is set AND
+        # the target prefix-cache hit overshoots the drafter's, demote
+        # this single request to ``draft_mode='none'``. The user's
+        # request still completes (target-only generation); the next
+        # request with a warm drafter cache will spec normally.
+        ssm_target_trim_unsafe = is_target_ssm_trim_unsafe(
+            pipelined_ssm_aware=pipelined_ssm_aware,
+            target_hit=target_hit,
+            drafter_hit=drafter_hit,
+        )
+        if ssm_target_trim_unsafe:
+            logger.warning(
+                "draft_mode demoted from %r to 'none' for this request: "
+                "target prefix-cache hit (%d) overshoots drafter hit (%d) "
+                "and the target cache contains non-trimmable SSM entries "
+                "(ArraysCache, e.g. Qwen 3.5 GatedDeltaNet). Trimming the "
+                "target via mlx_trim_prompt_cache would silently leave the "
+                "SSM state at the original offset and corrupt verify/propose. "
+                "Drafter cache will be warmed to the full prompt boundary "
+                "before demotion so subsequent requests on this prefix can "
+                "speculate normally.",
+                draft_mode,
+                target_hit,
+                drafter_hit,
             )
-            if drafter_matched_index is not None and aligned_hit < drafter_hit:
-                drafter_matched_index = None
+            # Codex P2 (PR #31, generate.py:1394): if we just dropped the
+            # drafter cache and flipped ``spec_active=False`` here, the
+            # snapshot block at L1575 (gated on ``spec_active``) would
+            # never write the drafter cache back to
+            # ``drafter_kv_prefix_cache``. The next request on the same
+            # conversation prefix would re-read a cold drafter cache,
+            # land in the same ``target_hit > drafter_hit`` mismatch,
+            # and re-trigger the demotion -- permanently disabling
+            # speculative decoding for that conversation instead of
+            # being a one-request fallback.
+            #
+            # Fix: warm the drafter cache to the full prompt boundary
+            # *before* demoting and snapshot it back into
+            # ``drafter_kv_prefix_cache`` directly. The drafter is a
+            # plain KV-only model (Qwen 3.5 SSM-aware targets pair with
+            # text-only drafters like Qwen3.5-4B-MLX-8bit); its prefix
+            # cache and the catch-up forward have no SSM-state hazard.
+            # ``effective_draft_model`` and ``drafter_caches`` are
+            # guaranteed non-None / non-empty here because we entered
+            # the enclosing ``if spec_active and effective_draft_model
+            # is not None`` block at L1330 to compute ``drafter_hit``;
+            # only ``drafter_kv_prefix_cache`` is independently nullable.
+            if drafter_kv_prefix_cache is not None and len(drafter_caches) > 0:
+                gap_tokens = all_prompt_tokens[drafter_hit:]
+                if gap_tokens.size > 0:
+                    _spec_drafter_prefill(
+                        effective_draft_model,
+                        drafter_caches,
+                        gap_tokens,
+                    )
+                if drafter_matched_index is not None:
+                    drafter_kv_prefix_cache.update_kv_cache(
+                        drafter_matched_index,
+                        all_prompt_tokens,
+                        drafter_caches,
+                        None,
+                        restore_pos=len(all_prompt_tokens),
+                        media_regions=media_regions,
+                        prefill_tps=0.0,
+                    )
+                else:
+                    drafter_kv_prefix_cache.add_kv_cache(
+                        all_prompt_tokens,
+                        drafter_caches,
+                        None,
+                        media_regions=media_regions,
+                        prefill_tps=0.0,
+                    )
+            draft_mode = "none"
+            spec_active = False
+            effective_draft_model = None
+            asymmetric_drafter_active = False
+            asymmetric_drafter_is_root = False
+            pipelined_ssm_aware = False
+            drafter_caches = []
+            drafter_matched_index = None
+        else:
+            # Trim whichever cache overshoots so both start at ``aligned_hit``.
+            if target_hit > aligned_hit:
+                mlx_trim_prompt_cache(cast(list[object], caches), target_hit - aligned_hit)  # type: ignore[reportArgumentType]
+                prompt_tokens = all_prompt_tokens[aligned_hit:]
+                prefix_hit_length = aligned_hit
+                if matched_index is not None and aligned_hit < target_hit:
+                    # Trimming below the prior match invalidates the
+                    # update-in-place path; treat as a fresh add.
+                    matched_index = None
+                    is_exact_hit = False
+            if drafter_hit > aligned_hit:
+                mlx_trim_prompt_cache(
+                    cast("list[Any]", drafter_caches),
+                    drafter_hit - aligned_hit,
+                )
+                if drafter_matched_index is not None and aligned_hit < drafter_hit:
+                    drafter_matched_index = None
 
     logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
         make_logits_processors(
@@ -1370,14 +1543,41 @@ def mlx_generate(
                 distributed_prompt_progress_callback,
             )
         # On the spec path we mirror exo's prefill on the drafter so its
-        # cache reaches the same offset as the target's (prompt - 2 after
-        # the trim(2) inside exo.prefill). mlx_lm's
-        # speculative_generate_step._prefill then advances both caches by
-        # 1 (decode_prompt size = 2 -> processes 1 token), arriving at
-        # prompt - 1 with ``y = decode_prompt[-1:]`` -- the canonical
-        # entry state for the spec loop.
+        # cache reaches the same offset as the target's *at the entry
+        # point of the spec loop*. Two regimes:
+        #
+        # * ``draft_mode == "model"``: dispatch routes through
+        #   :func:`mlx_lm.speculative_generate_step`, whose internal
+        #   ``_prefill`` runs over ``decode_prompt = prompt[-2:]`` on BOTH
+        #   target and drafter caches, advancing each by 1 token
+        #   (``prompt[-2]``) so the spec loop seeds from ``prompt[-1]``
+        #   with both caches at offset ``len(prompt) - 1``. To set this
+        #   up we prefill the drafter to offset ``len(prompt) - 2``
+        #   (= target's post-``exo.prefill`` offset) and let mlx_lm
+        #   advance both caches in lockstep.
+        #
+        # * ``draft_mode == "pipelined"``: dispatch routes through
+        #   :func:`_pipelined_speculative_step_body`, whose entry-state
+        #   prefill loop (``while y.size > 1: model(...)``) only advances
+        #   the *target* cache by one token; the drafter cache is opaque
+        #   to that loop (the in-process drafter would have to be invoked
+        #   explicitly here, and the remote drafter only receives the
+        #   first OP_FORWARD when the spec loop starts). To match the
+        #   "model" regime's invariant (both caches at ``len(prompt) - 1``
+        #   at spec-loop entry) we have to bake ``prompt[-2]`` into the
+        #   drafter prefill itself rather than rely on a subsequent
+        #   advance step. Pre-fix we sent ``prompt[:-2]`` for both
+        #   regimes, leaving the drafter one token short (its K/V slot
+        #   at offset ``len(prompt) - 2`` ended up populated by the
+        #   round-0 ``forward([prompt[-1]], k)`` input instead of by
+        #   ``prompt[-2]``); the drafter's subsequent proposals
+        #   attended over a context with ``prompt[-2]`` replaced by
+        #   ``prompt[-1]``, corrupting acceptance rate and emitted text.
         if spec_active and effective_draft_model is not None:
-            drafter_prefill_tokens = prompt_tokens[:-2]
+            if draft_mode == "pipelined":
+                drafter_prefill_tokens = prompt_tokens[:-1]
+            else:
+                drafter_prefill_tokens = prompt_tokens[:-2]
             if drafter_prefill_tokens.size > 0:
                 _spec_drafter_prefill(
                     effective_draft_model,
@@ -1534,16 +1734,32 @@ def mlx_generate(
                 )
             # Sync this request's drafter cache against the prompt before
             # constructing the drafter wrapper. The session sends OP_PREFILL
-            # with prompt[:-2] (matching ``_spec_drafter_prefill``'s
-            # invariant: align the drafter's offset to ``len(prompt) - 2``
-            # so the spec loop's first OP_FORWARD seeds from prompt[-2]).
+            # with prompt[:-1] so the drafter's offset lands at
+            # ``len(prompt) - 1``, matching the target's offset at the
+            # entry point of :func:`_pipelined_speculative_step_body`
+            # (the target's ``while y.size > 1`` prefill loop advances
+            # the target cache by one token, but does NOT touch the
+            # drafter cache -- the drafter is remote and only learns
+            # of new tokens via OP_FORWARD / OP_PREFILL). The pipelined
+            # spec loop then issues its round-0 ``transport.forward(
+            # [prompt[-1]], k)`` from this aligned state, with the
+            # drafter's K/V slot at offset ``len(prompt) - 1``
+            # correctly populated by ``prompt[-1]`` (and the K/V at
+            # offset ``len(prompt) - 2`` correctly populated by
+            # ``prompt[-2]`` from this OP_PREFILL). Pre-fix we sent
+            # ``prompt[:-2]``, leaving the drafter at offset
+            # ``len(prompt) - 2`` and forcing the round-0 OP_FORWARD
+            # to overwrite the ``prompt[-2]`` slot with ``prompt[-1]``;
+            # the drafter then attended over a context with
+            # ``prompt[-2]`` replaced by ``prompt[-1]``, corrupting
+            # every subsequent draft and tanking acceptance rate.
             _diag_t0 = time.perf_counter()
             _spec_diag(
                 f"rank 0: about to materialize prefill_prompt "
                 f"via tolist() ({all_prompt_tokens.size} prompt tokens total)"
             )
             prefill_prompt: list[int] = [
-                int(t) for t in cast(list[int], all_prompt_tokens[:-2].tolist())
+                int(t) for t in cast(list[int], all_prompt_tokens[:-1].tolist())
             ]
             _spec_diag(
                 f"rank 0: prefill_prompt materialized in "
@@ -1569,6 +1785,7 @@ def mlx_generate(
                     target_group=group,
                     target_peer_fanout=target_peer_fanout,
                     is_target_root=True,
+                    ssm_aware=pipelined_ssm_aware,
                 )
             except BaseException:
                 # ``make_drafter`` or ``reset_and_prefill`` raised;
@@ -1606,6 +1823,7 @@ def mlx_generate(
                 target_group=group,
                 target_peer_fanout=target_peer_fanout,
                 is_target_root=False,
+                ssm_aware=pipelined_ssm_aware,
             )
     elif coupled_drafter_active and coupled_drafter is not None:
         # Coupled-drafter dispatch: build the adapter +
@@ -1685,6 +1903,7 @@ def mlx_generate(
             num_draft_tokens=effective_num_draft_tokens,
             draft_model=effective_draft_model if spec_active else None,
             draft_cache=drafter_caches if spec_active else None,
+            ssm_aware=pipelined_ssm_aware,
         )
 
     # ``decode_prompt`` is the prefill-tail (last two tokens of the

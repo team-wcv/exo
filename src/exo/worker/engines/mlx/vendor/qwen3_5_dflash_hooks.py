@@ -662,25 +662,43 @@ def qwen3_5_rollback_speculative_cache(
     if not ssm_caches:
         return max_accepted
 
-    # Second pass: batch every gated-delta replay into one kernel
-    # launch via ``gated_delta_update``. The flatten-then-scatter dance
-    # is what mlx-vlm 0.5.0 does to amortize ~30 layer launches into 1.
-    n_ssm = len(ssm_caches)
-    replay_mask: mx.array | None = None
-    if is_batch:
-        replay_mask = mx.arange(n_keep)[None, :] <= accepted_array[:, None]
-
-    q_list: list[mx.array] = []
-    k_list: list[mx.array] = []
-    v_list: list[mx.array] = []
-    a_list: list[mx.array] = []
-    b_list: list[mx.array] = []
-    a_log_list: list[mx.array] = []
-    dt_bias_list: list[mx.array] = []
-    state_list: list[mx.array] = []
-    layer_batch_sizes: list[int] = []
-    conv_data: list[tuple[mx.array, int]] = []
-    for ssm_layer_index in range(n_ssm):
+    # Second pass: replay gated-delta state per SSM layer.
+    #
+    # mlx-vlm 0.5.0 batches every layer's q/k/v/a/b/A_log/dt_bias/state
+    # along the batch axis and issues a single kernel launch. That
+    # optimisation looks correct on paper but silently corrupts every
+    # SSM layer past the first one: the gated-delta Metal kernel
+    # (``_make_gated_delta_kernel`` in :mod:`mlx_lm.models.gated_delta`)
+    # indexes ``A_log`` and ``dt_bias`` by ``hv_idx`` ONLY:
+    #
+    #     float dt_val = static_cast<float>(dt_bias[hv_idx]);
+    #     float g_val = exp(-exp(static_cast<float>(A_log[hv_idx])) * sp);
+    #
+    # i.e. it assumes ``A_log`` / ``dt_bias`` are shape ``[Hv]`` (per-
+    # layer scalars), not ``[B, ..., Hv]``. When the upstream rollback
+    # broadcasts each layer's parameters to ``[1, 1, Hv]`` and
+    # concatenates along ``axis=0``, the kernel reads the first ``Hv``
+    # bytes for *every* batched row -- so every SSM layer past index 0
+    # has its state replayed with layer 0's A_log/dt_bias instead of
+    # its own. The result is a state that diverges from the native
+    # forward by a small but non-zero amount per layer, compounding
+    # across layers and rounds into the ``!`` garbage we observed on
+    # Qwen 3.5 SSM-hybrid targets (35B/122B/397B).
+    #
+    # Filed upstream as the captured-forward / rollback divergence
+    # that the SSM-hybrid demotion in ``generate.py`` was hiding. The
+    # safe fix is to loop per layer so each ``_gated_delta_update``
+    # call gets its own A_log/dt_bias -- the kernel-launch amortisation
+    # is small compared to the cost of running with a poisoned cache,
+    # and a future kernel that accepts ``[B, 1, Hv]`` parameters can
+    # restore the batched shape.
+    is_batch_replay: bool = is_batch  # alias for readability inside the loop
+    single_accept_offset: int | None = (
+        None if is_batch_replay else int(accepted_array[0].item())
+    )
+    for ssm_layer_index, ssm_cache_entry in enumerate(  # pyright: ignore[reportAny]
+        ssm_caches
+    ):
         (
             q_capture,
             k_capture,
@@ -700,17 +718,6 @@ def qwen3_5_rollback_speculative_cache(
         a_capture = a_capture[:, :n_keep]
         b_capture = b_capture[:, :n_keep]
         batch_rows = int(q_capture.shape[0])
-        q_list.append(q_capture)
-        k_list.append(k_capture)
-        v_list.append(v_capture)
-        a_list.append(a_capture)
-        b_list.append(b_capture)
-        a_log_list.append(
-            mx.broadcast_to(a_log[None, None, :], (batch_rows, 1, a_log.shape[0]))
-        )
-        dt_bias_list.append(
-            mx.broadcast_to(dt_bias[None, None, :], (batch_rows, 1, dt_bias.shape[0]))
-        )
         if init_state is None:
             init_state = mx.zeros(
                 (
@@ -721,63 +728,37 @@ def qwen3_5_rollback_speculative_cache(
                 ),
                 dtype=mx.float32,
             )
-        state_list.append(init_state)
-        layer_batch_sizes.append(batch_rows)
-        conv_data.append((conv_input, conv_kernel_size))
-        if not is_batch and replay_mask is None and captured_mask is not None:
-            replay_mask = captured_mask[:, :n_keep]
 
-    q_batched = mx.concatenate(q_list, axis=0)
-    k_batched = mx.concatenate(k_list, axis=0)
-    v_batched = mx.concatenate(v_list, axis=0)
-    a_batched = mx.concatenate(a_list, axis=0)
-    b_batched = mx.concatenate(b_list, axis=0)
-    a_log_batched = mx.concatenate(a_log_list, axis=0)
-    dt_bias_batched = mx.concatenate(dt_bias_list, axis=0)
-    state_batched = mx.concatenate(state_list, axis=0)
+        # Per-layer replay mask: only the captured padding mask
+        # (single-batch) needs a [:, :n_keep] slice; the batched-rollback
+        # mask is a fresh ``mx.arange(n_keep) <= accepted`` aligned
+        # to the layer's batch_rows.
+        layer_replay_mask: mx.array | None = None
+        if is_batch_replay:
+            layer_replay_mask = mx.arange(n_keep)[None, :] <= accepted_array[:, None]
+        elif captured_mask is not None:
+            layer_replay_mask = captured_mask[:, :n_keep]
 
-    # Replay-mask alignment guard: when a batch SSM rollback flattens
-    # multiple layers' rows, the mask has to repeat to match. mlx-vlm
-    # raises ValueError on misalignment; we keep that contract.
-    if replay_mask is not None and replay_mask.shape[0] != q_batched.shape[0]:
-        if q_batched.shape[0] % replay_mask.shape[0] != 0:
-            raise ValueError(
-                "qwen3_5_rollback_speculative_cache: replay mask batch "
-                "does not align with flattened SSM rollback rows "
-                f"(mask rows={replay_mask.shape[0]}, "
-                f"total rows={q_batched.shape[0]})."
-            )
-        repeats = q_batched.shape[0] // replay_mask.shape[0]
-        replay_mask = mx.concatenate([replay_mask] * repeats, axis=0)
+        _, layer_state_out = _gated_delta_update(
+            q_capture,
+            k_capture,
+            v_capture,
+            a_capture,
+            b_capture,
+            a_log,
+            dt_bias,
+            init_state,
+            layer_replay_mask,
+            use_kernel=True,
+        )
 
-    _, states_out = _gated_delta_update(
-        q_batched,
-        k_batched,
-        v_batched,
-        a_batched,
-        b_batched,
-        a_log_batched,
-        dt_bias_batched,
-        state_batched,
-        replay_mask,
-        use_kernel=True,
-    )
+        ssm_cache: Any = ssm_cache_entry  # pyright: ignore[reportAny]
+        ssm_cache[1] = layer_state_out
 
-    # Scatter results back to individual caches and rewind conv_input
-    # to the accepted-prefix slice. The two branches mirror mlx-vlm:
-    # batch dispatch uses per-row accepted offsets; single-batch uses
-    # the scalar offset.
-    single_accept_offset: int | None = (
-        None if is_batch else int(accepted_array[0].item())
-    )
-    state_offset = 0
-    for ssm_layer_index in range(len(ssm_caches)):
-        ssm_cache: Any = ssm_caches[ssm_layer_index]  # pyright: ignore[reportAny]
-        batch_rows = layer_batch_sizes[ssm_layer_index]
-        ssm_cache[1] = states_out[state_offset : state_offset + batch_rows]
-        state_offset += batch_rows
-        conv_input, conv_kernel_size = conv_data[ssm_layer_index]
-        if is_batch:
+        # Rewind conv_input to the accepted-prefix slice. Mirrors
+        # mlx-vlm's branch structure: batched dispatch uses per-row
+        # offsets, single-batch uses the scalar offset.
+        if is_batch_replay:
             acc_list = cast("list[int]", accepted_array.tolist())
             slices: list[mx.array] = [
                 conv_input[

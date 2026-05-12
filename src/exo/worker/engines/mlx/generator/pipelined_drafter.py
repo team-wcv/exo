@@ -157,7 +157,7 @@ import contextlib
 import os as _diag_os
 import sys as _diag_sys
 import time
-from typing import Callable, Final, Generator, Sequence, Sized, cast, final
+from typing import Any, Callable, Final, Generator, Sequence, Sized, cast, final
 
 import mlx.core as mx
 from mlx_lm.generate import GenerationResponse
@@ -168,6 +168,11 @@ from exo.worker.engines.mlx.generator.drafter import DraftMode
 from exo.worker.engines.mlx.generator.drafter_transport import (
     DrafterTransport,
     DraftFuture,
+)
+from exo.worker.engines.mlx.generator.ssm_rollback import (
+    SSMCaptureHandle,
+    captured_verify,
+    rollback_after_verify,
 )
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
@@ -353,6 +358,7 @@ class PipelinedModelDrafter:
         target_group: mx.distributed.Group | None = None,
         target_peer_fanout: TargetPeerFanout | None = None,
         is_target_root: bool = True,
+        ssm_aware: bool = False,
     ) -> None:
         if num_draft_tokens < 1:
             raise ValueError(f"num_draft_tokens must be >= 1, got {num_draft_tokens}")
@@ -386,6 +392,16 @@ class PipelinedModelDrafter:
         self._target_group = target_group
         self._target_peer_fanout = target_peer_fanout
         self._is_target_root = is_target_root
+        # Whether the target has captured-forward + SSM rollback support
+        # (Qwen 3.5 hybrid). When True the verify loop swaps the
+        # standard forward + ``mlx_trim_prompt_cache`` pair for the
+        # architecture-specific captured-forward + replay-rollback in
+        # :mod:`ssm_rollback`; without that swap, ``ArraysCache`` entries
+        # in the target cache short-circuit ``can_trim_prompt_cache`` to
+        # False and the per-round trim becomes a silent no-op, leaving
+        # the next round's verify reading SSM state polluted by
+        # rejected drafts.
+        self._ssm_aware = ssm_aware
         # Per-request spec-decode telemetry. Mutated in place by the
         # spec body each round; read by ``mlx_generate`` after streaming
         # completes to populate ``GenerationStats``. Single-request
@@ -446,6 +462,7 @@ class PipelinedModelDrafter:
             target_peer_fanout=self._target_peer_fanout,
             is_target_root=self._is_target_root,
             metrics=self._metrics,
+            ssm_aware=self._ssm_aware,
         )
 
     def shutdown(self) -> None:
@@ -471,6 +488,7 @@ def _pipelined_stream_generate(
     target_peer_fanout: TargetPeerFanout | None = None,
     is_target_root: bool = True,
     metrics: dict[str, int] | None = None,
+    ssm_aware: bool = False,
 ) -> Generator[GenerationResponse, None, None]:
     """Mirror of ``mlx_lm.stream_generate`` framing for the pipelined drafter.
 
@@ -503,6 +521,7 @@ def _pipelined_stream_generate(
         target_peer_fanout=target_peer_fanout,
         is_target_root=is_target_root,
         metrics=metrics,
+        ssm_aware=ssm_aware,
     )
 
     prompt_size = len(context_tokens)
@@ -771,6 +790,7 @@ def _pipelined_speculative_step(
     target_peer_fanout: TargetPeerFanout | None = None,
     is_target_root: bool = True,
     metrics: dict[str, int] | None = None,
+    ssm_aware: bool = False,
 ) -> Generator[tuple[int, mx.array, bool], None, None]:
     """Public spec-step generator with drafter-failure recovery.
 
@@ -805,6 +825,7 @@ def _pipelined_speculative_step(
         target_peer_fanout=target_peer_fanout,
         is_target_root=is_target_root,
         metrics=metrics,
+        ssm_aware=ssm_aware,
     )
     try:
         yield from inner
@@ -841,6 +862,7 @@ def _pipelined_speculative_step_body(
     target_peer_fanout: TargetPeerFanout | None = None,
     is_target_root: bool = True,
     metrics: dict[str, int] | None = None,
+    ssm_aware: bool = False,
 ) -> Generator[tuple[int, mx.array, bool], None, None]:
     """Cross-round speculative decoding loop using ``transport``.
 
@@ -895,8 +917,15 @@ def _pipelined_speculative_step_body(
 
     # Mirror mlx_lm._prefill: caller has aligned ``prompt_cache`` to
     # ``context_tokens[:-2]`` via ``exo.prefill`` + ``trim(2)``; this loop
-    # advances the cache by one more token, leaving ``y`` (length 1) as
-    # the seed for the spec loop.
+    # advances the *target* cache by one more token (``prompt[-2]``),
+    # leaving ``y`` (length 1) as the seed for the spec loop. The drafter
+    # cache is opaque to this loop -- ``mlx_generate`` is responsible for
+    # placing the drafter at offset ``len(prompt) - 1`` BEFORE the body
+    # is entered (asymmetric: via ``OP_PREFILL`` over ``prompt[:-1]``;
+    # in-process pipelined: via ``_spec_drafter_prefill`` over
+    # ``prompt[:-1]``). That way the drafter's first ``forward([seed], k)``
+    # in round 0 lands ``prompt[-1]``'s K/V at offset ``len(prompt) - 1``
+    # rather than overwriting the ``prompt[-2]`` slot.
     _diag_prefill_iters = 0
     while y.size > 1:
         _diag_prefill_t0 = time.perf_counter()
@@ -1006,7 +1035,22 @@ def _pipelined_speculative_step_body(
         draft_arr = mx.array(drafts, dtype=mx.uint32)
         verify_input = mx.concatenate([seed_arr, draft_arr])
         _diag_verify_t0 = time.perf_counter()
-        logits = model(verify_input[None], cache=prompt_cache)
+        # SSM-aware targets (Qwen 3.5 hybrid) take the captured-forward
+        # branch so the per-round rollback can replay each gated-delta
+        # layer's state against its own captured intermediates. The
+        # standard forward path is fine for KV-only targets where
+        # ``mlx_trim_prompt_cache`` actually rolls back rejected drafts.
+        # The captured forward's logits are the same shape as the
+        # standard forward's, so the rest of the verify body (sampler,
+        # accept loop, emission) is shared between both branches.
+        captured_state: SSMCaptureHandle | None = None
+        if ssm_aware:
+            cache_list: list[Any] = list(prompt_cache)
+            verify_out = captured_verify(model, verify_input[None], cache_list)
+            logits: mx.array = verify_out[0]
+            captured_state = verify_out[1]
+        else:
+            logits = model(verify_input[None], cache=prompt_cache)
         # CRITICAL: force eval of ``logits`` on every target rank so the
         # TP all-reduce kernels embedded in ``model()`` actually launch
         # before any rank proceeds to its next blocking step. Without
@@ -1180,9 +1224,28 @@ def _pipelined_speculative_step_body(
         # Verify forward extended target cache by k_this + 1; we keep
         # ``num_accepted + 1`` of those (= emit_count) so trim
         # ``k_this - num_accepted``.
+        #
+        # SSM-aware branch: ``mlx_trim_prompt_cache`` short-circuits to
+        # a no-op when ANY cache entry is non-trimmable
+        # (``can_trim_prompt_cache`` -> False on ``ArraysCache``), so
+        # using it for Qwen 3.5 hybrid targets would silently leave
+        # rejected drafts' SSM contributions in the cache. Route
+        # through the architecture-specific rollback instead, which
+        # trims KV in place AND replays each gated-delta layer's
+        # post-prefix state from the captured intermediates.
         target_trim = k_this - num_accepted
         if target_trim > 0:
-            mlx_trim_prompt_cache(cast(list[object], prompt_cache), target_trim)  # type: ignore[reportArgumentType]
+            if ssm_aware:
+                assert captured_state is not None  # narrowed by ssm_aware
+                rollback_after_verify(
+                    model,
+                    list(prompt_cache),
+                    captured_state,
+                    num_accepted=num_accepted,
+                    block_size=k_this + 1,
+                )
+            else:
+                mlx_trim_prompt_cache(cast(list[object], prompt_cache), target_trim)  # type: ignore[reportArgumentType]
 
         if ntoks >= max_tokens:
             # Discard any in-flight speculation; we're done. Rolling back
