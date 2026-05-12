@@ -1382,12 +1382,61 @@ def mlx_generate(
                 "(ArraysCache, e.g. Qwen 3.5 GatedDeltaNet). Trimming the "
                 "target via mlx_trim_prompt_cache would silently leave the "
                 "SSM state at the original offset and corrupt verify/propose. "
-                "Subsequent requests with a warm drafter prefix cache will "
+                "Drafter cache will be warmed to the full prompt boundary "
+                "before demotion so subsequent requests on this prefix can "
                 "speculate normally.",
                 draft_mode,
                 target_hit,
                 drafter_hit,
             )
+            # Codex P2 (PR #31, generate.py:1394): if we just dropped the
+            # drafter cache and flipped ``spec_active=False`` here, the
+            # snapshot block at L1575 (gated on ``spec_active``) would
+            # never write the drafter cache back to
+            # ``drafter_kv_prefix_cache``. The next request on the same
+            # conversation prefix would re-read a cold drafter cache,
+            # land in the same ``target_hit > drafter_hit`` mismatch,
+            # and re-trigger the demotion -- permanently disabling
+            # speculative decoding for that conversation instead of
+            # being a one-request fallback.
+            #
+            # Fix: warm the drafter cache to the full prompt boundary
+            # *before* demoting and snapshot it back into
+            # ``drafter_kv_prefix_cache`` directly. The drafter is a
+            # plain KV-only model (Qwen 3.5 SSM-aware targets pair with
+            # text-only drafters like Qwen3.5-4B-MLX-8bit); its prefix
+            # cache and the catch-up forward have no SSM-state hazard.
+            # ``effective_draft_model`` and ``drafter_caches`` are
+            # guaranteed non-None / non-empty here because we entered
+            # the enclosing ``if spec_active and effective_draft_model
+            # is not None`` block at L1330 to compute ``drafter_hit``;
+            # only ``drafter_kv_prefix_cache`` is independently nullable.
+            if drafter_kv_prefix_cache is not None and len(drafter_caches) > 0:
+                gap_tokens = all_prompt_tokens[drafter_hit:]
+                if gap_tokens.size > 0:
+                    _spec_drafter_prefill(
+                        effective_draft_model,
+                        drafter_caches,
+                        gap_tokens,
+                    )
+                if drafter_matched_index is not None:
+                    drafter_kv_prefix_cache.update_kv_cache(
+                        drafter_matched_index,
+                        all_prompt_tokens,
+                        drafter_caches,
+                        None,
+                        restore_pos=len(all_prompt_tokens),
+                        media_regions=media_regions,
+                        prefill_tps=0.0,
+                    )
+                else:
+                    drafter_kv_prefix_cache.add_kv_cache(
+                        all_prompt_tokens,
+                        drafter_caches,
+                        None,
+                        media_regions=media_regions,
+                        prefill_tps=0.0,
+                    )
             draft_mode = "none"
             spec_active = False
             effective_draft_model = None
