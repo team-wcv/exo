@@ -138,7 +138,7 @@ class EventRouter:
                         f"event_type={type(event.event).__name__}"
                     )
                     # Request the next index.
-                    self._tg.start_soon(self._nack_request, buf.next_idx_to_release)
+                    self._start_nack_request(buf.next_idx_to_release)
                     continue
 
                 for idx, event in drained:
@@ -150,6 +150,12 @@ class EventRouter:
                             to_clear.add(i)
                     for i in sorted(to_clear, reverse=True):
                         self.internal_outbound.pop(i)
+                if drained and buf.store:
+                    # A one-event replay can close the first hole while
+                    # leaving later buffered events behind another gap.
+                    # Schedule the next replay immediately instead of
+                    # waiting for unrelated future global traffic.
+                    self._start_nack_request(buf.next_idx_to_release)
 
     async def _nack_request(self, since_idx: int) -> None:
         # We request all events after (and including) the missing index.
@@ -182,6 +188,14 @@ class EventRouter:
             finally:
                 if self._nack_cancel_scope is scope:
                     self._nack_cancel_scope = None
+
+    def _start_nack_request(self, since_idx: int) -> None:
+        if (
+            self._nack_cancel_scope is not None
+            and not self._nack_cancel_scope.cancel_called
+        ):
+            return
+        self._tg.start_soon(self._nack_request, since_idx)
 
     def _log_outbound_pressure(self) -> None:
         size = len(self.out_for_delivery)
