@@ -27,7 +27,7 @@ async def test_nack_requests_only_the_missing_event() -> None:
     )
     router._nack_base_seconds = 0
 
-    await router._nack_request(since_idx=42)
+    await router._nack_request(since_idx=42, max_events=1)
 
     commands = command_receiver.collect()
     assert len(commands) == 1
@@ -68,7 +68,7 @@ async def test_gap_replay_chains_when_buffer_still_has_future_events() -> None:
         first = await command_receiver.receive()
         assert isinstance(first.command, RequestEventLog)
         assert first.command.since_idx == 0
-        assert first.command.max_events == 1
+        assert first.command.max_events == 3
 
         await global_sender.send(
             GlobalForwarderEvent(
@@ -81,9 +81,47 @@ async def test_gap_replay_chains_when_buffer_still_has_future_events() -> None:
         second = await command_receiver.receive()
         assert isinstance(second.command, RequestEventLog)
         assert second.command.since_idx == 1
-        assert second.command.max_events == 1
+        assert second.command.max_events == 2
         applied = await internal_receiver.receive()
         assert applied.idx == 0
+
+        router.shutdown()
+        task_group.cancel_scope.cancel()
+
+    global_sender.close()
+    local_receiver.close()
+
+
+@pytest.mark.asyncio
+async def test_gap_replay_batches_are_capped() -> None:
+    command_sender, command_receiver = channel[ForwarderCommand]()
+    global_sender, global_receiver = channel[GlobalForwarderEvent]()
+    local_sender, local_receiver = channel[LocalForwarderEvent]()
+    session_id = SessionId(master_node_id=NodeId("master"), election_clock=0)
+    router = EventRouter(
+        session_id=session_id,
+        command_sender=command_sender,
+        external_inbound=global_receiver,
+        external_outbound=local_sender,
+    )
+    router._nack_base_seconds = 0
+    router._nack_max_events = 2
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(router.run)
+        await global_sender.send(
+            GlobalForwarderEvent(
+                origin=NodeId("master"),
+                origin_idx=10,
+                session=session_id,
+                event=TestEvent(),
+            )
+        )
+
+        command = (await command_receiver.receive()).command
+        assert isinstance(command, RequestEventLog)
+        assert command.since_idx == 0
+        assert command.max_events == 2
 
         router.shutdown()
         task_group.cancel_scope.cancel()
