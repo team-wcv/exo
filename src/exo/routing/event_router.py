@@ -176,7 +176,7 @@ class EventRouter:
                 await self.command_sender.send(
                     ForwarderCommand(
                         origin=self._system_id,
-                        command=RequestEventLog(since_idx=since_idx),
+                        command=RequestEventLog(since_idx=since_idx, max_events=1),
                     )
                 )
             finally:

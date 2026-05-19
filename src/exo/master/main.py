@@ -518,14 +518,11 @@ class Master:
                                 InstanceLinkDeleted(link_id=command.link_id)
                             )
                         case RequestEventLog():
-                            # We should just be able to send everything, since other buffers will ignore old messages
-                            # rate limit to 1000 at a time
-                            end = min(command.since_idx + 1000, len(self._event_log))
-                            for i, event in enumerate(
-                                self._event_log.read_range(command.since_idx, end),
-                                start=command.since_idx,
-                            ):
-                                await self._send_event(IndexedEvent(idx=i, event=event))
+                            # Replays are intentionally bounded because gap
+                            # recovery shares the normal gossipsub path.
+                            await self._replay_event_log(
+                                command.since_idx, command.max_events
+                            )
                     for event in generated_events:
                         await self.event_sender.send(event)
                 except ValueError as e:
@@ -651,6 +648,14 @@ class Master:
                 event=event.event,
             )
         )
+
+    async def _replay_event_log(self, since_idx: int, max_events: int) -> None:
+        end = min(since_idx + max_events, len(self._event_log))
+        for i, event in enumerate(
+            self._event_log.read_range(since_idx, end),
+            start=since_idx,
+        ):
+            await self._send_event(IndexedEvent(idx=i, event=event))
 
     def _friendly_name(self, node_id: NodeId) -> str:
         identity = self.state.node_identities.get(node_id)
