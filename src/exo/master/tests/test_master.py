@@ -328,6 +328,40 @@ def test_master_prunes_old_session_log_directories(tmp_path: Path):
     master._event_log.close()
 
 
+@pytest.mark.asyncio
+async def test_request_event_log_replays_bounded_range(tmp_path: Path):
+    node_id = NodeId("master-node")
+    session_id = SessionId(master_node_id=node_id, election_clock=0)
+    ge_sender, global_event_receiver = channel[GlobalForwarderEvent]()
+    _, co_receiver = channel[ForwarderCommand]()
+    _, le_receiver = channel[LocalForwarderEvent]()
+    fcds, _fcdr = channel[ForwarderDownloadCommand]()
+    ev_send, _ev_recv = channel[Event]()
+
+    master = Master(
+        node_id,
+        session_id,
+        event_sender=ev_send,
+        global_event_sender=ge_sender,
+        local_event_receiver=le_receiver,
+        command_receiver=co_receiver,
+        download_command_sender=fcds,
+        event_log_root=tmp_path,
+    )
+    events = [TestEvent() for _ in range(5)]
+    for event in events:
+        master._event_log.append(event)
+
+    await master._replay_event_log(since_idx=2, max_events=1)
+
+    replayed = global_event_receiver.collect()
+    assert len(replayed) == 1
+    assert replayed[0].origin_idx == 2
+    assert replayed[0].event == events[2]
+
+    master._event_log.close()
+
+
 def _test_model_card(model_id: ModelId) -> ModelCard:
     return ModelCard(
         model_id=model_id,

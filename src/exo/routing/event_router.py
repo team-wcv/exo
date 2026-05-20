@@ -42,6 +42,7 @@ class EventRouter:
     _nack_attempts: int = field(init=False, default=0)
     _nack_base_seconds: float = field(init=False, default=0.5)
     _nack_cap_seconds: float = field(init=False, default=10.0)
+    _nack_max_events: int = field(init=False, default=64)
     _last_outbound_warning_size: int = field(init=False, default=0)
 
     async def run(self):
@@ -138,7 +139,10 @@ class EventRouter:
                         f"event_type={type(event.event).__name__}"
                     )
                     # Request the next index.
-                    self._tg.start_soon(self._nack_request, buf.next_idx_to_release)
+                    self._start_nack_request(
+                        buf.next_idx_to_release,
+                        max_events=self._nack_replay_size(buf),
+                    )
                     continue
 
                 for idx, event in drained:
@@ -150,8 +154,23 @@ class EventRouter:
                             to_clear.add(i)
                     for i in sorted(to_clear, reverse=True):
                         self.internal_outbound.pop(i)
+                if drained and buf.store:
+                    # A one-event replay can close the first hole while
+                    # leaving later buffered events behind another gap.
+                    # Schedule the next replay immediately instead of
+                    # waiting for unrelated future global traffic.
+                    self._start_nack_request(
+                        buf.next_idx_to_release,
+                        max_events=self._nack_replay_size(buf),
+                    )
 
-    async def _nack_request(self, since_idx: int) -> None:
+    def _nack_replay_size(self, buf: OrderedBuffer[Event]) -> int:
+        if not buf.store:
+            return 1
+        buffered_gap = max(buf.store) - buf.next_idx_to_release + 1
+        return max(1, min(buffered_gap, self._nack_max_events))
+
+    async def _nack_request(self, since_idx: int, max_events: int) -> None:
         # We request all events after (and including) the missing index.
         # This function is started whenever we receive an event that is out of sequence.
         # It is cancelled as soon as we receiver an event that is in sequence.
@@ -176,12 +195,22 @@ class EventRouter:
                 await self.command_sender.send(
                     ForwarderCommand(
                         origin=self._system_id,
-                        command=RequestEventLog(since_idx=since_idx),
+                        command=RequestEventLog(
+                            since_idx=since_idx, max_events=max_events
+                        ),
                     )
                 )
             finally:
                 if self._nack_cancel_scope is scope:
                     self._nack_cancel_scope = None
+
+    def _start_nack_request(self, since_idx: int, *, max_events: int) -> None:
+        if (
+            self._nack_cancel_scope is not None
+            and not self._nack_cancel_scope.cancel_called
+        ):
+            return
+        self._tg.start_soon(self._nack_request, since_idx, max_events)
 
     def _log_outbound_pressure(self) -> None:
         size = len(self.out_for_delivery)
