@@ -1,3 +1,4 @@
+import anyio
 import pytest
 from anyio import create_task_group, fail_after, move_on_after
 
@@ -421,6 +422,57 @@ async def test_transient_disconnect_reconnect_does_not_start_new_round() -> None
                     break
 
             await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=False))
+            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+
+            got_flap_round = False
+            with move_on_after(0.3):
+                while True:
+                    got = await em_out_rx.receive()
+                    if got.clock > 1:
+                        got_flap_round = True
+                        break
+            assert not got_flap_round
+
+            em_in_tx.close()
+            cm_tx.close()
+            co_tx.close()
+
+
+@pytest.mark.anyio
+async def test_transient_disconnect_uses_configured_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXO_DROPOUT_GRACE_SECONDS", "0.2")
+
+    em_out_tx, em_out_rx = channel[ElectionMessage]()
+    em_in_tx, em_in_rx = channel[ElectionMessage]()
+    er_tx, _er_rx = channel[ElectionResult]()
+    cm_tx, cm_rx = channel[ConnectionMessage]()
+    co_tx, co_rx = channel[ForwarderCommand]()
+
+    election = Election(
+        node_id=NodeId("ME"),
+        election_message_receiver=em_in_rx,
+        election_message_sender=em_out_tx,
+        election_result_sender=er_tx,
+        connection_message_receiver=cm_rx,
+        command_receiver=co_rx,
+        is_candidate=True,
+    )
+
+    async with create_task_group() as tg:
+        with fail_after(2):
+            tg.start_soon(election.run)
+
+            peer_id = NodeId("PEER")
+            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            while True:
+                got = await em_out_rx.receive()
+                if got.clock == 1:
+                    break
+
+            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=False))
+            await anyio.sleep(0.1)
             await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
 
             got_flap_round = False

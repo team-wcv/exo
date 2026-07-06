@@ -1,4 +1,5 @@
 import hashlib
+import os
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -60,6 +61,33 @@ from exo.utils.keyed_backoff import KeyedBackoff
 from exo.utils.task_group import TaskGroup
 from exo.worker.plan import plan
 from exo.worker.runner.supervisor import RunnerSupervisor
+
+DEFAULT_SOCKET_PROBE_FAILURE_THRESHOLD = 3
+EXO_SOCKET_PROBE_FAILURE_THRESHOLD_ENV = "EXO_SOCKET_PROBE_FAILURE_THRESHOLD"
+
+
+def _socket_probe_failure_threshold() -> int:
+    value = os.getenv(EXO_SOCKET_PROBE_FAILURE_THRESHOLD_ENV)
+    if value is None:
+        return DEFAULT_SOCKET_PROBE_FAILURE_THRESHOLD
+    try:
+        return max(1, int(value))
+    except ValueError:
+        logger.warning(
+            f"Ignoring invalid {EXO_SOCKET_PROBE_FAILURE_THRESHOLD_ENV}={value!r}; "
+            f"using {DEFAULT_SOCKET_PROBE_FAILURE_THRESHOLD}"
+        )
+        return DEFAULT_SOCKET_PROBE_FAILURE_THRESHOLD
+
+
+def _socket_probe_key(conn: Connection) -> tuple[NodeId, NodeId, str, int]:
+    assert isinstance(conn.edge, SocketConnection)
+    return (
+        conn.source,
+        conn.sink,
+        conn.edge.sink_multiaddr.ip_address,
+        conn.edge.sink_multiaddr.port,
+    )
 
 
 def _should_drop_generation_task_at_drafter(
@@ -144,6 +172,9 @@ class Worker:
             base=0.5, cap=10.0
         )
         self._stopped: anyio.Event = anyio.Event()
+        self._socket_probe_failures: defaultdict[
+            tuple[NodeId, NodeId, str, int], int
+        ] = defaultdict(int)
 
     async def run(self):
         logger.info("Starting Worker")
@@ -531,7 +562,20 @@ class Worker:
                     conn.sink not in conns
                     or conn.edge.sink_multiaddr.ip_address not in conns[conn.sink]
                 ):
-                    logger.debug(f"ping failed to discover {conn=}")
+                    key = _socket_probe_key(conn)
+                    self._socket_probe_failures[key] += 1
+                    failures = self._socket_probe_failures[key]
+                    threshold = _socket_probe_failure_threshold()
+                    logger.debug(
+                        "ping failed to discover "
+                        f"{conn=} consecutive_failures={failures} "
+                        f"threshold={threshold}"
+                    )
+                    if failures < threshold:
+                        continue
+                    self._socket_probe_failures.pop(key, None)
                     await self.event_sender.send(TopologyEdgeDeleted(conn=conn))
+                else:
+                    self._socket_probe_failures.pop(_socket_probe_key(conn), None)
 
             await anyio.sleep(10)

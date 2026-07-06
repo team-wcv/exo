@@ -3,6 +3,7 @@ import pytest
 from exo.master.placement_utils import (
     allocate_layers_proportionally,
     filter_cycles_by_memory,
+    find_ip_prioritised,
     get_mlx_jaccl_coordinators,
     get_shard_assignments,
     get_shard_assignments_for_pipeline_parallel,
@@ -16,6 +17,7 @@ from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
 from exo.shared.topology import Topology
 from exo.shared.types.common import NodeId
 from exo.shared.types.memory import Memory
+from exo.shared.types.multiaddr import Multiaddr
 from exo.shared.types.profiling import (
     NetworkInterfaceInfo,
     NodeNetworkInfo,
@@ -370,6 +372,60 @@ def test_get_mlx_jaccl_coordinators():
     assert coordinators[node_c_id] == (
         f"{conn_c_a.edge.sink_multiaddr.ip_address}:5000"
     ), "node_c should use the IP from conn_c_a"
+
+
+def test_jaccl_coordinator_prefers_thunderbolt_over_lan():
+    node_a_id = NodeId()
+    node_b_id = NodeId()
+    topology = Topology()
+    topology.add_node(node_a_id)
+    topology.add_node(node_b_id)
+    topology.add_connection(
+        Connection(
+            source=node_a_id,
+            sink=node_b_id,
+            edge=SocketConnection(
+                sink_multiaddr=Multiaddr(address="/ip4/192.168.1.11/tcp/5000")
+            ),
+        )
+    )
+    topology.add_connection(
+        Connection(
+            source=node_a_id,
+            sink=node_b_id,
+            edge=SocketConnection(
+                sink_multiaddr=Multiaddr(address="/ip4/192.168.0.2/tcp/5000")
+            ),
+        )
+    )
+
+    node_network = {
+        node_b_id: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.11",
+                    interface_type="ethernet",
+                ),
+                NetworkInterfaceInfo(
+                    name="bridge0",
+                    ip_address="192.168.0.2",
+                    interface_type="thunderbolt",
+                ),
+            ]
+        )
+    }
+
+    assert (
+        find_ip_prioritised(
+            node_a_id,
+            node_b_id,
+            topology,
+            node_network,
+            ring=False,
+        )
+        == "192.168.0.2"
+    )
 
 
 class TestAllocateLayersProportionally:

@@ -429,23 +429,51 @@ def apply_node_gathered_info(event: NodeGatheredInfo, state: State) -> State:
             source_is_rdma_enabled = _is_rdma_ctl_enabled(
                 event.node_id, state.node_rdma_ctl
             )
-            as_rdma_conns = [
-                Connection(
-                    source=event.node_id,
-                    sink=conn_map[tb_conn.sink_uuid][0],
-                    edge=RDMAConnection(
-                        source_rdma_iface=conn_map[tb_conn.source_uuid][1],
-                        sink_rdma_iface=conn_map[tb_conn.sink_uuid][1],
-                    ),
-                )
+            if any(
+                tb_conn.source_uuid not in conn_map or tb_conn.sink_uuid not in conn_map
                 for tb_conn in info.conns
-                if tb_conn.source_uuid in conn_map
-                if tb_conn.sink_uuid in conn_map
-                if source_is_rdma_enabled
-                and _is_rdma_ctl_enabled(
-                    conn_map[tb_conn.sink_uuid][0], state.node_rdma_ctl
+            ):
+                return state
+            as_rdma_conns: list[Connection] = []
+            for tb_conn in info.conns:
+                if tb_conn.source_uuid not in conn_map:
+                    continue
+                if tb_conn.sink_uuid not in conn_map:
+                    continue
+                sink_node, sink_iface = conn_map[tb_conn.sink_uuid]
+                if not (
+                    source_is_rdma_enabled
+                    and _is_rdma_ctl_enabled(sink_node, state.node_rdma_ctl)
+                ):
+                    continue
+
+                source_iface = conn_map[tb_conn.source_uuid][1]
+                as_rdma_conns.append(
+                    Connection(
+                        source=event.node_id,
+                        sink=sink_node,
+                        edge=RDMAConnection(
+                            source_rdma_iface=source_iface,
+                            sink_rdma_iface=sink_iface,
+                        ),
+                    )
                 )
-            ]
+                # JACCL placement needs a directed RDMA cycle. A Thunderbolt RDMA
+                # link is full-duplex, so materialize the reverse edge when either
+                # side reports the physical connection.
+                as_rdma_conns.append(
+                    Connection(
+                        source=sink_node,
+                        sink=event.node_id,
+                        edge=RDMAConnection(
+                            source_rdma_iface=sink_iface,
+                            sink_rdma_iface=source_iface,
+                        ),
+                    )
+                )
+
+            if not as_rdma_conns:
+                return state
             topology.replace_all_out_rdma_connections(event.node_id, as_rdma_conns)
         case ThunderboltBridgeInfo():
             new_tb_bridge: dict[NodeId, ThunderboltBridgeStatus] = {

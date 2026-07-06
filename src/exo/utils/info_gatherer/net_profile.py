@@ -1,5 +1,7 @@
 from collections import defaultdict
 from collections.abc import AsyncGenerator, Mapping
+import ipaddress
+import os
 
 import anyio
 import httpx
@@ -12,6 +14,68 @@ from exo.shared.types.profiling import NodeNetworkInfo
 from exo.utils.channels import Sender, channel
 
 REACHABILITY_ATTEMPTS = 3
+REACHABILITY_ALLOWED_IPS_ENV = "EXO_REACHABILITY_ALLOWED_IPS"
+REACHABILITY_ALLOWED_CIDRS_ENV = "EXO_REACHABILITY_ALLOWED_CIDRS"
+_IGNORED_INTERFACE_PREFIXES = ("lo", "utun", "awdl", "llw")
+_TAILSCALE_IPV4 = ipaddress.ip_network("100.64.0.0/10")
+_TAILSCALE_IPV6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+
+
+def _parse_allowed_cidrs() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    raw = os.getenv(REACHABILITY_ALLOWED_CIDRS_ENV, "")
+    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(value, strict=False))
+        except ValueError:
+            logger.warning(
+                f"Ignoring invalid {REACHABILITY_ALLOWED_CIDRS_ENV} entry {value!r}"
+            )
+    return tuple(networks)
+
+
+def _parse_allowed_ips() -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, ...]:
+    raw = os.getenv(REACHABILITY_ALLOWED_IPS_ENV, "")
+    ips: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        try:
+            ips.append(ipaddress.ip_address(value.split("%", 1)[0]))
+        except ValueError:
+            logger.warning(
+                f"Ignoring invalid {REACHABILITY_ALLOWED_IPS_ENV} entry {value!r}"
+            )
+    return tuple(ips)
+
+
+def _probeable_interface(name: str, ip_address: str) -> bool:
+    if name.startswith(_IGNORED_INTERFACE_PREFIXES):
+        return False
+
+    try:
+        ip = ipaddress.ip_address(ip_address.split("%", 1)[0])
+    except ValueError:
+        return False
+
+    if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+        return False
+    if ip in _TAILSCALE_IPV4 or ip in _TAILSCALE_IPV6:
+        return False
+
+    allowed_ips = _parse_allowed_ips()
+    if allowed_ips and ip not in allowed_ips:
+        return False
+
+    allowed_cidrs = _parse_allowed_cidrs()
+    if allowed_cidrs and not any(ip in network for network in allowed_cidrs):
+        return False
+
+    return True
 
 
 async def check_reachability(
@@ -119,6 +183,8 @@ async def check_reachable(
             if node_id == self_node_id:
                 continue
             for iface in node_network[node_id].interfaces:
+                if not _probeable_interface(iface.name, iface.ip_address):
+                    continue
                 tg.start_soon(_probe, iface.ip_address, node_id, client, send.clone())
         send.close()
 
