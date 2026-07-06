@@ -34,6 +34,7 @@ from exo.shared.types.events import (
 )
 from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
 from exo.shared.types.profiling import (
+    NetworkInterfaceInfo,
     NodeIdentity,
     NodeNetworkInfo,
     NodeRdmaCtlStatus,
@@ -71,6 +72,34 @@ def _is_rdma_ctl_enabled(
 ) -> bool:
     status = node_rdma_ctl.get(node_id)
     return status is not None and status.enabled
+
+
+def _is_thunderbolt_ipv4(interface: NetworkInterfaceInfo) -> bool:
+    return (
+        interface.interface_type in ("thunderbolt", "maybe_ethernet")
+        and interface.ip_address.count(".") == 3
+        and not interface.ip_address.startswith("169.254.")
+    )
+
+
+def _merge_network_interfaces(
+    previous: NodeNetworkInfo | None, current: NodeNetworkInfo
+) -> NodeNetworkInfo:
+    if previous is None:
+        return current
+
+    interfaces = list(current.interfaces)
+    seen = {(iface.name, iface.ip_address) for iface in interfaces}
+
+    for iface in previous.interfaces:
+        if not _is_thunderbolt_ipv4(iface):
+            continue
+        key = (iface.name, iface.ip_address)
+        if key not in seen:
+            interfaces.append(iface)
+            seen.add(key)
+
+    return NodeNetworkInfo(interfaces=interfaces)
 
 
 def event_apply(event: Event, state: State) -> State:
@@ -411,9 +440,13 @@ def apply_node_gathered_info(event: NodeGatheredInfo, state: State) -> State:
                 event.node_id: new_identity,
             }
         case NodeNetworkInterfaces():
+            network_info = _merge_network_interfaces(
+                state.node_network.get(event.node_id),
+                NodeNetworkInfo(interfaces=info.ifaces),
+            )
             update["node_network"] = {
                 **state.node_network,
-                event.node_id: NodeNetworkInfo(interfaces=info.ifaces),
+                event.node_id: network_info,
             }
         case MacThunderboltIdentifiers():
             update["node_thunderbolt"] = {

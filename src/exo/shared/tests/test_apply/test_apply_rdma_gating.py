@@ -5,6 +5,8 @@ from exo.shared.topology import Topology
 from exo.shared.types.common import NodeId
 from exo.shared.types.events import NodeGatheredInfo
 from exo.shared.types.profiling import (
+    NetworkInterfaceInfo,
+    NodeNetworkInfo,
     NodeRdmaCtlStatus,
     NodeThunderboltInfo,
 )
@@ -13,6 +15,7 @@ from exo.shared.types.thunderbolt import ThunderboltConnection, ThunderboltIdent
 from exo.shared.types.topology import RDMAConnection
 from exo.utils.info_gatherer.info_gatherer import (
     MacThunderboltConnections,
+    NodeNetworkInterfaces,
     RdmaCtlStatus,
 )
 
@@ -44,6 +47,49 @@ def _has_rdma_edge(topology: Topology, source: NodeId, sink: NodeId) -> bool:
         isinstance(edge, RDMAConnection)
         for edge in topology.get_all_connections_between(source, sink)
     )
+
+
+def test_node_network_interfaces_preserves_previous_thunderbolt_ipv4():
+    node = NodeId()
+    state = State(
+        node_network={
+            node: NodeNetworkInfo(
+                interfaces=[
+                    NetworkInterfaceInfo(
+                        name="en2",
+                        ip_address="192.168.0.2",
+                        interface_type="thunderbolt",
+                    )
+                ]
+            )
+        }
+    )
+
+    new_state = apply_node_gathered_info(
+        NodeGatheredInfo(
+            node_id=node,
+            when=_now(),
+            info=NodeNetworkInterfaces(
+                ifaces=[
+                    NetworkInterfaceInfo(
+                        name="en16",
+                        ip_address="192.168.1.224",
+                        interface_type="ethernet",
+                    )
+                ]
+            ),
+        ),
+        state,
+    )
+
+    interfaces = new_state.node_network[node].interfaces
+    assert any(
+        iface.name == "en2"
+        and iface.ip_address == "192.168.0.2"
+        and iface.interface_type == "thunderbolt"
+        for iface in interfaces
+    )
+    assert any(iface.name == "en16" for iface in interfaces)
 
 
 def test_mac_thunderbolt_connections_emits_rdma_when_both_endpoints_enabled():
