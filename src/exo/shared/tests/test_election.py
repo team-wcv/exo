@@ -652,3 +652,57 @@ async def test_rejects_low_seniority_winner_when_forced_master_seen() -> None:
             em_in_tx.close()
             cm_tx.close()
             co_tx.close()
+
+
+@pytest.mark.anyio
+async def test_late_same_clock_higher_seniority_message_settles_session() -> None:
+    """
+    A same-clock election message can arrive just after the local campaign
+    finishes. It must still be considered, otherwise two connected nodes can
+    remain split-brained with each node believing it is master.
+    """
+    em_out_tx, em_out_rx = channel[ElectionMessage]()
+    em_in_tx, em_in_rx = channel[ElectionMessage]()
+    er_tx, er_rx = channel[ElectionResult]()
+    cm_tx, cm_rx = channel[ConnectionMessage]()
+    co_tx, co_rx = channel[ForwarderCommand]()
+
+    election = Election(
+        node_id=NodeId("WORKER"),
+        election_message_receiver=em_in_rx,
+        election_message_sender=em_out_tx,
+        election_result_sender=er_tx,
+        connection_message_receiver=cm_rx,
+        command_receiver=co_rx,
+        is_candidate=True,
+        seniority=0,
+    )
+
+    async with create_task_group() as tg:
+        with fail_after(3):
+            tg.start_soon(election.run)
+
+            # Consume the immediate self-election result.
+            await er_rx.receive()
+
+            # Trigger a connection-driven round and let it finish with only
+            # the local node's candidate present.
+            await cm_tx.send(ConnectionMessage(node_id=NodeId("MASTER"), connected=True))
+            while True:
+                got = await em_out_rx.receive()
+                if got.clock == 1:
+                    break
+            local_result = await er_rx.receive()
+            assert local_result.session_id.master_node_id == NodeId("WORKER")
+
+            # The forced master's same-clock message arrives after the local
+            # campaign has already completed.
+            await em_in_tx.send(em(clock=1, seniority=1_000_000, node_id="MASTER"))
+
+            settled_result = await er_rx.receive()
+            assert settled_result.session_id.master_node_id == NodeId("MASTER")
+            assert election.current_session.master_node_id == NodeId("MASTER")
+
+            em_in_tx.close()
+            cm_tx.close()
+            co_tx.close()

@@ -63,6 +63,51 @@ async fn two_nodes_connect_via_bootstrap_peers() {
     );
 }
 
+#[tokio::test]
+async fn two_nodes_connect_via_bootstrap_peer_with_peer_id_suffix() {
+    let port_a = free_port();
+
+    let keypair_a = libp2p::identity::Keypair::generate_ed25519();
+    let peer_id_a = keypair_a.public().to_peer_id();
+    let (_tx_a, rx_a) = mpsc::channel(16);
+    let swarm_a = create_swarm(keypair_a, rx_a, vec![], port_a).expect("create swarm A");
+    let mut stream_a = swarm_a.into_stream();
+
+    let keypair_b = libp2p::identity::Keypair::generate_ed25519();
+    let (_tx_b, rx_b) = mpsc::channel(16);
+    let swarm_b = create_swarm(
+        keypair_b,
+        rx_b,
+        vec![format!("/ip4/127.0.0.1/tcp/{port_a}/p2p/{peer_id_a}")],
+        0,
+    )
+    .expect("create swarm B");
+    let mut stream_b = swarm_b.into_stream();
+
+    let connected = timeout(Duration::from_secs(10), async {
+        loop {
+            tokio::select! {
+                Some(event) = stream_a.next() => {
+                    let _ = event;
+                }
+                Some(event) = stream_b.next() => {
+                    if let FromSwarm::Discovered { peer_id } = event {
+                        if peer_id == peer_id_a {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        connected.is_ok() && connected.unwrap(),
+        "Node B should discover Node A via peer-suffixed bootstrap peer"
+    );
+}
+
 /// Empty bootstrap peers should work (backward compatible).
 #[tokio::test]
 async fn create_swarm_with_empty_bootstrap_peers() {

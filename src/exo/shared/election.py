@@ -181,9 +181,34 @@ class Election:
                 if message.clock < self.clock:
                     logger.debug(f"Dropping old message: {message}")
                     continue
+                if self._campaign_cancel_scope is None:
+                    await self._settle_late_candidate(message)
+                    continue
                 logger.debug(f"Election added candidate {message}")
                 # Now we are processing this rounds messages - including the message that triggered this round.
                 self._candidates.append(message)
+
+    async def _settle_late_candidate(self, message: ElectionMessage) -> None:
+        status = self._election_status(message.clock)
+        elected = max([status, message])
+
+        if elected.seniority < self._max_observed_seniority:
+            logger.info(
+                f"Rejecting late election winner (seniority={elected.seniority}) "
+                f"because a node with seniority={self._max_observed_seniority} "
+                f"was previously observed. Keeping current master "
+                f"{self.current_session.master_node_id}."
+            )
+            return
+
+        if elected.proposed_session == self.current_session:
+            logger.debug(
+                f"Late election message does not change current session: {message}"
+            )
+            return
+
+        logger.info(f"Settling late same-clock election message with winner {elected}")
+        await self.elect(elected)
 
     async def _connection_receiver(self) -> None:
         with self._cm_receiver as connection_messages:

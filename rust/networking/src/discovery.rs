@@ -15,6 +15,7 @@ use libp2p::swarm::{
 use libp2p::{Multiaddr, PeerId, identity, mdns};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
+use std::env;
 use std::io;
 use std::net::IpAddr;
 use std::task::{Context, Poll};
@@ -22,8 +23,11 @@ use std::time::Duration;
 use util::wakerdeque::WakerDeque;
 
 const RETRY_CONNECT_INTERVAL: Duration = Duration::from_secs(5);
+const DIAL_MODE_ENV: &str = "EXO_LIBP2P_DIAL_MODE";
+const MDNS_DIAL_ENV: &str = "EXO_LIBP2P_MDNS_DIAL";
 
 mod managed {
+    use libp2p::swarm::behaviour::toggle::Toggle;
     use libp2p::swarm::NetworkBehaviour;
     use libp2p::{identity, mdns, ping};
     use std::env;
@@ -34,13 +38,14 @@ mod managed {
     const MDNS_QUERY_INTERVAL: Duration = Duration::from_secs(1_500);
     const DEFAULT_PING_TIMEOUT_MS: u64 = 15_000;
     const DEFAULT_PING_INTERVAL_MS: u64 = 5_000;
+    const PING_ENABLED_ENV: &str = "EXO_LIBP2P_PING_ENABLED";
     const PING_TIMEOUT_MS_ENV: &str = "EXO_LIBP2P_PING_TIMEOUT_MS";
     const PING_INTERVAL_MS_ENV: &str = "EXO_LIBP2P_PING_INTERVAL_MS";
 
     #[derive(NetworkBehaviour)]
     pub struct Behaviour {
         mdns: mdns::tokio::Behaviour,
-        ping: ping::Behaviour,
+        ping: Toggle<ping::Behaviour>,
     }
 
     impl Behaviour {
@@ -68,7 +73,11 @@ mod managed {
         Ok(mdns_behaviour?)
     }
 
-    fn ping_behaviour() -> ping::Behaviour {
+    fn ping_behaviour() -> Toggle<ping::Behaviour> {
+        if !bool_env(PING_ENABLED_ENV, true) {
+            return None.into();
+        }
+
         let timeout = Duration::from_millis(duration_millis_env(
             PING_TIMEOUT_MS_ENV,
             DEFAULT_PING_TIMEOUT_MS,
@@ -77,11 +86,24 @@ mod managed {
             PING_INTERVAL_MS_ENV,
             DEFAULT_PING_INTERVAL_MS,
         ));
-        ping::Behaviour::new(
+        Some(ping::Behaviour::new(
             ping::Config::new()
                 .with_timeout(timeout)
                 .with_interval(interval),
-        )
+        ))
+        .into()
+    }
+
+    fn bool_env(name: &str, default: bool) -> bool {
+        env::var(name)
+            .ok()
+            .map(|value| {
+                !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
+            .unwrap_or(default)
     }
 
     fn duration_millis_env(name: &str, default: u64) -> u64 {
@@ -120,6 +142,8 @@ pub enum Event {
 ///  2) Every fixed interval: discovered but not connected peers are dialed, and expired but
 ///     connected peers are disconnected from.
 pub struct Behaviour {
+    local_peer_id: PeerId,
+
     // state-tracking for managed behaviors & mDNS-discovered peers
     managed: managed::Behaviour,
     mdns_discovered: HashMap<PeerId, BTreeSet<Multiaddr>>,
@@ -134,7 +158,9 @@ pub struct Behaviour {
 
 impl Behaviour {
     pub fn new(keypair: &identity::Keypair, bootstrap_peers: Vec<Multiaddr>) -> io::Result<Self> {
+        let local_peer_id = keypair.public().to_peer_id();
         let mut behaviour = Self {
+            local_peer_id,
             managed: managed::Behaviour::new(keypair)?,
             mdns_discovered: HashMap::new(),
             bootstrap_peers,
@@ -146,11 +172,41 @@ impl Behaviour {
         Ok(behaviour)
     }
 
+    fn should_dial(&self, peer_id: &PeerId) -> bool {
+        match env::var(DIAL_MODE_ENV)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "active" | "dialer" => true,
+            "passive" | "listener" => false,
+            _ => self.local_peer_id.to_bytes() < peer_id.to_bytes(),
+        }
+    }
+
+    fn mdns_dial_enabled(&self) -> bool {
+        !matches!(
+            env::var(MDNS_DIAL_ENV)
+                .unwrap_or_else(|_| "1".to_string())
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    }
+
     fn dial(&mut self, peer_id: PeerId, addr: Multiaddr) {
         if self.is_connected(&peer_id) {
             return;
         }
+        if !self.should_dial(&peer_id) {
+            log::debug!(
+                "skipping dial for passive peer local_peer_id={} peer_id={peer_id} addr={addr}",
+                self.local_peer_id
+            );
+            return;
+        }
         let addr = addr_without_peer_id(&addr);
+        log::debug!("dialing known peer peer_id={peer_id} addr={addr}");
         self.pending_events.push_back(ToSwarm::Dial {
             opts: DialOpts::peer_id(peer_id).addresses(vec![addr]).build(),
         })
@@ -158,9 +214,21 @@ impl Behaviour {
 
     fn dial_bootstrap_peers(&mut self) {
         for addr in self.bootstrap_peers.clone() {
-            if peer_id_from_addr(&addr).is_some_and(|peer_id| self.is_connected(&peer_id)) {
+            if let Some(peer_id) = peer_id_from_addr(&addr) {
+                if self.is_connected(&peer_id) {
+                    continue;
+                }
+                if !self.should_dial(&peer_id) {
+                    log::debug!(
+                        "skipping bootstrap dial for passive peer local_peer_id={} peer_id={peer_id} addr={addr}",
+                        self.local_peer_id
+                    );
+                    continue;
+                }
+                self.dial(peer_id, addr);
                 continue;
             }
+            log::debug!("dialing bootstrap peer addr={addr}");
             self.pending_events.push_back(ToSwarm::Dial {
                 opts: DialOpts::unknown_peer_id().address(addr).build(),
             })
@@ -198,7 +266,9 @@ impl Behaviour {
     fn handle_mdns_discovered(&mut self, peers: Vec<(PeerId, Multiaddr)>) {
         for (p, ma) in peers {
             self.mdns_discovered.entry(p).or_default().insert(ma.clone());
-            self.dial(p, ma);
+            if self.mdns_dial_enabled() {
+                self.dial(p, ma);
+            }
         }
     }
 
@@ -230,6 +300,10 @@ impl Behaviour {
             return;
         }
 
+        log::info!(
+            "peer connection established peer_id={peer_id} connection_id={connection_id:?} remote={remote_ip}:{remote_tcp_port}"
+        );
+
         // send out connected event
         self.pending_events
             .push_back(ToSwarm::GenerateEvent(Event::ConnectionEstablished {
@@ -255,6 +329,10 @@ impl Behaviour {
             return;
         }
         self.connected_peers.remove(&peer_id);
+
+        log::warn!(
+            "peer connection closed peer_id={peer_id} connection_id={connection_id:?} remote={remote_ip}:{remote_tcp_port}; redialing"
+        );
 
         // send out disconnected event
         self.pending_events
@@ -376,12 +454,17 @@ impl NetworkBehaviour for Behaviour {
                 peer_id,
                 connection_id,
                 endpoint,
+                cause,
                 ..
             }) => {
                 let remote_address = match endpoint {
                     ConnectedPoint::Dialer { address, .. } => address,
                     ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
                 };
+
+                log::warn!(
+                    "raw connection closed peer_id={peer_id} connection_id={connection_id:?} endpoint={remote_address} cause={cause:?}"
+                );
 
                 if let Some((ip, port)) = remote_address.try_to_tcp_addr() {
                     // handle connection closed event which is filtered correctly
@@ -438,9 +521,11 @@ impl NetworkBehaviour for Behaviour {
 
         // retry connecting to all mDNS peers periodically (fails safely if already connected)
         if self.retry_delay.poll(cx).is_ready() {
-            for (p, mas) in self.mdns_discovered.clone() {
-                for ma in mas {
-                    self.dial(p, ma)
+            if self.mdns_dial_enabled() {
+                for (p, mas) in self.mdns_discovered.clone() {
+                    for ma in mas {
+                        self.dial(p, ma)
+                    }
                 }
             }
             // dial bootstrap peers (for environments where mDNS is unavailable)
