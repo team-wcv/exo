@@ -69,6 +69,56 @@ def test_mac_thunderbolt_connections_emits_rdma_when_both_endpoints_enabled():
     new_state = apply_node_gathered_info(event, state)
 
     assert _has_rdma_edge(new_state.topology, node_a, node_b)
+    assert _has_rdma_edge(new_state.topology, node_b, node_a)
+
+
+def test_mac_thunderbolt_connections_keeps_existing_edges_until_uuids_resolve():
+    node_a = NodeId()
+    node_b = NodeId()
+    state = _make_state_with_thunderbolt_idents(
+        (node_a, "uuid-a", "rdma_en1"),
+        (node_b, "uuid-b", "rdma_en2"),
+        rdma_ctl={
+            node_a: NodeRdmaCtlStatus(enabled=True),
+            node_b: NodeRdmaCtlStatus(enabled=True),
+        },
+    )
+    state = apply_node_gathered_info(
+        NodeGatheredInfo(
+            node_id=node_a,
+            when=_now(),
+            info=MacThunderboltConnections(
+                conns=[ThunderboltConnection(source_uuid="uuid-a", sink_uuid="uuid-b")]
+            ),
+        ),
+        state,
+    )
+
+    state_without_b_ident = state.model_copy(
+        update={
+            "node_thunderbolt": {
+                node_a: state.node_thunderbolt[node_a],
+            }
+        }
+    )
+
+    new_state = apply_node_gathered_info(
+        NodeGatheredInfo(
+            node_id=node_a,
+            when=_now(),
+            info=MacThunderboltConnections(
+                conns=[
+                    ThunderboltConnection(
+                        source_uuid="uuid-a", sink_uuid="missing-uuid"
+                    )
+                ]
+            ),
+        ),
+        state_without_b_ident,
+    )
+
+    assert _has_rdma_edge(new_state.topology, node_a, node_b)
+    assert _has_rdma_edge(new_state.topology, node_b, node_a)
 
 
 def test_mac_thunderbolt_connections_skips_rdma_when_source_rdma_ctl_disabled():

@@ -444,14 +444,15 @@ def find_ip_prioritised(
             "unknown": 4,
         }
 
-    # RDMA prefers ethernet coordinator
+    # MLX_JACCL_COORDINATOR is the JACCL rendezvous, not the exo control plane;
+    # Big Brain forms RDMA groups reliably when this stays on Thunderbolt.
     else:
         type_priority = {
-            "ethernet": 0,
+            "thunderbolt": 0,
             "maybe_ethernet": 1,
-            "wifi": 2,
-            "unknown": 3,
-            "thunderbolt": 4,
+            "ethernet": 2,
+            "wifi": 3,
+            "unknown": 4,
         }
 
     return min(
