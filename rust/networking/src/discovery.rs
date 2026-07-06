@@ -150,6 +150,7 @@ impl Behaviour {
         if self.is_connected(&peer_id) {
             return;
         }
+        let addr = addr_without_peer_id(&addr);
         self.pending_events.push_back(ToSwarm::Dial {
             opts: DialOpts::peer_id(peer_id).addresses(vec![addr]).build(),
         })
@@ -272,6 +273,12 @@ fn peer_id_from_addr(addr: &Multiaddr) -> Option<PeerId> {
         Protocol::P2p(peer_id) => Some(peer_id),
         _ => None,
     })
+}
+
+fn addr_without_peer_id(addr: &Multiaddr) -> Multiaddr {
+    addr.iter()
+        .filter(|protocol| !matches!(protocol, Protocol::P2p(_)))
+        .collect()
 }
 
 impl NetworkBehaviour for Behaviour {

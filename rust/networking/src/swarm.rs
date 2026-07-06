@@ -71,6 +71,7 @@ impl Swarm {
                     }
                     event = swarm.next() => {
                         let Some(event) = event else { break };
+                        sync_gossipsub_explicit_peers(&mut swarm, &event);
                         if let Some(item) = filter_swarm_event(event) {
                             yield item;
                         }
@@ -79,6 +80,18 @@ impl Swarm {
             }
         };
         Box::pin(stream)
+    }
+}
+
+fn sync_gossipsub_explicit_peers(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    event: &SwarmEvent<BehaviourEvent>,
+) {
+    if let SwarmEvent::Behaviour(BehaviourEvent::Discovery(
+        discovery::Event::ConnectionEstablished { peer_id, .. },
+    )) = event
+    {
+        swarm.behaviour_mut().gossipsub.add_explicit_peer(peer_id);
     }
 }
 
