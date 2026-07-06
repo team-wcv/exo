@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::time::Duration;
 
 use crate::swarm::transport::tcp_transport;
 use crate::{alias, discovery};
@@ -16,6 +17,8 @@ use tokio::sync::{mpsc, oneshot};
 ///       this is all VERY very hard to figure out and needs to be mulled over as a team.
 pub const NETWORK_VERSION: &[u8] = b"v0.0.1";
 pub const OVERRIDE_VERSION_ENV_VAR: &str = "EXO_LIBP2P_NAMESPACE";
+const DEFAULT_IDLE_CONNECTION_TIMEOUT_MS: u64 = 900_000;
+const IDLE_CONNECTION_TIMEOUT_MS_ENV: &str = "EXO_LIBP2P_IDLE_CONNECTION_TIMEOUT_MS";
 
 // Uses oneshot senders to emulate function calling apis while avoiding requiring unique ownership
 // of the Swarm.
@@ -162,10 +165,28 @@ pub fn create_swarm(
         .with_tokio()
         .with_other_transport(tcp_transport)?
         .with_behaviour(|keypair| Behaviour::new(keypair, parsed_bootstrap_peers))?
+        .with_swarm_config(|config| {
+            config.with_idle_connection_timeout(idle_connection_timeout())
+        })
         .build();
 
     swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{listen_port}").parse()?)?;
     Ok(Swarm { swarm, from_client })
+}
+
+fn idle_connection_timeout() -> Duration {
+    Duration::from_millis(duration_millis_env(
+        IDLE_CONNECTION_TIMEOUT_MS_ENV,
+        DEFAULT_IDLE_CONNECTION_TIMEOUT_MS,
+    ))
+}
+
+fn duration_millis_env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 mod transport {
