@@ -420,10 +420,15 @@ def find_ip_prioritised(
 ) -> str | None:
     """Find an IP address between nodes with prioritization.
 
-    Priority: ethernet > wifi > unknown > thunderbolt
+    Priority: thunderbolt > ethernet > wifi > unknown
     """
-    ips = list(_find_connection_ip(node_id, other_node_id, cycle_digraph))
     other_network = node_network.get(other_node_id, NodeNetworkInfo())
+    ips = list(_find_connection_ip(node_id, other_node_id, cycle_digraph))
+    if not ring:
+        # JACCL rendezvous should prefer Thunderbolt even when generic socket
+        # reachability is intentionally restricted to LAN control addresses.
+        ips.extend(_fallback_interface_ips(other_network))
+        ips = list(dict.fromkeys(ips))
     ip_to_type = {
         iface.ip_address: iface.interface_type for iface in other_network.interfaces
     }

@@ -1012,7 +1012,7 @@ def test_ring_placement_uses_advertised_lan_ips_for_rdma_only_topology(
     assert any(host.ip == "192.168.1.10" for host in instance.hosts_by_node[node_b])
 
 
-def test_jaccl_placement_uses_advertised_lan_ip_for_rdma_coordinator(
+def test_jaccl_placement_prefers_thunderbolt_ip_for_rdma_coordinator(
     model_card: ModelCard,
 ) -> None:
     topology = Topology()
@@ -1071,7 +1071,7 @@ def test_jaccl_placement_uses_advertised_lan_ip_for_rdma_coordinator(
     assert isinstance(instance, MlxJacclInstance)
     assert len(instance.shard_assignments.node_to_runner) == 2
     assert any(
-        coordinator.startswith("192.168.1.")
+        coordinator.startswith("192.168.0.")
         for coordinator in instance.jaccl_coordinators.values()
     )
 
