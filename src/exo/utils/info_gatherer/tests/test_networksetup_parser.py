@@ -51,6 +51,7 @@ import pytest
 
 from exo.utils.info_gatherer.system_info import (
     _get_interface_types_from_networksetup,  # pyright: ignore[reportPrivateUsage]
+    _parse_ifconfig_ipv4_interfaces,  # pyright: ignore[reportPrivateUsage]
 )
 
 
@@ -113,6 +114,44 @@ Hardware Port: Thunderbolt 3
 Device: en2
 Ethernet Address: 36:79:2c:66:09:88
 """
+
+_SMBP_IFCONFIG_WITH_THUNDERBOLT_IPV4 = """\
+en2: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST> mtu 1500
+\toptions=460<TSO4,TSO6,CHANNEL_IO>
+\tether 36:28:3d:58:2e:08
+\tinet6 fe80::4c8:a2ae:fe93:5727%en2 prefixlen 64 secured scopeid 0xc
+\tinet 192.168.0.2 netmask 0xfffffffc broadcast 192.168.0.3
+\tnd6 options=201<PERFORMNUD,DAD>
+\tmedia: autoselect <full-duplex>
+\tstatus: active
+bridge100: flags=8a63<UP,BROADCAST,SMART,RUNNING,ALLMULTI,SIMPLEX,MULTICAST> mtu 1500
+\toptions=63<RXCSUM,TXCSUM,TSO4,TSO6>
+\tether 36:28:3d:85:e2:64
+\tinet 192.168.2.1 netmask 0xffffff00 broadcast 192.168.2.255
+\tinet6 fe80::3428:3dff:fe85:e264%bridge100 prefixlen 64 scopeid 0x14
+"""
+
+
+def test_ifconfig_parser_recovers_thunderbolt_ipv4() -> None:
+    """The fallback parser keeps JACCL preflight from losing the TB peer IP.
+
+    On wc-smbp, ``psutil.net_if_addrs()`` can intermittently omit the
+    active ``en2`` IPv4 even while ``ifconfig`` reports it. The gatherer
+    augments psutil from this parser so ``node_network`` keeps advertising
+    the Thunderbolt peer path required by Tensor+JACCL placement.
+    """
+
+    interfaces = _parse_ifconfig_ipv4_interfaces(
+        _SMBP_IFCONFIG_WITH_THUNDERBOLT_IPV4,
+        {"en2": "thunderbolt"},
+    )
+
+    assert any(
+        iface.name == "en2"
+        and iface.ip_address == "192.168.0.2"
+        and iface.interface_type == "thunderbolt"
+        for iface in interfaces
+    )
 
 
 @pytest.mark.anyio

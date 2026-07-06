@@ -1,4 +1,5 @@
 import platform
+import re
 import socket
 import sys
 from subprocess import CalledProcessError
@@ -7,6 +8,9 @@ import psutil
 from anyio import run_process
 
 from exo.shared.types.profiling import InterfaceType, NetworkInterfaceInfo
+
+_IFCONFIG_IFACE_RE = re.compile(r"^([A-Za-z0-9_.:-]+):\s")
+_IFCONFIG_INET_RE = re.compile(r"^\s+inet\s+(\d{1,3}(?:\.\d{1,3}){3})\s")
 
 
 def get_os_version() -> str:
@@ -120,6 +124,56 @@ async def _get_interface_types_from_networksetup() -> dict[str, InterfaceType]:
     return types
 
 
+def _parse_ifconfig_ipv4_interfaces(
+    output: str, interface_types: dict[str, InterfaceType]
+) -> list[NetworkInterfaceInfo]:
+    """Extract IPv4 interface addresses from macOS ``ifconfig`` output.
+
+    ``psutil.net_if_addrs()`` can briefly omit a Thunderbolt peer IPv4
+    immediately after network service churn even while ``ifconfig`` shows it.
+    Placement uses this data to decide whether JACCL has a routable peer path,
+    so the gatherer augments psutil with this parser on macOS.
+    """
+
+    interfaces: list[NetworkInterfaceInfo] = []
+    current_iface: str | None = None
+
+    for line in output.splitlines():
+        iface_match = _IFCONFIG_IFACE_RE.match(line)
+        if iface_match:
+            current_iface = iface_match.group(1)
+            continue
+
+        if current_iface is None:
+            continue
+
+        inet_match = _IFCONFIG_INET_RE.match(line)
+        if inet_match:
+            interfaces.append(
+                NetworkInterfaceInfo(
+                    name=current_iface,
+                    ip_address=inet_match.group(1),
+                    interface_type=interface_types.get(current_iface, "unknown"),
+                )
+            )
+
+    return interfaces
+
+
+async def _get_ifconfig_ipv4_interfaces(
+    interface_types: dict[str, InterfaceType],
+) -> list[NetworkInterfaceInfo]:
+    if sys.platform != "darwin":
+        return []
+
+    try:
+        result = await run_process(["ifconfig"])
+    except CalledProcessError:
+        return []
+
+    return _parse_ifconfig_ipv4_interfaces(result.stdout.decode(), interface_types)
+
+
 async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     """
     Retrieves detailed network interface information on macOS.
@@ -129,11 +183,13 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     """
     interfaces_info: list[NetworkInterfaceInfo] = []
     interface_types = await _get_interface_types_from_networksetup()
+    seen: set[tuple[str, str]] = set()
 
     for iface, services in psutil.net_if_addrs().items():
         for service in services:
             match service.family:
                 case socket.AF_INET | socket.AF_INET6:
+                    seen.add((iface, service.address))
                     interfaces_info.append(
                         NetworkInterfaceInfo(
                             name=iface,
@@ -143,6 +199,12 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
                     )
                 case _:
                     pass
+
+    for interface in await _get_ifconfig_ipv4_interfaces(interface_types):
+        key = (interface.name, interface.ip_address)
+        if key not in seen:
+            seen.add(key)
+            interfaces_info.append(interface)
 
     return interfaces_info
 
