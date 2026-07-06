@@ -5,15 +5,15 @@ use futures_lite::FutureExt;
 use futures_timer::Delay;
 use libp2p::core::transport::PortUse;
 use libp2p::core::{ConnectedPoint, Endpoint};
+use libp2p::multiaddr::Protocol;
 use libp2p::swarm::behaviour::ConnectionEstablished;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{
-    CloseConnection, ConnectionClosed, ConnectionDenied, ConnectionHandler,
-    ConnectionHandlerSelect, ConnectionId, FromSwarm, NetworkBehaviour, THandler, THandlerInEvent,
-    THandlerOutEvent, ToSwarm, dummy,
+    ConnectionClosed, ConnectionDenied, ConnectionHandler, ConnectionHandlerSelect, ConnectionId,
+    FromSwarm, NetworkBehaviour, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm, dummy,
 };
 use libp2p::{Multiaddr, PeerId, identity, mdns};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::io;
 use std::net::IpAddr;
@@ -26,13 +26,16 @@ const RETRY_CONNECT_INTERVAL: Duration = Duration::from_secs(5);
 mod managed {
     use libp2p::swarm::NetworkBehaviour;
     use libp2p::{identity, mdns, ping};
+    use std::env;
     use std::io;
     use std::time::Duration;
 
     const MDNS_RECORD_TTL: Duration = Duration::from_secs(2_500);
     const MDNS_QUERY_INTERVAL: Duration = Duration::from_secs(1_500);
-    const PING_TIMEOUT: Duration = Duration::from_millis(2_500);
-    const PING_INTERVAL: Duration = Duration::from_millis(2_500);
+    const DEFAULT_PING_TIMEOUT_MS: u64 = 15_000;
+    const DEFAULT_PING_INTERVAL_MS: u64 = 5_000;
+    const PING_TIMEOUT_MS_ENV: &str = "EXO_LIBP2P_PING_TIMEOUT_MS";
+    const PING_INTERVAL_MS_ENV: &str = "EXO_LIBP2P_PING_INTERVAL_MS";
 
     #[derive(NetworkBehaviour)]
     pub struct Behaviour {
@@ -66,11 +69,27 @@ mod managed {
     }
 
     fn ping_behaviour() -> ping::Behaviour {
+        let timeout = Duration::from_millis(duration_millis_env(
+            PING_TIMEOUT_MS_ENV,
+            DEFAULT_PING_TIMEOUT_MS,
+        ));
+        let interval = Duration::from_millis(duration_millis_env(
+            PING_INTERVAL_MS_ENV,
+            DEFAULT_PING_INTERVAL_MS,
+        ));
         ping::Behaviour::new(
             ping::Config::new()
-                .with_timeout(PING_TIMEOUT)
-                .with_interval(PING_INTERVAL),
+                .with_timeout(timeout)
+                .with_interval(interval),
         )
+    }
+
+    fn duration_millis_env(name: &str, default: u64) -> u64 {
+        env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
     }
 }
 
@@ -105,6 +124,7 @@ pub struct Behaviour {
     managed: managed::Behaviour,
     mdns_discovered: HashMap<PeerId, BTreeSet<Multiaddr>>,
     bootstrap_peers: Vec<Multiaddr>,
+    connected_peers: HashMap<PeerId, HashSet<ConnectionId>>,
 
     retry_delay: Delay, // retry interval
 
@@ -118,6 +138,7 @@ impl Behaviour {
             managed: managed::Behaviour::new(keypair)?,
             mdns_discovered: HashMap::new(),
             bootstrap_peers,
+            connected_peers: HashMap::new(),
             retry_delay: Delay::new(RETRY_CONNECT_INTERVAL),
             pending_events: WakerDeque::new(),
         };
@@ -126,57 +147,69 @@ impl Behaviour {
     }
 
     fn dial(&mut self, peer_id: PeerId, addr: Multiaddr) {
+        if self.is_connected(&peer_id) {
+            return;
+        }
         self.pending_events.push_back(ToSwarm::Dial {
             opts: DialOpts::peer_id(peer_id).addresses(vec![addr]).build(),
         })
     }
 
     fn dial_bootstrap_peers(&mut self) {
-        for addr in &self.bootstrap_peers {
+        for addr in self.bootstrap_peers.clone() {
+            if peer_id_from_addr(&addr).is_some_and(|peer_id| self.is_connected(&peer_id)) {
+                continue;
+            }
             self.pending_events.push_back(ToSwarm::Dial {
-                opts: DialOpts::unknown_peer_id().address(addr.clone()).build(),
+                opts: DialOpts::unknown_peer_id().address(addr).build(),
             })
         }
     }
 
-    fn close_connection(&mut self, peer_id: PeerId, connection: ConnectionId) {
-        // push front to make this IMMEDIATE
-        self.pending_events.push_front(ToSwarm::CloseConnection {
-            peer_id,
-            connection: CloseConnection::One(connection),
-        })
+    fn is_connected(&self, peer_id: &PeerId) -> bool {
+        self.connected_peers
+            .get(peer_id)
+            .is_some_and(|connection_ids| !connection_ids.is_empty())
+    }
+
+    fn redial_peer(&mut self, peer_id: PeerId) {
+        let mut dialed = false;
+
+        if let Some(addrs) = self.mdns_discovered.get(&peer_id).cloned() {
+            for addr in addrs {
+                self.dial(peer_id, addr);
+                dialed = true;
+            }
+        }
+
+        for addr in self.bootstrap_peers.clone() {
+            if peer_id_from_addr(&addr).is_some_and(|candidate| candidate == peer_id) {
+                self.dial(peer_id, addr);
+                dialed = true;
+            }
+        }
+
+        if !dialed {
+            self.dial_bootstrap_peers();
+        }
     }
 
     fn handle_mdns_discovered(&mut self, peers: Vec<(PeerId, Multiaddr)>) {
         for (p, ma) in peers {
-            self.dial(p, ma.clone()); // always connect
-
-            // get peer's multi-addresses or insert if missing
-            let Some(mas) = self.mdns_discovered.get_mut(&p) else {
-                self.mdns_discovered.insert(p, BTreeSet::from([ma]));
-                continue;
-            };
-
-            // multiaddress should never already be present - else something has gone wrong
-            let is_new_addr = mas.insert(ma);
-            assert!(is_new_addr, "cannot discover a discovered peer");
+            self.mdns_discovered.entry(p).or_default().insert(ma.clone());
+            self.dial(p, ma);
         }
     }
 
     fn handle_mdns_expired(&mut self, peers: Vec<(PeerId, Multiaddr)>) {
         for (p, ma) in peers {
-            // at this point, we *must* have the peer
-            let mas = self
-                .mdns_discovered
-                .get_mut(&p)
-                .expect("nonexistent peer cannot expire");
-
-            // at this point, we *must* have the multiaddress
-            let was_present = mas.remove(&ma);
-            assert!(was_present, "nonexistent multiaddress cannot expire");
-
-            // if empty, remove the peer-id entirely
-            if mas.is_empty() {
+            let should_remove = if let Some(mas) = self.mdns_discovered.get_mut(&p) {
+                mas.remove(&ma);
+                mas.is_empty()
+            } else {
+                false
+            };
+            if should_remove {
                 self.mdns_discovered.remove(&p);
             }
         }
@@ -189,6 +222,13 @@ impl Behaviour {
         remote_ip: IpAddr,
         remote_tcp_port: u16,
     ) {
+        let connection_ids = self.connected_peers.entry(peer_id).or_default();
+        let was_disconnected = connection_ids.is_empty();
+        connection_ids.insert(connection_id);
+        if !was_disconnected {
+            return;
+        }
+
         // send out connected event
         self.pending_events
             .push_back(ToSwarm::GenerateEvent(Event::ConnectionEstablished {
@@ -206,6 +246,15 @@ impl Behaviour {
         remote_ip: IpAddr,
         remote_tcp_port: u16,
     ) {
+        let Some(connection_ids) = self.connected_peers.get_mut(&peer_id) else {
+            return;
+        };
+        connection_ids.remove(&connection_id);
+        if !connection_ids.is_empty() {
+            return;
+        }
+        self.connected_peers.remove(&peer_id);
+
         // send out disconnected event
         self.pending_events
             .push_back(ToSwarm::GenerateEvent(Event::ConnectionClosed {
@@ -214,7 +263,15 @@ impl Behaviour {
                 remote_ip,
                 remote_tcp_port,
             }));
+        self.redial_peer(peer_id);
     }
+}
+
+fn peer_id_from_addr(addr: &Multiaddr) -> Option<PeerId> {
+    addr.iter().find_map(|protocol| match protocol {
+        Protocol::P2p(peer_id) => Some(peer_id),
+        _ => None,
+    })
 }
 
 impl NetworkBehaviour for Behaviour {
@@ -349,12 +406,11 @@ impl NetworkBehaviour for Behaviour {
                         }
                     },
 
-                    // handle ping events => if error then disconnect
-                    managed::BehaviourEvent::Ping(e) => {
-                        if let Err(_) = e.result {
-                            self.close_connection(e.peer, e.connection.clone())
-                        }
-                    }
+                    // Let libp2p manage connection lifecycle. Treating a
+                    // ping behaviour error as an immediate peer disconnect
+                    // can tear down gossipsub during transient control-plane
+                    // stalls while the peer is still reachable for exo/RDMA.
+                    managed::BehaviourEvent::Ping(_) => {}
                 }
 
                 // since we just consumed an event, we should immediately wake just in case

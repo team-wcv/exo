@@ -479,10 +479,10 @@ def _node_id_keypair_scope(args: "Args") -> str:
     )
 
 
-def _darwin_en0_ip_address() -> str | None:
+def _darwin_interface_ip_address(interface_name: str) -> str | None:
     try:
         return subprocess.check_output(
-            ["ipconfig", "getifaddr", "en0"],
+            ["ipconfig", "getifaddr", interface_name],
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
@@ -490,10 +490,12 @@ def _darwin_en0_ip_address() -> str | None:
         return None
 
 
-def _darwin_en0_broadcast_address(ip_address: str) -> str | None:
+def _darwin_interface_broadcast_address(
+    interface_name: str, ip_address: str
+) -> str | None:
     try:
         subnet_mask = subprocess.check_output(
-            ["ipconfig", "getoption", "en0", "subnet_mask"],
+            ["ipconfig", "getoption", interface_name, "subnet_mask"],
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
@@ -503,13 +505,29 @@ def _darwin_en0_broadcast_address(ip_address: str) -> str | None:
         return None
 
 
-async def _darwin_mdns_broadcast_announcer(node_id: NodeId, libp2p_port: int) -> None:
-    ip_address = _darwin_en0_ip_address()
+def _darwin_mdns_advertise_address() -> tuple[str, str | None] | None:
+    interface_name = os.getenv("EXO_MDNS_INTERFACE", "en0")
+    ip_address = os.getenv("EXO_MDNS_IP_ADDRESS") or _darwin_interface_ip_address(
+        interface_name
+    )
     if not ip_address:
-        logger.debug("Darwin mDNS broadcast announcer disabled: no en0 IPv4 address")
+        logger.debug(
+            f"Darwin mDNS broadcast announcer disabled: no {interface_name} IPv4 address"
+        )
+        return None
+
+    broadcast_address = os.getenv(
+        "EXO_MDNS_BROADCAST_ADDRESS"
+    ) or _darwin_interface_broadcast_address(interface_name, ip_address)
+    return ip_address, broadcast_address
+
+
+async def _darwin_mdns_broadcast_announcer(node_id: NodeId, libp2p_port: int) -> None:
+    advertise_address = _darwin_mdns_advertise_address()
+    if advertise_address is None:
         return
 
-    broadcast_address = _darwin_en0_broadcast_address(ip_address)
+    ip_address, broadcast_address = advertise_address
     logger.debug(
         f"Darwin mDNS announcer advertising {node_id} at {ip_address}:{libp2p_port}"
     )

@@ -1,3 +1,4 @@
+import os
 from typing import Self
 
 import anyio
@@ -18,6 +19,21 @@ from exo.utils.task_group import TaskGroup
 DEFAULT_ELECTION_TIMEOUT = 3.0
 DEFAULT_CONNECTION_SETTLE_SECONDS = 0.2
 DEFAULT_DROPOUT_GRACE_SECONDS = 1.0
+EXO_DROPOUT_GRACE_SECONDS_ENV = "EXO_DROPOUT_GRACE_SECONDS"
+
+
+def _dropout_grace_seconds() -> float:
+    value = os.getenv(EXO_DROPOUT_GRACE_SECONDS_ENV)
+    if value is None:
+        return DEFAULT_DROPOUT_GRACE_SECONDS
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        logger.warning(
+            f"Ignoring invalid {EXO_DROPOUT_GRACE_SECONDS_ENV}={value!r}; "
+            f"using {DEFAULT_DROPOUT_GRACE_SECONDS}s"
+        )
+        return DEFAULT_DROPOUT_GRACE_SECONDS
 
 
 class ElectionMessage(FrozenModel):
@@ -189,7 +205,7 @@ class Election:
                 if any(
                     not self._connection_state[node_id] for node_id in changed_node_ids
                 ):
-                    await anyio.sleep(DEFAULT_DROPOUT_GRACE_SECONDS)
+                    await anyio.sleep(_dropout_grace_seconds())
                     follow_up_messages = connection_messages.collect()
                     changed_node_ids.update(
                         self._apply_connection_messages(follow_up_messages)

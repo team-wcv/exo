@@ -472,6 +472,8 @@ def apply_node_gathered_info(event: NodeGatheredInfo, state: State) -> State:
                     )
                 )
 
+            if not as_rdma_conns:
+                return state
             topology.replace_all_out_rdma_connections(event.node_id, as_rdma_conns)
         case ThunderboltBridgeInfo():
             new_tb_bridge: dict[NodeId, ThunderboltBridgeStatus] = {

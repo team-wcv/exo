@@ -1,9 +1,31 @@
+import os
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import anyio
 from loguru import logger
+
+NODE_INACTIVITY_TIMEOUT_SECONDS_ENV = "EXO_NODE_INACTIVITY_TIMEOUT_SECONDS"
+
+
+def _node_inactivity_timeout_seconds() -> float:
+    value = os.getenv(NODE_INACTIVITY_TIMEOUT_SECONDS_ENV)
+    if value is None:
+        return 30.0
+    try:
+        timeout = float(value)
+    except ValueError:
+        logger.warning(
+            f"Ignoring invalid {NODE_INACTIVITY_TIMEOUT_SECONDS_ENV}={value!r}; using 30s"
+        )
+        return 30.0
+    if timeout <= 0:
+        logger.warning(
+            f"Ignoring non-positive {NODE_INACTIVITY_TIMEOUT_SECONDS_ENV}={value!r}; using 30s"
+        )
+        return 30.0
+    return timeout
 
 from exo.master.placement import (
     add_instance_to_placements,
@@ -541,7 +563,9 @@ class Master:
         # unnecessary instance churn. Restore the upstream-safe
         # 30s budget while keeping the 1s tick so the master still
         # reacts quickly when a node *does* genuinely time out.
-        node_inactivity_timeout = timedelta(seconds=30)
+        node_inactivity_timeout = timedelta(
+            seconds=_node_inactivity_timeout_seconds()
+        )
         tick_interval_seconds = 1.0
 
         while True:
