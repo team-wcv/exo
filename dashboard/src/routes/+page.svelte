@@ -1799,8 +1799,6 @@
 
     const inst = instance as {
       shardAssignments?: {
-        nodeToRunner?: Record<string, string>;
-        runnerToShard?: Record<string, unknown>;
         modelId?: string;
       };
     };
@@ -1818,16 +1816,10 @@
       };
     }
 
-    // Get node IDs assigned to this instance
-    const nodeToRunner = inst.shardAssignments?.nodeToRunner || {};
-    const runnerToShard = inst.shardAssignments?.runnerToShard || {};
-    const runnerToNode: Record<string, string> = {};
-    for (const [nodeId, runnerId] of Object.entries(nodeToRunner)) {
-      runnerToNode[runnerId] = nodeId;
-    }
-    const instanceNodeIds = Object.keys(runnerToShard)
-      .map((runnerId) => runnerToNode[runnerId])
-      .filter(Boolean);
+    // Get node IDs assigned to this instance.
+    const instanceNodeIds = getInstanceShardEntries(instance)
+      .map((entry) => entry.nodeId)
+      .filter((nodeId): nodeId is string => Boolean(nodeId));
 
     const result = collectDownloadStatus(instanceModelId, instanceNodeIds);
 
@@ -1900,10 +1892,9 @@
       return { statusText: "PREPARING", statusClass: "inactive" };
     }
 
-    const inst = instance as {
-      shardAssignments?: { runnerToShard?: Record<string, unknown> };
-    };
-    const runnerIds = Object.keys(inst.shardAssignments?.runnerToShard || {});
+    const runnerIds = getInstanceShardEntries(instance).map(
+      (entry) => entry.runnerId,
+    );
 
     const statuses = runnerIds
       .map((rid) => {
@@ -2048,6 +2039,57 @@
     return [null, null];
   }
 
+  function getInstanceShardEntries(instance: unknown): Array<{
+    nodeId: string | null;
+    runnerId: string;
+    shard: unknown;
+  }> {
+    if (!instance || typeof instance !== "object") return [];
+    const inst = instance as {
+      shardAssignments?: {
+        nodeToRunner?: Record<string, string>;
+        runnerToShard?: Record<string, unknown>;
+        shards?: unknown[];
+      };
+    };
+    const assignments = inst.shardAssignments;
+    if (!assignments) return [];
+
+    const runnerToNode = new Map<string, string>();
+    for (const [nodeId, runnerId] of Object.entries(
+      assignments.nodeToRunner || {},
+    )) {
+      runnerToNode.set(runnerId, nodeId);
+    }
+
+    const oldWireEntries = Object.entries(assignments.runnerToShard || {}).map(
+      ([runnerId, shard]) => ({
+        nodeId: runnerToNode.get(runnerId) ?? null,
+        runnerId,
+        shard,
+      }),
+    );
+    if (oldWireEntries.length > 0) return oldWireEntries;
+
+    return (assignments.shards || [])
+      .map((entry) => {
+        if (!Array.isArray(entry) || entry.length < 3) return null;
+        const [nodeId, runnerId, shard] = entry;
+        if (typeof runnerId !== "string") return null;
+        return {
+          nodeId: typeof nodeId === "string" ? nodeId : null,
+          runnerId,
+          shard,
+        };
+      })
+      .filter(
+        (
+          entry,
+        ): entry is { nodeId: string | null; runnerId: string; shard: unknown } =>
+          entry !== null,
+      );
+  }
+
   // Get model ID from an instance
   function getInstanceModelId(instanceWrapped: unknown): string {
     const [, instance] = getTagged(instanceWrapped);
@@ -2080,19 +2122,12 @@
     if (instanceTag === "MlxRingInstance") instanceType = "MLX Ring";
     else if (instanceTag === "MlxJacclInstance") instanceType = "MLX RDMA";
 
-    const inst = instance as {
-      shardAssignments?: {
-        nodeToRunner?: Record<string, string>;
-        runnerToShard?: Record<string, unknown>;
-      };
-    };
-
     // Sharding strategy from first shard
     let sharding = "Unknown";
-    const runnerToShard = inst.shardAssignments?.runnerToShard || {};
-    const firstShardWrapped = Object.values(runnerToShard)[0];
-    if (firstShardWrapped) {
-      const [shardTag] = getTagged(firstShardWrapped);
+    const shardEntries = getInstanceShardEntries(instance);
+    const firstShard = shardEntries[0]?.shard;
+    if (firstShard) {
+      const [shardTag] = getTagged(firstShard);
       if (shardTag === "PipelineShardMetadata") sharding = "Pipeline";
       else if (shardTag === "TensorShardMetadata") sharding = "Tensor";
       else if (shardTag === "AsymmetricTensorShardMetadata")
@@ -2102,8 +2137,13 @@
     }
 
     // Node names from topology
-    const nodeToRunner = inst.shardAssignments?.nodeToRunner || {};
-    const nodeIds = Object.keys(nodeToRunner);
+    const nodeIds = Array.from(
+      new Set(
+        shardEntries
+          .map((entry) => entry.nodeId)
+          .filter((nodeId): nodeId is string => Boolean(nodeId)),
+      ),
+    );
     const nodeNames = nodeIds.map((nodeId) => {
       const node = data?.nodes?.[nodeId];
       return node?.friendly_name || nodeId.slice(0, 8);
