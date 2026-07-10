@@ -1,0 +1,53 @@
+#!/bin/zsh
+set -eu
+
+unsetopt bgnice 2>/dev/null || true
+
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+export EXO_LOG="$HOME/.cache/exo/exo_log"
+export EXO_DEFAULT_MODELS_DIR="$HOME/.exo/models"
+export EXO_ROUTER_SETTLE_SECONDS="12"
+export EXO_ENABLE_ASYMMETRIC_TP_AUTO_UPGRADE="1"
+export EXO_PREFERRED_RANK_ZERO_NODE_IDS="12D3KooWHLxC5XKA8Rt18ttADwH8emXdUAvyN4uciksbdUt3gtLK"
+export EXO_PREFERRED_RANK_ZERO_FRIENDLY_NAMES="wc-smbp"
+export EXO_REACHABILITY_ALLOWED_IPS="192.168.1.63,192.168.1.120"
+export CARGO_TARGET_DIR="$HOME/Development/Tooling/exo/target"
+
+unset EXO_LIBP2P_NAMESPACE
+unset EXO_REACHABILITY_ALLOWED_CIDRS
+
+host="$(hostname -s)"
+case "$host" in
+  wc-smbp)
+    export EXO_NETWORK_ALLOWED_IPS="192.168.0.2,192.168.1.63"
+    export EXO_MDNS_INTERFACE="en11"
+    export EXO_MDNS_IP_ADDRESS="192.168.1.63"
+    export EXO_MDNS_BROADCAST_ADDRESS="192.168.1.255"
+    exo_role_args=(-m)
+    ;;
+  wc-smbpt)
+    export EXO_NETWORK_ALLOWED_IPS="192.168.0.1,192.168.1.120"
+    export EXO_MDNS_INTERFACE="en0"
+    export EXO_MDNS_IP_ADDRESS="192.168.1.120"
+    export EXO_MDNS_BROADCAST_ADDRESS="192.168.1.255"
+    exo_role_args=(--bootstrap-peers /ip4/192.168.1.63/tcp/52418)
+    ;;
+  *)
+    echo "Unsupported Big Brain EXO host: $host" >&2
+    exit 64
+    ;;
+esac
+
+mkdir -p "$HOME/.cache/exo"
+if [[ -f "$HOME/.orchestraitor/worktrees/exo/cluster-main/dashboard/build/index.html" ]]; then
+  cd "$HOME/.orchestraitor/worktrees/exo/cluster-main"
+else
+  cd "$HOME/Development/Tooling/exo"
+fi
+
+exec /usr/bin/caffeinate -dimsu /opt/homebrew/bin/uv run exo \
+  "${exo_role_args[@]}" \
+  --api-port 52415 \
+  --libp2p-port 52418 \
+  --peer-download-port 52416 \
+  --trust-remote-code
