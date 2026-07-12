@@ -250,6 +250,31 @@ class Node:
             sys.exit(1)
         self._tg.cancel_tasks()
 
+    async def _restart_stalled_worker_session(self) -> None:
+        """Exit cleanly so the service manager can bootstrap a fresh session.
+
+        This callback is installed only on non-master event routers. A worker
+        that misses master acknowledgements for the configured timeout has a
+        stale cluster session; restarting it is safer than retaining an
+        unbounded local event queue that can never be applied by a new master.
+        """
+        logger.error(
+            "Worker master session is stale; shutting down for service-managed restart"
+        )
+        self.shutdown()
+
+    def _create_event_router(self, session_id: SessionId) -> EventRouter:
+        is_worker_session = session_id.master_node_id != self.node_id
+        return EventRouter(
+            session_id,
+            self.router.sender(topics.COMMANDS),
+            self.router.receiver(topics.GLOBAL_EVENTS),
+            self.router.sender(topics.LOCAL_EVENTS),
+            on_master_ack_stall=(
+                self._restart_stalled_worker_session if is_worker_session else None
+            ),
+        )
+
     async def _elect_loop(self):
         with self.election_result_receiver as results:
             async for result in results:
@@ -271,12 +296,7 @@ class Node:
                         await self.master.shutdown()
                         self.master = None
                     self.event_router.shutdown()
-                    self.event_router = EventRouter(
-                        result.session_id,
-                        self.router.sender(topics.COMMANDS),
-                        self.router.receiver(topics.GLOBAL_EVENTS),
-                        self.router.sender(topics.LOCAL_EVENTS),
-                    )
+                    self.event_router = self._create_event_router(result.session_id)
 
                 if (
                     result.session_id.master_node_id == self.node_id

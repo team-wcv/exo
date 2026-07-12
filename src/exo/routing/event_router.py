@@ -1,3 +1,5 @@
+import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from random import random
 
@@ -19,6 +21,24 @@ from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.event_buffer import OrderedBuffer
 from exo.utils.task_group import TaskGroup
 
+DEFAULT_MASTER_ACK_STALL_SECONDS = 120.0
+EXO_MASTER_ACK_STALL_SECONDS_ENV = "EXO_MASTER_ACK_STALL_SECONDS"
+
+
+def _master_ack_stall_seconds() -> float | None:
+    value = os.getenv(EXO_MASTER_ACK_STALL_SECONDS_ENV)
+    if value is None:
+        return DEFAULT_MASTER_ACK_STALL_SECONDS
+    try:
+        seconds = float(value)
+    except ValueError:
+        logger.warning(
+            f"Ignoring invalid {EXO_MASTER_ACK_STALL_SECONDS_ENV}={value!r}; "
+            f"using {DEFAULT_MASTER_ACK_STALL_SECONDS}s"
+        )
+        return DEFAULT_MASTER_ACK_STALL_SECONDS
+    return seconds if seconds > 0 else None
+
 
 @dataclass
 class EventRouter:
@@ -26,6 +46,7 @@ class EventRouter:
     command_sender: Sender[ForwarderCommand]
     external_inbound: Receiver[GlobalForwarderEvent]
     external_outbound: Sender[LocalForwarderEvent]
+    on_master_ack_stall: Callable[[], Awaitable[None]] | None = None
     _system_id: SystemId = field(init=False, default_factory=SystemId)
     internal_outbound: list[Sender[IndexedEvent]] = field(
         init=False, default_factory=list
@@ -36,6 +57,9 @@ class EventRouter:
     out_for_delivery: dict[EventId, tuple[float, LocalForwarderEvent]] = field(
         init=False, default_factory=dict
     )
+    _outbound_first_queued_at: dict[EventId, float] = field(
+        init=False, default_factory=dict
+    )
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
 
     _nack_cancel_scope: CancelScope | None = field(init=False, default=None)
@@ -44,6 +68,7 @@ class EventRouter:
     _nack_cap_seconds: float = field(init=False, default=10.0)
     _nack_max_events: int = field(init=False, default=64)
     _last_outbound_warning_size: int = field(init=False, default=0)
+    _master_ack_stall_fired: bool = field(init=False, default=False)
 
     async def run(self):
         try:
@@ -59,10 +84,11 @@ class EventRouter:
     async def _simple_retry(self):
         while True:
             await anyio.sleep(1 + random())
+            now = anyio.current_time()
             # list here is a shallow clone for shared mutation
             for e_id, (time, event) in list(self.out_for_delivery.items()):
-                if anyio.current_time() > time + 5:
-                    self.out_for_delivery[e_id] = (anyio.current_time(), event)
+                if now > time + 5:
+                    self.out_for_delivery[e_id] = (now, event)
                     logger.debug(
                         "Retrying unacknowledged local event "
                         f"event_id={e_id} origin_idx={event.origin_idx} "
@@ -70,6 +96,36 @@ class EventRouter:
                         f"out_for_delivery={len(self.out_for_delivery)}"
                     )
                     await self.external_outbound.send(event)
+            await self._recover_from_master_ack_stall(now)
+
+    async def _recover_from_master_ack_stall(self, now: float) -> None:
+        """Request a node-level recovery when a worker cannot reach its master.
+
+        The local event queue is acknowledged only when the same event returns
+        on the master's global stream. Retrying it forever after a master
+        restart keeps a worker in a stale session indefinitely. A node-level
+        callback lets the service restart into a fresh bootstrap session while
+        keeping the master itself exempt from this worker-only watchdog.
+        """
+        if self.on_master_ack_stall is None or self._master_ack_stall_fired:
+            return
+        timeout = _master_ack_stall_seconds()
+        if timeout is None or not self.out_for_delivery:
+            return
+
+        oldest_time = min(self._outbound_first_queued_at.values())
+        stalled_for = now - oldest_time
+        if stalled_for < timeout:
+            return
+
+        self._master_ack_stall_fired = True
+        logger.error(
+            "Master acknowledgement stalled; restarting worker session "
+            f"stalled_for_seconds={stalled_for:.3f} "
+            f"out_for_delivery={len(self.out_for_delivery)} "
+            f"session={self.session_id}"
+        )
+        await self.on_master_ack_stall()
 
     def sender(self) -> Sender[Event]:
         send, recv = channel[Event]()
@@ -101,6 +157,7 @@ class EventRouter:
                 idx += 1
                 await self.external_outbound.send(f_ev)
                 self.out_for_delivery[event.event_id] = (anyio.current_time(), f_ev)
+                self._outbound_first_queued_at[event.event_id] = anyio.current_time()
                 self._log_outbound_pressure()
 
     async def _run_ext_in(self):
@@ -116,6 +173,7 @@ class EventRouter:
                 event_id = event.event.event_id
                 if event_id in self.out_for_delivery:
                     self.out_for_delivery.pop(event_id)
+                    self._outbound_first_queued_at.pop(event_id, None)
                     logger.debug(
                         "Acknowledged local event from global stream "
                         f"event_id={event_id} origin_idx={event.origin_idx} "

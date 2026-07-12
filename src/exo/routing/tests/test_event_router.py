@@ -5,7 +5,7 @@ import pytest
 
 from exo.routing.event_router import EventRouter
 from exo.shared.types.commands import ForwarderCommand, RequestEventLog
-from exo.shared.types.common import NodeId, SessionId
+from exo.shared.types.common import NodeId, SessionId, SystemId
 from exo.shared.types.events import (
     GlobalForwarderEvent,
     LocalForwarderEvent,
@@ -125,6 +125,47 @@ async def test_gap_replay_batches_are_capped() -> None:
 
         router.shutdown()
         task_group.cancel_scope.cancel()
+
+    global_sender.close()
+    local_receiver.close()
+
+
+@pytest.mark.asyncio
+async def test_stalled_worker_events_request_session_recovery() -> None:
+    command_sender, _ = channel[ForwarderCommand]()
+    global_sender, global_receiver = channel[GlobalForwarderEvent]()
+    local_sender, local_receiver = channel[LocalForwarderEvent]()
+    session_id = SessionId(master_node_id=NodeId("master"), election_clock=0)
+    recovered = False
+
+    async def recover() -> None:
+        nonlocal recovered
+        recovered = True
+
+    router = EventRouter(
+        session_id=session_id,
+        command_sender=command_sender,
+        external_inbound=global_receiver,
+        external_outbound=local_sender,
+        on_master_ack_stall=recover,
+    )
+    local_event = LocalForwarderEvent(
+        origin_idx=0,
+        origin=SystemId(),
+        session=session_id,
+        event=TestEvent(),
+    )
+    router.out_for_delivery[local_event.event.event_id] = (10.0, local_event)
+    router._outbound_first_queued_at[local_event.event.event_id] = 10.0
+
+    await router._recover_from_master_ack_stall(10.0 + 121.0)
+
+    assert recovered
+    assert router._master_ack_stall_fired
+
+    # A stalled queue must request recovery once, not restart-loop locally.
+    await router._recover_from_master_ack_stall(10.0 + 240.0)
+    assert recovered
 
     global_sender.close()
     local_receiver.close()
