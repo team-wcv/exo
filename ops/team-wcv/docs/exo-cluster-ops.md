@@ -298,6 +298,17 @@ The verified tensor placement uses `TensorShardMetadata` on both 128 GB M5 Max
 nodes and `MlxJaccl` over the direct `rdma_en2` / `rdma_en1` edge. A warmed
 OpenAI-compatible request produced 42 tokens/s with an exact prefix-cache hit.
 
+### Half-open control-plane recovery
+
+The launchd profile sets `EXO_EVENT_DELIVERY_STALL_SECONDS=15`, below the
+master's 30-second inactive-node timeout. If a libp2p flap leaves pubsub
+half-open, an individual local event that remains unacknowledged for 15 seconds
+terminates Exo with a descriptive error. Launchd then rebuilds the routing
+session while there is still time for the worker to publish fresh telemetry
+before the master deletes its tensor placement. A growing `out_for_delivery`
+count together with repeated event-log replay requests is the diagnostic
+signature for this condition.
+
 ## Speculative-Decoding Drafters
 
 The `SKILL.md` section "Drafter strategies" covers placement
