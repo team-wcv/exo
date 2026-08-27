@@ -16,6 +16,13 @@ export CARGO_TARGET_DIR="$HOME/Development/Tooling/exo/target"
 unset EXO_LIBP2P_NAMESPACE
 unset EXO_REACHABILITY_ALLOWED_CIDRS
 
+source_root="${EXO_BIGBRAIN_SOURCE_ROOT:-$HOME/.orchestraitor/worktrees/exo/cluster-main}"
+if [[ -n "${EXO_BIGBRAIN_SOURCE_ROOT:-}" && \
+      ! -f "$source_root/dashboard/build/index.html" ]]; then
+  echo "EXO_BIGBRAIN_SOURCE_ROOT is not a prepared Exo checkout: $source_root (missing dashboard/build/index.html)" >&2
+  exit 78
+fi
+
 host="$(hostname -s)"
 case "$host" in
   wc-smbp)
@@ -39,7 +46,6 @@ case "$host" in
 esac
 
 mkdir -p "$HOME/.cache/exo"
-source_root="${EXO_BIGBRAIN_SOURCE_ROOT:-$HOME/.orchestraitor/worktrees/exo/cluster-main}"
 if [[ -f "$source_root/dashboard/build/index.html" ]]; then
   cd "$source_root"
 else
