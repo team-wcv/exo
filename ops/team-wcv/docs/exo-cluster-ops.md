@@ -261,11 +261,26 @@ Then restart the cluster (master first, then workers). Models are preserved in
 | GLM-4.6-4bit                                         | 185 GB | No (`supportsTensor=False`) | Yes (needs ~2x working memory) | Freshly-rebooted cluster recommended                                                                   |
 | gpt-oss-120b-MXFP4-Q8                                | 71 GB  | No (8 KV heads % 3 != 0)    | Yes                            | 2-way Tensor OK                                                                                        |
 | Step-3.5-Flash-8Bit                                  | varies | Depends on KV heads         | Yes                            | Supports thinking/reasoning                                                                            |
+| pipenetwork/Qwen3.8-Flash-Next-MLX-8bit              | 192.2 GB | n/a (use 2-way Tensor)     | 2-way only with balanced slices | Verified TP2 + `MlxJaccl` on smbp+smbpt at 42 t/s warmed generation; Qwen4-Exp PLE heads and expert projections are split across both ranks. |
 | Qwen3.5-122B-A10B-mlx-8bit (MoE)                     | ~122 GB | n/a (use 2-way Tensor)     | Yes                            | **Headline DFlash configuration**: 2-way Tensor + `MlxJaccl` on smbp+smbpt yields 159 t/s (3.02x speedup) via per-rank coupled DFlash drafter. See `bench/results/dflash/REPORT.md` in the exo repo. |
 | Qwen3.5-397B-A17B-4bit (MoE)                         | ~224 GB | n/a (use 2-way Tensor)     | No (per-rank shard too large for bmbp) | TP2 on smbp+smbpt with asymmetric `Qwen3.5-2B-MLX-4bit` drafter on bmbp via TB-5 wire. Post-classifier-fix bench (PR team-wcv/exo#28): target-only 50.0 t/s; K=3 drafter +38% (code), +60% (list), +22% (explain); K=5 hits 104 t/s on list (83% accept, x2.10) but goes net-negative on lower-accept-rate workloads. Custom card override at `~/.exo/custom_model_cards/mlx-community--Qwen3.5-397B-A17B-4bit.toml` (declares `drafter_model_ids` + `drafter_eligible_nodes`). |
 | Qwen3.5-35B-A3B-4bit (MoE)                           | ~20 GB | Single-device fits         | Single-device fits             | Single-node Pipeline + `MlxRing` on smbp with in-process `z-lab/Qwen3.5-35B-A3B-DFlash` coupled drafter delivers 221–278 t/s inference rate across workloads (+105% / +143% on code / explain). Throughput champion among models tested on the 3-node cluster. Custom card declares `coupled_drafter = "z-lab/Qwen3.5-35B-A3B-DFlash"`. |
 | Qwen3.6-35B-A3B-8bit (MoE)                           | ~36 GB | Single-device fits         | Single-device fits             | DFlash coupled drafter delivers 4.30x (377 t/s) on a single M5 Max via in-process drafter.             |
 | gemma-4-31b-it-bf16                                  | ~62 GB | Yes (2-way + asym drafter)  | Yes                            | Verified TP2 config: smbp+smbpt + asymmetric standard drafter on bmbp, +13–24% speedup.                |
+
+### Qwen3.8 Flash Next loader compatibility
+
+The current `pipenetwork/Qwen3.8-Flash-Next-MLX-8bit` repository supplies its
+own `qwen4_exp.py` because released `mlx-lm` does not yet carry the
+architecture. Before deploying it through Exo, verify that the loader builds
+caches from the live pipeline slice and supports array-valued batch-cache
+offsets when constructing rotary positions. The initial 2026-08-26 upload
+lacked both behaviors; the twin deployment used a reviewed local overlay while
+those fixes remain upstream model-repository work.
+
+The verified tensor placement uses `TensorShardMetadata` on both 128 GB M5 Max
+nodes and `MlxJaccl` over the direct `rdma_en2` / `rdma_en1` edge. A warmed
+OpenAI-compatible request produced 42 tokens/s with an exact prefix-cache hit.
 
 ## Speculative-Decoding Drafters
 
