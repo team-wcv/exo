@@ -124,6 +124,13 @@ to target rank 0 = smbp, which broadcasts to smbpt internally over TP2).
 The current twin fleet is managed by the launchd wrapper in
 `ops/team-wcv/launchd/teamwcv-exo-bigbrain`.
 
+For an isolated branch deployment, set `EXO_BIGBRAIN_SOURCE_ROOT` in the
+launchd manager environment to a prepared worktree containing
+`dashboard/build/index.html`, then restart the service through the normal
+consensus flow. When the variable is unset, the wrapper continues to prefer
+`~/.orchestraitor/worktrees/exo/cluster-main` and falls back to the primary
+checkout.
+
 - **Master**: `wc-smbp`, `--api-port 52415`, `--libp2p-port 52418`, `-m`.
 - **Worker**: `wc-smbpt`, `--api-port 52415`,
   `--bootstrap-peers /ip4/192.168.1.63/tcp/52418`.

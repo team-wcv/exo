@@ -39,8 +39,9 @@ case "$host" in
 esac
 
 mkdir -p "$HOME/.cache/exo"
-if [[ -f "$HOME/.orchestraitor/worktrees/exo/cluster-main/dashboard/build/index.html" ]]; then
-  cd "$HOME/.orchestraitor/worktrees/exo/cluster-main"
+source_root="${EXO_BIGBRAIN_SOURCE_ROOT:-$HOME/.orchestraitor/worktrees/exo/cluster-main}"
+if [[ -f "$source_root/dashboard/build/index.html" ]]; then
+  cd "$source_root"
 else
   cd "$HOME/Development/Tooling/exo"
 fi
