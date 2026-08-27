@@ -1,18 +1,24 @@
 ---
-branch: feature/asymmetric-tp-integration
-created: 2026-04-28
-owner: cursor-agent
+branch: feature/6a8facfc-qwen4-exp-tensor
+created: 2026-08-26
+owner: codex-agent
 status: active
-scope: "Adapt upstream asymmetric tensor parallelism for safe review in team-wcv/exo"
+scope: "Add Qwen4-Exp tensor support and recover half-open Exo control-plane delivery"
 orchestraitor:
-  ticket: none
-  task_url: none
+  ticket: 6a8facfc92a48d1b2d984ef6
+  task_url: null
 pr:
-  url: https://github.com/team-wcv/exo/pull/5
+  url: https://github.com/team-wcv/exo/pull/40
   state: open
+cleanup:
+  merged_into: team-wcv/main
+  archived_after: null
+  successor_branch: null
+source_branches:
+  - feature/asymmetric-tp-integration (merged via PR #5; stale base ledger replaced)
 ---
 
-- Why this branch exists: prepare upstream exo PR #1821 for safe integration into the team-wcv fork.
-- Changed paths: placement, shard metadata, MLX loading, asymmetric MLX sharding, placement previews, focused tests, PR #6 stability/dashboard fixes, and topology model-share badges for asymmetric tensor and pipeline shards.
-- Validation run: targeted ruff, basedpyright, focused pytest, and dashboard svelte-check (`npm run check`).
-- Known follow-ups: real two-node Apple Silicon distributed generation test before enabling automatic asymmetric placement broadly.
+- Why this branch exists: make Qwen3.8 Flash Next run across the Exo twins with JACCL/RDMA tensor sharding and preserve the live-proven compatibility fixes in reviewed source.
+- Changed paths: model-card tensor eligibility, MLX auto-parallel Qwen4-Exp strategy, pipeline cache compatibility, focused model-card/PLE tests, an isolated-source launchd override, and a fleet-scoped event-delivery watchdog with operator documentation.
+- Validation run: remote routing tests 29 passed, master tests 8 passed, Qwen tests 7 passed, Ruff/BasedPyright pass, and the wrapper passes `zsh -n`; after a coordinated two-node restart, live TP2 + JACCL/RDMA returned two HTTP 200 completions at 42.18/42.24 tokens/s with both runners ready and `out_for_delivery=0`.
+- Known follow-ups: Deliberaitor plan creation is unavailable because its MCP rejects the authenticated Codex caller identity; the PR will document this required-plan fallback. The current Hugging Face loader still needs its external batch-position overlay until that model repository publishes the fix.

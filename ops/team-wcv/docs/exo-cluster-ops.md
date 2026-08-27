@@ -124,6 +124,13 @@ to target rank 0 = smbp, which broadcasts to smbpt internally over TP2).
 The current twin fleet is managed by the launchd wrapper in
 `ops/team-wcv/launchd/teamwcv-exo-bigbrain`.
 
+For an isolated branch deployment, set `EXO_BIGBRAIN_SOURCE_ROOT` in the
+launchd manager environment to a prepared worktree containing
+`dashboard/build/index.html`, then restart the service through the normal
+consensus flow. When the variable is unset, the wrapper continues to prefer
+`~/.orchestraitor/worktrees/exo/cluster-main` and falls back to the primary
+checkout.
+
 - **Master**: `wc-smbp`, `--api-port 52415`, `--libp2p-port 52418`, `-m`.
 - **Worker**: `wc-smbpt`, `--api-port 52415`,
   `--bootstrap-peers /ip4/192.168.1.63/tcp/52418`.
@@ -254,11 +261,53 @@ Then restart the cluster (master first, then workers). Models are preserved in
 | GLM-4.6-4bit                                         | 185 GB | No (`supportsTensor=False`) | Yes (needs ~2x working memory) | Freshly-rebooted cluster recommended                                                                   |
 | gpt-oss-120b-MXFP4-Q8                                | 71 GB  | No (8 KV heads % 3 != 0)    | Yes                            | 2-way Tensor OK                                                                                        |
 | Step-3.5-Flash-8Bit                                  | varies | Depends on KV heads         | Yes                            | Supports thinking/reasoning                                                                            |
+| pipenetwork/Qwen3.8-Flash-Next-MLX-8bit              | 192.2 GB | n/a (use 2-way Tensor)     | 2-way only with balanced slices | Verified TP2 + `MlxJaccl` on smbp+smbpt at 42 t/s warmed generation; Qwen4-Exp PLE heads and expert projections are split across both ranks. |
 | Qwen3.5-122B-A10B-mlx-8bit (MoE)                     | ~122 GB | n/a (use 2-way Tensor)     | Yes                            | **Headline DFlash configuration**: 2-way Tensor + `MlxJaccl` on smbp+smbpt yields 159 t/s (3.02x speedup) via per-rank coupled DFlash drafter. See `bench/results/dflash/REPORT.md` in the exo repo. |
 | Qwen3.5-397B-A17B-4bit (MoE)                         | ~224 GB | n/a (use 2-way Tensor)     | No (per-rank shard too large for bmbp) | TP2 on smbp+smbpt with asymmetric `Qwen3.5-2B-MLX-4bit` drafter on bmbp via TB-5 wire. Post-classifier-fix bench (PR team-wcv/exo#28): target-only 50.0 t/s; K=3 drafter +38% (code), +60% (list), +22% (explain); K=5 hits 104 t/s on list (83% accept, x2.10) but goes net-negative on lower-accept-rate workloads. Custom card override at `~/.exo/custom_model_cards/mlx-community--Qwen3.5-397B-A17B-4bit.toml` (declares `drafter_model_ids` + `drafter_eligible_nodes`). |
 | Qwen3.5-35B-A3B-4bit (MoE)                           | ~20 GB | Single-device fits         | Single-device fits             | Single-node Pipeline + `MlxRing` on smbp with in-process `z-lab/Qwen3.5-35B-A3B-DFlash` coupled drafter delivers 221–278 t/s inference rate across workloads (+105% / +143% on code / explain). Throughput champion among models tested on the 3-node cluster. Custom card declares `coupled_drafter = "z-lab/Qwen3.5-35B-A3B-DFlash"`. |
 | Qwen3.6-35B-A3B-8bit (MoE)                           | ~36 GB | Single-device fits         | Single-device fits             | DFlash coupled drafter delivers 4.30x (377 t/s) on a single M5 Max via in-process drafter.             |
 | gemma-4-31b-it-bf16                                  | ~62 GB | Yes (2-way + asym drafter)  | Yes                            | Verified TP2 config: smbp+smbpt + asymmetric standard drafter on bmbp, +13–24% speedup.                |
+
+### Qwen3.8 Flash Next loader compatibility
+
+The current `pipenetwork/Qwen3.8-Flash-Next-MLX-8bit` repository supplies its
+own `qwen4_exp.py` because released `mlx-lm` does not yet carry the
+architecture. Before deploying it through Exo, verify that the loader builds
+caches from the live pipeline slice and supports array-valued batch-cache
+offsets when constructing rotary positions. The initial 2026-08-26 upload
+lacked both behaviors; the twin deployment used a reviewed local overlay while
+those fixes remain upstream model-repository work.
+
+The exact overlay is versioned at
+`ops/team-wcv/patches/qwen3.8-flash-next-mlx-8bit-loader.patch`. Apply it from
+the Exo repository root after the model download finishes:
+
+```bash
+qwen_model_dir="${HOME}/.exo/models/pipenetwork--Qwen3.8-Flash-Next-MLX-8bit"
+cp -n "$qwen_model_dir/qwen4_exp.py" "$qwen_model_dir/qwen4_exp.py.hf-original"
+patch -N -p1 -d "$qwen_model_dir" \
+  < ops/team-wcv/patches/qwen3.8-flash-next-mlx-8bit-loader.patch
+```
+
+The patched file's SHA-256 is
+`21374eec159e6e9916e63f6a77d078aaaa35cf7ecba18a3c30df2dc63b16133e`;
+the 2026-08-26 source file's SHA-256 is
+`6fae4ec0decbf77ca4a4571de683bc5580ec75e84325ecb432dfcd2fc81df75e`.
+
+The verified tensor placement uses `TensorShardMetadata` on both 128 GB M5 Max
+nodes and `MlxJaccl` over the direct `rdma_en2` / `rdma_en1` edge. A warmed
+OpenAI-compatible request produced 42 tokens/s with an exact prefix-cache hit.
+
+### Half-open control-plane recovery
+
+The launchd profile sets `EXO_EVENT_DELIVERY_STALL_SECONDS=15`, below the
+master's 30-second inactive-node timeout. If a libp2p flap leaves pubsub
+half-open, an individual local event that remains unacknowledged for 15 seconds
+terminates Exo with a descriptive error. Launchd then rebuilds the routing
+session while there is still time for the worker to publish fresh telemetry
+before the master deletes its tensor placement. A growing `out_for_delivery`
+count together with repeated event-log replay requests is the diagnostic
+signature for this condition.
 
 ## Speculative-Decoding Drafters
 

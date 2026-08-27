@@ -8,6 +8,7 @@ export EXO_LOG="$HOME/.cache/exo/exo_log"
 export EXO_DEFAULT_MODELS_DIR="$HOME/.exo/models"
 export EXO_ROUTER_SETTLE_SECONDS="12"
 export EXO_ENABLE_ASYMMETRIC_TP_AUTO_UPGRADE="1"
+export EXO_EVENT_DELIVERY_STALL_SECONDS="15"
 export EXO_PREFERRED_RANK_ZERO_NODE_IDS="12D3KooWHLxC5XKA8Rt18ttADwH8emXdUAvyN4uciksbdUt3gtLK"
 export EXO_PREFERRED_RANK_ZERO_FRIENDLY_NAMES="wc-smbp"
 export EXO_REACHABILITY_ALLOWED_IPS="192.168.1.63,192.168.1.120"
@@ -15,6 +16,13 @@ export CARGO_TARGET_DIR="$HOME/Development/Tooling/exo/target"
 
 unset EXO_LIBP2P_NAMESPACE
 unset EXO_REACHABILITY_ALLOWED_CIDRS
+
+source_root="${EXO_BIGBRAIN_SOURCE_ROOT:-$HOME/.orchestraitor/worktrees/exo/cluster-main}"
+if [[ -n "${EXO_BIGBRAIN_SOURCE_ROOT:-}" && \
+      ! -f "$source_root/dashboard/build/index.html" ]]; then
+  echo "EXO_BIGBRAIN_SOURCE_ROOT is not a prepared Exo checkout: $source_root (missing dashboard/build/index.html)" >&2
+  exit 78
+fi
 
 host="$(hostname -s)"
 case "$host" in
@@ -39,8 +47,8 @@ case "$host" in
 esac
 
 mkdir -p "$HOME/.cache/exo"
-if [[ -f "$HOME/.orchestraitor/worktrees/exo/cluster-main/dashboard/build/index.html" ]]; then
-  cd "$HOME/.orchestraitor/worktrees/exo/cluster-main"
+if [[ -f "$source_root/dashboard/build/index.html" ]]; then
+  cd "$source_root"
 else
   cd "$HOME/Development/Tooling/exo"
 fi
