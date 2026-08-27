@@ -1,18 +1,24 @@
 ---
-branch: feature/asymmetric-tp-integration
-created: 2026-04-28
-owner: cursor-agent
+branch: feature/6a8facfc-qwen4-exp-tensor
+created: 2026-08-26
+owner: codex-agent
 status: active
-scope: "Adapt upstream asymmetric tensor parallelism for safe review in team-wcv/exo"
+scope: "Add first-class Qwen4-Exp MLX tensor support and upstream the verified pipeline/cache compatibility fixes"
 orchestraitor:
-  ticket: none
-  task_url: none
+  ticket: 6a8facfc92a48d1b2d984ef6
+  task_url: null
 pr:
-  url: https://github.com/team-wcv/exo/pull/5
-  state: open
+  url: null
+  state: pending
+cleanup:
+  merged_into: team-wcv/main
+  archived_after: null
+  successor_branch: null
+source_branches:
+  - feature/asymmetric-tp-integration (merged via PR #5; stale base ledger replaced)
 ---
 
-- Why this branch exists: prepare upstream exo PR #1821 for safe integration into the team-wcv fork.
-- Changed paths: placement, shard metadata, MLX loading, asymmetric MLX sharding, placement previews, focused tests, PR #6 stability/dashboard fixes, and topology model-share badges for asymmetric tensor and pipeline shards.
-- Validation run: targeted ruff, basedpyright, focused pytest, and dashboard svelte-check (`npm run check`).
-- Known follow-ups: real two-node Apple Silicon distributed generation test before enabling automatic asymmetric placement broadly.
+- Why this branch exists: make Qwen3.8 Flash Next run across the Exo twins with JACCL/RDMA tensor sharding and preserve the live-proven compatibility fixes in reviewed source.
+- Changed paths: pending implementation audit.
+- Validation run: pending.
+- Known follow-ups: Deliberaitor plan creation is unavailable because its MCP rejects the authenticated Codex caller identity; the PR will document this required-plan fallback.
