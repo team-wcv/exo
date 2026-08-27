@@ -278,6 +278,22 @@ offsets when constructing rotary positions. The initial 2026-08-26 upload
 lacked both behaviors; the twin deployment used a reviewed local overlay while
 those fixes remain upstream model-repository work.
 
+The exact overlay is versioned at
+`ops/team-wcv/patches/qwen3.8-flash-next-mlx-8bit-loader.patch`. Apply it from
+the Exo repository root after the model download finishes:
+
+```bash
+qwen_model_dir="${HOME}/.exo/models/pipenetwork--Qwen3.8-Flash-Next-MLX-8bit"
+cp -n "$qwen_model_dir/qwen4_exp.py" "$qwen_model_dir/qwen4_exp.py.hf-original"
+patch -N -p1 -d "$qwen_model_dir" \
+  < ops/team-wcv/patches/qwen3.8-flash-next-mlx-8bit-loader.patch
+```
+
+The patched file's SHA-256 is
+`21374eec159e6e9916e63f6a77d078aaaa35cf7ecba18a3c30df2dc63b16133e`;
+the 2026-08-26 source file's SHA-256 is
+`6fae4ec0decbf77ca4a4571de683bc5580ec75e84325ecb432dfcd2fc81df75e`.
+
 The verified tensor placement uses `TensorShardMetadata` on both 128 GB M5 Max
 nodes and `MlxJaccl` over the direct `rdma_en2` / `rdma_en1` edge. A warmed
 OpenAI-compatible request produced 42 tokens/s with an exact prefix-cache hit.
