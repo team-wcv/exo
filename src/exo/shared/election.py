@@ -20,6 +20,7 @@ DEFAULT_ELECTION_TIMEOUT = 3.0
 DEFAULT_CONNECTION_SETTLE_SECONDS = 0.2
 DEFAULT_DROPOUT_GRACE_SECONDS = 1.0
 EXO_DROPOUT_GRACE_SECONDS_ENV = "EXO_DROPOUT_GRACE_SECONDS"
+EXO_ROUTER_SETTLE_SECONDS_ENV = "EXO_ROUTER_SETTLE_SECONDS"
 
 
 def _dropout_grace_seconds() -> float:
@@ -34,6 +35,20 @@ def _dropout_grace_seconds() -> float:
             f"using {DEFAULT_DROPOUT_GRACE_SECONDS}s"
         )
         return DEFAULT_DROPOUT_GRACE_SECONDS
+
+
+def _router_settle_seconds() -> float:
+    value = os.getenv(EXO_ROUTER_SETTLE_SECONDS_ENV)
+    if value is None:
+        return 0.0
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        logger.warning(
+            f"Ignoring invalid {EXO_ROUTER_SETTLE_SECONDS_ENV}={value!r}; "
+            "post-settle campaign disabled"
+        )
+        return 0.0
 
 
 class ElectionMessage(FrozenModel):
@@ -105,6 +120,7 @@ class Election:
         self._campaign_cancel_scope: CancelScope | None = None
         self._campaign_done: Event | None = None
         self._connection_state: dict[NodeId, bool] = {}
+        self._router_settle_seconds = _router_settle_seconds()
         self._tg = TaskGroup()
 
     async def run(self):
@@ -121,6 +137,8 @@ class Election:
                 self._candidates = candidates
                 await self._campaign(candidates, campaign_timeout=0.0)
                 logger.debug("Initial campaign finished")
+                if self._router_settle_seconds > 0:
+                    tg.start_soon(self._post_settle_campaign)
         finally:
             # Cancel and wait for the last election to end
             if self._campaign_cancel_scope is not None:
@@ -147,6 +165,17 @@ class Election:
 
     async def shutdown(self) -> None:
         self._tg.cancel_tasks()
+
+    async def _post_settle_campaign(self) -> None:
+        await anyio.sleep(self._router_settle_seconds)
+        self.clock += 1
+        candidates: list[ElectionMessage] = []
+        self._candidates = candidates
+        logger.info(
+            "Starting post-settle election campaign "
+            f"clock={self.clock} settle_seconds={self._router_settle_seconds}"
+        )
+        await self._campaign(candidates, DEFAULT_ELECTION_TIMEOUT)
 
     async def _election_receiver(self) -> None:
         with self._em_receiver as election_messages:

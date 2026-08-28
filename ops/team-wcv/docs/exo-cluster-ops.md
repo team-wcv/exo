@@ -309,6 +309,14 @@ before the master deletes its tensor placement. A growing `out_for_delivery`
 count together with repeated event-log replay requests is the diagnostic
 signature for this condition.
 
+`EXO_ROUTER_SETTLE_SECONDS=12` also schedules a higher-clock election campaign
+after startup. A restarted worker can establish its bootstrap TCP connection
+before the election receiver observes a connection-state transition; without
+the delayed campaign, its clock-0 self-election and the long-running forced
+master's clock-0 session can remain split indefinitely. The post-settle round
+forces both sides to compare candidates again, allowing the preferred
+`wc-smbp` master to win and the restarted worker to rejoin automatically.
+
 ## Speculative-Decoding Drafters
 
 The `SKILL.md` section "Drafter strategies" covers placement
