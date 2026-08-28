@@ -19,6 +19,6 @@ source_branches:
 ---
 
 - Why this branch exists: make Qwen3.8 Flash Next run across the Exo twins with JACCL/RDMA tensor sharding and preserve the live-proven compatibility fixes in reviewed source.
-- Changed paths: model-card tensor eligibility, MLX auto-parallel Qwen4-Exp strategy, pipeline cache compatibility, focused model-card/PLE tests, an isolated-source launchd override, a fleet-scoped event-delivery watchdog, and post-settle election recovery with operator documentation.
+- Changed paths: model-card tensor eligibility, MLX auto-parallel Qwen4-Exp strategy, pipeline cache compatibility, focused model-card/PLE tests, an isolated-source launchd override, a fleet-scoped event-delivery watchdog, post-settle election recovery, and Thunderbolt-pinned control routing with operator documentation.
 - Validation run: remote routing tests 29 passed, master tests 8 passed, Qwen tests 7 passed, Ruff/BasedPyright pass, and the wrapper passes `zsh -n`; after a coordinated two-node restart, live TP2 + JACCL/RDMA returned two HTTP 200 completions at 42.18/42.24 tokens/s with both runners ready and `out_for_delivery=0`.
 - Known follow-ups: Deliberaitor plan creation is unavailable because its MCP rejects the authenticated Codex caller identity; the PR will document this required-plan fallback. The current Hugging Face loader still needs its external batch-position overlay until that model repository publishes the fix.

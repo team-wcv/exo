@@ -133,12 +133,13 @@ checkout.
 
 - **Master**: `wc-smbp`, `--api-port 52415`, `--libp2p-port 52418`, `-m`.
 - **Worker**: `wc-smbpt`, `--api-port 52415`,
-  `--bootstrap-peers /ip4/192.168.1.63/tcp/52418`.
+  `--bootstrap-peers /ip4/192.168.0.2/tcp/52418`.
 - **Client/API alias**: `http://bigbrain.localhost:18888/v1`, via Caddy on
   `wc-studio`, proxying to `http://192.168.1.63:52415`.
 - **Never** use Tailscale or `.local` hostnames for the EXO workload/control
-  path. The stable operator path is numeric LAN for API/control and
-  Thunderbolt/RDMA for tensor traffic.
+  path. The stable operator API path is numeric LAN to `192.168.1.63`; twin
+  libp2p control is pinned to the direct Thunderbolt IPs
+  (`192.168.0.1`/`192.168.0.2`), and tensor traffic uses RDMA on that link.
 
 ## Topology Sanity Check
 
@@ -309,13 +310,16 @@ before the master deletes its tensor placement. A growing `out_for_delivery`
 count together with repeated event-log replay requests is the diagnostic
 signature for this condition.
 
-`EXO_ROUTER_SETTLE_SECONDS=12` also schedules a higher-clock election campaign
+`EXO_ROUTER_SETTLE_SECONDS=4` also schedules a higher-clock election campaign
 after startup. A restarted worker can establish its bootstrap TCP connection
 before the election receiver observes a connection-state transition; without
 the delayed campaign, its clock-0 self-election and the long-running forced
 master's clock-0 session can remain split indefinitely. The post-settle round
 forces both sides to compare candidates again, allowing the preferred
 `wc-smbp` master to win and the restarted worker to rejoin automatically.
+Four seconds leaves enough time for libp2p topic subscription while keeping the
+full restart-and-election path comfortably below the master's 30-second
+inactive-node timeout.
 
 ## Speculative-Decoding Drafters
 
