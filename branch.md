@@ -1,24 +1,24 @@
 ---
-branch: feature/6a8facfc-qwen4-exp-tensor
-created: 2026-08-26
+branch: fix/6a8facfc-exo-twin-restart-recovery
+created: 2026-08-28
 owner: codex-agent
 status: active
-scope: "Add Qwen4-Exp tensor support and recover half-open Exo control-plane delivery"
+scope: "Make Exo twin watchdog restarts converge and pin control to Thunderbolt"
 orchestraitor:
   ticket: 6a8facfc92a48d1b2d984ef6
   task_url: null
 pr:
-  url: https://github.com/team-wcv/exo/pull/40
+  url: https://github.com/team-wcv/exo/pull/41
   state: open
 cleanup:
   merged_into: team-wcv/main
   archived_after: null
   successor_branch: null
 source_branches:
-  - feature/asymmetric-tp-integration (merged via PR #5; stale base ledger replaced)
+  - feature/6a8facfc-qwen4-exp-tensor (merged via PR #40; recovery continued after merge)
 ---
 
-- Why this branch exists: make Qwen3.8 Flash Next run across the Exo twins with JACCL/RDMA tensor sharding and preserve the live-proven compatibility fixes in reviewed source.
-- Changed paths: model-card tensor eligibility, MLX auto-parallel Qwen4-Exp strategy, pipeline cache compatibility, focused model-card/PLE tests, an isolated-source launchd override, and a fleet-scoped event-delivery watchdog with operator documentation.
-- Validation run: remote routing tests 29 passed, master tests 8 passed, Qwen tests 7 passed, Ruff/BasedPyright pass, and the wrapper passes `zsh -n`; after a coordinated two-node restart, live TP2 + JACCL/RDMA returned two HTTP 200 completions at 42.18/42.24 tokens/s with both runners ready and `out_for_delivery=0`.
+- Why this branch exists: PR #40 merged before the live watchdog follow-up; preserve the restart-election and Thunderbolt-control fixes in a reviewable successor PR and address the Qwen pipeline cache P1 reported on the merged PR.
+- Changed paths: post-settle election recovery, focused election tests, Thunderbolt-pinned twin launch configuration, operator documentation, and adaptive Qwen4-Exp pipeline cache handling.
+- Validation run: successor head passed 28 election tests, 37 routing+master tests, 5 focused Qwen cache tests, Ruff, BasedPyright, and wrapper syntax on `wc-smbp`; live recovery uses ~0.35 ms Thunderbolt control, both TP2 runners are Ready, inference returned HTTP 200 at 42.00/41.41 tokens/s, and both delivery queues remain zero.
 - Known follow-ups: Deliberaitor plan creation is unavailable because its MCP rejects the authenticated Codex caller identity; the PR will document this required-plan fallback. The current Hugging Face loader still needs its external batch-position overlay until that model repository publishes the fix.
