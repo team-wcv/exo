@@ -50,6 +50,11 @@ class _CacheModel(nn.Module):
         return ["cache-0", "cache-1", "cache-2", "cache-3"]
 
 
+class _LocalCacheModel(_CacheModel):
+    def make_cache(self) -> list[object]:
+        return ["local-cache-0", "local-cache-1"]
+
+
 class _PipelineInnerModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -130,6 +135,26 @@ def test_qwen4_exp_pipeline_cache_tracks_the_live_slice() -> None:
     )
 
     assert model.make_cache() == ["cache-2", "cache-3"]
+    assert inner.ple_layers == [1]
+
+
+def test_qwen4_exp_pipeline_cache_does_not_slice_a_local_cache_twice() -> None:
+    model = _LocalCacheModel()
+    layers = [
+        _PipelineLayer(ple=None),
+        _PipelineLayer(ple=object()),
+    ]
+    inner = _PipelineInnerModel()
+
+    _patch_qwen4_exp_pipeline_state(
+        model,
+        inner,
+        cast(list[_LayerCallable], cast(object, layers)),
+        start_layer=2,
+        end_layer=4,
+    )
+
+    assert model.make_cache() == ["local-cache-0", "local-cache-1"]
     assert inner.ple_layers == [1]
 
 

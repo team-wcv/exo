@@ -368,7 +368,17 @@ def _patch_qwen4_exp_pipeline_state(
     typed_make_cache = cast(Callable[[], list[object]], make_cache)
 
     def patched_make_cache() -> list[object]:
-        return typed_make_cache()[start_layer:end_layer]
+        caches = typed_make_cache()
+        local_layer_count = end_layer - start_layer
+        if len(caches) == local_layer_count:
+            return caches
+        if len(caches) >= end_layer:
+            return caches[start_layer:end_layer]
+        raise ValueError(
+            "Qwen4-Exp cache count does not match the local or global layer "
+            f"layout: got {len(caches)}, expected {local_layer_count} local "
+            f"entries or at least {end_layer} global entries"
+        )
 
     model.make_cache = patched_make_cache
     if hasattr(inner_model, "ple_layers"):
