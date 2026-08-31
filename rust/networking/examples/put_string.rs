@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
         .and_then(|it| it.parse::<usize>().ok())
         .expect("USAGE: put_string <n> -- pub a string of n bytes into stream/data");
     info!("Opening session...");
-    let cfg = networking::cfg(&format!("{:x}", rand::random::<u128>()), 52414)?;
+    let cfg = networking::cfg(&format!("{:x}", rand::random::<u128>()), 52414, &[])?;
     let session = networking::open(cfg, "exo", 52414, 52413).await?;
     let _tok = session
         .z

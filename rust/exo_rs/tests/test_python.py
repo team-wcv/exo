@@ -14,7 +14,7 @@ from exo_rs import (
 async def test_sleep_on_multiple_items() -> None:
     print("PYTHON: starting handle")
     h = NetworkingHandle.new(
-        os.urandom(16).hex().lstrip("0"), "test", 52414, 52413
+        os.urandom(16).hex().lstrip("0"), "test", 52414, 52413, []
     )
     print("PYTHON: handle started")
 

@@ -20,7 +20,11 @@ pub fn is_valid_zid(identity: &str) -> bool {
         && identity.len() <= 32
 }
 
-pub fn cfg(identity: &str, listen_port: u16) -> Result<zenoh::Config> {
+pub fn cfg(
+    identity: &str,
+    listen_port: u16,
+    connect_endpoints: &[String],
+) -> Result<zenoh::Config> {
     assert!(is_valid_zid(identity));
     assert!(identity.len() <= 32);
     assert!(listen_port != 0, "must used defined listen port");
@@ -29,6 +33,12 @@ pub fn cfg(identity: &str, listen_port: u16) -> Result<zenoh::Config> {
     cfg.insert_json5("id", &format!("\"{identity}\""))?;
     cfg.insert_json5("mode", "\"router\"")?;
     cfg.insert_json5("listen/endpoints", &format!("[\"tcp/[::]:{listen_port}\"]"))?;
+    if !connect_endpoints.is_empty() {
+        cfg.insert_json5(
+            "connect/endpoints",
+            &serde_json::to_string(connect_endpoints)?,
+        )?;
+    }
     cfg.insert_json5("scouting/multicast/enabled", "false")?;
     cfg.insert_json5("scouting/multicast/autoconnect", "[]")?;
     cfg.insert_json5("scouting/gossip/multihop", "true")?;

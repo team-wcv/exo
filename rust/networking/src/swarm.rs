@@ -198,8 +198,9 @@ pub async fn create_swarm(
     from_client: mpsc::Receiver<ToSwarm>,
     listen_port: u16,
     discovery_service_port: u16,
+    connect_endpoints: Vec<String>,
 ) -> Result<Swarm> {
-    let cfg = crate::cfg(identity, listen_port)?;
+    let cfg = crate::cfg(identity, listen_port, &connect_endpoints)?;
     let session = crate::open(cfg, namespace, listen_port, discovery_service_port).await?;
     Ok(Swarm {
         session,

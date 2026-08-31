@@ -1,4 +1,5 @@
 import argparse
+import ipaddress
 import multiprocessing as mp
 import os
 import resource
@@ -70,6 +71,7 @@ class Node:
             namespace=args.namespace,
             listen_port=args.zenoh_port,
             discovery_service_port=args.discovery_port,
+            connect_endpoints=_zenoh_bootstrap_endpoints(args.bootstrap_peers),
         )
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
@@ -495,8 +497,6 @@ def main_inner(args: "Args"):
     if args.offline:
         logger.info("Running in OFFLINE mode — no internet checks, local models only")
 
-    _handle_legacy_bootstrap_peers(args.bootstrap_peers)
-
     if args.no_batch:
         os.environ["EXO_NO_BATCH"] = "1"
         logger.info("Continuous batching disabled (--no-batch)")
@@ -544,14 +544,43 @@ def _git_commit() -> str:
     return commit if result.returncode == 0 and commit else "unknown"
 
 
-def _handle_legacy_bootstrap_peers(bootstrap_peers: list[str]) -> None:
+def _zenoh_bootstrap_endpoints(bootstrap_peers: list[str]) -> list[str]:
     if not bootstrap_peers:
-        return
+        return []
+
+    endpoints: list[str] = []
+    for peer in bootstrap_peers:
+        parts = peer.removeprefix("/").split("/")
+        if len(parts) < 4 or parts[0] not in {"ip4", "ip6"} or parts[2] != "tcp":
+            raise ValueError(
+                "Legacy bootstrap peers must use /ip4/<address>/tcp/<port> "
+                "or /ip6/<address>/tcp/<port> multiaddrs"
+            )
+
+        address = ipaddress.ip_address(parts[1])
+        expected_version = 4 if parts[0] == "ip4" else 6
+        if address.version != expected_version:
+            raise ValueError(
+                f"Bootstrap peer address {parts[1]!r} does not match {parts[0]}"
+            )
+
+        try:
+            port = int(parts[3])
+        except ValueError as exception:
+            raise ValueError(
+                f"Bootstrap peer port must be an integer, got {parts[3]!r}"
+            ) from exception
+        if not 1 <= port <= 65535:
+            raise ValueError(f"Bootstrap peer port must be 1-65535, got {port}")
+
+        host = f"[{address}]" if address.version == 6 else str(address)
+        endpoints.append(f"tcp/{host}:{port}")
+
     logger.warning(
-        "--bootstrap-peers is retained for legacy launch compatibility but "
-        "is ignored by Zenoh; peers are discovered automatically through "
-        "--discovery-port"
+        f"Translated {len(endpoints)} legacy --bootstrap-peers multiaddr(s) "
+        "to explicit Zenoh TCP endpoint(s)"
     )
+    return endpoints
 
 
 class Args(FrozenModel):

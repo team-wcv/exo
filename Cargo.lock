@@ -2045,6 +2045,7 @@ dependencies = [
  "netwatcher",
  "parking_lot",
  "rand 0.10.1",
+ "serde_json",
  "smol",
  "socket2 0.6.4",
  "tokio",
