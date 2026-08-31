@@ -188,7 +188,7 @@ let
       editableOverlay = workspace.mkEditablePyprojectOverlay {
         # Use environment variable pointing to editable root directory
         root = "$REPO_ROOT";
-        members = [ "exo" "exo-bench" ];
+        members = [ "exo" "exo-bench" "exo-tools" ];
       };
       pythonSet = (pkgs.callPackage inputs.pyproject-nix.build.packages {
         inherit python;
@@ -257,6 +257,7 @@ in
         inherit self' pkgs lib; members = {
         exo = [ "mlx-cpu" ];
         exo-bench = [ ]; # Include pytest, pytest-asyncio, pytest-env
+        exo-tools = [ ];
       };
       }).mkPythonScript;
 
