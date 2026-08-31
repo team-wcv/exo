@@ -495,8 +495,7 @@ def main_inner(args: "Args"):
     if args.offline:
         logger.info("Running in OFFLINE mode — no internet checks, local models only")
 
-    if args.bootstrap_peers:
-        raise ValueError("Bootstrap peers has been temporarily removed")
+    _handle_legacy_bootstrap_peers(args.bootstrap_peers)
 
     if args.no_batch:
         os.environ["EXO_NO_BATCH"] = "1"
@@ -543,6 +542,16 @@ def _git_commit() -> str:
         return "unknown"
     commit = result.stdout.strip()
     return commit if result.returncode == 0 and commit else "unknown"
+
+
+def _handle_legacy_bootstrap_peers(bootstrap_peers: list[str]) -> None:
+    if not bootstrap_peers:
+        return
+    logger.warning(
+        "--bootstrap-peers is retained for legacy launch compatibility but "
+        "is ignored by Zenoh; peers are discovered automatically through "
+        "--discovery-port"
+    )
 
 
 class Args(FrozenModel):
