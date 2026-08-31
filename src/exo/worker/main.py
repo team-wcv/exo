@@ -26,6 +26,7 @@ from exo.shared.types.commands import (
 )
 from exo.shared.types.common import CommandId, NodeId, SystemId
 from exo.shared.types.events import (
+    CustomModelCardAdded,
     Event,
     IndexedEvent,
     InputChunkReceived,
@@ -258,17 +259,35 @@ class Worker:
                             ] = img
 
     async def _reconcile_custom_cards(self) -> None:
+        pending_startup_cards = await self._publish_persisted_custom_cards()
         while True:
             await anyio.sleep(1)
-            target = dict(self.state.custom_model_cards)
-            for model_id, card in target.items():
-                if card_cache.get(model_id) == card:
-                    continue
-                await card_cache.save(card)
+            await self._reconcile_custom_cards_once(pending_startup_cards)
 
-            for card in await card_cache.list_all():
-                if card.model_id not in target:
-                    await card_cache.pop(card.model_id)
+    async def _publish_persisted_custom_cards(self) -> set[ModelId]:
+        persisted = [card for card in await card_cache.list_all() if card.is_custom]
+        for card in persisted:
+            await self.event_sender.send(CustomModelCardAdded(model_card=card))
+        return {card.model_id for card in persisted}
+
+    async def _reconcile_custom_cards_once(
+        self, pending_startup_cards: set[ModelId]
+    ) -> None:
+        target = dict(self.state.custom_model_cards)
+        pending_startup_cards.difference_update(target)
+
+        for model_id, card in target.items():
+            if card_cache.get(model_id) == card:
+                continue
+            await card_cache.save(card)
+
+        for card in await card_cache.list_all():
+            if (
+                card.is_custom
+                and card.model_id not in target
+                and card.model_id not in pending_startup_cards
+            ):
+                await card_cache.pop(card.model_id)
 
     async def _reconcile_instance_backoff(self) -> None:
         while True:
