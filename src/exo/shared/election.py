@@ -255,9 +255,7 @@ class Election:
                 logger.debug("Campaign started")
                 logger.debug("Connection message added")
 
-    def _apply_connection_messages(
-        self, messages: list[ConnectionMessage]
-    ) -> bool:
+    def _apply_connection_messages(self, messages: list[ConnectionMessage]) -> bool:
         previous = self._connection_state
         for message in messages:
             self._connection_state = message.connected

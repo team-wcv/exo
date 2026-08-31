@@ -301,7 +301,6 @@ export interface PrefillProgress {
  * UI should fall back to the generic "SPEC" pill in that case. */
 export type DraftMode = "model" | "pipelined" | "ngram" | "eagle" | "lookahead";
 
-
 export interface DrafterStats {
   // ``modelId`` is null for n-gram speculation (no external drafter
   // model -- the suffix lookup runs in-process against the prompt and

@@ -420,9 +420,7 @@ def _node_zid_scope(args: "Args") -> str:
             f"zenoh-pid-{os.getpid()}."
             f"api-{args.api_port}.peer-{args.peer_download_port}"
         )
-    return (
-        f"zenoh-{args.zenoh_port}.api-{args.api_port}.peer-{args.peer_download_port}"
-    )
+    return f"zenoh-{args.zenoh_port}.api-{args.api_port}.peer-{args.peer_download_port}"
 
 
 def main():

@@ -570,9 +570,7 @@ class Master:
         # unnecessary instance churn. Restore the upstream-safe
         # 30s budget while keeping the 1s tick so the master still
         # reacts quickly when a node *does* genuinely time out.
-        node_inactivity_timeout = timedelta(
-            seconds=_node_inactivity_timeout_seconds()
-        )
+        node_inactivity_timeout = timedelta(seconds=_node_inactivity_timeout_seconds())
         tick_interval_seconds = 1.0
 
         while True:

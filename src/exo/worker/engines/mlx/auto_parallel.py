@@ -382,9 +382,7 @@ def _patch_qwen4_exp_pipeline_state(
 
     model.make_cache = patched_make_cache
     if hasattr(inner_model, "ple_layers"):
-        typed_inner_model = cast(
-            _Qwen4ExpInnerModel, cast(object, inner_model)
-        )
+        typed_inner_model = cast(_Qwen4ExpInnerModel, cast(object, inner_model))
         typed_inner_model.ple_layers = [
             index
             for index, layer in enumerate(layers)
@@ -1331,7 +1329,9 @@ class Qwen4ExpShardingStrategy(TensorParallelShardingStrategy):
 
     def _shard_attention(self, attention: _Qwen4ExpAttention) -> None:
         if attention.n_heads % self.N or attention.n_kv_heads % self.N:
-            raise ValueError("Qwen4-Exp attention heads must divide evenly across ranks")
+            raise ValueError(
+                "Qwen4-Exp attention heads must divide evenly across ranks"
+            )
         attention.q_proj = self.all_to_sharded_linear(attention.q_proj)
         attention.k_proj = self.all_to_sharded_linear(attention.k_proj)
         attention.v_proj = self.all_to_sharded_linear(attention.v_proj)
@@ -1341,9 +1341,7 @@ class Qwen4ExpShardingStrategy(TensorParallelShardingStrategy):
 
     def _shard_ple(self, ple: _Qwen4ExpPle) -> None:
         ngram = ple.ple_embedding
-        table = cast(
-            _Qwen4ExpEmbeddingTable, cast(object, ngram.ngram_embedding)
-        )
+        table = cast(_Qwen4ExpEmbeddingTable, cast(object, ngram.ngram_embedding))
         head_count = int(ngram.ngram_heads)
         if head_count % self.N:
             raise ValueError("Qwen4-Exp n-gram heads must divide evenly across ranks")

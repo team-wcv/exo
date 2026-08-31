@@ -139,9 +139,7 @@ def entrypoint(
                 cancel_receiver=cancel_receiver,
             )
 
-        runner = Runner(
-            bound_instance, builder, event_sender_downcast, task_receiver
-        )
+        runner = Runner(bound_instance, builder, event_sender_downcast, task_receiver)
         runner_kind = "image" if bound_instance.is_image_model else "text"
         logger.info(f"Starting {runner_kind} runner main loop {runner_context}")
         runner.main()
