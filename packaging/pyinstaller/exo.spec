@@ -1,11 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-import sys
 import importlib.util
 import shutil
+import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, copy_metadata
 
 PROJECT_ROOT = Path.cwd()
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -63,6 +63,7 @@ HIDDEN_IMPORTS = sorted(
 )
 
 DATAS: list[tuple[str, str]] = [
+    *copy_metadata("exo"),
     (str(DASHBOARD_DIR), "dashboard"),
     (str(RESOURCES_DIR), "resources"),
     (str(MLX_LIB_DIR), "mlx/lib"),
