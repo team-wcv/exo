@@ -35,8 +35,8 @@ pub enum ToSwarm {
 #[derive(Debug)]
 pub enum FromSwarm {
     Message { topic: String, data: Vec<u8> },
-    Discovered {},
-    Expired {},
+    Discovered { peer_id: String },
+    Expired { peer_id: String },
 }
 
 pub type Topics = HashMap<String, (Subscriber<()>, Publisher<'static>)>;
@@ -70,15 +70,16 @@ impl Swarm {
                     token = discovery.recv_async() => {
                         if let Ok(token) = token {
                             let key_expr = token.key_expr().as_str().to_owned();
-                            let zid = key_expr.strip_prefix("live/");
-                            yield match token.kind() {
-                                SampleKind::Put => {
-                                    log::info!("discovered: {zid:?}");
-                                    FromSwarm::Discovered {}
-                                }
-                                SampleKind::Delete => {
-                                    log::info!("expired: {zid:?}");
-                                    FromSwarm::Expired {}
+                            if let Some(peer_id) = key_expr.strip_prefix("live/") {
+                                yield match token.kind() {
+                                    SampleKind::Put => {
+                                        log::info!("discovered: {peer_id}");
+                                        FromSwarm::Discovered { peer_id: peer_id.to_owned() }
+                                    }
+                                    SampleKind::Delete => {
+                                        log::info!("expired: {peer_id}");
+                                        FromSwarm::Expired { peer_id: peer_id.to_owned() }
+                                    }
                                 }
                             }
                         }

@@ -107,6 +107,35 @@ async def test_single_round_broadcasts_and_updates_seniority_on_self_win() -> No
     assert election.seniority == 2
 
 
+def test_each_peer_membership_change_updates_election_state() -> None:
+    em_out_tx, _ = channel[ElectionMessage]()
+    _, em_in_rx = channel[ElectionMessage]()
+    er_tx, _ = channel[ElectionResult]()
+    _, cm_rx = channel[ConnectionMessage]()
+    _, co_rx = channel[ForwarderCommand]()
+    election = Election(
+        node_id=NodeId("ME"),
+        election_message_receiver=em_in_rx,
+        election_message_sender=em_out_tx,
+        election_result_sender=er_tx,
+        connection_message_receiver=cm_rx,
+        command_receiver=co_rx,
+    )
+
+    peer_a = NodeId("A")
+    peer_b = NodeId("B")
+    apply_messages = election._apply_connection_messages
+
+    assert apply_messages([ConnectionMessage(connected=True, peer_id=peer_a)])
+    election._peer_seniority[peer_a] = 1_000_000
+    election._refresh_max_observed_seniority()
+    assert apply_messages([ConnectionMessage(connected=True, peer_id=peer_b)])
+    assert not apply_messages([ConnectionMessage(connected=True, peer_id=peer_b)])
+    assert apply_messages([ConnectionMessage(connected=False, peer_id=peer_a)])
+    assert election._max_observed_seniority == election.seniority
+    assert apply_messages([ConnectionMessage(connected=False, peer_id=peer_b)])
+
+
 @pytest.mark.anyio
 async def test_peer_with_higher_seniority_wins_and_we_switch_master() -> None:
     """
