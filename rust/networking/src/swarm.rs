@@ -243,22 +243,42 @@ pub async fn create_swarm(
     discovery_service_port: u16,
     connect_endpoints: Vec<String>,
 ) -> Result<Swarm> {
+    let enable_discovery = should_enable_discovery(&connect_endpoints);
     let cfg = crate::cfg(identity, listen_port, &connect_endpoints)?;
-    let session = crate::open(cfg, namespace, listen_port, discovery_service_port).await?;
+    let session = crate::open_with_discovery(
+        cfg,
+        namespace,
+        listen_port,
+        discovery_service_port,
+        enable_discovery,
+    )
+    .await?;
     Ok(Swarm {
         session,
         from_client,
     })
 }
 
+fn should_enable_discovery(connect_endpoints: &[String]) -> bool {
+    connect_endpoints.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{live_prefix, topic_key};
+    use super::{live_prefix, should_enable_discovery, topic_key};
 
     #[test]
     fn zenoh_keys_are_scoped_by_namespace() {
         assert_eq!(live_prefix("abc"), "clusters/abc/live/");
         assert_eq!(topic_key("abc", "events"), "clusters/abc/topics/events");
         assert_ne!(topic_key("abc", "events"), topic_key("def", "events"));
+    }
+
+    #[test]
+    fn explicit_bootstrap_disables_ipv6_discovery() {
+        assert!(should_enable_discovery(&[]));
+        assert!(!should_enable_discovery(&[
+            "tcp/192.0.2.10:52414".to_owned()
+        ]));
     }
 }

@@ -74,6 +74,16 @@ pub async fn open(
     listen_port: u16,
     discovery_service_port: u16,
 ) -> Result<Session> {
+    open_with_discovery(cfg, namespace, listen_port, discovery_service_port, true).await
+}
+
+pub async fn open_with_discovery(
+    cfg: zenoh::Config,
+    namespace: &str,
+    listen_port: u16,
+    discovery_service_port: u16,
+    enable_discovery: bool,
+) -> Result<Session> {
     assert!(listen_port != 0, "must used defined listen port");
     let namespace_hash: [u8; 8] = {
         blake3::hash(namespace.as_bytes()).as_bytes()[..8]
@@ -89,38 +99,43 @@ pub async fn open(
         .await?;
     let z = zenoh::session::init(runtime.clone().into()).await?;
     runtime.start().await?;
-    let mut discovery =
-        Discovery::new(z.zid(), namespace_hash, listen_port, discovery_service_port).await?;
-    let _jh = Arc::new(AbortOnDrop(tokio::task::spawn(async move {
-        loop {
-            let Ok(discovered) = discovery.next().await.inspect_err(|e| {
-                log::warn!("discovery error {e}");
-            }) else {
-                continue;
-            };
+    let discovery_task = if enable_discovery {
+        let mut discovery =
+            Discovery::new(z.zid(), namespace_hash, listen_port, discovery_service_port).await?;
+        Some(Arc::new(AbortOnDrop(tokio::task::spawn(async move {
+            loop {
+                let Ok(discovered) = discovery.next().await.inspect_err(|e| {
+                    log::warn!("discovery error {e}");
+                }) else {
+                    continue;
+                };
 
-            if discovered.zid > runtime.zid() {
-                log::debug!("not connecting to peer with greater zid");
-                continue;
+                if discovered.zid > runtime.zid() {
+                    log::debug!("not connecting to peer with greater zid");
+                    continue;
+                }
+
+                let Ok(locator) =
+                    Locator::new("tcp", discovered.addr.to_string(), "").inspect_err(|e| {
+                        log::warn!("failed to parse locator from addr: {e}");
+                    })
+                else {
+                    continue;
+                };
+
+                runtime
+                    .connect_peer(&discovered.zid.into(), &[locator])
+                    .await;
             }
-
-            let Ok(locator) =
-                Locator::new("tcp", discovered.addr.to_string(), "").inspect_err(|e| {
-                    log::warn!("failed to parse locator from addr: {e}");
-                })
-            else {
-                continue;
-            };
-
-            runtime
-                .connect_peer(&discovered.zid.into(), &[locator])
-                .await;
-        }
-    })));
+        }))))
+    } else {
+        log::info!("IPv6 discovery disabled because explicit bootstrap endpoints are configured");
+        None
+    };
     Ok(Session {
         z,
         namespace_prefix,
-        _jh,
+        _discovery_task: discovery_task,
     })
 }
 
@@ -135,7 +150,7 @@ impl Drop for AbortOnDrop {
 pub struct Session {
     pub z: ZSession,
     pub namespace_prefix: String,
-    _jh: Arc<AbortOnDrop>,
+    _discovery_task: Option<Arc<AbortOnDrop>>,
 }
 
 #[cfg(test)]
