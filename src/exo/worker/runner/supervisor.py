@@ -13,7 +13,6 @@ from anyio import (
     CancelScope,
     ClosedResourceError,
     current_time,
-    to_thread,
 )
 from loguru import logger
 
@@ -284,16 +283,15 @@ class RunnerSupervisor:
         return placement.drafter_model_id
 
     async def run(self):
-        self.runner_process.start()
-        self._started_at = current_time()
-        logger.info(
-            f"Runner process started {self._runner_context()} "
-            f"pid={self.runner_process.pid} model_id={self.model_id}"
-        )
         try:
             async with self._tg as tg:
                 # start the process itself & handle its stdout/stderr
                 await tg.start(self.runner_process.run)
+                self._started_at = current_time()
+                logger.info(
+                    f"Runner process started {self._runner_context()} "
+                    f"pid={self.runner_process.pid} model_id={self.model_id}"
+                )
                 tg.start_soon(self._runner_stdio_handler.run)
 
                 tg.start_soon(self._watch_runner)
@@ -317,60 +315,13 @@ class RunnerSupervisor:
             with contextlib.suppress(ClosedResourceError):
                 self._cancel_sender.close()
 
-            await to_thread.run_sync(self.runner_process.join, 5)
-
-            if self.runner_process.is_alive():
-                logger.warning(
-                    "Runner process did not shutdown successfully, terminating "
-                    f"{self._runner_context()} pid={self.runner_process.pid} "
-                    f"rss_mb={self._runner_rss_mb()}"
-                )
-                self.runner_process.terminate()
-                self.runner_process.join(timeout=10)
-
-                if not self.runner_process.is_alive():
-                    logger.warning(
-                        "Runner terminated after first SIGTERM "
-                        f"{self._runner_context()} pid={self.runner_process.pid}"
-                    )
-
-                else:
-                    # Try really hard to terminate
-                    for i in range(2, 11):
-                        self.runner_process.terminate()
-                        self.runner_process.join(timeout=2)
-                        if not self.runner_process.is_alive():
-                            logger.warning(
-                                "Runner terminated after repeated SIGTERM "
-                                f"{self._runner_context()} attempts={i} "
-                                f"pid={self.runner_process.pid}"
-                            )
-                            break
-                    # Try even harder to kill
-                    else:
-                        logger.critical(
-                            "Runner process did not respond to SIGTERM, killing "
-                            f"{self._runner_context()} pid={self.runner_process.pid} "
-                            f"rss_mb={self._runner_rss_mb()}"
-                        )
-                        j = 0
-                        while self.runner_process.is_alive():
-                            j += 1
-                            self.runner_process.kill()
-                            self.runner_process.join(timeout=5)
-                            logger.warning(
-                                "Runner kill attempt completed "
-                                f"{self._runner_context()} attempts={j} "
-                                f"pid={self.runner_process.pid}"
-                            )
-            else:
+            with anyio.CancelScope(shield=True):
+                await self.runner_process.stop()
                 logger.info(
                     "Runner process successfully terminated "
                     f"{self._runner_context()} exitcode={self.runner_process.exitcode} "
                     f"runtime_seconds={self._runtime_seconds()}"
                 )
-
-            self.runner_process.close()
 
     def shutdown(self):
         self._tg.cancel_tasks()
@@ -518,10 +469,11 @@ class RunnerSupervisor:
         )
         if self.runner_process.is_alive():
             logger.info(
-                "Runner was found alive, attempting to join process "
+                "Runner was found alive, stopping process "
                 f"{self._runner_context()} pid={self.runner_process.pid}"
             )
-            await to_thread.run_sync(self.runner_process.join, 5)
+            with anyio.CancelScope(shield=True):
+                await self.runner_process.stop()
         rc = self.runner_process.exitcode
         logger.info(
             "Runner exited "
@@ -543,8 +495,9 @@ class RunnerSupervisor:
         else:
             cause: str = f"exitcode={rc}"
 
-        logger.opt(exception=e).error(
-            f"Runner terminated with {cause} {self._runner_context()}"
+        logged_exception = e if isinstance(e, Exception) else None
+        logger.opt(exception=logged_exception).error(
+            f"Runner terminated with {cause} {self._runner_context()} details={e}"
         )
 
         diagnostics = [
@@ -594,8 +547,6 @@ class RunnerSupervisor:
 
     def _runner_rss_mb(self) -> float | None:
         pid = self.runner_process.pid
-        if pid is None:
-            return None
         try:
             return round(psutil.Process(pid).memory_info().rss / (1024 * 1024), 3)
         except psutil.Error:

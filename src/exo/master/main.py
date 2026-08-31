@@ -146,46 +146,6 @@ def _prefill_endpoint_for(state: State, decode_instance_id: InstanceId) -> str |
     return None
 
 
-def _prefill_endpoint_for(state: State, decode_instance_id: InstanceId) -> str | None:
-    decode = state.instances.get(decode_instance_id)
-    if decode is None:
-        return None
-    decode_node = next(iter(decode.shard_assignments.node_to_runner.keys()), None)
-    if decode_node is None:
-        return None
-
-    sources: set[InstanceId] = set()
-    for link in state.instance_links.values():
-        if decode_instance_id in link.decode_instances:
-            sources.update(link.prefill_instances)
-    sources.discard(decode_instance_id)
-
-    in_flight = {TaskStatus.Pending, TaskStatus.Running}
-    task_counts: dict[InstanceId, int] = {
-        src_id: sum(
-            1
-            for task in state.tasks.values()
-            if task.instance_id == src_id and task.task_status in in_flight
-        )
-        for src_id in sources
-    }
-    for src_id in sorted(sources, key=lambda sid: task_counts[sid]):
-        instance = state.instances.get(src_id)
-        if instance is None:
-            continue
-        for node_id, runner_id in instance.shard_assignments.node_to_runner.items():
-            port = state.prefill_server_ports.get(runner_id)
-            if port is None:
-                continue
-            ip = find_ip_prioritised(
-                decode_node, node_id, state.topology, state.node_network, ring=True
-            )
-            if ip is None:
-                continue
-            return f"{ip}:{port}"
-    return None
-
-
 class Master:
     def __init__(
         self,
@@ -726,7 +686,7 @@ class Master:
             self._event_log.read_range(since_idx, end),
             start=since_idx,
         ):
-            await self._send_event(IndexedEvent(idx=i, event=event))
+            await self._send_indexed_event(IndexedEvent(idx=i, event=event))
 
     def _friendly_name(self, node_id: NodeId) -> str:
         identity = self.state.node_identities.get(node_id)

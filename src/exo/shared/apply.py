@@ -58,6 +58,7 @@ from exo.utils.info_gatherer.info_gatherer import (
     MacThunderboltIdentifiers,
     MemoryUsage,
     MiscData,
+    NodeBackends,
     NodeConfig,
     NodeDiskUsage,
     NodeNetworkInterfaces,
@@ -84,8 +85,6 @@ def event_apply(event: Event, state: State) -> State:
             | InputChunkReceived()
             | TracesCollected()
             | TracesMerged()
-            | CustomModelCardAdded()
-            | CustomModelCardDeleted()
             | DrafterPlacementDegraded()
         ):  # Pass-through events that don't modify state
             return state
@@ -503,6 +502,11 @@ def apply_node_gathered_info(event: NodeGatheredInfo, state: State) -> State:
             }
             if not info.enabled:
                 topology.remove_all_rdma_connections_touching(event.node_id)
+        case NodeBackends():
+            update["node_backends"] = {
+                **state.node_backends,
+                event.node_id: info.backends,
+            }
 
     return state.model_copy(update=update)
 

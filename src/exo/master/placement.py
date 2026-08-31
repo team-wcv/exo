@@ -197,7 +197,7 @@ def place_instance(
     current_instances: Mapping[InstanceId, Instance],
     node_memory: Mapping[NodeId, MemoryUsage],
     node_network: Mapping[NodeId, NodeNetworkInfo],
-    node_backends: Mapping[NodeId, list[Backend]],
+    node_backends: Mapping[NodeId, list[Backend]] | None = None,
     required_nodes: set[NodeId] | None = None,
     allowed_nodes: set[NodeId] | None = None,
     allow_single_node_total_memory: bool = False,
@@ -376,14 +376,6 @@ def place_instance(
             )
 
     smallest_cycles = get_smallest_cycles(cycles_with_sufficient_memory)
-    rdma_ctl_status = node_rdma_ctl or {}
-
-    def _all_rdma_ctl_enabled(cycle: Cycle) -> bool:
-        return all(
-            ((status := rdma_ctl_status.get(node_id)) is not None and status.enabled)
-            for node_id in cycle
-        )
-
     required_backends = set(INSTANCE_META_BACKENDS[command.instance_meta]) & set(
         command.model_card.backends
     )
@@ -398,7 +390,8 @@ def place_instance(
         cycle
         for cycle in smallest_cycles
         if all(
-            set(node_backends.get(node_id, [])) & required_backends for node_id in cycle
+            set((node_backends or {}).get(node_id, list(Backend))) & required_backends
+            for node_id in cycle
         )
     ]
     if not smallest_cycles:
@@ -1640,6 +1633,7 @@ def auto_place_prefill_siblings(
     current_instances: Mapping[InstanceId, Instance],
     node_memory: Mapping[NodeId, MemoryUsage],
     node_network: Mapping[NodeId, NodeNetworkInfo],
+    node_backends: Mapping[NodeId, list[Backend]] | None = None,
     download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
 ) -> tuple[dict[InstanceId, Instance], list[InstanceId]]:
     """Place single-rank prefill-only siblings on each viable eligible node.
@@ -1716,6 +1710,7 @@ def auto_place_prefill_siblings(
                 accumulating_instances,
                 node_memory,
                 node_network,
+                node_backends=node_backends,
                 allowed_nodes={candidate_node},
                 download_status=download_status,
             )
