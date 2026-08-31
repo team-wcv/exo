@@ -9,7 +9,7 @@ import pytest
 from loguru import logger
 
 from exo.master.main import _MAX_MASTER_SESSION_LOG_DIRS, Master
-from exo.routing.router import get_node_id_keypair
+from exo.routing.router import get_node_zid
 from exo.shared.models.model_cards import ModelCard, ModelTask
 from exo.shared.types.backends import Backend
 from exo.shared.types.commands import (
@@ -52,6 +52,7 @@ from exo.shared.types.worker.runners import RunnerId, ShardWithId
 from exo.shared.types.worker.shards import PipelineShardMetadata, Sharding
 from exo.utils.channels import channel
 from exo.utils.disk_event_log import DiskEventLog
+from exo.utils.info_gatherer.info_gatherer import NodeBackends
 
 
 @pytest.mark.asyncio

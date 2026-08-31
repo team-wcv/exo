@@ -52,6 +52,8 @@ from exo.api.types import (
     AdvancedImageParams,
     AgentEndpoint,
     AgentEndpointList,
+    AwaitInstanceReadyMessage,
+    AwaitInstanceTimeoutMessage,
     BenchChatCompletionRequest,
     BenchChatCompletionResponse,
     BenchImageGenerationResponse,

@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from typing import Self
 
 import anyio
-from anyio.lowlevel import checkpoint as anyio_checkpoint
 from daemon import DaemonContext  # pyright: ignore[reportMissingTypeStubs]
 from exo_rs import Pidfile, PidfileError
 from loguru import logger
@@ -25,17 +24,19 @@ from exo.download.impl_shard_downloader import exo_shard_downloader
 from exo.download.peer_file_server import PeerFileServer
 from exo.master.main import Master
 from exo.routing.event_router import EventRouter
-from exo.routing.router import Router, get_node_id_keypair
+from exo.routing.router import Router, get_node_zid
 from exo.shared.constants import (
     EXO_LOG,
     EXO_MODELS_DIRS,
     EXO_MODELS_READ_ONLY_DIRS,
     EXO_PEER_DOWNLOAD_PORT,
+    EXO_PID_FILE,
 )
 from exo.shared.election import Election, ElectionResult
 from exo.shared.logging import logger_cleanup, logger_set_context, logger_setup
 from exo.shared.types.common import NodeId, SessionId
 from exo.shared.types.state import State
+from exo.utils import STDIO_FDS
 from exo.utils.channels import Receiver, channel
 from exo.utils.pydantic_ext import FrozenModel
 from exo.utils.task_group import TaskGroup
@@ -56,35 +57,14 @@ class Node:
     node_id: NodeId
     offline: bool
     _api_port: int
-    _libp2p_port: int
+    _zenoh_port: int
     _peer_download_port: int
     peer_file_server: PeerFileServer | None = None
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
 
     @classmethod
     async def create(cls, args: "Args") -> Self:
-        # Codex P1 (PR #16 round-(N+3), main.py:74): scope the on-disk
-        # node-ID keypair by the *combination* of ports the operator
-        # has chosen, not just ``--peer-download-port``. The earlier
-        # peer-download-only scope leaked identity collisions when
-        # ``--no-downloads`` / ``--no-peer-download`` is set: that
-        # mode doesn't bind the peer file server, so two same-host
-        # processes can legitimately keep the default
-        # ``peer_download_port`` and would then load the same scoped
-        # keypair file -- producing identical ``NodeId``s and
-        # breaking election/routing's unique-NodeId invariants.
-        #
-        # Combined-port scoping is robust against every same-host
-        # multi-process configuration: at least one of the listening
-        # ports MUST differ between processes (libp2p, peer-download,
-        # api -- each is a distinct local socket bind), so the scope
-        # tuple differs whenever the actual configuration differs.
-        # Single-process deployments on default ports keep a stable
-        # filename (e.g. ``node_id.libp2p-0.api-52415.peer-52416.keypair``)
-        # so identity persists across restarts.
-        process_scope = _node_id_keypair_scope(args)
-        keypair = get_node_id_keypair(process_scope=process_scope)
-        node_id = NodeId(keypair.to_node_id())
+        node_id = get_node_zid()
         session_id = SessionId(master_node_id=node_id, election_clock=0)
         router = Router.create(
             node_id,
@@ -208,7 +188,7 @@ class Node:
             node_id,
             args.offline,
             args.api_port,
-            args.libp2p_port,
+            args.zenoh_port,
             args.peer_download_port,
             peer_file_server,
         )
@@ -217,7 +197,7 @@ class Node:
         )
         logger.info(
             f"Node components created node_id={node_id} api_port={args.api_port} "
-            f"libp2p_port={args.libp2p_port} bootstrap_peers={args.bootstrap_peers}"
+            f"zenoh_port={args.zenoh_port} bootstrap_peers={args.bootstrap_peers}"
         )
         return self
 
@@ -238,12 +218,6 @@ class Node:
                 tg.start_soon(self.master.run)
             if self.api:
                 tg.start_soon(self.api.run)
-            if sys.platform == "darwin" and self._libp2p_port != 0:
-                tg.start_soon(
-                    _darwin_mdns_broadcast_announcer,
-                    self.node_id,
-                    self._libp2p_port,
-                )
             tg.start_soon(self._elect_loop)
             tg.start_soon(self._diagnostic_snapshot_loop)
 
@@ -707,7 +681,9 @@ class Args(FrozenModel):
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
     legacy_daemon: bool = False
     bootstrap_peers: list[str] = []
-    libp2p_port: int
+    namespace: str
+    zenoh_port: int
+    discovery_port: int
     # Per-process listener port for peer-to-peer model file serving.
     # Defaults to ``EXO_PEER_DOWNLOAD_PORT`` so existing single-node-per-
     # host deployments keep working unchanged. Operators running
@@ -805,10 +781,11 @@ class Args(FrozenModel):
         )
         parser.add_argument(
             "--zenoh-port",
+            "--libp2p-port",
             type=int,
             default=52414,
             dest="zenoh_port",
-            help="Fixed TCP port for zenoh to listen.",
+            help="Fixed TCP port for Zenoh to listen (legacy alias: --libp2p-port).",
         )
         parser.add_argument(
             "--discovery-port",

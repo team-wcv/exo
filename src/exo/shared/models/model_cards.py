@@ -68,6 +68,8 @@ class _CardCache:
     async def list_all(self) -> list["ModelCard"]:
         if len(self.cc) == 0:
             await self.refresh()
+        else:
+            await self._load_cards_from_dir(_custom_cards_dir, is_custom=True)
         if EXO_ENABLE_IMAGE_MODELS:
             return list(self.cc.values())
         return [c for c in self.cc.values() if not _is_image_card(c)]
@@ -79,7 +81,7 @@ class _CardCache:
                 card = await ModelCard.load_from_path(toml_file)
                 if is_custom:
                     card = card.model_copy(update={"is_custom": True})
-                if self.get(card.model_id) is None:
+                if is_custom or self.get(card.model_id) is None:
                     self.cc[card.model_id] = card
             except (ValidationError, TOMLKitError) as e:
                 logger.opt(exception=e).warning(
@@ -112,46 +114,17 @@ def detect_vision_from_config(model_id: ModelId) -> "VisionCardConfig | None":
     return None
 
 
-async def _load_cards_from_dir(directory: Path, *, is_custom: bool) -> None:
-    """Load all TOML model cards from a directory into the cache."""
-    async for toml_file in directory.rglob("*.toml"):
-        try:
-            card = await ModelCard.load_from_path(toml_file)
-            if is_custom:
-                card = card.model_copy(update={"is_custom": True})
-            if is_custom or card.model_id not in _card_cache:
-                _card_cache[card.model_id] = card
-        except (ValidationError, TOMLKitError):
-            pass
-
-
-async def _refresh_card_cache() -> None:
-    for path in _BUILTIN_CARD_DIRS:
-        await _load_cards_from_dir(path, is_custom=False)
-    await _load_cards_from_dir(_custom_cards_dir, is_custom=True)
-
-
-async def _refresh_custom_card_cache() -> None:
-    await _load_cards_from_dir(_custom_cards_dir, is_custom=True)
-
-
 def _is_image_card(card: "ModelCard") -> bool:
     return any(t in (ModelTask.TextToImage, ModelTask.ImageToImage) for t in card.tasks)
 
 
 def get_card(model_id: ModelId) -> "ModelCard | None":
     """Look up a single model card from the cache by ID."""
-    return _card_cache.get(model_id)
+    return card_cache.get(model_id)
 
 
 async def get_model_cards() -> list["ModelCard"]:
-    if len(_card_cache) == 0:
-        await _refresh_card_cache()
-    else:
-        await _refresh_custom_card_cache()
-    if EXO_ENABLE_IMAGE_MODELS:
-        return list(_card_cache.values())
-    return [c for c in _card_cache.values() if not _is_image_card(c)]
+    return await card_cache.list_all()
 
 
 class ModelTask(str, Enum):
@@ -397,9 +370,9 @@ class ModelCard(FrozenModel):
         legitimately need to pull a previously-unseen card from HF
         (initial ``StartDownload`` of a third-party model id).
         """
-        if model_id not in _card_cache:
-            await _refresh_card_cache()
-        return _card_cache.get(model_id)
+        if card_cache.get(model_id) is None:
+            await card_cache.refresh()
+        return card_cache.get(model_id)
 
     @staticmethod
     async def fetch_from_hf(model_id: ModelId) -> "ModelCard":

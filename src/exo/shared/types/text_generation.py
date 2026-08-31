@@ -169,9 +169,6 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
     draft_mode: Literal["model", "pipelined", "ngram", "none"] | None = None
 
     def with_card_sampling_defaults(self) -> "TextGenerationTaskParams":
-        from exo.shared.models.model_cards import get_card
-
-    def with_card_sampling_defaults(self) -> "TextGenerationTaskParams":
         from exo.shared.models import model_cards
 
         card = model_cards.card_cache.get(self.model)

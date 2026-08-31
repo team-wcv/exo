@@ -1301,7 +1301,7 @@ class DownloadCoordinator:
                     )
                 # Scan read-only directories for pre-downloaded models
                 if EXO_MODELS_READ_ONLY_DIRS:
-                    for card in await model_cards.card_cache.list_all():
+                    for card in await get_model_cards():
                         mid = card.model_id
                         if mid in self.active_downloads:
                             continue

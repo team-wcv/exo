@@ -10,6 +10,10 @@ from loguru import logger
 from exo.api.types import ImageEditsTaskParams
 from exo.download.download_utils import is_read_only_model_dir, resolve_existing_model
 from exo.download.peer_state import discover_peers_for_model
+from exo.routing.event_router import (
+    EventRouterBrokenResourceError,
+    EventRouterClosedResourceError,
+)
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_MAX_INSTANCE_RETRIES
 from exo.shared.models.model_cards import ModelId, card_cache

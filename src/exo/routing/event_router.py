@@ -22,6 +22,22 @@ from exo.utils.event_buffer import OrderedBuffer
 from exo.utils.task_group import TaskGroup
 
 
+class EventRouterClosedResourceError(ClosedResourceError):
+    pass
+
+
+class EventRouterBrokenResourceError(BrokenResourceError):
+    pass
+
+
+# Event Router is created and destroyed before consumers of its channels are,
+# so tag its channel-closure errors for consumers that need to distinguish them.
+_ERROR_CFG = channels.ErrorOverride(
+    closed_resource_error=EventRouterClosedResourceError,
+    broken_resource_error=EventRouterBrokenResourceError,
+)
+
+
 class EventDeliveryStalledError(RuntimeError):
     """Raised when pubsub stays half-open long enough to require a restart."""
 

@@ -287,6 +287,7 @@ def run_one_completion(
         "logprobs": False,
         "use_prefix_cache": use_prefix_cache,
     }
+    power_usage = None
 
     if not stream:
         payload["stream"] = False

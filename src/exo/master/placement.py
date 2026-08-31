@@ -66,6 +66,11 @@ from exo.utils.ports import random_ephemeral_port, random_ephemeral_port_excludi
 
 ASYMMETRIC_TENSOR_AUTO_UPGRADE_ENV = "EXO_ENABLE_ASYMMETRIC_TP_AUTO_UPGRADE"
 
+INSTANCE_META_BACKENDS: dict[InstanceMeta, list[Backend]] = {
+    InstanceMeta.MlxRing: [Backend.MlxMetal, Backend.MlxCuda, Backend.MlxCpu],
+    InstanceMeta.MlxJaccl: [Backend.MlxMetal],
+}
+
 
 def resolve_drafter_eligible_nodes(
     model_card: ModelCard,

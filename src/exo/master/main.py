@@ -6,27 +6,6 @@ from pathlib import Path
 import anyio
 from loguru import logger
 
-NODE_INACTIVITY_TIMEOUT_SECONDS_ENV = "EXO_NODE_INACTIVITY_TIMEOUT_SECONDS"
-
-
-def _node_inactivity_timeout_seconds() -> float:
-    value = os.getenv(NODE_INACTIVITY_TIMEOUT_SECONDS_ENV)
-    if value is None:
-        return 30.0
-    try:
-        timeout = float(value)
-    except ValueError:
-        logger.warning(
-            f"Ignoring invalid {NODE_INACTIVITY_TIMEOUT_SECONDS_ENV}={value!r}; using 30s"
-        )
-        return 30.0
-    if timeout <= 0:
-        logger.warning(
-            f"Ignoring non-positive {NODE_INACTIVITY_TIMEOUT_SECONDS_ENV}={value!r}; using 30s"
-        )
-        return 30.0
-    return timeout
-
 from exo.master.placement import (
     add_instance_to_placements,
     auto_place_prefill_siblings,
@@ -36,6 +15,10 @@ from exo.master.placement import (
     place_instance,
 )
 from exo.master.placement_utils import find_ip_prioritised
+from exo.routing.event_router import (
+    EventRouterBrokenResourceError,
+    EventRouterClosedResourceError,
+)
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_EVENT_LOG_DIR, EXO_TRACING_ENABLED
 from exo.shared.types.commands import (
@@ -100,7 +83,27 @@ from exo.utils.disk_event_log import DiskEventLog
 from exo.utils.event_buffer import MultiSourceBuffer
 from exo.utils.task_group import TaskGroup
 
+NODE_INACTIVITY_TIMEOUT_SECONDS_ENV = "EXO_NODE_INACTIVITY_TIMEOUT_SECONDS"
 _MAX_MASTER_SESSION_LOG_DIRS = 5
+
+
+def _node_inactivity_timeout_seconds() -> float:
+    value = os.getenv(NODE_INACTIVITY_TIMEOUT_SECONDS_ENV)
+    if value is None:
+        return 30.0
+    try:
+        timeout = float(value)
+    except ValueError:
+        logger.warning(
+            f"Ignoring invalid {NODE_INACTIVITY_TIMEOUT_SECONDS_ENV}={value!r}; using 30s"
+        )
+        return 30.0
+    if timeout <= 0:
+        logger.warning(
+            f"Ignoring non-positive {NODE_INACTIVITY_TIMEOUT_SECONDS_ENV}={value!r}; using 30s"
+        )
+        return 30.0
+    return timeout
 
 
 def _prefill_endpoint_for(state: State, decode_instance_id: InstanceId) -> str | None:

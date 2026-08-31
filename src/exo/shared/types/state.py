@@ -5,8 +5,8 @@ from typing import Any, cast
 from pydantic import ConfigDict, Field, field_serializer, field_validator
 from pydantic.alias_generators import to_camel
 
-from exo.shared.models.model_cards import ModelCard
 from exo.shared.topology import Topology, TopologySnapshot
+from exo.shared.types.backends import Backend
 from exo.shared.types.common import NodeId
 from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
 from exo.shared.types.profiling import (

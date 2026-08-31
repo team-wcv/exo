@@ -58,7 +58,6 @@ from exo.utils.info_gatherer.info_gatherer import (
     MacThunderboltIdentifiers,
     MemoryUsage,
     MiscData,
-    NodeBackends,
     NodeConfig,
     NodeDiskUsage,
     NodeNetworkInterfaces,
