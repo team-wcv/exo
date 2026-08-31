@@ -19,7 +19,7 @@ class FromSwarm:
         @property
         def connected(self) -> builtins.bool: ...
         def __new__(cls, connected: builtins.bool) -> FromSwarm.Connection: ...
-    
+
     @typing.final
     class Message(FromSwarm):
         __match_args__ = ("topic", "data",)
@@ -28,7 +28,7 @@ class FromSwarm:
         @property
         def data(self) -> bytes: ...
         def __new__(cls, topic: builtins.str, data: bytes) -> FromSwarm.Message: ...
-    
+
     ...
 
 @typing.final
@@ -39,19 +39,19 @@ class NetworkingHandle:
     async def gossipsub_subscribe(self, topic: builtins.str) -> builtins.bool:
         r"""
         Subscribe to a `GossipSub` topic.
-        
+
         Returns `True` if the subscription worked. Returns `False` if we were already subscribed.
         """
     async def gossipsub_unsubscribe(self, topic: builtins.str) -> builtins.bool:
         r"""
         Unsubscribes from a `GossipSub` topic.
-        
+
         Returns `True` if we were subscribed to this topic. Returns `False` if we were not subscribed.
         """
     async def gossipsub_publish(self, topic: builtins.str, data: bytes) -> None:
         r"""
         Publishes a message with multiple topics to the `GossipSub` network.
-        
+
         If no peers are found that subscribe to this topic, throws `NoPeersSubscribedToTopicError` exception.
         """
 
@@ -59,20 +59,20 @@ class NetworkingHandle:
 class Pidfile:
     r"""
     A PID file protected with a lock.
-    
+
     An instance of `Pidfile` can be used to manage a PID file: create it,
     lock it, detect already running daemons. It is backed by [`pidfile`]
     functions of `libbsd`/`libutil` which use `flopen` to lock the PID
     file.
-    
+
     When a PID file is created, the process ID of the current process is
     *not* written there, making it possible to lock the PID file before
     forking and only write the ID of the forked process when it is ready.
-    
+
     The PID file is deleted automatically when the `Pidfile` comes out of
     the scope. To close the PID file without deleting it, for example, in
     the parent process of a forked daemon, call `close()`.
-    
+
     [`exit`]: https://doc.rust-lang.org/std/process/fn.exit.html
     [`pidfile`]: https://linux.die.net/man/3/pidfile
     [`daemon`(3)]: https://linux.die.net/man/3/daemon
@@ -80,7 +80,7 @@ class Pidfile:
     def __new__(cls, path: builtins.str | os.PathLike | pathlib.Path, mode: builtins.int) -> Pidfile:
         r"""
         Creates a new PID file and locks it.
-        
+
         If the PID file cannot be locked, returns `PidfileError::AlreadyRunning` with
         a PID of the already running process, or `None` if no PID has been written to
         the PID file yet.
@@ -88,13 +88,13 @@ class Pidfile:
     def write(self) -> None:
         r"""
         Writes the current process ID to the PID file.
-        
+
         The file is truncated before writing.
         """
     def as_raw_fd(self) -> builtins.int:
         r"""
         Extracts the raw file descriptor.
-        
+
         This function is typically used to **borrow** an owned file descriptor.
         When used in this way, this method does **not** pass ownership of the
         raw file descriptor to the caller, and the file descriptor is only
@@ -110,4 +110,3 @@ class Pidfile:
 class PidfileError(builtins.Exception):
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
-
