@@ -261,11 +261,6 @@ in
       };
       }).mkPythonScript;
 
-      mkSimplePythonScript = name: path: pkgs.writeShellApplication {
-        inherit name;
-        runtimeInputs = [ pkgs.python313 ];
-        text = ''exec python ${path} "$@"'';
-      };
       # if someone is particularly interested in cuda12 support in nix, please open an issue.
       # until then, it's more hassle than its worth
       #cuda12Set = mkPythonSet { inherit self' lib; inherit (unfreePkgs.pkgsCuda.cudaPackages_12) pkgs; members = { exo = [ "mlx-cuda12" ]; }; };
@@ -279,8 +274,6 @@ in
         exo-bench = mkBenchScript "exo-bench" (inputs.self + /bench/exo_bench.py);
         exo-eval = mkBenchScript "exo-eval" (inputs.self + /bench/exo_eval.py);
         exo-eval-tool-calls = mkBenchScript "exo-eval-tool-calls" (inputs.self + /bench/eval_tool_calls.py);
-        # used by ./tests/run_exo_on.sh
-        exo-get-all-models-on-cluster = mkSimplePythonScript "exo-get-all-models-on-cluster" (inputs.self + /tests/get_all_models_on_cluster.py);
       } // lib.optionalAttrs isLinux {
         #exo-cuda-12 = cuda12Set.exo;
         exo-cuda-13 = cuda13Set.exo;
