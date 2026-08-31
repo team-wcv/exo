@@ -376,7 +376,7 @@ def test_get_mlx_jaccl_coordinators():
     ), "node_c should use the IP from conn_c_a"
 
 
-def test_jaccl_coordinator_prefers_thunderbolt_over_lan():
+def test_jaccl_coordinator_prefers_lan_over_thunderbolt():
     node_a_id = NodeId()
     node_b_id = NodeId()
     topology = Topology()
@@ -426,7 +426,7 @@ def test_jaccl_coordinator_prefers_thunderbolt_over_lan():
             node_network,
             ring=False,
         )
-        == "192.168.0.2"
+        == "192.168.1.11"
     )
 
 

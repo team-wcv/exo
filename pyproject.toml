@@ -251,5 +251,5 @@ pythonpath = "."
 asyncio_mode = "auto"
 markers = ["slow: marks tests as slow (deselected by default)"]
 env = ["EXO_TESTS=1"]
-addopts = "-m 'not slow' --ignore=tests --ignore=tmp"
+addopts = "-m 'not slow' --import-mode=importlib --ignore=tests --ignore=tmp"
 filterwarnings = ["ignore:builtin type Swig:DeprecationWarning"]

@@ -61,7 +61,7 @@ in_bytes = 1
 
     monkeypatch.setattr(model_cards, "_BUILTIN_CARD_DIRS", [AsyncPath(builtin_dir)])
     monkeypatch.setattr(model_cards, "_custom_cards_dir", AsyncPath(custom_dir))
-    monkeypatch.setattr(model_cards, "_card_cache", {})
+    model_cards.card_cache.cc.clear()
 
     loaded = {card.model_id: card for card in await get_model_cards()}
 

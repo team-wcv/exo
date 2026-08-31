@@ -232,6 +232,7 @@ async def test_master():
                             hidden_size=7168,
                             supports_tensor=True,
                             tasks=[ModelTask.TextGeneration],
+                            backends=[Backend.MlxMetal],
                         ),
                         device_rank=0,
                         world_size=1,

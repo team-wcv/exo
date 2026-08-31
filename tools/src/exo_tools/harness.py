@@ -8,6 +8,7 @@ managing downloads, filtering placements, and common CLI arguments.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import time
 from enum import Enum
@@ -535,3 +536,96 @@ def add_common_instance_args(ap: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Reuse an existing running instance for this model instead of creating a new one.",
     )
+
+
+def get_instance_ids(client: ExoClient) -> set[str]:
+    """Return the current instance IDs from cluster state."""
+    state = client.request_json("GET", "/state") or {}
+    result: set[str] = set()
+    for instance in state.get("instances", {}).values():
+        with contextlib.suppress(Exception):
+            result.add(instance_id_from_instance(instance))
+    return result
+
+
+def wait_for_cluster_ready(
+    client: ExoClient, expected_nodes: int = 1, timeout: float = 120.0
+) -> None:
+    """Wait until all expected nodes report identity and memory."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            state = client.request_json("GET", "/state") or {}
+            if (
+                len(state.get("nodeIdentities", {})) >= expected_nodes
+                and len(state.get("nodeMemory", {})) >= expected_nodes
+            ):
+                return
+        except Exception:
+            pass
+        time.sleep(1.0)
+    raise TimeoutError(f"Cluster not ready: expected {expected_nodes} nodes")
+
+
+def place_instance(
+    client: ExoClient,
+    model_id: str,
+    *,
+    sharding: Sharding = Sharding.PIPELINE,
+    comm: Comm = Comm.RING,
+    min_nodes: int = 1,
+    timeout: float = 600.0,
+    placement_retries: int = 10,
+    placement_retry_delay: float = 10.0,
+) -> str:
+    """Place an instance, wait for readiness, and return its instance ID."""
+    wait_for_cluster_ready(client, expected_nodes=min_nodes)
+    body = {
+        "model_id": model_id,
+        "sharding": sharding.value,
+        "instance_meta": comm.value,
+        "min_nodes": min_nodes,
+    }
+
+    instance_id: str | None = None
+    for attempt in range(placement_retries):
+        before_ids = get_instance_ids(client)
+        client.request_json("POST", "/place_instance", body=body)
+
+        poll_deadline = time.time() + 30.0
+        while time.time() < poll_deadline:
+            new_ids = get_instance_ids(client) - before_ids
+            if new_ids:
+                instance_id = next(iter(new_ids))
+                break
+            time.sleep(1.0)
+
+        if instance_id is not None:
+            break
+        if attempt < placement_retries - 1:
+            time.sleep(placement_retry_delay)
+
+    if instance_id is None:
+        raise TimeoutError(
+            f"Placement failed after {placement_retries} attempts "
+            f"({sharding.value}/{comm.value} for {model_id})"
+        )
+
+    wait_for_instance_ready(client, instance_id, timeout=timeout)
+    return instance_id
+
+
+def cleanup_all_instances(client: ExoClient) -> None:
+    """Remove all running instances from the cluster."""
+    state = client.request_json("GET", "/state") or {}
+    for instance in state.get("instances", {}).values():
+        with contextlib.suppress(Exception):
+            instance_id = instance_id_from_instance(instance)
+            client.request_json("DELETE", f"/instance/{instance_id}")
+            wait_for_instance_gone(client, instance_id, timeout=30.0)
+
+
+def is_model_downloaded(client: ExoClient, model_id: str) -> bool:
+    response = client.request_json("GET", "/models", params={"status": "downloaded"})
+    data = (response or {}).get("data", [])
+    return all(model.get("id") == model_id for model in data)

@@ -392,5 +392,5 @@ async def collect_chat_response(
         ],
         usage=last_usage,
         generation_stats=last_stats,
-    ).model_dump_json()
+    ).model_dump_json(exclude_none=True)
     return

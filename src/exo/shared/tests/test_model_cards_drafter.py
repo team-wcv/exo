@@ -41,7 +41,7 @@ def _isolate_custom_cards(  # pyright: ignore[reportUnusedFunction]
     custom_dir = tmp_path / "custom_model_cards"
     custom_dir.mkdir()
     monkeypatch.setattr(model_cards, "_custom_cards_dir", AsyncPath(custom_dir))
-    monkeypatch.setattr(model_cards, "_card_cache", {})
+    model_cards.card_cache.cc.clear()
 
 
 @pytest.mark.asyncio
