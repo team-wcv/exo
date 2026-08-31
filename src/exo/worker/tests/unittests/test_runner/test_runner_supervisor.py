@@ -17,13 +17,19 @@ from exo.shared.types.worker.instances import BoundInstance, InstanceId
 from exo.shared.types.worker.runners import RunnerFailed, RunnerId
 from exo.utils.async_process import AsyncProcess
 from exo.utils.channels import channel, mp_channel
-from exo.worker.runner.supervisor import RunnerSupervisor
+from exo.worker.runner.bootstrap import RunnerTerminationError
+from exo.worker.runner.supervisor import RunnerStdioHandler, RunnerSupervisor
 from exo.worker.tests.unittests.conftest import get_bound_mlx_ring_instance
 
 
 class _DeadProcess:
-    exitcode = -6
     pid = 0
+
+    def __init__(self):
+        rx1, _ = channel[bytes]()
+        rx2, _ = channel[bytes]()
+        self.stdout = rx1
+        self.stderr = rx2
 
     exitcode = -6
 

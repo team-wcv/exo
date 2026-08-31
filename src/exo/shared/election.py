@@ -119,7 +119,7 @@ class Election:
         self._candidates: list[ElectionMessage] = []
         self._campaign_cancel_scope: CancelScope | None = None
         self._campaign_done: Event | None = None
-        self._connection_state: dict[NodeId, bool] = {}
+        self._connection_state: bool | None = None
         self._router_settle_seconds = _router_settle_seconds()
         self._tg = TaskGroup()
 
@@ -225,28 +225,18 @@ class Election:
                 logger.debug(
                     f"Connection messages received: {first} followed by {rest}"
                 )
-                baseline_connection_state = dict(self._connection_state)
-                changed_node_ids = self._apply_connection_messages(messages)
-                if not changed_node_ids:
+                baseline_connection_state = self._connection_state
+                changed = self._apply_connection_messages(messages)
+                if not changed:
                     logger.debug("Connection messages did not change peer state")
                     continue
 
-                if any(
-                    not self._connection_state[node_id] for node_id in changed_node_ids
-                ):
+                if self._connection_state is False:
                     await anyio.sleep(_dropout_grace_seconds())
                     follow_up_messages = connection_messages.collect()
-                    changed_node_ids.update(
-                        self._apply_connection_messages(follow_up_messages)
-                    )
+                    self._apply_connection_messages(follow_up_messages)
 
-                net_changed_node_ids = [
-                    node_id
-                    for node_id in changed_node_ids
-                    if baseline_connection_state.get(node_id)
-                    != self._connection_state.get(node_id)
-                ]
-                if not net_changed_node_ids:
+                if baseline_connection_state == self._connection_state:
                     logger.info(
                         "Ignoring transient connection flap; peer state returned to baseline"
                     )
@@ -267,18 +257,13 @@ class Election:
 
     def _apply_connection_messages(
         self, messages: list[ConnectionMessage]
-    ) -> set[NodeId]:
-        changed_node_ids: set[NodeId] = set()
+    ) -> bool:
+        previous = self._connection_state
         for message in messages:
-            previous = self._connection_state.get(message.node_id)
-            if previous is None and not message.connected:
-                self._connection_state[message.node_id] = False
-                continue
-            if previous == message.connected:
-                continue
-            self._connection_state[message.node_id] = message.connected
-            changed_node_ids.add(message.node_id)
-        return changed_node_ids
+            self._connection_state = message.connected
+        if previous is None and self._connection_state is False:
+            return False
+        return previous != self._connection_state
 
     async def _command_counter(self) -> None:
         with self._co_receiver as commands:
