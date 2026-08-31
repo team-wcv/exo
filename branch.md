@@ -1,25 +1,26 @@
 ---
-branch: chore/6a959fcc-sync-exo-upstream
+branch: fix/6a95c4b0-resilient-downloads-vq
 created: 2026-08-31
 owner: codex-agent
 status: active
-scope: "Merge current exo-explore/exo main into the team-wcv fork while preserving the fork's custom inference, fleet, and twin-recovery work"
+scope: "Stack peer-safe stale-download recovery and VQ codebook replication on the hardware-validated exo upstream merge"
 orchestraitor:
-  ticket: 6a959fcce6b6efd51fc85507
-  task_url: orchestraitor://task/6a959fcce6b6efd51fc85507
+  ticket: 6a95c4b0e6b6efd51fc8569d
+  task_url: orchestraitor://task/6a95c4b0e6b6efd51fc8569d
 pr:
-  url: https://github.com/team-wcv/exo/pull/42
-  state: open
+  url: null
+  state: pending
 cleanup:
-  merged_into: team-wcv/main
+  merged_into: team-wcv/chore/6a959fcc-sync-exo-upstream
   archived_after: null
   successor_branch: null
 source_branches:
-  - team-wcv/main (fork integration baseline at 0909a1ed)
-  - origin/main (official upstream at 21a54c5e)
+  - chore/6a959fcc-sync-exo-upstream (stack base at 7763d51e, PR #42)
+  - exo-explore/exo PR #2278 (adapted HTTP 416 recovery)
+  - exo-explore/exo PR #2268 (codebook replication guard only)
 ---
 
-- Why this branch exists: preserve the known-good two-node exo deployment, then bring the fork current with official upstream without losing team-wcv custom behavior.
-- Changed paths: upstream Zenoh/exo_rs transition; Python package and dashboard locks; persistent scoped identity; event routing and election recovery; model-card/backend compatibility; peer-download, custom drafting, placement, runner supervision, API serialization, tests, and formatting.
-- Validation run: matching smbp/smbpt snapshots archived with Git bundle at f033e597; official and fork tips are ancestors of the merge head; uv lock/sync succeeded; Ruff and Ruff format pass; BasedPyright reports 0 errors; Cargo check/test/fmt pass; dashboard npm ci/build, Svelte check, and Prettier pass; CPU-safe pytest result is 611 passed, 5 skipped, 3 environment-deselected. Live twin testing found and fixed two merge regressions: the legacy `--bootstrap-peers` multiaddr is now translated to an explicit Zenoh TCP endpoint, and MLX cache typing no longer imports a protocol absent from the pinned runtime. The corrected build formed a shared two-node cluster, loaded all 48 layers of the cached 192 GB Qwen model as a Tensor/JACCL instance, and completed the same 66-token inference probe used against the stable baseline. Nix is unavailable on this host.
-- Known follow-ups: Deliberaitor plan creation is unavailable because its workspace-local route rejects this bastion-scoped Codex session; the PR will use the required outage note. The legacy `--libp2p-port` flag remains a Zenoh-port alias, and supported `/ip4` or `/ip6` TCP bootstrap multiaddrs are translated to Zenoh endpoints for existing launch scripts.
+- Why this branch exists: add two bounded upstream improvements without changing the exact PR #42 build currently running on smbp/smbpt.
+- Changed paths: pending implementation in download recovery, peer partial metadata, tensor sharding, and focused tests.
+- Validation run: pending.
+- Known follow-ups: Deliberaitor plan creation is unavailable because its workspace-local route rejects this bastion-scoped Codex session; the PR will use the required outage note. VQ model cards from upstream #2268 are intentionally out of scope.
