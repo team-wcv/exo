@@ -18,6 +18,7 @@ from exo.master.placement_utils import (
 )
 from exo.shared.models.model_cards import ModelCard, ModelId
 from exo.shared.topology import Topology
+from exo.shared.types.backends import Backend
 from exo.shared.types.commands import (
     CancelDownload,
     CreateInstance,
@@ -191,6 +192,7 @@ def place_instance(
     current_instances: Mapping[InstanceId, Instance],
     node_memory: Mapping[NodeId, MemoryUsage],
     node_network: Mapping[NodeId, NodeNetworkInfo],
+    node_backends: Mapping[NodeId, list[Backend]],
     required_nodes: set[NodeId] | None = None,
     allowed_nodes: set[NodeId] | None = None,
     allow_single_node_total_memory: bool = False,
@@ -369,6 +371,37 @@ def place_instance(
             )
 
     smallest_cycles = get_smallest_cycles(cycles_with_sufficient_memory)
+    rdma_ctl_status = node_rdma_ctl or {}
+
+    def _all_rdma_ctl_enabled(cycle: Cycle) -> bool:
+        return all(
+            ((status := rdma_ctl_status.get(node_id)) is not None and status.enabled)
+            for node_id in cycle
+        )
+
+    required_backends = set(INSTANCE_META_BACKENDS[command.instance_meta]) & set(
+        command.model_card.backends
+    )
+    if not required_backends:
+        raise ValueError(
+            f"Model {command.model_card.model_id} backends "
+            f"{sorted(b.value for b in command.model_card.backends)} cannot satisfy engine "
+            f"{command.instance_meta.value} which requires "
+            f"{sorted(b.value for b in INSTANCE_META_BACKENDS[command.instance_meta])}"
+        )
+    smallest_cycles = [
+        cycle
+        for cycle in smallest_cycles
+        if all(
+            set(node_backends.get(node_id, [])) & required_backends for node_id in cycle
+        )
+    ]
+    if not smallest_cycles:
+        raise ValueError(
+            f"No cycle where every node supports a backend in "
+            f"{sorted(b.value for b in required_backends)} for {command.model_card.model_id}"
+        )
+
     rdma_ctl_status = node_rdma_ctl or {}
 
     def _all_rdma_ctl_enabled(cycle: Cycle) -> bool:

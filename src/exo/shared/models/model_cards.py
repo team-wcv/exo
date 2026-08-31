@@ -39,7 +39,59 @@ _BUILTIN_CARD_DIRS = [
     Path(RESOURCES_DIR) / "image_model_cards",
 ]
 
-_card_cache: dict[ModelId, "ModelCard"] = {}
+
+class _CardCache:
+    def __init__(self):
+        self.cc: dict[ModelId, "ModelCard"] = {}
+
+    def get(self, model_id: ModelId) -> "ModelCard | None":
+        return self.cc.get(model_id)
+
+    async def save(self, card: "ModelCard"):
+        self.cc[card.model_id] = card
+        try:
+            await card.save_to_custom_dir()
+        except OSError as e:
+            logger.warning(f"failed to save custom model card ({e.strerror})")
+
+    async def pop(self, model_id: ModelId) -> "ModelCard | None":
+        """Delete a user-added custom model card. Returns True if deleted."""
+        card_path = _custom_cards_dir / (ModelId(model_id).normalize() + ".toml")
+        try:
+            if await card_path.exists():
+                await card_path.unlink()
+                return self.cc.pop(model_id, None)
+        except OSError as e:
+            logger.warning(f"failed to delete custom model card ({e.strerror})")
+
+    async def list_all(self) -> list["ModelCard"]:
+        if len(self.cc) == 0:
+            await self.refresh()
+        if EXO_ENABLE_IMAGE_MODELS:
+            return list(self.cc.values())
+        return [c for c in self.cc.values() if not _is_image_card(c)]
+
+    async def _load_cards_from_dir(self, directory: Path, *, is_custom: bool) -> None:
+        """Load all TOML model cards from a directory into the cache."""
+        async for toml_file in directory.rglob("*.toml"):
+            try:
+                card = await ModelCard.load_from_path(toml_file)
+                if is_custom:
+                    card = card.model_copy(update={"is_custom": True})
+                if self.get(card.model_id) is None:
+                    self.cc[card.model_id] = card
+            except (ValidationError, TOMLKitError) as e:
+                logger.opt(exception=e).warning(
+                    f"failed to validate model card at {toml_file}"
+                )
+
+    async def refresh(self) -> None:
+        for path in _BUILTIN_CARD_DIRS:
+            await self._load_cards_from_dir(path, is_custom=False)
+        await self._load_cards_from_dir(_custom_cards_dir, is_custom=True)
+
+
+card_cache = _CardCache()
 
 
 def detect_vision_from_config(model_id: ModelId) -> "VisionCardConfig | None":
@@ -284,6 +336,11 @@ class ModelCard(FrozenModel):
     def _validate_tasks(cls, v: list[str | ModelTask]) -> list[ModelTask]:
         return [item if isinstance(item, ModelTask) else ModelTask(item) for item in v]
 
+    @field_validator("backends", mode="before")
+    @classmethod
+    def _validate_backends(cls, v: list[str | Backend]) -> list[Backend]:
+        return [item if isinstance(item, Backend) else Backend(item) for item in v]
+
     async def save(self, path: Path) -> None:
         async with await open_file(path, "w") as f:
             py = self.model_dump(exclude_none=True, exclude={"is_custom"})
@@ -303,14 +360,13 @@ class ModelCard(FrozenModel):
     # Is it okay that model card.load defaults to network access if the card doesn't exist? do we want to be more explicit here?
     @staticmethod
     async def load(model_id: ModelId) -> "ModelCard":
-        if model_id not in _card_cache:
-            await _refresh_card_cache()
-        if (mc := _card_cache.get(model_id)) is not None:
+        if card_cache.get(model_id) is None:
+            await card_cache.refresh()
+        if (mc := card_cache.get(model_id)) is not None:
             return mc
 
         mc = await ModelCard.fetch_from_hf(model_id)
         await mc.save_to_custom_dir()
-        _card_cache[model_id] = mc
         return mc
 
     @staticmethod
@@ -367,22 +423,10 @@ class ModelCard(FrozenModel):
             trust_remote_code=False,
             is_custom=True,
             vision=config_data.vision,
+            backends=list(
+                Backend
+            ),  # all backends — we don't know what an arbitrary HF model supports; let placement gate decide
         )
-
-
-def add_to_card_cache(card: "ModelCard") -> None:
-    """Add or update a model card in the in-memory cache."""
-    _card_cache[card.model_id] = card
-
-
-async def delete_custom_card(model_id: ModelId) -> bool:
-    """Delete a user-added custom model card. Returns True if deleted."""
-    card_path = _custom_cards_dir / (ModelId(model_id).normalize() + ".toml")
-    if await card_path.exists():
-        await card_path.unlink()
-        _card_cache.pop(model_id, None)
-        return True
-    return False
 
 
 class ConfigData(BaseModel):

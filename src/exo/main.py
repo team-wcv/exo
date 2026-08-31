@@ -11,10 +11,14 @@ from datetime import datetime, timezone
 from typing import Self
 
 import anyio
+from anyio.lowlevel import checkpoint as anyio_checkpoint
+from daemon import DaemonContext  # pyright: ignore[reportMissingTypeStubs]
+from exo_rs import Pidfile, PidfileError
 from loguru import logger
 from pydantic import PositiveInt
 
 import exo.routing.topics as topics
+from exo import __version__
 from exo.api.main import API
 from exo.download.coordinator import DownloadCoordinator
 from exo.download.impl_shard_downloader import exo_shard_downloader
@@ -83,9 +87,10 @@ class Node:
         node_id = NodeId(keypair.to_node_id())
         session_id = SessionId(master_node_id=node_id, election_clock=0)
         router = Router.create(
-            keypair,
-            bootstrap_peers=args.bootstrap_peers,
-            listen_port=args.libp2p_port,
+            node_id,
+            namespace=args.namespace,
+            listen_port=args.zenoh_port,
+            discovery_service_port=args.discovery_port,
         )
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
@@ -567,12 +572,66 @@ async def _darwin_mdns_broadcast_announcer(node_id: NodeId, libp2p_port: int) ->
 
 
 def main():
+    # Parse args first => --help or bad args don't require PID-locking
     args = Args.parse()
+
+    # Exit early if cannot acquire PID file
+    try:
+        pidfile = Pidfile(EXO_PID_FILE, 0o0600)
+    except PidfileError as e:
+        print(e, file=sys.stderr)
+        raise SystemExit(1) from e
+
+    try:
+        if args.legacy_daemon:
+            # keep stdio backed by explicit /dev/null streams. multiprocessing spawn expects
+            # valid stdio FDs; letting DaemonContext close/reopen them can break runner startup.
+            for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
+                if stream is not None:
+                    stream.flush()
+            stdin = open(os.devnull, "r")  # noqa: SIM115
+            stdout = open(os.devnull, "w")  # noqa: SIM115
+            stderr = open(os.devnull, "w")  # noqa: SIM115
+
+            with DaemonContext(
+                detach_process=True,
+                files_preserve=[pidfile.as_raw_fd()],
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+            ):
+                # cleanup loose file descriptors (as long as they aren't stdio)
+                for f in (
+                    f for f in (stdin, stdout, stderr) if f.fileno() not in STDIO_FDS
+                ):
+                    f.close()
+
+                # 1) if daemonizing => fork then write PID
+                try:
+                    pidfile.write()
+                except PidfileError as e:
+                    print(e, file=sys.stderr)
+                    raise SystemExit(1) from e
+                main_inner(args)
+        else:
+            # 2) otherwise      => just write PID
+            try:
+                pidfile.write()
+            except PidfileError as e:
+                print(e, file=sys.stderr)
+                raise SystemExit(1) from e
+            main_inner(args)
+    finally:
+        pidfile.close()
+
+
+def main_inner(args: "Args"):
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     target = min(max(soft, 65535), hard)
     resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
 
     mp.set_start_method("spawn", force=True)
+
     # TODO: Refactor the current verbosity system
     logger_setup(EXO_LOG, args.verbosity)
     logger_set_context(git_commit=_git_commit())
@@ -585,7 +644,7 @@ def main():
         logger.info("Running in OFFLINE mode — no internet checks, local models only")
 
     if args.bootstrap_peers:
-        logger.info(f"Bootstrap peers: {args.bootstrap_peers}")
+        raise ValueError("Bootstrap peers has been temporarily removed")
 
     if args.no_batch:
         os.environ["EXO_NO_BATCH"] = "1"
@@ -646,6 +705,7 @@ class Args(FrozenModel):
     offline: bool = os.getenv("EXO_OFFLINE", "false").lower() == "true"
     no_batch: bool = False
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
+    legacy_daemon: bool = False
     bootstrap_peers: list[str] = []
     libp2p_port: int
     # Per-process listener port for peer-to-peer model file serving.
@@ -737,11 +797,25 @@ class Args(FrozenModel):
             help="Comma-separated libp2p multiaddrs to dial on startup (env: EXO_BOOTSTRAP_PEERS)",
         )
         parser.add_argument(
-            "--libp2p-port",
+            "--namespace",
+            type=str,
+            default=__version__,
+            dest="namespace",
+            help="Discovery namespace, nodes with different namespaces will not connect.",
+        )
+        parser.add_argument(
+            "--zenoh-port",
             type=int,
-            default=0,
-            dest="libp2p_port",
-            help="Fixed TCP port for libp2p to listen on (0 = OS-assigned).",
+            default=52414,
+            dest="zenoh_port",
+            help="Fixed TCP port for zenoh to listen.",
+        )
+        parser.add_argument(
+            "--discovery-port",
+            type=int,
+            default=52413,
+            dest="discovery_port",
+            help="Fixed UDP port for the discovery service.",
         )
         parser.add_argument(
             "--peer-download-port",

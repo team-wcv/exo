@@ -5,6 +5,7 @@ from typing import Any, cast
 from pydantic import ConfigDict, Field, field_serializer, field_validator
 from pydantic.alias_generators import to_camel
 
+from exo.shared.models.model_cards import ModelCard
 from exo.shared.topology import Topology, TopologySnapshot
 from exo.shared.types.common import NodeId
 from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
@@ -58,6 +59,7 @@ class State(FrozenModel):
     node_thunderbolt: Mapping[NodeId, NodeThunderboltInfo] = {}
     node_thunderbolt_bridge: Mapping[NodeId, ThunderboltBridgeStatus] = {}
     node_rdma_ctl: Mapping[NodeId, NodeRdmaCtlStatus] = {}
+    node_backends: Mapping[NodeId, list[Backend]] = {}
 
     # Detected cycles where all nodes have Thunderbolt bridge enabled (>2 nodes)
     thunderbolt_bridge_cycles: Sequence[Sequence[NodeId]] = []

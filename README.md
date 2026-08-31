@@ -118,7 +118,7 @@ Then restart the Nix daemon: `sudo launchctl kickstart -k system/org.nixos.nix-d
     --force
   ```
 
-Clone the repo, build the dashboard, and run exo:
+Clone the repo, build the dashboard, install the dependencies, and run exo:
 
 ```bash
 # Clone exo
@@ -126,6 +126,9 @@ git clone https://github.com/exo-explore/exo
 
 # Build dashboard
 cd exo/dashboard && npm install && npm run build && cd ..
+
+# Install Python dependencies, including the MLX backend
+uv sync --extra mlx
 
 # Run exo
 uv run exo
@@ -176,7 +179,7 @@ rustup toolchain install nightly
 
 **Note:** The `macmon` package is macOS-only and not required for Linux.
 
-Clone the repo, build the dashboard, and run exo:
+Clone the repo, build the dashboard, install the dependencies, and run exo:
 
 ```bash
 # Clone exo
@@ -184,6 +187,10 @@ git clone https://github.com/exo-explore/exo
 
 # Build dashboard
 cd exo/dashboard && npm install && npm run build && cd ..
+
+# Install Python dependencies with the MLX backend for your hardware
+# (NVIDIA: --extra mlx-cuda13 or --extra mlx-cuda12)
+uv sync --extra mlx-cpu
 
 # Run exo
 uv run exo
@@ -199,6 +206,12 @@ This starts the exo dashboard and API at http://localhost:52415/
 
   ```bash
   uv run exo --no-worker
+  ```
+
+- `--legacy-daemon`: Run exo as a legacy SysV-style background daemon using double-fork daemonization. This is intended for legacy init scripts; systemd and launchd should run exo in the foreground without this flag.
+
+  ```bash
+  uv run exo --legacy-daemon
   ```
 
 **File Locations (Linux):**
@@ -222,6 +235,12 @@ exo ships a macOS app that runs in the background on your Mac.
 The macOS app requires macOS Tahoe 26.2 or later.
 
 Download the latest build here: [EXO-latest.dmg](https://assets.exolabs.net/EXO-latest.dmg).
+
+You can also install the latest build with Homebrew:
+
+```bash
+brew install --cask exo
+```
 
 The app will ask for permission to modify system settings and install a new Network profile. Improvements to this are being worked on.
 
@@ -394,6 +413,18 @@ Sample response:
   "command_id": "e9d1a8ab-...."
 }
 ```
+
+This command is asynchronous. Before sending inference requests, wait until the
+API sees the new instance for this model:
+
+```bash
+curl -N "http://localhost:52415/instance/await?model_id=mlx-community/Llama-3.2-1B-Instruct-4bit"
+```
+
+The endpoint returns an SSE stream. A successful wait emits a message with
+`"type": "ready"` and the matching instance; a timeout emits `"type": "timeout"`.
+By default it waits indefinitely. Set `timeout_seconds` to a positive value to
+bound the wait.
 
 ---
 

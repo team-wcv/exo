@@ -21,7 +21,15 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use util::wakerdeque::WakerDeque;
 
-const RETRY_CONNECT_INTERVAL: Duration = Duration::from_secs(5);
+use bytemuck::{Pod, Zeroable};
+use log::{debug, trace, warn};
+use netwatcher::WatchHandle;
+use parking_lot::Mutex;
+use tokio::{
+    net::UdpSocket,
+    time::{Interval, interval},
+};
+use zenoh::config::ZenohId;
 
 mod managed {
     use libp2p::swarm::NetworkBehaviour;
@@ -93,21 +101,10 @@ mod managed {
     }
 }
 
-/// Events for when a listening connection is truly established and truly closed.
-#[derive(Debug, Clone)]
-pub enum Event {
-    ConnectionEstablished {
-        peer_id: PeerId,
-        connection_id: ConnectionId,
-        remote_ip: IpAddr,
-        remote_tcp_port: u16,
-    },
-    ConnectionClosed {
-        peer_id: PeerId,
-        connection_id: ConnectionId,
-        remote_ip: IpAddr,
-        remote_tcp_port: u16,
-    },
+#[derive(Debug, Clone, Copy)]
+pub struct Discovered {
+    pub zid: ZenohId,
+    pub addr: SocketAddrV6,
 }
 
 /// Discovery behavior that wraps mDNS to produce truly discovered durable peer-connections.
@@ -408,10 +405,6 @@ impl NetworkBehaviour for Behaviour {
                         mdns::Event::Discovered(peers) => {
                             self.handle_mdns_discovered(peers);
                         }
-                        mdns::Event::Expired(peers) => {
-                            self.handle_mdns_expired(peers);
-                        }
-                    },
 
                     // Let libp2p manage connection lifecycle. Treating a
                     // ping behaviour error as an immediate peer disconnect
@@ -419,41 +412,138 @@ impl NetworkBehaviour for Behaviour {
                     // stalls while the peer is still reachable for exo/RDMA.
                     managed::BehaviourEvent::Ping(_) => {}
                 }
+            })
+            // todo: better error handling here
+            .expect("failed to bind discovery watcher"),
+        );
+        Ok(Self {
+            sock,
+            namespace,
+            ifaces,
+            last_nonce: Mutex::new(rand::random()),
+            listen_port,
+            zid,
+            tick: interval(Duration::from_secs(1)),
+            _sync,
+        })
+    }
 
-                // since we just consumed an event, we should immediately wake just in case
-                // there are more events to come where that came from
-                cx.waker().wake_by_ref();
-            }
-
-            // forward any other mDNS event to the swarm or its connection handler(s)
-            Poll::Ready(e) => {
-                return Poll::Ready(
-                    e.map_out(|_| unreachable!("events returning to swarm already handled"))
-                        .map_in(Either::Right),
-                );
-            }
-
-            Poll::Pending => {}
-        }
-
-        // retry connecting to all mDNS peers periodically (fails safely if already connected)
-        if self.retry_delay.poll(cx).is_ready() {
-            for (p, mas) in self.mdns_discovered.clone() {
-                for ma in mas {
-                    self.dial(p, ma)
+    pub async fn next(&mut self) -> io::Result<Discovered> {
+        let mut buf = [0u8; Hello::buf_size() + WhatsUp::buf_size() + 1];
+        loop {
+            tokio::select! {
+                _ = self.tick.tick() => {
+                    self.announce().await?;
+                }
+                res = self.sock.recv_from(&mut buf) => {
+                    let Ok((bytes_read, addr)) = res else { continue; };
+                    if let Some(discovered) = self.respond(bytes_read, addr, &buf).await? {
+                        return Ok(discovered)
+                    }
                 }
             }
             // dial bootstrap peers (for environments where mDNS is unavailable)
             self.dial_bootstrap_peers();
             self.retry_delay.reset(RETRY_CONNECT_INTERVAL) // reset timeout
         }
+    }
 
-        // send out any pending events from our own service
-        if let Some(e) = self.pending_events.pop_front(cx) {
-            return Poll::Ready(e.map_in(Either::Left));
+    async fn announce(&self) -> io::Result<()> {
+        let nonce = rand::random();
+        *self.last_nonce.lock() = nonce;
+        let buf = Hello {
+            nonce,
+            namespace: self.namespace,
         }
+        .alloc();
 
-        // wait for pending events
-        Poll::Pending
+        let addrs = self.ifaces.lock().clone();
+        debug!("announcing Hello({nonce:?}) to {addrs:?}");
+        // rev so .remove() doesn't break things
+        for (i, addr) in addrs.into_iter().enumerate().rev() {
+            match self.sock.send_to(&buf, addr).await {
+                Ok(bytes) => trace!("sent {bytes} to {addr}"),
+                Err(e) if e.kind() == io::ErrorKind::HostUnreachable => {
+                    debug!("disabling discovery address {addr}: {e}");
+                    _ = self.ifaces.lock().swap_remove(i);
+                }
+                Err(e) => debug!("failed to reach {addr}: {e}"),
+            }
+        }
+        Ok(())
     }
 }
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy)]
+// packet & version
+pub enum Kind {
+    Hello = 0,
+    WhatsUp = 1,
+}
+
+pub struct UnknownKind;
+impl TryFrom<u8> for Kind {
+    type Error = UnknownKind;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Hello),
+            1 => Ok(Self::WhatsUp),
+            _ => Err(UnknownKind),
+        }
+    }
+}
+
+pub trait Message: Pod {
+    const KIND: Kind;
+}
+// should be part of the Message trait, but const in traits isnt stabilized. this lets alloc :: Self -> [u8; Self::buf_size()]
+macro_rules! impl_alloc {
+    ($a:ident) => {
+        impl $a {
+            const fn buf_size() -> usize {
+                size_of::<Header>() + size_of::<Self>()
+            }
+            pub fn alloc(self) -> [u8; Self::buf_size()] {
+                let mut buf = [0u8; Self::buf_size()];
+                buf[0..size_of::<Header>()].copy_from_slice(bytemuck::bytes_of(&Header {
+                    magic: MAGIC,
+                    kind: Self::KIND as u8,
+                }));
+                buf[size_of::<Header>()..Self::buf_size()]
+                    .copy_from_slice(bytemuck::bytes_of(&self));
+                buf
+            }
+        }
+    };
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Header {
+    magic: [u8; 3],
+    kind: u8,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Hello {
+    pub nonce: [u8; 8],
+    pub namespace: [u8; 8],
+}
+impl Message for Hello {
+    const KIND: Kind = Kind::Hello;
+}
+impl_alloc!(Hello);
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct WhatsUp {
+    pub nonce: [u8; 8],
+    pub zid: [u8; 16],
+    pub port_le: [u8; 2],
+}
+impl Message for WhatsUp {
+    const KIND: Kind = Kind::WhatsUp;
+}
+impl_alloc!(WhatsUp);

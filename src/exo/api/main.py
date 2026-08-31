@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from hypercorn.asyncio import serve  # pyright: ignore[reportUnknownVariableType]
 from hypercorn.config import Config
 from hypercorn.typing import ASGIFramework
+from hypercorn.utils import LifespanTimeoutError, ShutdownError
 from loguru import logger
 
 from exo.api.adapters.chat_completions import (
@@ -105,6 +106,7 @@ from exo.api.types.claude_api import (
     ClaudeMessagesResponse,
 )
 from exo.api.types.ollama_api import (
+    OllamaCapability,
     OllamaChatRequest,
     OllamaChatResponse,
     OllamaGenerateRequest,
@@ -136,12 +138,11 @@ from exo.shared.constants import (
 )
 from exo.shared.election import ElectionMessage
 from exo.shared.logging import InterceptLogger
+from exo.shared.models import model_cards
 from exo.shared.models.model_cards import (
     ModelCard,
     ModelId,
-    add_to_card_cache,
-    get_card,
-    get_model_cards,
+    ModelTask,
 )
 from exo.shared.tracing import TraceEvent, compute_stats, export_trace, load_trace_file
 from exo.shared.types.chunks import (
@@ -352,6 +353,7 @@ class API:
         self.app.post("/place_instance")(self.place_instance)
         self.app.get("/instance/placement")(self.get_placement)
         self.app.get("/instance/previews")(self.get_placement_previews)
+        self.app.get("/instance/await", response_model=None)(self.await_instance)
         self.app.get("/instance/{instance_id}")(self.get_instance)
         self.app.delete("/instance/{instance_id}")(self.delete_instance)
         self.app.get("/v1/instance-links")(self.list_instance_links)
@@ -394,6 +396,9 @@ class API:
         # Ollama API
         self.app.head("/ollama/")(self.ollama_version)
         self.app.head("/ollama/api/version")(self.ollama_version)
+        self.app.post("/ollama/v1/chat/completions", response_model=None)(
+            self.chat_completions
+        )
         self.app.post("/ollama/api/chat", response_model=None)(self.ollama_chat)
         self.app.post("/ollama/api/api/chat", response_model=None)(self.ollama_chat)
         self.app.post("/ollama/api/v1/chat", response_model=None)(self.ollama_chat)
@@ -737,6 +742,7 @@ class API:
                 ),
                 node_memory=self.state.node_memory,
                 node_network=self.state.node_network,
+                node_backends=self.state.node_backends,
                 topology=self.state.topology,
                 current_instances=self.state.instances,
                 download_status=self.state.downloads,
@@ -800,6 +806,7 @@ class API:
                     ),
                     node_memory=self.state.node_memory,
                     node_network=self.state.node_network,
+                    node_backends=self.state.node_backends,
                     topology=self.state.topology,
                     current_instances=self.state.instances,
                     allowed_nodes=allowed_nodes,
@@ -908,6 +915,48 @@ class API:
         if instance_id not in self.state.instances:
             raise HTTPException(status_code=404, detail="Instance not found")
         return self.state.instances[instance_id]
+
+    async def await_instance(
+        self,
+        model_id: ModelId,
+        timeout_seconds: float = Query(default=0.0, ge=0.0, le=300.0),
+    ) -> StreamingResponse:
+        _sleep = 0.1
+
+        async def _stream() -> AsyncGenerator[str, None]:
+            deadline = (
+                None if timeout_seconds == 0 else anyio.current_time() + timeout_seconds
+            )
+
+            while True:
+                for instance in self.state.instances.values():
+                    if instance.shard_assignments.model_id == model_id:
+                        payload = AwaitInstanceReadyMessage(instance=instance)
+                        yield f"data: {payload.model_dump_json()}\n\n"
+                        return
+
+                if deadline is None:
+                    await anyio.sleep(_sleep)
+                else:
+                    remaining = deadline - anyio.current_time()
+                    if remaining <= 0:
+                        payload = AwaitInstanceTimeoutMessage(
+                            message=f"No instance found for model {model_id}"
+                        )
+                        yield f"data: {payload.model_dump_json()}\n\n"
+                        return
+
+                    await anyio.sleep(min(_sleep, remaining))
+
+        return StreamingResponse(
+            with_sse_keepalive(_stream()),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "close",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     async def delete_instance(self, instance_id: InstanceId) -> DeleteInstanceResponse:
         if instance_id not in self.state.instances:
@@ -1036,6 +1085,8 @@ class API:
             async for chunk in self._token_chunk_stream(command_id):
                 if isinstance(chunk, PrefillProgressChunk):
                     continue
+
+                sampler.mark_prefill_done()
 
                 if chunk.finish_reason == "error":
                     raise HTTPException(
@@ -1206,10 +1257,10 @@ class API:
         self, payload: BenchChatCompletionRequest
     ) -> BenchChatCompletionResponse | StreamingResponse:
         task_params = await chat_request_to_text_generation(payload)
-        resolved_model = await self._resolve_and_validate_text_model(
+        validated_model = await self._validate_model_has_instance(
             ModelId(task_params.model)
         )
-        task_params = task_params.model_copy(update={"model": resolved_model})
+        task_params = task_params.model_copy(update={"model": validated_model})
 
         task_params = task_params.model_copy(
             update={
@@ -1239,8 +1290,10 @@ class API:
 
         return await self._collect_text_generation_with_stats(command.command_id)
 
-    async def _resolve_and_validate_text_model(self, model_id: ModelId) -> ModelId:
-        """Validate a text model exists and return the resolved model ID.
+    async def _validate_model_has_instance(self, model_id: ModelId) -> ModelId:
+        """Validate a model has an active instance.
+        If the model isn't even downloaded, triggers notification to user to download model.
+
 
         Raises HTTPException 404 if no instance is found for the model.
         """
@@ -1248,29 +1301,20 @@ class API:
             instance.shard_assignments.model_id == model_id
             for instance in self.state.instances.values()
         ):
-            await self._trigger_notify_user_to_download_model(model_id)
+            # Check if model is actually downloaded
+            model_is_downloaded = any(
+                isinstance(download, DownloadCompleted)
+                and download.shard_metadata.model_card.model_id == model_id
+                for node_downloads in self.state.downloads.values()
+                for download in node_downloads
+            )
+            if not model_is_downloaded:
+                await self._trigger_notify_user_to_download_model(model_id)
+
             raise HTTPException(
-                status_code=404,
-                detail=f"No instance found for model {model_id}",
+                status_code=404, detail=f"No instance found for model {model_id}"
             )
         return model_id
-
-    async def _validate_image_model(self, model: ModelId) -> ModelId:
-        """Validate model exists and return resolved model ID.
-
-        Raises HTTPException 404 if no instance is found for the model.
-        """
-        model_card = await ModelCard.load(model)
-        resolved_model = model_card.model_id
-        if not any(
-            instance.shard_assignments.model_id == resolved_model
-            for instance in self.state.instances.values()
-        ):
-            await self._trigger_notify_user_to_download_model(resolved_model)
-            raise HTTPException(
-                status_code=404, detail=f"No instance found for model {resolved_model}"
-            )
-        return resolved_model
 
     def stream_events(self) -> StreamingResponse:
         def _generate_json_array(events: Iterable[Event]) -> Iterable[str]:
@@ -1324,7 +1368,9 @@ class API:
         """
         payload = payload.model_copy(
             update={
-                "model": await self._validate_image_model(ModelId(payload.model)),
+                "model": await self._validate_model_has_instance(
+                    ModelId(payload.model)
+                ),
                 "advanced_params": _ensure_seed(payload.advanced_params),
             }
         )
@@ -1592,7 +1638,9 @@ class API:
     ) -> BenchImageGenerationResponse:
         payload = payload.model_copy(
             update={
-                "model": await self._validate_image_model(ModelId(payload.model)),
+                "model": await self._validate_model_has_instance(
+                    ModelId(payload.model)
+                ),
                 "stream": False,
                 "partial_images": 0,
                 "advanced_params": _ensure_seed(payload.advanced_params),
@@ -1628,7 +1676,7 @@ class API:
         advanced_params: AdvancedImageParams | None,
     ) -> ImageEdits:
         """Prepare and send an image edits command with chunked image upload."""
-        resolved_model = await self._validate_image_model(model)
+        validated_model = await self._validate_model_has_instance(model)
         advanced_params = _ensure_seed(advanced_params)
 
         image_content = await image.read()
@@ -1647,7 +1695,7 @@ class API:
                 image_data="",
                 total_input_chunks=total_chunks,
                 prompt=prompt,
-                model=resolved_model,
+                model=validated_model,
                 n=n,
                 size=size,
                 response_format=response_format,
@@ -1668,7 +1716,7 @@ class API:
             await self._send(
                 SendInputChunk(
                     chunk=InputImageChunk(
-                        model=resolved_model,
+                        model=validated_model,
                         command_id=command.command_id,
                         data=chunk_data,
                         chunk_index=chunk_index,
@@ -1792,10 +1840,10 @@ class API:
     ) -> ClaudeMessagesResponse | StreamingResponse:
         """Claude Messages API - adapter."""
         task_params = await claude_request_to_text_generation(payload)
-        resolved_model = await self._resolve_and_validate_text_model(
+        validated_model = await self._validate_model_has_instance(
             ModelId(task_params.model)
         )
-        task_params = task_params.model_copy(update={"model": resolved_model})
+        task_params = task_params.model_copy(update={"model": validated_model})
 
         command = await self._send_text_generation_with_images(task_params)
 
@@ -1907,10 +1955,10 @@ class API:
         body = await request.body()
         payload = OllamaChatRequest.model_validate_json(body)
         task_params = ollama_request_to_text_generation(payload)
-        resolved_model = await self._resolve_and_validate_text_model(
+        validated_model = await self._validate_model_has_instance(
             ModelId(task_params.model)
         )
-        task_params = task_params.model_copy(update={"model": resolved_model})
+        task_params = task_params.model_copy(update={"model": validated_model})
 
         command = await self._send_text_generation_with_images(task_params)
 
@@ -1947,10 +1995,10 @@ class API:
         body = await request.body()
         payload = OllamaGenerateRequest.model_validate_json(body)
         task_params = ollama_generate_request_to_text_generation(payload)
-        resolved_model = await self._resolve_and_validate_text_model(
+        validated_model = await self._validate_model_has_instance(
             ModelId(task_params.model)
         )
-        task_params = task_params.model_copy(update={"model": resolved_model})
+        task_params = task_params.model_copy(update={"model": validated_model})
 
         command = await self._send_text_generation_with_images(task_params)
 
@@ -1979,17 +2027,16 @@ class API:
     async def ollama_tags(self) -> OllamaTagsResponse:
         """Returns list of models in Ollama tags format. We return the downloaded ones only."""
 
-        def none_if_empty(value: str) -> str | None:
-            return value or None
-
-        downloaded_model_ids: set[str] = set()
+        downloaded_model_ids: set[ModelId] = set()
         for node_downloads in self.state.downloads.values():
             for dl in node_downloads:
                 if isinstance(dl, DownloadCompleted):
                     downloaded_model_ids.add(dl.shard_metadata.model_card.model_id)
 
         cards = [
-            c for c in await get_model_cards() if c.model_id in downloaded_model_ids
+            c
+            for c in await model_cards.card_cache.list_all()
+            if c.model_id in downloaded_model_ids
         ]
 
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -2002,8 +2049,8 @@ class API:
                     size=card.storage_size.in_bytes,
                     digest="sha256:000000000000",
                     details=OllamaModelDetails(
-                        family=none_if_empty(card.family),
-                        quantization_level=none_if_empty(card.quantization),
+                        family=card.family or None,
+                        quantization_level=card.quantization or None,
                     ),
                 )
                 for card in cards
@@ -2028,6 +2075,20 @@ class API:
                 status_code=404, detail=f"Model not found: {model_name}"
             ) from exc
 
+        capabilities: list[OllamaCapability] = []
+        if ModelTask.TextGeneration in card.tasks:
+            capabilities.extend(("completion", "tools"))
+        if card.vision is not None:
+            capabilities.append("vision")
+
+        architecture = card.family or "unknown"
+        model_info: dict[str, Any] = {
+            "general.architecture": architecture,
+            "general.basename": card.base_model or str(card.model_id),
+        }
+        if card.context_length > 0:
+            model_info[f"{architecture}.context_length"] = card.context_length
+
         return OllamaShowResponse(
             modelfile=f"FROM {card.model_id}",
             template="{{ .Prompt }}",
@@ -2035,6 +2096,8 @@ class API:
                 family=card.family or None,
                 quantization_level=card.quantization or None,
             ),
+            model_info=model_info,
+            capabilities=capabilities,
         )
 
     async def ollama_ps(self) -> OllamaPsResponse:
@@ -2057,7 +2120,7 @@ class API:
 
     async def ollama_version(self) -> dict[str, str]:
         """Returns version information for Ollama API compatibility."""
-        return {"version": "exo v1.0"}
+        return {"version": "1.0.0"}
 
     def _calculate_total_available_memory(self) -> Memory:
         """Calculate total available memory across all nodes in bytes."""
@@ -2070,7 +2133,7 @@ class API:
 
     async def get_models(self, status: str | None = Query(default=None)) -> ModelList:
         """Returns list of available models, optionally filtered by being downloaded."""
-        cards = await get_model_cards()
+        cards = await model_cards.card_cache.list_all()
 
         if status == "downloaded":
             downloaded_model_ids: set[str] = set()
@@ -2107,7 +2170,7 @@ class API:
 
         # Immediately update the local cache so the subsequent GET /models
         # returns the new model without waiting for the event round-trip.
-        add_to_card_cache(card)
+        model_cards.card_cache.cc[card.model_id] = card
 
         return ModelListModel(
             id=card.model_id,
@@ -2123,7 +2186,7 @@ class API:
 
     async def delete_custom_model(self, model_id: ModelId) -> JSONResponse:
         """Delete a user-added custom model card and sync deletion across the cluster."""
-        card = get_card(model_id)
+        card = model_cards.card_cache.get(model_id)
         if card is None or not card.is_custom:
             raise HTTPException(status_code=404, detail="Custom model card not found")
 
@@ -2193,11 +2256,20 @@ class API:
                     await anyio.sleep_forever()
                 finally:
                     with anyio.CancelScope(shield=True):
+                        # IMPORTANT: when new queues are added, update this (for proper shutdown semantics)
+                        self._shutdown_queues(self._text_generation_queues)
+                        self._shutdown_queues(self._image_generation_queues)
+
                         shutdown_ev.set()
         finally:
             self._event_log.close()
             self.command_sender.close()
             self.event_receiver.close()
+
+    @staticmethod
+    def _shutdown_queues[K, V](queues: dict[K, Sender[V]]):
+        for v in queues.values():
+            v.close()
 
     async def run_api(self, ev: anyio.Event):
         cfg = Config()
@@ -2206,12 +2278,27 @@ class API:
         cfg.accesslog = None
         cfg.errorlog = "-"
         cfg.logger_class = InterceptLogger
+
+        # prevents hangs when mid-request and connection refuses to close
+        cfg.graceful_timeout = 2  # seconds
+        cfg.shutdown_timeout = 3  # seconds
+
         with anyio.CancelScope(shield=True):
-            await serve(
-                cast(ASGIFramework, self.app),
-                cfg,
-                shutdown_trigger=ev.wait,
-            )
+            try:
+                await serve(
+                    cast(ASGIFramework, self.app),
+                    cfg,
+                    shutdown_trigger=ev.wait,
+                )
+                if not ev.is_set():
+                    raise ShutdownError(
+                        "Server exited without shutdown trigger - exiting abnormally"
+                    )
+            except LifespanTimeoutError as e:
+                logger.warning(
+                    "Graceful server shutdown timed out, some connections forcebly closed"
+                )
+                logger.opt(exception=e).debug("")
 
     async def _apply_state(self):
         with self.event_receiver as events:
