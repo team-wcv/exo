@@ -3,6 +3,9 @@ import os
 import resource
 import signal
 import sys
+import traceback
+from dataclasses import dataclass
+from typing import Self, cast
 
 import loguru
 
@@ -91,6 +94,8 @@ def entrypoint(
 
     # Import main after setting global logger - this lets us just import logger from this module
     try:
+        event_sender_downcast: MpSender[Event] = cast(MpSender[Event], event_sender)
+
         if bound_instance.is_drafter_rank:
             # Drafter rank takes a separate code path: load only the
             # drafter model, never enter the target generator, run the
@@ -103,7 +108,9 @@ def entrypoint(
 
             from exo.worker.runner.drafter_runner import DrafterRunner
 
-            drafter_runner = DrafterRunner(bound_instance, event_sender, task_receiver)
+            drafter_runner = DrafterRunner(
+                bound_instance, event_sender_downcast, task_receiver
+            )
             logger.info(f"Starting drafter runner main loop {runner_context}")
             drafter_runner.main()
             return
@@ -116,7 +123,7 @@ def entrypoint(
             from exo.worker.engines.image.builder import MfluxBuilder
 
             builder = MfluxBuilder(
-                event_sender, cancel_receiver, bound_instance.bound_shard
+                event_sender_downcast, cancel_receiver, bound_instance.bound_shard
             )
         else:
             from exo.worker.engines.mlx.patches import apply_mlx_patches
@@ -128,23 +135,15 @@ def entrypoint(
             # evil sharing of the event sender
             builder = MlxBuilder(
                 model_id=bound_instance.bound_shard.model_card.model_id,
-                event_sender=event_sender,
-                cancel_receiver=cancel_receiver,
-            )
-
-        runner = Runner(bound_instance, builder, event_sender, task_receiver)
-        runner_kind = "image" if bound_instance.is_image_model else "text"
-        logger.info(f"Starting {runner_kind} runner main loop {runner_context}")
-        runner.main()
-
-            # evil sharing of the event sender
-            builder = MlxBuilder(
-                model_id=bound_instance.bound_shard.model_card.model_id,
                 event_sender=event_sender_downcast,
                 cancel_receiver=cancel_receiver,
             )
 
-        runner = Runner(bound_instance, builder, event_sender_downcast, task_receiver)
+        runner = Runner(
+            bound_instance, builder, event_sender_downcast, task_receiver
+        )
+        runner_kind = "image" if bound_instance.is_image_model else "text"
+        logger.info(f"Starting {runner_kind} runner main loop {runner_context}")
         runner.main()
     except ClosedResourceError:
         logger.warning("Runner communication closed unexpectedly")
