@@ -20,6 +20,13 @@ pub fn is_valid_zid(identity: &str) -> bool {
         && identity.len() <= 32
 }
 
+fn namespace_prefix(namespace: &str) -> String {
+    blake3::hash(namespace.as_bytes()).as_bytes()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 pub fn cfg(
     identity: &str,
     listen_port: u16,
@@ -68,11 +75,12 @@ pub async fn open(
     discovery_service_port: u16,
 ) -> Result<Session> {
     assert!(listen_port != 0, "must used defined listen port");
-    let namespace: [u8; 8] = {
+    let namespace_hash: [u8; 8] = {
         blake3::hash(namespace.as_bytes()).as_bytes()[..8]
             .try_into()
             .expect("8 is equal to 8")
     };
+    let namespace_prefix = namespace_prefix(namespace);
     let mut plugins = PluginsManager::static_plugins_only();
     plugins.declare_static_plugin::<StoragesPlugin, _>("storage_manager", true);
     let mut runtime = zenoh::internal::runtime::RuntimeBuilder::new(cfg)
@@ -82,7 +90,7 @@ pub async fn open(
     let z = zenoh::session::init(runtime.clone().into()).await?;
     runtime.start().await?;
     let mut discovery =
-        Discovery::new(z.zid(), namespace, listen_port, discovery_service_port).await?;
+        Discovery::new(z.zid(), namespace_hash, listen_port, discovery_service_port).await?;
     let _jh = Arc::new(AbortOnDrop(tokio::task::spawn(async move {
         loop {
             let Ok(discovered) = discovery.next().await.inspect_err(|e| {
@@ -109,7 +117,11 @@ pub async fn open(
                 .await;
         }
     })));
-    Ok(Session { z, _jh })
+    Ok(Session {
+        z,
+        namespace_prefix,
+        _jh,
+    })
 }
 
 struct AbortOnDrop(JoinHandle<()>);
@@ -122,5 +134,20 @@ impl Drop for AbortOnDrop {
 #[derive(Clone)]
 pub struct Session {
     pub z: ZSession,
+    pub namespace_prefix: String,
     _jh: Arc<AbortOnDrop>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::namespace_prefix;
+
+    #[test]
+    fn namespace_prefix_is_stable_and_isolated() {
+        let first = namespace_prefix("private-cluster");
+        assert_eq!(first, namespace_prefix("private-cluster"));
+        assert_ne!(first, namespace_prefix("other-cluster"));
+        assert_eq!(first.len(), 16);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
+    }
 }

@@ -6,6 +6,7 @@ use std::pin::Pin;
 use futures_lite::Stream;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use zenoh::Result;
 use zenoh::Session;
 use zenoh::handlers::FifoChannelHandler;
@@ -39,10 +40,25 @@ pub enum FromSwarm {
     Expired { peer_id: String },
 }
 
-pub type Topics = HashMap<String, (Subscriber<()>, Publisher<'static>)>;
+pub type Topics = HashMap<
+    String,
+    (
+        Subscriber<FifoChannelHandler<Sample>>,
+        Publisher<'static>,
+        JoinHandle<()>,
+    ),
+>;
 pub struct Swarm {
     pub session: crate::Session,
     pub from_client: mpsc::Receiver<ToSwarm>,
+}
+
+fn live_prefix(namespace_prefix: &str) -> String {
+    format!("clusters/{namespace_prefix}/live/")
+}
+
+fn topic_key(namespace_prefix: &str, topic: &str) -> String {
+    format!("clusters/{namespace_prefix}/topics/{topic}")
 }
 
 impl Swarm {
@@ -55,12 +71,19 @@ impl Swarm {
             let mut session = session;
             let (mut to_topics, mut from_topics) = mpsc::channel(1024);
             let mut topics = Topics::new();
-            let Ok((_token, discovery)) = register_liveness(&mut session.z).await else { return; };
+            let namespace_prefix = session.namespace_prefix.clone();
+            let Ok((_token, discovery)) = register_liveness(&mut session.z, &namespace_prefix).await else { return; };
             loop {
                 tokio::select! {
                     msg = from_client.recv() => {
                         let Some(msg) = msg else { break };
-                        on_message(&mut session.z, &mut topics, &mut to_topics, msg).await;
+                        on_message(
+                            &mut session.z,
+                            &session.namespace_prefix,
+                            &mut topics,
+                            &mut to_topics,
+                            msg,
+                        ).await;
                     }
                     event = from_topics.recv() => {
                         if let Some(event) = event {
@@ -70,7 +93,7 @@ impl Swarm {
                     token = discovery.recv_async() => {
                         if let Ok(token) = token {
                             let key_expr = token.key_expr().as_str().to_owned();
-                            if let Some(peer_id) = key_expr.strip_prefix("live/") {
+                            if let Some(peer_id) = key_expr.strip_prefix(&live_prefix(&namespace_prefix)) {
                                 yield match token.kind() {
                                     SampleKind::Put => {
                                         log::info!("discovered: {peer_id}");
@@ -94,14 +117,19 @@ impl Swarm {
 
 async fn register_liveness(
     session: &mut Session,
+    namespace_prefix: &str,
 ) -> Result<(LivelinessToken, Subscriber<FifoChannelHandler<Sample>>)> {
     let token = session
         .liveliness()
-        .declare_token(format!("live/{}", session.zid()))
+        .declare_token(format!(
+            "{}{}",
+            live_prefix(namespace_prefix),
+            session.zid()
+        ))
         .await?;
     let sub = session
         .liveliness()
-        .declare_subscriber("live/*")
+        .declare_subscriber(format!("{}*", live_prefix(namespace_prefix)))
         .history(true)
         .await?;
     Ok((token, sub))
@@ -109,6 +137,7 @@ async fn register_liveness(
 
 async fn on_message(
     session: &mut Session,
+    namespace_prefix: &str,
     topics: &mut Topics,
     to_topics: &mut mpsc::Sender<FromSwarm>,
     msg: ToSwarm,
@@ -132,10 +161,11 @@ async fn on_message(
             topic,
             result_sender,
         } => {
-            let Some((_, (subscriber, publisher))) = topics.remove_entry(&topic) else {
+            let Some((_, (subscriber, publisher, forwarder))) = topics.remove_entry(&topic) else {
                 _ = result_sender.send(false);
                 return;
             };
+            forwarder.abort();
             _ = publisher.undeclare().await;
             _ = subscriber.undeclare().await;
             _ = result_sender.send(true);
@@ -151,7 +181,7 @@ async fn on_message(
             }
 
             let publisher_res = session
-                .declare_publisher(format!("topics/{topic}"))
+                .declare_publisher(topic_key(namespace_prefix, &topic))
                 .congestion_control(CongestionControl::Block)
                 .await;
             let publisher = match publisher_res {
@@ -163,21 +193,8 @@ async fn on_message(
             };
 
             let subscriber_res = session
-                .declare_subscriber(format!("topics/{topic}"))
+                .declare_subscriber(topic_key(namespace_prefix, &topic))
                 .allowed_origin(zenoh::sample::Locality::Remote)
-                .callback({
-                    let sender = to_topics.clone();
-                    let topic = topic.clone();
-                    move |sample| {
-                        if sample.kind() != SampleKind::Put {
-                            return;
-                        }
-                        _ = sender.try_send(FromSwarm::Message {
-                            topic: topic.clone(),
-                            data: sample.payload().to_bytes().to_vec(),
-                        });
-                    }
-                })
                 .await;
             let subscriber = match subscriber_res {
                 Ok(s) => s,
@@ -187,7 +204,32 @@ async fn on_message(
                 }
             };
 
-            assert!(topics.insert(topic, (subscriber, publisher)).is_none());
+            let handler = subscriber.handler().clone();
+            let sender = to_topics.clone();
+            let forward_topic = topic.clone();
+            let forwarder = tokio::spawn(async move {
+                while let Ok(sample) = handler.recv_async().await {
+                    if sample.kind() != SampleKind::Put {
+                        continue;
+                    }
+                    if sender
+                        .send(FromSwarm::Message {
+                            topic: forward_topic.clone(),
+                            data: sample.payload().to_bytes().to_vec(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+
+            assert!(
+                topics
+                    .insert(topic, (subscriber, publisher, forwarder))
+                    .is_none()
+            );
             _ = result_sender.send(Ok(true));
         }
     }
@@ -207,4 +249,16 @@ pub async fn create_swarm(
         session,
         from_client,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{live_prefix, topic_key};
+
+    #[test]
+    fn zenoh_keys_are_scoped_by_namespace() {
+        assert_eq!(live_prefix("abc"), "clusters/abc/live/");
+        assert_eq!(topic_key("abc", "events"), "clusters/abc/topics/events");
+        assert_ne!(topic_key("abc", "events"), topic_key("def", "events"));
+    }
 }
