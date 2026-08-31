@@ -8,8 +8,8 @@ orchestraitor:
   ticket: 6a95c4b0e6b6efd51fc8569d
   task_url: orchestraitor://task/6a95c4b0e6b6efd51fc8569d
 pr:
-  url: null
-  state: pending
+  url: https://github.com/team-wcv/exo/pull/43
+  state: open
 cleanup:
   merged_into: team-wcv/chore/6a959fcc-sync-exo-upstream
   archived_after: null
