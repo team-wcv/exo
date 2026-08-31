@@ -277,7 +277,9 @@ class Worker:
         pending_startup_cards.difference_update(target)
 
         for model_id, card in target.items():
-            if card_cache.get(model_id) == card:
+            if card_cache.get(model_id) == card and await card_cache.is_persisted(
+                model_id
+            ):
                 continue
             await card_cache.save(card)
 

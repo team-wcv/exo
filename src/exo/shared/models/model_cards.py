@@ -48,6 +48,10 @@ class _CardCache:
     def get(self, model_id: ModelId) -> "ModelCard | None":
         return self.cc.get(model_id)
 
+    async def is_persisted(self, model_id: ModelId) -> bool:
+        card_path = _custom_cards_dir / (ModelId(model_id).normalize() + ".toml")
+        return await card_path.exists()
+
     async def save(self, card: "ModelCard"):
         self.cc[card.model_id] = card
         try:

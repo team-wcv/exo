@@ -94,6 +94,11 @@ async def test_replayed_then_deleted_custom_card_is_removed_from_disk() -> None:
     with (
         patch("exo.worker.main.card_cache.get", new=Mock(return_value=card)),
         patch(
+            "exo.worker.main.card_cache.is_persisted",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
             "exo.worker.main.card_cache.list_all",
             new_callable=AsyncMock,
             return_value=[card],
@@ -106,3 +111,28 @@ async def test_replayed_then_deleted_custom_card_is_removed_from_disk() -> None:
 
     pop_card.assert_awaited_once_with(card.model_id)
     assert pending == set()
+
+
+@pytest.mark.anyio
+async def test_state_card_is_saved_when_cached_but_not_persisted() -> None:
+    card = _custom_card()
+    worker, _ = _worker()
+    worker.state = State(custom_model_cards={card.model_id: card})
+
+    with (
+        patch("exo.worker.main.card_cache.get", new=Mock(return_value=card)),
+        patch(
+            "exo.worker.main.card_cache.is_persisted",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        patch("exo.worker.main.card_cache.save", new_callable=AsyncMock) as save_card,
+        patch(
+            "exo.worker.main.card_cache.list_all",
+            new_callable=AsyncMock,
+            return_value=[card],
+        ),
+    ):
+        await worker._reconcile_custom_cards_once(set())
+
+    save_card.assert_awaited_once_with(card)
