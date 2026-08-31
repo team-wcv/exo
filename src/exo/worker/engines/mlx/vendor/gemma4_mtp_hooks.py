@@ -67,7 +67,7 @@ from mlx_lm.models.gemma4_text import Gemma4TextModel
 from mlx_lm.models.gemma4_text import Model as Gemma4Model
 
 # mlx-lm's gemma4_text exposes ``logit_softcap`` at module scope but the
-# stub in ``.mlx_typings`` doesn't re-export it (the only call site lives
+# stub in ``.typings`` doesn't re-export it (the only call site lives
 # inside ``Model.__call__``, which never escapes the module). Resolve
 # the binding through the imported module so the runtime lookup is
 # unambiguous and the typed surface stays clean -- the cast pins the

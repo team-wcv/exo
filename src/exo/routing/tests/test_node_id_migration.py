@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from exo_pyo3_bindings import Keypair
+from exo_rs import Keypair
 
 from exo.routing.router import (
     _migrate_legacy_node_id_keypair,  # pyright: ignore[reportPrivateUsage]
