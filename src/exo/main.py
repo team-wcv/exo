@@ -1,5 +1,4 @@
 import argparse
-import ipaddress
 import multiprocessing as mp
 import os
 import resource
@@ -64,7 +63,7 @@ class Node:
 
     @classmethod
     async def create(cls, args: "Args") -> Self:
-        node_id = get_node_zid()
+        node_id = get_node_zid(process_scope=_node_zid_scope(args))
         session_id = SessionId(master_node_id=node_id, election_clock=0)
         router = Router.create(
             node_id,
@@ -414,135 +413,16 @@ class Node:
         return ages
 
 
-def _node_id_keypair_scope(args: "Args") -> str:
-    """Produce a stable per-process scope for the node-ID keypair file.
-
-    Combines every listening port the operator could plausibly
-    distinguish between same-host processes: ``--libp2p-port``,
-    ``--api-port``, and ``--peer-download-port``. At least one of
-    these MUST differ between two processes that share a host (each
-    is a distinct local socket bind), so the resulting scope is
-    always unique per process while remaining stable across
-    restarts of the same configuration.
-
-    Used by :func:`get_node_id_keypair` to avoid two same-host
-    processes loading the same scoped keypair file when peer
-    download is disabled (which would otherwise let them collide
-    on the default ``peer_download_port`` since no socket is
-    actually being bound). See Codex P1 (PR #16 round-(N+3),
-    main.py:74).
-
-    Codex P1 (PR #16 round-(N+8), main.py:457): when
-    ``--libp2p-port 0`` is set, the configured value is the literal
-    ``0`` even though each process actually binds a different
-    ephemeral port at runtime. Two same-host worker-only processes
-    (no API, no peer download) sharing the default
-    ``peer_download_port`` and ``api_port`` -- but each binding
-    ``libp2p_port=0`` -- would otherwise produce identical scope
-    strings ``"libp2p-0.api-...peer-..."`` and load the same
-    keypair file, breaking the unique-NodeId invariant.
-    Stability across restarts is impossible in this configuration
-    anyway (the OS hands out a different ephemeral port on every
-    bind), so fold in ``os.getpid()`` as a per-process
-    discriminator. The trade-off (ephemeral identity for
-    ephemeral ports) is the right semantic: the operator opted
-    into ephemeral binding by setting ``libp2p_port=0``.
-    """
-    if args.libp2p_port == 0:
+def _node_zid_scope(args: "Args") -> str:
+    """Produce a stable, collision-free identity scope from bound ports."""
+    if args.zenoh_port == 0:
         return (
-            f"libp2p-pid-{os.getpid()}."
+            f"zenoh-pid-{os.getpid()}."
             f"api-{args.api_port}.peer-{args.peer_download_port}"
         )
     return (
-        f"libp2p-{args.libp2p_port}.api-{args.api_port}.peer-{args.peer_download_port}"
+        f"zenoh-{args.zenoh_port}.api-{args.api_port}.peer-{args.peer_download_port}"
     )
-
-
-def _darwin_interface_ip_address(interface_name: str) -> str | None:
-    try:
-        return subprocess.check_output(
-            ["ipconfig", "getifaddr", interface_name],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-    except (OSError, subprocess.CalledProcessError):
-        return None
-
-
-def _darwin_interface_broadcast_address(
-    interface_name: str, ip_address: str
-) -> str | None:
-    try:
-        subnet_mask = subprocess.check_output(
-            ["ipconfig", "getoption", interface_name, "subnet_mask"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-        interface = ipaddress.IPv4Interface(f"{ip_address}/{subnet_mask}")
-        return str(interface.network.broadcast_address)
-    except (OSError, ValueError, subprocess.CalledProcessError):
-        return None
-
-
-def _darwin_mdns_advertise_address() -> tuple[str, str | None] | None:
-    interface_name = os.getenv("EXO_MDNS_INTERFACE", "en0")
-    ip_address = os.getenv("EXO_MDNS_IP_ADDRESS") or _darwin_interface_ip_address(
-        interface_name
-    )
-    if not ip_address:
-        logger.debug(
-            f"Darwin mDNS broadcast announcer disabled: no {interface_name} IPv4 address"
-        )
-        return None
-
-    broadcast_address = os.getenv(
-        "EXO_MDNS_BROADCAST_ADDRESS"
-    ) or _darwin_interface_broadcast_address(interface_name, ip_address)
-    return ip_address, broadcast_address
-
-
-async def _darwin_mdns_broadcast_announcer(node_id: NodeId, libp2p_port: int) -> None:
-    advertise_address = _darwin_mdns_advertise_address()
-    if advertise_address is None:
-        return
-
-    ip_address, broadcast_address = advertise_address
-    logger.debug(
-        f"Darwin mDNS announcer advertising {node_id} at {ip_address}:{libp2p_port}"
-    )
-    command = [
-        sys.executable,
-        "-m",
-        "exo.routing.mdns_announcer",
-        "--node-id",
-        str(node_id),
-        "--ip-address",
-        ip_address,
-        "--libp2p-port",
-        str(libp2p_port),
-    ]
-    if broadcast_address is not None:
-        command.extend(["--broadcast-address", broadcast_address])
-    process = subprocess.Popen(
-        command,
-        start_new_session=True,
-        stdout=subprocess.DEVNULL,
-    )
-    try:
-        while process.poll() is None:
-            await anyio.sleep(60)
-        logger.debug(
-            f"Darwin mDNS announcer subprocess exited with {process.returncode}"
-        )
-    finally:
-        if process.poll() is None:
-            process.terminate()
-            with anyio.move_on_after(2):
-                while process.poll() is None:
-                    await anyio.sleep(0.1)
-            if process.poll() is None:
-                process.kill()
-                await anyio.sleep(0)
 
 
 def main():

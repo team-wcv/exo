@@ -178,7 +178,7 @@ class ModelCard(FrozenModel):
     quantization: str = ""
     base_model: str = ""
     capabilities: list[str] = []
-    backends: list[Backend]
+    backends: list[Backend] = Field(default_factory=lambda: list(Backend))
     reasoning_dialect: ReasoningDialect = "none"
     context_length: int = 0
     uses_cfg: bool = False

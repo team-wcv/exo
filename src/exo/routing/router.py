@@ -15,6 +15,7 @@ from exo_rs import (
     FromSwarm,
     NetworkingHandle,
 )
+from filelock import FileLock
 from loguru import logger
 
 from exo.shared.constants import EXO_NODE_ZID
@@ -231,34 +232,32 @@ class Router:
 
 def get_node_zid(
     path: Path = EXO_NODE_ZID,
+    process_scope: str | None = None,
 ) -> NodeId:
-    """
-    Obtains the :class:`Keypair` associated with this node-ID.
-    Obtain the :class:`PeerId` by from it.
-    """
-    # TODO(evan): bring back node id persistence once we figure out how to deal with duplicates
-    return NodeId(os.urandom(16).hex().lstrip("0"))
+    """Return a persistent Zenoh node identity for this process scope."""
+    resolved_path = _scoped_zid_path(path, process_scope)
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
-    """
-    def lock_path(path: str | bytes | PathLike[str] | PathLike[bytes]) -> Path:
-        return Path(str(path) + ".lock")
+    with FileLock(str(resolved_path) + ".lock"):
+        if resolved_path.exists():
+            value = resolved_path.read_text().strip().lower()
+            if len(value) == 32 and all(char in "0123456789abcdef" for char in value):
+                return NodeId(value)
+            logger.warning(
+                f"Ignoring invalid Zenoh node identity at {resolved_path}; regenerating"
+            )
 
-    # operate with cross-process lock to avoid race conditions
-    with FileLock(lock_path(path)):
-        with open(path, "a+b") as f:  # opens in append-mode => starts at EOF
-            # if non-zero EOF, then file exists => use to get node-ID
-            if f.tell() != 0:
-                f.seek(0)  # go to start & read protobuf-encoded bytes
-                protobuf_encoded = f.read()
+        value = os.urandom(16).hex()
+        temporary_path = resolved_path.with_name(
+            f".{resolved_path.name}.{os.getpid()}.tmp"
+        )
+        temporary_path.write_text(value + "\n")
+        temporary_path.chmod(0o600)
+        temporary_path.replace(resolved_path)
+        return NodeId(value)
 
-                try:  # if decoded successfully, save & return
-                    return Keypair.from_bytes(protobuf_encoded)
-                except ValueError as e:  # on runtime error, assume corrupt file
-                    logger.warning(f"Encountered error when trying to get keypair: {e}")
 
-        # if no valid credentials, create new ones and persist
-        with open(path, "w+b") as f:
-            keypair = Keypair.generate()
-            f.write(keypair.to_bytes())
-            return keypair
-    """
+def _scoped_zid_path(path: Path, process_scope: str | None) -> Path:
+    if process_scope is None:
+        return path
+    return path.with_name(f"{path.name}.{process_scope}")
