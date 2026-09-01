@@ -12,6 +12,6 @@ pr:
 ---
 
 - Why this branch exists: Keep the Twin cluster on svc:bigbrain while Studio and Spark expose independent Exo control planes and Tailscale Services.
-- Changed paths: pending
-- Validation run: pending
+- Changed paths: `ops/team-wcv/bigbrain/` host service profiles and endpoint-isolation runbook.
+- Validation run: Studio and Spark each report one isolated topology node and 124 models; all three dashboard roots return HTTP 200; Studio LaunchAgent is RunAtLoad/KeepAlive and running; Spark systemd unit is enabled/active with zero restarts; Twin topology contains only smbp/smbpt with two RunnerReady runners; post-detach Twin decode is 41.29 tok/s; Spark Laguna remains active with zero restarts.
 - Known follow-ups: Spark cannot load another large model while Laguna occupies most unified memory; endpoint availability and simultaneous heavyweight inference are separate constraints.
