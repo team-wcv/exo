@@ -12,6 +12,6 @@ pr:
 ---
 
 - Why this branch exists: Give wc-bmbp a persistent solo Exo control plane for local runtimes without changing the Twin, Studio, or Spark namespaces.
-- Changed paths: planned `ops/team-wcv/bigbrain/bmbp/` LaunchAgent profile and endpoint-isolation runbook update.
-- Validation run: pending live installation and four-endpoint readiness verification.
-- Known follow-ups: none.
+- Changed paths: `ops/team-wcv/bigbrain/bmbp/` LaunchAgent profile and endpoint-isolation runbook update.
+- Validation run: all four dashboard roots return HTTP 200 from peer devices; Twins remain exactly smbp/smbpt with two RunnerReady runners; Studio, Spark, and BMBP each report one isolated topology node and 124 models; all persistent services are running; Spark Laguna remains active with zero restarts.
+- Known follow-ups: BMBP should use localhost for same-host runtimes because its own Tailnet hostname does not hairpin from the host; peer devices reach the Tailnet URL normally.

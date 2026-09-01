@@ -54,6 +54,9 @@ BMBP resolves its runtime through
 `~/.local/share/bigbrain-endpoints/bmbp/exo-current`, allowing the validated checkout
 to be advanced without changing the LaunchAgent definition.
 
+Use `http://127.0.0.1:52615/v1` for runtimes running on BMBP itself and
+`https://wc-bmbp.taile43e67.ts.net:8443/v1` for runtimes on other Tailnet devices.
+
 ## Publish Tailnet services
 
 ```bash
