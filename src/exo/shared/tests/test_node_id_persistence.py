@@ -8,9 +8,10 @@ from multiprocessing.synchronize import Event as EventT
 from multiprocessing.synchronize import Semaphore as SemaphoreT
 from pathlib import Path
 from unittest.mock import patch
+from unittest.mock import Mock
 
 from loguru import logger
-from pytest import LogCaptureFixture, mark
+from pytest import LogCaptureFixture, MonkeyPatch, mark
 
 from exo.routing.router import get_node_zid
 from exo.shared.constants import EXO_NODE_ZID
@@ -41,6 +42,30 @@ def test_node_id_generation_retries_invalid_random_value(tmp_path: Path) -> None
         node_id = get_node_zid(path)
 
     assert node_id == "a" + "3" * 31
+def test_node_zid_rejects_a_persisted_leading_zero(tmp_path: Path) -> None:
+    path = tmp_path / "node_zid"
+    path.write_text("0" + "a" * 31)
+
+    node_id = get_node_zid(path=path)
+
+    assert len(node_id) == 32
+    assert node_id[0] != "0"
+    assert path.read_text().strip() == node_id
+
+
+def test_node_zid_retries_random_leading_zero(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "node_zid"
+    random_bytes = Mock(
+        side_effect=[bytes.fromhex("0" + "a" * 31), bytes.fromhex("1" + "b" * 31)]
+    )
+    monkeypatch.setattr("exo.routing.router.os.urandom", random_bytes)
+
+    node_id = get_node_zid(path=path)
+
+    assert node_id == "1" + "b" * 31
+    assert random_bytes.call_count == 2
 
 
 def _get_keypair_concurrent_subprocess_task(

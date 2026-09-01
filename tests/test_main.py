@@ -1,6 +1,15 @@
+import sys
+
 import pytest
 
-from exo.main import _zenoh_bootstrap_endpoints
+from exo.main import Args, _zenoh_bootstrap_endpoints
+
+
+def test_namespace_defaults_to_app_environment(monkeypatch) -> None:
+    monkeypatch.setenv("EXO_ZENOH_NAMESPACE", "private-app-cluster")
+    monkeypatch.setattr(sys, "argv", ["exo"])
+
+    assert Args.parse().namespace == "private-app-cluster"
 
 
 def test_legacy_bootstrap_peers_are_accepted(monkeypatch) -> None:

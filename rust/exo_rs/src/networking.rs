@@ -24,14 +24,20 @@ pub struct PyNetworkingHandle {
 #[gen_stub_pyclass_complex_enum]
 #[pyclass(name = "FromSwarm")]
 pub enum PyFromSwarm {
-    Connection { connected: bool },
+    Connection { connected: bool, peer_id: String },
     Message { topic: String, data: Py<PyBytes> },
 }
 impl From<FromSwarm> for PyFromSwarm {
     fn from(value: FromSwarm) -> Self {
         match value {
-            FromSwarm::Discovered {} => Self::Connection { connected: true },
-            FromSwarm::Expired {} => Self::Connection { connected: false },
+            FromSwarm::Discovered { peer_id } => Self::Connection {
+                connected: true,
+                peer_id,
+            },
+            FromSwarm::Expired { peer_id } => Self::Connection {
+                connected: false,
+                peer_id,
+            },
             FromSwarm::Message { topic, data } => Self::Message {
                 topic: topic,
                 data: data.pybytes(),

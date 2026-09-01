@@ -15,10 +15,12 @@ __all__ = [
 class FromSwarm:
     @typing.final
     class Connection(FromSwarm):
-        __match_args__ = ("connected",)
+        __match_args__ = ("connected", "peer_id",)
         @property
         def connected(self) -> builtins.bool: ...
-        def __new__(cls, connected: builtins.bool) -> FromSwarm.Connection: ...
+        @property
+        def peer_id(self) -> builtins.str: ...
+        def __new__(cls, connected: builtins.bool, peer_id: builtins.str) -> FromSwarm.Connection: ...
 
     @typing.final
     class Message(FromSwarm):
