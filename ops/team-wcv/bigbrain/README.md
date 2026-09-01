@@ -5,8 +5,8 @@ This profile keeps three Exo control planes active at the same time:
 | Tailnet service | Owner | Local API | Namespace | Placement boundary |
 |---|---|---:|---|---|
 | `svc:bigbrain` | `wc-smbp` | `52415` | Twin production cluster | `wc-smbp` + `wc-smbpt` only |
-| `svc:studio-bigbrain` | `wc-studio` | `52615` | `bigbrain-studio` | Studio only |
-| `svc:spark-bigbrain` | `wc-spark` | `52615` | `bigbrain-spark` | Spark only |
+| `https://wc-studio.taile43e67.ts.net:8443` | `wc-studio` | `52615` | `bigbrain-studio` | Studio only |
+| `https://wc-spark.taile43e67.ts.net:8443` | `wc-spark` | `52615` | `bigbrain-spark` | Spark only |
 
 Spark's Laguna vLLM endpoint on port 8888 is independent of Exo and remains active. A
 Spark-local Exo endpoint can coexist with Laguna as a control plane, but the host does not
@@ -42,15 +42,17 @@ service file only after validating a replacement build on the target host.
 
 ```bash
 # Studio
-tailscale serve --service=svc:studio-bigbrain --bg --yes http://127.0.0.1:52615
+tailscale serve --https=8443 --bg --yes http://127.0.0.1:52615
 
 # Spark
-tailscale serve --service=svc:spark-bigbrain --bg --yes http://127.0.0.1:52615
+tailscale serve --https=8443 --bg --yes http://127.0.0.1:52615
 ```
 
-The tailnet policy must grant the host permission to advertise the service. Capture the
-current configuration before changing it with `tailscale serve status --json` or
-`tailscale serve get-config <path> --all`.
+Studio and Spark are intentionally operator-owned, untagged Tailscale devices. Named
+Tailscale Services require tagged service hosts and would change device ownership/SSH
+policy, so their dedicated endpoints use HTTPS 8443 on the existing device DNS names.
+Capture the current configuration before changing it with
+`tailscale serve status --json`.
 
 ## Validation
 
