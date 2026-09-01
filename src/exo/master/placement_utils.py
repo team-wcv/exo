@@ -425,11 +425,22 @@ def find_ip_prioritised(
     direct link. ``ring=False`` is for socket/control-plane paths that
     should stay on broadly reachable LAN addresses.
     """
-    ips = list(_find_connection_ip(node_id, other_node_id, cycle_digraph))
     other_network = node_network.get(other_node_id, NodeNetworkInfo())
+    ip_to_interface = {iface.ip_address: iface for iface in other_network.interfaces}
     ip_to_type: dict[str, InterfaceType] = {
         iface.ip_address: iface.interface_type for iface in other_network.interfaces
     }
+    ips = [
+        ip
+        for ip in _find_connection_ip(node_id, other_node_id, cycle_digraph)
+        if (
+            (iface := ip_to_interface.get(ip)) is not None
+            and is_probeable_interface(
+                iface.name, iface.ip_address, iface.interface_type
+            )
+        )
+        or (iface is None and is_probeable_interface("", ip, "unknown"))
+    ]
 
     if not ips:
         ips = _fallback_interface_ips(other_network)
@@ -459,7 +470,11 @@ def find_ip_prioritised(
     return min(
         ips,
         key=lambda ip: (
-            _address_priority(ip, ip_to_type.get(ip, "unknown")),
+            _address_priority(
+                ip,
+                ip_to_type.get(ip, "unknown"),
+                promote_apple_usb_ncm=ring,
+            ),
             type_priority.get(ip_to_type.get(ip, "unknown"), 5),
         ),
     )
@@ -481,7 +496,12 @@ def _is_candidate_host_ip(ip: str) -> bool:
     return not (ip.startswith("127.") or ip == "0.0.0.0")
 
 
-def _address_priority(ip: str, interface_type: InterfaceType = "unknown") -> int:
+def _address_priority(
+    ip: str,
+    interface_type: InterfaceType = "unknown",
+    *,
+    promote_apple_usb_ncm: bool = False,
+) -> int:
     if ip.startswith(("192.168.", "10.")):
         return 0
     if ip.startswith("172."):
@@ -491,10 +511,12 @@ def _address_priority(ip: str, interface_type: InterfaceType = "unknown") -> int
             return 3
         if 16 <= second_octet <= 31:
             return 0
+    if interface_type in {"ethernet", "maybe_ethernet", "thunderbolt"}:
+        return 0
     if ip.startswith("100."):
         return 2
     if ip.startswith("169.254."):
-        if interface_type == "apple_usb_ncm":
+        if interface_type == "apple_usb_ncm" and promote_apple_usb_ncm:
             return 0
         return 3
     return 1
