@@ -526,6 +526,40 @@ def test_control_plane_prefers_wifi_lan_over_apple_usb_ncm():
     )
 
 
+def test_fallback_respects_reachability_cidr(monkeypatch: pytest.MonkeyPatch):
+    source = NodeId()
+    sink = NodeId()
+    topology = Topology()
+    topology.add_node(source)
+    topology.add_node(sink)
+    network = {
+        sink: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="enP7s7",
+                    ip_address="192.168.1.150",
+                    interface_type="ethernet",
+                ),
+                NetworkInterfaceInfo(
+                    name="enx3a524871d6c5",
+                    ip_address="169.254.49.225",
+                    interface_type="apple_usb_ncm",
+                ),
+            ]
+        )
+    }
+
+    monkeypatch.setenv("EXO_REACHABILITY_ALLOWED_CIDRS", "192.168.1.0/24")
+    assert find_ip_prioritised(source, sink, topology, network, ring=True) == (
+        "192.168.1.150"
+    )
+
+    monkeypatch.setenv("EXO_REACHABILITY_ALLOWED_CIDRS", "169.254.0.0/16")
+    assert find_ip_prioritised(source, sink, topology, network, ring=True) == (
+        "169.254.49.225"
+    )
+
+
 class TestAllocateLayersProportionally:
     def test_empty_node_list_raises(self):
         with pytest.raises(ValueError, match="empty node list"):

@@ -181,6 +181,35 @@ def _get_apple_usb_ncm_interfaces_from_sysfs(
     return matched
 
 
+def _get_linux_interface_types_from_sysfs(
+    sys_class_net: Path = _LINUX_SYS_CLASS_NET,
+) -> dict[str, InterfaceType]:
+    """Classify Linux interfaces only when sysfs proves the link kind."""
+    apple_usb_ncm = _get_apple_usb_ncm_interfaces_from_sysfs(sys_class_net)
+    try:
+        interfaces = list(sys_class_net.iterdir())
+    except OSError:
+        return {}
+
+    types: dict[str, InterfaceType] = {}
+    for interface in interfaces:
+        if interface.name in apple_usb_ncm:
+            types[interface.name] = "apple_usb_ncm"
+            continue
+        if (interface / "wireless").is_dir():
+            types[interface.name] = "wifi"
+            continue
+        try:
+            device = (interface / "device").resolve(strict=True)
+            (device / "driver").resolve(strict=True)
+        except OSError:
+            continue
+        if _read_sysfs_value(interface / "type") == "1":
+            types[interface.name] = "ethernet"
+
+    return types
+
+
 async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     """
     Retrieves detailed network interface information on macOS.
@@ -193,7 +222,8 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     if sys.platform == "darwin":
         apple_usb_ncm_interfaces = await _get_apple_usb_ncm_interfaces_from_ioreg()
     elif sys.platform == "linux":
-        apple_usb_ncm_interfaces = _get_apple_usb_ncm_interfaces_from_sysfs()
+        interface_types = _get_linux_interface_types_from_sysfs()
+        apple_usb_ncm_interfaces = set()
     else:
         apple_usb_ncm_interfaces = set()
 

@@ -54,6 +54,7 @@ from exo.utils.info_gatherer.system_info import (
     _get_apple_usb_ncm_interfaces_from_ioreg,  # pyright: ignore[reportPrivateUsage]
     _get_apple_usb_ncm_interfaces_from_sysfs,  # pyright: ignore[reportPrivateUsage]
     _get_interface_types_from_networksetup,  # pyright: ignore[reportPrivateUsage]
+    _get_linux_interface_types_from_sysfs,  # pyright: ignore[reportPrivateUsage]
 )
 
 
@@ -161,6 +162,31 @@ def test_linux_apple_usb_ncm_requires_driver_and_usb_identity(tmp_path: Path) ->
 
     (device / "idProduct").write_text("1904\n")
     assert _get_apple_usb_ncm_interfaces_from_sysfs(sys_class_net) == set()
+
+
+def test_linux_physical_network_types_require_sysfs_evidence(tmp_path: Path) -> None:
+    sys_class_net = tmp_path / "sys" / "class" / "net"
+    driver_root = tmp_path / "sys" / "drivers"
+
+    ethernet = sys_class_net / "enP7s7"
+    ethernet_device = ethernet / "device"
+    ethernet_driver = driver_root / "r8127"
+    ethernet_device.mkdir(parents=True)
+    ethernet_driver.mkdir(parents=True)
+    (ethernet_device / "driver").symlink_to(ethernet_driver, target_is_directory=True)
+    (ethernet / "type").write_text("1\n")
+
+    wifi = sys_class_net / "wlP9s9"
+    (wifi / "wireless").mkdir(parents=True)
+
+    virtual = sys_class_net / "docker0"
+    (virtual / "device").mkdir(parents=True)
+    (virtual / "type").write_text("1\n")
+
+    assert _get_linux_interface_types_from_sysfs(sys_class_net) == {
+        "enP7s7": "ethernet",
+        "wlP9s9": "wifi",
+    }
 
 
 @pytest.mark.anyio

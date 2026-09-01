@@ -23,3 +23,8 @@ makes route-isolated testing possible: use the LAN subnet to force Ethernet or
 For model data, Exo ranks a measured wired Ethernet path ahead of Apple USB-NCM
 and Apple USB-NCM ahead of Wi-Fi. Control-plane sockets continue to prefer a
 broadly reachable LAN address.
+
+On Linux, physical Ethernet classification requires an Ethernet-type sysfs
+device with a bound driver; virtual bridges without a device driver stay
+`unknown`. Placement fallbacks apply the same reachability filter as active
+probes, so an excluded interface cannot silently re-enter route selection.

@@ -53,7 +53,7 @@ def _parse_allowed_ips() -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address,
     return tuple(ips)
 
 
-def _probeable_interface(
+def is_probeable_interface(
     name: str, ip_address: str, interface_type: InterfaceType = "unknown"
 ) -> bool:
     if name.startswith(_IGNORED_INTERFACE_PREFIXES):
@@ -186,7 +186,7 @@ async def check_reachable(
             if node_id == self_node_id:
                 continue
             for iface in node_network[node_id].interfaces:
-                if not _probeable_interface(
+                if not is_probeable_interface(
                     iface.name, iface.ip_address, iface.interface_type
                 ):
                     continue

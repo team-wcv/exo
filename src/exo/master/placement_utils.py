@@ -16,6 +16,7 @@ from exo.shared.types.worker.shards import (
     Sharding,
     TensorShardMetadata,
 )
+from exo.utils.info_gatherer.net_profile import is_probeable_interface
 
 
 def filter_cycles_by_memory(
@@ -470,6 +471,7 @@ def _fallback_interface_ips(node_network: NodeNetworkInfo) -> list[str]:
         iface.ip_address
         for iface in node_network.interfaces
         if _is_candidate_host_ip(iface.ip_address)
+        and is_probeable_interface(iface.name, iface.ip_address, iface.interface_type)
     ]
 
 
