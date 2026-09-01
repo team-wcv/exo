@@ -11,10 +11,13 @@ from exo.routing.event_router import (
 from exo.shared.types.commands import ForwarderCommand, RequestEventLog
 from exo.shared.types.common import NodeId, SessionId, SystemId
 from exo.shared.types.events import (
+    Event,
     GlobalForwarderEvent,
     LocalForwarderEvent,
     TestEvent,
+    TracesCollected,
 )
+from exo.shared.types.tasks import TaskId
 from exo.utils.channels import channel
 
 
@@ -185,3 +188,43 @@ def test_delivery_watchdog_allows_recent_or_disabled_events() -> None:
     router._raise_if_delivery_stalled(now=24.9)
     router._delivery_stall_seconds = 0.0
     router._raise_if_delivery_stalled(now=100.0)
+
+
+@pytest.mark.asyncio
+async def test_trace_only_events_retry_until_producer_progress() -> None:
+    command_sender, command_receiver = channel[ForwarderCommand]()
+    global_sender, global_receiver = channel[GlobalForwarderEvent]()
+    local_sender, local_receiver = channel[LocalForwarderEvent]()
+    event_sender, event_receiver = channel[Event]()
+    session_id = SessionId(master_node_id=NodeId("master"), election_clock=0)
+    router = EventRouter(
+        session_id=session_id,
+        command_sender=command_sender,
+        external_inbound=global_receiver,
+        external_outbound=local_sender,
+    )
+    trace_event = TracesCollected(task_id=TaskId(), rank=0, traces=[])
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(router._ingest, SystemId("worker"), event_receiver)
+        await event_sender.send(trace_event)
+        forwarded = await local_receiver.receive()
+        assert forwarded.event == trace_event
+        assert trace_event.event_id in router.out_for_delivery
+        router._delivery_stall_seconds = 1.0
+        router._raise_if_delivery_stalled(now=anyio.current_time() + 60.0)
+
+        router._acknowledge_prior_trace_events(
+            LocalForwarderEvent(
+                origin_idx=forwarded.origin_idx + 1,
+                origin=forwarded.origin,
+                session=session_id,
+                event=TestEvent(),
+            )
+        )
+        assert trace_event.event_id not in router.out_for_delivery
+        event_sender.close()
+
+    command_receiver.close()
+    global_sender.close()
+    local_receiver.close()

@@ -15,6 +15,7 @@ from exo.shared.types.events import (
     GlobalForwarderEvent,
     IndexedEvent,
     LocalForwarderEvent,
+    TracesCollected,
 )
 from exo.utils import channels
 from exo.utils.channels import Receiver, Sender, channel
@@ -125,6 +126,12 @@ class EventRouter:
         if self._delivery_stall_seconds <= 0:
             return
         for event_id, pending in self.out_for_delivery.items():
+            # TracesCollected is sequenced and retried like every other local
+            # event, but the master aggregates it without echoing the original
+            # event. A later ordinary acknowledgement from the same producer
+            # proves the trace was accepted and clears it below.
+            if isinstance(pending.event.event, TracesCollected):
+                continue
             age_seconds = now - pending.first_sent_at
             if age_seconds < self._delivery_stall_seconds:
                 continue
@@ -188,8 +195,9 @@ class EventRouter:
 
                 buf.ingest(event.origin_idx, event.event)
                 event_id = event.event.event_id
-                if event_id in self.out_for_delivery:
-                    self.out_for_delivery.pop(event_id)
+                pending = self.out_for_delivery.pop(event_id, None)
+                if pending is not None:
+                    self._acknowledge_prior_trace_events(pending.event)
                     logger.debug(
                         "Acknowledged local event from global stream "
                         f"event_id={event_id} origin_idx={event.origin_idx} "
@@ -237,6 +245,26 @@ class EventRouter:
                         buf.next_idx_to_release,
                         max_events=self._nack_replay_size(buf),
                     )
+
+    def _acknowledge_prior_trace_events(
+        self, acknowledged_event: LocalForwarderEvent
+    ) -> None:
+        acknowledged_trace_ids = [
+            event_id
+            for event_id, pending in self.out_for_delivery.items()
+            if pending.event.origin == acknowledged_event.origin
+            and pending.event.origin_idx < acknowledged_event.origin_idx
+            and isinstance(pending.event.event, TracesCollected)
+        ]
+        for event_id in acknowledged_trace_ids:
+            self.out_for_delivery.pop(event_id, None)
+        if acknowledged_trace_ids:
+            logger.debug(
+                "Acknowledged prior trace-only deliveries by producer progress "
+                f"origin={acknowledged_event.origin} "
+                f"origin_idx={acknowledged_event.origin_idx} "
+                f"trace_events={len(acknowledged_trace_ids)}"
+            )
 
     def _nack_replay_size(self, buf: OrderedBuffer[Event]) -> int:
         if not buf.store:
