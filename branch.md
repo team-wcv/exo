@@ -7,8 +7,8 @@ scope: "Add durable isolated Bigbrain endpoint profiles for Twins, Studio, and S
 orchestraitor:
   ticket: 6a96f375e6b6efd51fc86192
 pr:
-  url: pending
-  state: pending
+  url: https://github.com/team-wcv/exo/pull/45
+  state: open
 ---
 
 - Why this branch exists: Keep the Twin cluster on svc:bigbrain while Studio and Spark expose independent Exo control planes and Tailscale Services.
