@@ -15,6 +15,7 @@ from exo.master.tests.conftest import (
 )
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
 from exo.shared.topology import Topology
+from exo.shared.types.backends import Backend
 from exo.shared.types.common import NodeId
 from exo.shared.types.memory import Memory
 from exo.shared.types.multiaddr import Multiaddr
@@ -250,6 +251,7 @@ def test_get_shard_assignments(
         hidden_size=1000,
         supports_tensor=True,
         tasks=[ModelTask.TextGeneration],
+        backends=[Backend.MlxMetal],
     )
 
     cycles = topology.get_cycles()
@@ -374,7 +376,7 @@ def test_get_mlx_jaccl_coordinators():
     ), "node_c should use the IP from conn_c_a"
 
 
-def test_jaccl_coordinator_prefers_thunderbolt_over_lan():
+def test_jaccl_coordinator_prefers_lan_over_thunderbolt():
     node_a_id = NodeId()
     node_b_id = NodeId()
     topology = Topology()
@@ -424,7 +426,7 @@ def test_jaccl_coordinator_prefers_thunderbolt_over_lan():
             node_network,
             ring=False,
         )
-        == "192.168.0.2"
+        == "192.168.1.11"
     )
 
 
@@ -528,6 +530,7 @@ def test_get_shard_assignments_insufficient_memory_raises():
         hidden_size=1000,
         supports_tensor=True,
         tasks=[ModelTask.TextGeneration],
+        backends=[Backend.MlxMetal],
     )
     cycles = topology.get_cycles()
     selected_cycle = cycles[0]
@@ -577,6 +580,7 @@ class TestCfgParallelPlacement:
             supports_tensor=False,
             uses_cfg=True,
             tasks=[ModelTask.TextToImage],
+            backends=[Backend.MlxMetal],
         )
 
         assignments = get_shard_assignments_for_pipeline_parallel(
@@ -620,6 +624,7 @@ class TestCfgParallelPlacement:
             supports_tensor=False,
             uses_cfg=True,
             tasks=[ModelTask.TextToImage],
+            backends=[Backend.MlxMetal],
         )
 
         assignments = get_shard_assignments_for_pipeline_parallel(
@@ -673,6 +678,7 @@ class TestCfgParallelPlacement:
             supports_tensor=False,
             uses_cfg=True,
             tasks=[ModelTask.TextToImage],
+            backends=[Backend.MlxMetal],
         )
 
         assignments = get_shard_assignments_for_pipeline_parallel(
@@ -708,6 +714,7 @@ class TestCfgParallelPlacement:
             supports_tensor=False,
             uses_cfg=False,  # Non-CFG model
             tasks=[ModelTask.TextToImage],
+            backends=[Backend.MlxMetal],
         )
 
         assignments = get_shard_assignments_for_pipeline_parallel(

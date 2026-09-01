@@ -19,7 +19,7 @@ capabilities = ["text", "thinking", "thinking_toggle", "vision"]
 coupled_drafter = "z-lab/Qwen3.6-27B-DFlash"
 reasoning_dialect = "post_last_user"
 context_length = 262144
-
+backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
 [storage_size]
 in_bytes = 28991029248
 

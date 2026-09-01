@@ -107,6 +107,35 @@ async def test_single_round_broadcasts_and_updates_seniority_on_self_win() -> No
     assert election.seniority == 2
 
 
+def test_each_peer_membership_change_updates_election_state() -> None:
+    em_out_tx, _ = channel[ElectionMessage]()
+    _, em_in_rx = channel[ElectionMessage]()
+    er_tx, _ = channel[ElectionResult]()
+    _, cm_rx = channel[ConnectionMessage]()
+    _, co_rx = channel[ForwarderCommand]()
+    election = Election(
+        node_id=NodeId("ME"),
+        election_message_receiver=em_in_rx,
+        election_message_sender=em_out_tx,
+        election_result_sender=er_tx,
+        connection_message_receiver=cm_rx,
+        command_receiver=co_rx,
+    )
+
+    peer_a = NodeId("A")
+    peer_b = NodeId("B")
+    apply_messages = election._apply_connection_messages
+
+    assert apply_messages([ConnectionMessage(connected=True, peer_id=peer_a)])
+    election._peer_seniority[peer_a] = 1_000_000
+    election._refresh_max_observed_seniority()
+    assert apply_messages([ConnectionMessage(connected=True, peer_id=peer_b)])
+    assert not apply_messages([ConnectionMessage(connected=True, peer_id=peer_b)])
+    assert apply_messages([ConnectionMessage(connected=False, peer_id=peer_a)])
+    assert election._max_observed_seniority == election.seniority
+    assert apply_messages([ConnectionMessage(connected=False, peer_id=peer_b)])
+
+
 @pytest.mark.anyio
 async def test_peer_with_higher_seniority_wins_and_we_switch_master() -> None:
     """
@@ -332,7 +361,7 @@ async def test_connection_message_triggers_new_round_broadcast() -> None:
             tg.start_soon(election.run)
 
             # Send any connection message object; we close quickly to cancel before result creation
-            await cm_tx.send(ConnectionMessage(node_id=NodeId(), connected=True))
+            await cm_tx.send(ConnectionMessage(connected=True))
 
             # Expect a broadcast for the new round at clock=1
             while True:
@@ -478,14 +507,13 @@ async def test_duplicate_connection_message_does_not_start_new_round() -> None:
         with fail_after(2):
             tg.start_soon(election.run)
 
-            peer_id = NodeId("PEER")
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            await cm_tx.send(ConnectionMessage(connected=True))
             while True:
                 got = await em_out_rx.receive()
                 if got.clock == 1:
                     break
 
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            await cm_tx.send(ConnectionMessage(connected=True))
             got_duplicate_round = False
             with move_on_after(0.3):
                 while True:
@@ -522,15 +550,14 @@ async def test_transient_disconnect_reconnect_does_not_start_new_round() -> None
         with fail_after(2):
             tg.start_soon(election.run)
 
-            peer_id = NodeId("PEER")
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            await cm_tx.send(ConnectionMessage(connected=True))
             while True:
                 got = await em_out_rx.receive()
                 if got.clock == 1:
                     break
 
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=False))
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            await cm_tx.send(ConnectionMessage(connected=False))
+            await cm_tx.send(ConnectionMessage(connected=True))
 
             got_flap_round = False
             with move_on_after(0.3):
@@ -572,16 +599,15 @@ async def test_transient_disconnect_uses_configured_grace(
         with fail_after(2):
             tg.start_soon(election.run)
 
-            peer_id = NodeId("PEER")
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            await cm_tx.send(ConnectionMessage(connected=True))
             while True:
                 got = await em_out_rx.receive()
                 if got.clock == 1:
                     break
 
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=False))
+            await cm_tx.send(ConnectionMessage(connected=False))
             await anyio.sleep(0.1)
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            await cm_tx.send(ConnectionMessage(connected=True))
 
             got_flap_round = False
             with move_on_after(0.3):
@@ -619,14 +645,13 @@ async def test_sustained_disconnect_starts_new_round_after_grace_period() -> Non
         with fail_after(2):
             tg.start_soon(election.run)
 
-            peer_id = NodeId("PEER")
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            await cm_tx.send(ConnectionMessage(connected=True))
             while True:
                 got = await em_out_rx.receive()
                 if got.clock == 1:
                     break
 
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=False))
+            await cm_tx.send(ConnectionMessage(connected=False))
             while True:
                 got = await em_out_rx.receive()
                 if got.clock == 2:

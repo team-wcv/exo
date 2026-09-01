@@ -107,6 +107,7 @@ class Election:
         # Prevents accepting a low-seniority winner when the high-seniority
         # node's message simply hasn't arrived yet (network delay / message loss).
         self._max_observed_seniority: int = seniority
+        self._peer_seniority: dict[NodeId, int] = {}
 
         # Senders/Receivers
         self._em_sender = election_message_sender
@@ -119,7 +120,8 @@ class Election:
         self._candidates: list[ElectionMessage] = []
         self._campaign_cancel_scope: CancelScope | None = None
         self._campaign_done: Event | None = None
-        self._connection_state: dict[NodeId, bool] = {}
+        self._connected_peers: set[NodeId] = set()
+        self._legacy_connection_state: bool | None = None
         self._router_settle_seconds = _router_settle_seconds()
         self._tg = TaskGroup()
 
@@ -186,9 +188,11 @@ class Election:
                     # Drop messages from us (See exo.routing.router)
                     continue
 
-                self._max_observed_seniority = max(
-                    self._max_observed_seniority, message.seniority
+                peer_id = message.proposed_session.master_node_id
+                self._peer_seniority[peer_id] = max(
+                    self._peer_seniority.get(peer_id, -1), message.seniority
                 )
+                self._refresh_max_observed_seniority()
 
                 # If a new round is starting, we participate
                 if message.clock > self.clock:
@@ -225,28 +229,18 @@ class Election:
                 logger.debug(
                     f"Connection messages received: {first} followed by {rest}"
                 )
-                baseline_connection_state = dict(self._connection_state)
-                changed_node_ids = self._apply_connection_messages(messages)
-                if not changed_node_ids:
+                baseline_connection_state = self._connection_snapshot()
+                changed = self._apply_connection_messages(messages)
+                if not changed:
                     logger.debug("Connection messages did not change peer state")
                     continue
 
-                if any(
-                    not self._connection_state[node_id] for node_id in changed_node_ids
-                ):
+                if any(not message.connected for message in messages):
                     await anyio.sleep(_dropout_grace_seconds())
                     follow_up_messages = connection_messages.collect()
-                    changed_node_ids.update(
-                        self._apply_connection_messages(follow_up_messages)
-                    )
+                    self._apply_connection_messages(follow_up_messages)
 
-                net_changed_node_ids = [
-                    node_id
-                    for node_id in changed_node_ids
-                    if baseline_connection_state.get(node_id)
-                    != self._connection_state.get(node_id)
-                ]
-                if not net_changed_node_ids:
+                if baseline_connection_state == self._connection_snapshot():
                     logger.info(
                         "Ignoring transient connection flap; peer state returned to baseline"
                     )
@@ -265,20 +259,31 @@ class Election:
                 logger.debug("Campaign started")
                 logger.debug("Connection message added")
 
-    def _apply_connection_messages(
-        self, messages: list[ConnectionMessage]
-    ) -> set[NodeId]:
-        changed_node_ids: set[NodeId] = set()
+    def _apply_connection_messages(self, messages: list[ConnectionMessage]) -> bool:
+        previous = self._connection_snapshot()
         for message in messages:
-            previous = self._connection_state.get(message.node_id)
-            if previous is None and not message.connected:
-                self._connection_state[message.node_id] = False
+            if message.peer_id is None:
+                self._legacy_connection_state = message.connected
+            elif message.peer_id == self.node_id:
                 continue
-            if previous == message.connected:
-                continue
-            self._connection_state[message.node_id] = message.connected
-            changed_node_ids.add(message.node_id)
-        return changed_node_ids
+            elif message.connected:
+                self._connected_peers.add(message.peer_id)
+            else:
+                self._connected_peers.discard(message.peer_id)
+                self._peer_seniority.pop(message.peer_id, None)
+                self._refresh_max_observed_seniority()
+        current = self._connection_snapshot()
+        if previous == (frozenset(), None) and current == (frozenset(), False):
+            return False
+        return previous != current
+
+    def _connection_snapshot(self) -> tuple[frozenset[NodeId], bool | None]:
+        return frozenset(self._connected_peers), self._legacy_connection_state
+
+    def _refresh_max_observed_seniority(self) -> None:
+        self._max_observed_seniority = max(
+            [self.seniority, *self._peer_seniority.values()]
+        )
 
     async def _command_counter(self) -> None:
         with self._co_receiver as commands:

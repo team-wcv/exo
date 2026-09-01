@@ -1,27 +1,23 @@
+//! Compat shim for the old libp2p code
+
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::time::Duration;
 
-use crate::swarm::transport::tcp_transport;
-use crate::{alias, discovery};
-pub use behaviour::{Behaviour, BehaviourEvent};
-use futures_lite::{Stream, StreamExt};
-use libp2p::{PeerId, SwarmBuilder, gossipsub, identity, swarm::SwarmEvent};
-use tokio::sync::{mpsc, oneshot};
+use futures_lite::Stream;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use zenoh::Result;
+use zenoh::Session;
+use zenoh::handlers::FifoChannelHandler;
+use zenoh::liveliness::LivelinessToken;
+use zenoh::pubsub::Publisher;
+use zenoh::pubsub::Subscriber;
+use zenoh::qos::CongestionControl;
+use zenoh::sample::Sample;
+use zenoh::sample::SampleKind;
 
-/// The current version of the network: this prevents devices running different versions of the
-/// software from interacting with each other.
-///
-/// TODO: right now this is a hardcoded constant; figure out what the versioning semantics should
-///       even be, and how to inject the right version into this config/initialization. E.g. should
-///       this be passed in as a parameter? What about rapidly changing versions in debug builds?
-///       this is all VERY very hard to figure out and needs to be mulled over as a team.
-pub const NETWORK_VERSION: &[u8] = b"v0.0.1";
-pub const OVERRIDE_VERSION_ENV_VAR: &str = "EXO_LIBP2P_NAMESPACE";
-const DEFAULT_IDLE_CONNECTION_TIMEOUT_MS: u64 = 900_000;
-const IDLE_CONNECTION_TIMEOUT_MS_ENV: &str = "EXO_LIBP2P_IDLE_CONNECTION_TIMEOUT_MS";
-
-// Uses oneshot senders to emulate function calling apis while avoiding requiring unique ownership
-// of the Swarm.
+#[derive(Debug)]
 pub enum ToSwarm {
     Unsubscribe {
         topic: String,
@@ -29,52 +25,88 @@ pub enum ToSwarm {
     },
     Subscribe {
         topic: String,
-        result_sender: oneshot::Sender<Result<bool, gossipsub::SubscriptionError>>,
+        result_sender: oneshot::Sender<Result<bool>>,
     },
     Publish {
         topic: String,
         data: Vec<u8>,
-        result_sender: oneshot::Sender<Result<gossipsub::MessageId, gossipsub::PublishError>>,
+        result_sender: oneshot::Sender<Result<()>>,
     },
 }
+#[derive(Debug)]
 pub enum FromSwarm {
-    Message {
-        from: PeerId,
-        topic: String,
-        data: Vec<u8>,
-    },
-    Discovered {
-        peer_id: PeerId,
-    },
-    Expired {
-        peer_id: PeerId,
-    },
+    Message { topic: String, data: Vec<u8> },
+    Discovered { peer_id: String },
+    Expired { peer_id: String },
 }
 
+pub type Topics = HashMap<
+    String,
+    (
+        Subscriber<FifoChannelHandler<Sample>>,
+        Publisher<'static>,
+        JoinHandle<()>,
+    ),
+>;
 pub struct Swarm {
-    swarm: libp2p::Swarm<Behaviour>,
-    from_client: mpsc::Receiver<ToSwarm>,
+    pub session: crate::Session,
+    pub from_client: mpsc::Receiver<ToSwarm>,
+}
+
+fn live_prefix(namespace_prefix: &str) -> String {
+    format!("clusters/{namespace_prefix}/live/")
+}
+
+fn topic_key(namespace_prefix: &str, topic: &str) -> String {
+    format!("clusters/{namespace_prefix}/topics/{topic}")
 }
 
 impl Swarm {
     pub fn into_stream(self) -> Pin<Box<dyn Stream<Item = FromSwarm> + Send>> {
         let Swarm {
-            mut swarm,
+            session,
             mut from_client,
         } = self;
         let stream = async_stream::stream! {
+            let mut session = session;
+            let (mut to_topics, mut from_topics) = mpsc::channel(1024);
+            let mut topics = Topics::new();
+            let namespace_prefix = session.namespace_prefix.clone();
+            let Ok((_token, discovery)) = register_liveness(&mut session.z, &namespace_prefix).await else { return; };
             loop {
                 tokio::select! {
                     msg = from_client.recv() => {
                         let Some(msg) = msg else { break };
-                        on_message(&mut swarm, msg);
+                        on_message(
+                            &mut session.z,
+                            &session.namespace_prefix,
+                            &mut topics,
+                            &mut to_topics,
+                            msg,
+                        ).await;
                     }
-                    event = swarm.next() => {
-                        let Some(event) = event else { break };
-                        sync_gossipsub_explicit_peers(&mut swarm, &event);
-                        if let Some(item) = filter_swarm_event(event) {
-                            yield item;
+                    event = from_topics.recv() => {
+                        if let Some(event) = event {
+                            yield event
                         }
+                    }
+                    token = discovery.recv_async() => {
+                        if let Ok(token) = token {
+                            let key_expr = token.key_expr().as_str().to_owned();
+                            if let Some(peer_id) = key_expr.strip_prefix(&live_prefix(&namespace_prefix)) {
+                                yield match token.kind() {
+                                    SampleKind::Put => {
+                                        log::info!("discovered: {peer_id}");
+                                        FromSwarm::Discovered { peer_id: peer_id.to_owned() }
+                                    }
+                                    SampleKind::Delete => {
+                                        log::info!("expired: {peer_id}");
+                                        FromSwarm::Expired { peer_id: peer_id.to_owned() }
+                                    }
+                                }
+                            }
+                        }
+
                     }
                 }
             }
@@ -83,238 +115,170 @@ impl Swarm {
     }
 }
 
-fn sync_gossipsub_explicit_peers(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    event: &SwarmEvent<BehaviourEvent>,
-) {
-    if let SwarmEvent::Behaviour(BehaviourEvent::Discovery(
-        discovery::Event::ConnectionEstablished { peer_id, .. },
-    )) = event
-    {
-        swarm.behaviour_mut().gossipsub.add_explicit_peer(peer_id);
-    }
+async fn register_liveness(
+    session: &mut Session,
+    namespace_prefix: &str,
+) -> Result<(LivelinessToken, Subscriber<FifoChannelHandler<Sample>>)> {
+    let token = session
+        .liveliness()
+        .declare_token(format!(
+            "{}{}",
+            live_prefix(namespace_prefix),
+            session.zid()
+        ))
+        .await?;
+    let sub = session
+        .liveliness()
+        .declare_subscriber(format!("{}*", live_prefix(namespace_prefix)))
+        .history(true)
+        .await?;
+    Ok((token, sub))
 }
 
-fn on_message(swarm: &mut libp2p::Swarm<Behaviour>, message: ToSwarm) {
-    match message {
-        ToSwarm::Subscribe {
-            topic,
-            result_sender,
-        } => {
-            let result = swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&gossipsub::IdentTopic::new(topic));
-            _ = result_sender.send(result);
-        }
-        ToSwarm::Unsubscribe {
-            topic,
-            result_sender,
-        } => {
-            let result = swarm
-                .behaviour_mut()
-                .gossipsub
-                .unsubscribe(&gossipsub::IdentTopic::new(topic));
-            _ = result_sender.send(result);
-        }
+async fn on_message(
+    session: &mut Session,
+    namespace_prefix: &str,
+    topics: &mut Topics,
+    to_topics: &mut mpsc::Sender<FromSwarm>,
+    msg: ToSwarm,
+) {
+    match msg {
         ToSwarm::Publish {
             topic,
             data,
             result_sender,
         } => {
-            let result = swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(gossipsub::IdentTopic::new(topic), data);
-            _ = result_sender.send(result);
+            let res = match topics.get(&topic) {
+                Some(topic) => topic.1.put(data).await,
+                None => {
+                    // TODO: this should be an error but the python FromSwarm is somewhat nondeterministic
+                    Ok(()) //Err("not subscribed to topic!".into()),
+                }
+            };
+            _ = result_sender.send(res);
+        }
+        ToSwarm::Unsubscribe {
+            topic,
+            result_sender,
+        } => {
+            let Some((_, (subscriber, publisher, forwarder))) = topics.remove_entry(&topic) else {
+                _ = result_sender.send(false);
+                return;
+            };
+            forwarder.abort();
+            _ = publisher.undeclare().await;
+            _ = subscriber.undeclare().await;
+            _ = result_sender.send(true);
+        }
+        ToSwarm::Subscribe {
+            topic,
+            result_sender,
+        } => {
+            assert!(topic.is_ascii());
+            if topics.contains_key(&topic) {
+                _ = result_sender.send(Ok(false));
+                return;
+            }
+
+            let publisher_res = session
+                .declare_publisher(topic_key(namespace_prefix, &topic))
+                .congestion_control(CongestionControl::Block)
+                .await;
+            let publisher = match publisher_res {
+                Ok(p) => p,
+                Err(e) => {
+                    _ = result_sender.send(Err(e));
+                    return;
+                }
+            };
+
+            let subscriber_res = session
+                .declare_subscriber(topic_key(namespace_prefix, &topic))
+                .allowed_origin(zenoh::sample::Locality::Remote)
+                .await;
+            let subscriber = match subscriber_res {
+                Ok(s) => s,
+                Err(e) => {
+                    _ = result_sender.send(Err(e));
+                    return;
+                }
+            };
+
+            let handler = subscriber.handler().clone();
+            let sender = to_topics.clone();
+            let forward_topic = topic.clone();
+            let forwarder = tokio::spawn(async move {
+                while let Ok(sample) = handler.recv_async().await {
+                    if sample.kind() != SampleKind::Put {
+                        continue;
+                    }
+                    if sender
+                        .send(FromSwarm::Message {
+                            topic: forward_topic.clone(),
+                            data: sample.payload().to_bytes().to_vec(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+
+            assert!(
+                topics
+                    .insert(topic, (subscriber, publisher, forwarder))
+                    .is_none()
+            );
+            _ = result_sender.send(Ok(true));
         }
     }
 }
 
-fn filter_swarm_event(event: SwarmEvent<BehaviourEvent>) -> Option<FromSwarm> {
-    match event {
-        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
-            message:
-                gossipsub::Message {
-                    source: Some(peer_id),
-                    topic,
-                    data,
-                    ..
-                },
-            ..
-        })) => Some(FromSwarm::Message {
-            from: peer_id,
-            topic: topic.into_string(),
-            data,
-        }),
-        SwarmEvent::Behaviour(BehaviourEvent::Discovery(
-            discovery::Event::ConnectionEstablished { peer_id, .. },
-        )) => Some(FromSwarm::Discovered { peer_id }),
-        SwarmEvent::Behaviour(BehaviourEvent::Discovery(discovery::Event::ConnectionClosed {
-            peer_id,
-            ..
-        })) => Some(FromSwarm::Expired { peer_id }),
-        _ => None,
-    }
-}
-
-/// Create and configure a swarm.
-///
-/// - `listen_port`: TCP port to listen on. `0` lets the OS assign one.
-/// - `bootstrap_peers`: multiaddrs to dial for environments without mDNS.
-pub fn create_swarm(
-    keypair: identity::Keypair,
+pub async fn create_swarm(
+    identity: &str,
+    namespace: &str,
     from_client: mpsc::Receiver<ToSwarm>,
-    bootstrap_peers: Vec<String>,
     listen_port: u16,
-) -> alias::AnyResult<Swarm> {
-    let parsed_bootstrap_peers: Vec<libp2p::Multiaddr> = bootstrap_peers
-        .iter()
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse().ok())
-        .collect();
-
-    let mut swarm = SwarmBuilder::with_existing_identity(keypair)
-        .with_tokio()
-        .with_other_transport(tcp_transport)?
-        .with_behaviour(|keypair| Behaviour::new(keypair, parsed_bootstrap_peers))?
-        .with_swarm_config(|config| {
-            config.with_idle_connection_timeout(idle_connection_timeout())
-        })
-        .build();
-
-    swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{listen_port}").parse()?)?;
-    Ok(Swarm { swarm, from_client })
+    discovery_service_port: u16,
+    connect_endpoints: Vec<String>,
+) -> Result<Swarm> {
+    let enable_discovery = should_enable_discovery(&connect_endpoints);
+    let cfg = crate::cfg(identity, listen_port, &connect_endpoints)?;
+    let session = crate::open_with_discovery(
+        cfg,
+        namespace,
+        listen_port,
+        discovery_service_port,
+        enable_discovery,
+    )
+    .await?;
+    Ok(Swarm {
+        session,
+        from_client,
+    })
 }
 
-fn idle_connection_timeout() -> Duration {
-    Duration::from_millis(duration_millis_env(
-        IDLE_CONNECTION_TIMEOUT_MS_ENV,
-        DEFAULT_IDLE_CONNECTION_TIMEOUT_MS,
-    ))
+fn should_enable_discovery(connect_endpoints: &[String]) -> bool {
+    connect_endpoints.is_empty()
 }
 
-fn duration_millis_env(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
-}
+#[cfg(test)]
+mod tests {
+    use super::{live_prefix, should_enable_discovery, topic_key};
 
-mod transport {
-    use crate::alias;
-    use crate::swarm::{NETWORK_VERSION, OVERRIDE_VERSION_ENV_VAR};
-    use futures_lite::{AsyncRead, AsyncWrite};
-    use keccak_const::Sha3_256;
-    use libp2p::core::muxing;
-    use libp2p::core::transport::Boxed;
-    use libp2p::pnet::{PnetError, PnetOutput};
-    use libp2p::{PeerId, Transport, identity, noise, pnet, yamux};
-    use std::{env, sync::LazyLock};
-
-    /// Key used for networking's private network; parametrized on the [`NETWORK_VERSION`].
-    /// See [`pnet_upgrade`] for more.
-    static PNET_PRESHARED_KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
-        let builder = Sha3_256::new().update(b"exo_discovery_network");
-
-        if let Ok(var) = env::var(OVERRIDE_VERSION_ENV_VAR) {
-            let bytes = var.into_bytes();
-            builder.update(&bytes)
-        } else {
-            builder.update(NETWORK_VERSION)
-        }
-        .finalize()
-    });
-
-    /// Make the Swarm run on a private network, as to not clash with public libp2p nodes and
-    /// also different-versioned instances of this same network.
-    /// This is implemented as an additional "upgrade" ontop of existing [`libp2p::Transport`] layers.
-    async fn pnet_upgrade<TSocket>(
-        socket: TSocket,
-        _: impl Sized,
-    ) -> Result<PnetOutput<TSocket>, PnetError>
-    where
-        TSocket: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-    {
-        use pnet::{PnetConfig, PreSharedKey};
-        PnetConfig::new(PreSharedKey::new(*PNET_PRESHARED_KEY))
-            .handshake(socket)
-            .await
+    #[test]
+    fn zenoh_keys_are_scoped_by_namespace() {
+        assert_eq!(live_prefix("abc"), "clusters/abc/live/");
+        assert_eq!(topic_key("abc", "events"), "clusters/abc/topics/events");
+        assert_ne!(topic_key("abc", "events"), topic_key("def", "events"));
     }
 
-    /// TCP/IP transport layer configuration.
-    pub fn tcp_transport(
-        keypair: &identity::Keypair,
-    ) -> alias::AnyResult<Boxed<(PeerId, muxing::StreamMuxerBox)>> {
-        use libp2p::{
-            core::upgrade::Version,
-            tcp::{Config, tokio},
-        };
-
-        // `TCP_NODELAY` enabled => avoid latency
-        let tcp_config = Config::default().nodelay(true);
-
-        // V1 + lazy flushing => 0-RTT negotiation
-        let upgrade_version = Version::V1Lazy;
-
-        // Noise is faster than TLS + we don't care much for security
-        let noise_config = noise::Config::new(keypair)?;
-
-        // Use default Yamux config for multiplexing
-        let yamux_config = yamux::Config::default();
-
-        // Create new Tokio-driven TCP/IP transport layer
-        let base_transport = tokio::Transport::new(tcp_config)
-            .and_then(pnet_upgrade)
-            .upgrade(upgrade_version)
-            .authenticate(noise_config)
-            .multiplex(yamux_config);
-
-        // Return boxed transport (to flatten complex type)
-        Ok(base_transport.boxed())
-    }
-}
-
-mod behaviour {
-    use crate::{alias, discovery};
-    use libp2p::swarm::NetworkBehaviour;
-    use libp2p::{gossipsub, identity};
-
-    /// Behavior of the Swarm which composes all desired behaviors:
-    /// Right now its just [`discovery::Behaviour`] and [`gossipsub::Behaviour`].
-    #[derive(NetworkBehaviour)]
-    pub struct Behaviour {
-        pub discovery: discovery::Behaviour,
-        pub gossipsub: gossipsub::Behaviour,
-    }
-
-    impl Behaviour {
-        pub fn new(
-            keypair: &identity::Keypair,
-            bootstrap_peers: Vec<libp2p::Multiaddr>,
-        ) -> alias::AnyResult<Self> {
-            Ok(Self {
-                discovery: discovery::Behaviour::new(keypair, bootstrap_peers)?,
-                gossipsub: gossipsub_behaviour(keypair),
-            })
-        }
-    }
-
-    fn gossipsub_behaviour(keypair: &identity::Keypair) -> gossipsub::Behaviour {
-        use gossipsub::{ConfigBuilder, MessageAuthenticity, ValidationMode};
-
-        // build a gossipsub network behaviour
-        //  => signed message authenticity + strict validation mode means the message-ID is
-        //     automatically provided by gossipsub w/out needing to provide custom message-ID function
-        gossipsub::Behaviour::new(
-            MessageAuthenticity::Signed(keypair.clone()),
-            ConfigBuilder::default()
-                .max_transmit_size(8 * 1024 * 1024)
-                .validation_mode(ValidationMode::Strict)
-                .build()
-                .expect("the configuration should always be valid"),
-        )
-        .expect("creating gossipsub behavior should always work")
+    #[test]
+    fn explicit_bootstrap_disables_ipv6_discovery() {
+        assert!(should_enable_discovery(&[]));
+        assert!(!should_enable_discovery(&[
+            "tcp/192.0.2.10:52414".to_owned()
+        ]));
     }
 }

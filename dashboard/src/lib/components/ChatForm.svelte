@@ -343,8 +343,7 @@
               class="w-full bg-exo-medium-gray/50 border border-exo-yellow/30 rounded pl-3 pr-8 py-1.5 text-xs font-mono text-left tracking-wide cursor-pointer transition-all duration-200 hover:border-exo-yellow/50 focus:outline-none focus:border-exo-yellow/70"
             >
               {#if currentModelLabel}
-                <span class="text-exo-yellow">{currentModelLabel}</span
-                >
+                <span class="text-exo-yellow">{currentModelLabel}</span>
               {:else}
                 <span class="text-exo-light-gray/50">— SELECT MODEL —</span>
               {/if}

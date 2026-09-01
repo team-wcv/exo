@@ -420,7 +420,9 @@ def find_ip_prioritised(
 ) -> str | None:
     """Find an IP address between nodes with prioritization.
 
-    Priority: ethernet > wifi > unknown > thunderbolt
+    ``ring=True`` is for model-data paths that should prefer the fastest
+    direct link. ``ring=False`` is for socket/control-plane paths that
+    should stay on broadly reachable LAN addresses.
     """
     ips = list(_find_connection_ip(node_id, other_node_id, cycle_digraph))
     other_network = node_network.get(other_node_id, NodeNetworkInfo())
@@ -433,8 +435,6 @@ def find_ip_prioritised(
         if not ips:
             return None
 
-    # Ring should prioritise fastest connection. As a best-effort, we prioritise TB.
-    # TODO: Profile and get actual connection speeds.
     if ring:
         type_priority = {
             "thunderbolt": 0,
@@ -444,15 +444,13 @@ def find_ip_prioritised(
             "unknown": 4,
         }
 
-    # MLX_JACCL_COORDINATOR is the JACCL rendezvous, not the exo control plane;
-    # Big Brain forms RDMA groups reliably when this stays on Thunderbolt.
     else:
         type_priority = {
-            "thunderbolt": 0,
-            "maybe_ethernet": 1,
-            "ethernet": 2,
-            "wifi": 3,
-            "unknown": 4,
+            "maybe_ethernet": 0,
+            "ethernet": 1,
+            "wifi": 2,
+            "unknown": 3,
+            "thunderbolt": 4,
         }
 
     return min(

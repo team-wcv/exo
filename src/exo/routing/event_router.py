@@ -16,9 +16,26 @@ from exo.shared.types.events import (
     IndexedEvent,
     LocalForwarderEvent,
 )
+from exo.utils import channels
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.event_buffer import OrderedBuffer
 from exo.utils.task_group import TaskGroup
+
+
+class EventRouterClosedResourceError(ClosedResourceError):
+    pass
+
+
+class EventRouterBrokenResourceError(BrokenResourceError):
+    pass
+
+
+# Event Router is created and destroyed before consumers of its channels are,
+# so tag its channel-closure errors for consumers that need to distinguish them.
+_ERROR_CFG = channels.ErrorOverride(
+    closed_resource_error=EventRouterClosedResourceError,
+    broken_resource_error=EventRouterBrokenResourceError,
+)
 
 
 class EventDeliveryStalledError(RuntimeError):
@@ -124,7 +141,7 @@ class EventRouter:
             raise EventDeliveryStalledError(message)
 
     def sender(self) -> Sender[Event]:
-        send, recv = channel[Event]()
+        send, recv = channel[Event](error_override_config=_ERROR_CFG)
         if self._tg.is_running():
             self._tg.start_soon(self._ingest, SystemId(), recv)
         else:
@@ -133,7 +150,7 @@ class EventRouter:
 
     def receiver(self) -> Receiver[IndexedEvent]:
         assert not self._tg.is_running()
-        send, recv = channel[IndexedEvent]()
+        send, recv = channel[IndexedEvent](error_override_config=_ERROR_CFG)
         self.internal_outbound.append(send)
         return recv
 

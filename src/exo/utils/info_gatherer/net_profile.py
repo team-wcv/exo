@@ -1,7 +1,7 @@
-from collections import defaultdict
-from collections.abc import AsyncGenerator, Mapping
 import ipaddress
 import os
+from collections import defaultdict
+from collections.abc import AsyncGenerator, Mapping
 
 import anyio
 import httpx
@@ -72,10 +72,7 @@ def _probeable_interface(name: str, ip_address: str) -> bool:
         return False
 
     allowed_cidrs = _parse_allowed_cidrs()
-    if allowed_cidrs and not any(ip in network for network in allowed_cidrs):
-        return False
-
-    return True
+    return not allowed_cidrs or any(ip in network for network in allowed_cidrs)
 
 
 async def check_reachability(
