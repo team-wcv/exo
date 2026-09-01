@@ -191,7 +191,7 @@ def test_delivery_watchdog_allows_recent_or_disabled_events() -> None:
 
 
 @pytest.mark.asyncio
-async def test_trace_only_events_are_not_tracked_for_acknowledgement() -> None:
+async def test_trace_only_events_retry_until_producer_progress() -> None:
     command_sender, command_receiver = channel[ForwarderCommand]()
     global_sender, global_receiver = channel[GlobalForwarderEvent]()
     local_sender, local_receiver = channel[LocalForwarderEvent]()
@@ -210,7 +210,19 @@ async def test_trace_only_events_are_not_tracked_for_acknowledgement() -> None:
         await event_sender.send(trace_event)
         forwarded = await local_receiver.receive()
         assert forwarded.event == trace_event
-        assert not router.out_for_delivery
+        assert trace_event.event_id in router.out_for_delivery
+        router._delivery_stall_seconds = 1.0
+        router._raise_if_delivery_stalled(now=anyio.current_time() + 60.0)
+
+        router._acknowledge_prior_trace_events(
+            LocalForwarderEvent(
+                origin_idx=forwarded.origin_idx + 1,
+                origin=forwarded.origin,
+                session=session_id,
+                event=TestEvent(),
+            )
+        )
+        assert trace_event.event_id not in router.out_for_delivery
         event_sender.close()
 
     command_receiver.close()
