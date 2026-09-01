@@ -63,6 +63,7 @@ from mlx_lm.models.step3p5 import Step3p5Model as Step35InnerModel
 
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
 from exo.shared.types.worker.shards import PipelineShardMetadata
+from exo.worker.engines.mlx.sharding_policy import should_replicate_tensor_parameter
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
@@ -597,6 +598,8 @@ def tensor_auto_parallel(
     segments: int = 1
 
     def _all_to_sharded(path: str, weight: mx.array):
+        if should_replicate_tensor_parameter(path):
+            return None
         if path.endswith("bias"):
             logger.info(f"Sharding bias for {path} - all to sharded")
             return weight.ndim - 1, segments
@@ -611,6 +614,8 @@ def tensor_auto_parallel(
     n = group.size()
 
     def _sharded_to_all(path: str, weight: mx.array):
+        if should_replicate_tensor_parameter(path):
+            return None
         if path.endswith("bias"):
             logger.info(f"Sharding bias for {path} - sharded to all")
             weight /= n

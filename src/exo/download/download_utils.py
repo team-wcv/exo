@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -772,6 +773,26 @@ async def download_file_with_retry(
     )
 
 
+def _partial_metadata_paths(partial_path: Path) -> tuple[Path, Path]:
+    return Path(f"{partial_path}.meta"), Path(f"{partial_path}.meta.tmp")
+
+
+async def _discard_partial_download(partial_path: Path) -> None:
+    """Remove a partial payload and all peer-streaming metadata.
+
+    A payload reset must invalidate its companion metadata first-class. Leaving
+    the old safe-byte count behind can let the peer file server advertise stale
+    bytes while the clean retry is opening and truncating the payload.
+
+    Args:
+        partial_path: Partial payload path to discard.
+    """
+    metadata_path, temporary_metadata_path = _partial_metadata_paths(partial_path)
+    for candidate in (partial_path, metadata_path, temporary_metadata_path):
+        with contextlib.suppress(FileNotFoundError):
+            await aios.remove(candidate)
+
+
 async def _download_file(
     model_id: ModelId,
     revision: str,
@@ -819,38 +840,71 @@ async def _download_file(
         if (await aios.path.exists(partial_path))
         else None
     )
+    if resume_byte_pos is not None and resume_byte_pos > length:
+        logger.warning(
+            f"Ignoring oversized partial download for {path}: "
+            f"local={resume_byte_pos}, remote={length}"
+        )
+        await _discard_partial_download(partial_path)
+        resume_byte_pos = None
+        on_progress(0, length, False)
+
     if resume_byte_pos != length:
         url = urljoin(f"{get_hf_endpoint()}/{model_id}/resolve/{revision}/", path)
         headers = await get_download_headers()
-        if resume_byte_pos:
-            headers["Range"] = f"bytes={resume_byte_pos}-"
-        n_read = resume_byte_pos or 0
-        async with (
-            create_http_session(timeout_profile="long") as session,
-            session.get(url, headers=headers) as r,
-        ):
-            if r.status == 404:
-                raise FileNotFoundError(f"File not found: {url}")
-            if r.status in [401, 403]:
-                msg = await _build_auth_error_message(r.status, model_id)
-                raise HuggingFaceAuthenticationError(msg)
-            if r.status == 429:
-                raise HuggingFaceRateLimitError(
-                    f"HuggingFace rate limit hit downloading {model_id}/{path}",
-                    retry_after=_parse_retry_after(r.headers),
-                )
-            assert r.status in [200, 206], (
-                f"Failed to download {path} from {url}: {r.status}"
-            )
-            async with aiofiles.open(
-                partial_path, "ab" if resume_byte_pos else "wb"
-            ) as f:
-                while chunk := await r.content.read(8 * 1024 * 1024):
-                    n_read = n_read + (await f.write(chunk))
-                    await f.flush()
-                    # Write companion metadata for peer download streaming
-                    await _write_partial_meta(partial_path, n_read, length, remote_hash)
-                    on_progress(n_read, length, False)
+        async with create_http_session(timeout_profile="long") as session:
+            while True:
+                request_headers = headers.copy()
+                if resume_byte_pos:
+                    request_headers["Range"] = f"bytes={resume_byte_pos}-"
+                n_read = resume_byte_pos or 0
+
+                async with session.get(url, headers=request_headers) as r:
+                    if r.status == 416 and resume_byte_pos:
+                        logger.warning(
+                            f"Server rejected resume range for {path} at "
+                            f"byte {resume_byte_pos}; restarting cleanly"
+                        )
+                        await _discard_partial_download(partial_path)
+                        resume_byte_pos = None
+                        on_progress(0, length, False)
+                        continue
+                    if r.status == 404:
+                        raise FileNotFoundError(f"File not found: {url}")
+                    if r.status in [401, 403]:
+                        msg = await _build_auth_error_message(r.status, model_id)
+                        raise HuggingFaceAuthenticationError(msg)
+                    if r.status == 429:
+                        raise HuggingFaceRateLimitError(
+                            f"HuggingFace rate limit hit downloading {model_id}/{path}",
+                            retry_after=_parse_retry_after(r.headers),
+                        )
+                    assert r.status in [200, 206], (
+                        f"Failed to download {path} from {url}: {r.status}"
+                    )
+
+                    if resume_byte_pos and r.status == 200:
+                        logger.warning(
+                            f"Server ignored resume range for {path}; "
+                            "replacing the partial file with the full response"
+                        )
+                        await _discard_partial_download(partial_path)
+                        resume_byte_pos = None
+                        n_read = 0
+                        on_progress(0, length, False)
+
+                    async with aiofiles.open(
+                        partial_path, "ab" if resume_byte_pos else "wb"
+                    ) as f:
+                        while chunk := await r.content.read(8 * 1024 * 1024):
+                            n_read = n_read + (await f.write(chunk))
+                            await f.flush()
+                            # Write companion metadata for peer download streaming
+                            await _write_partial_meta(
+                                partial_path, n_read, length, remote_hash
+                            )
+                            on_progress(n_read, length, False)
+                break
 
     final_hash = await calc_hash(
         partial_path, hash_type="sha256" if len(remote_hash) == 64 else "sha1"
@@ -858,15 +912,15 @@ async def _download_file(
     integrity = final_hash == remote_hash
     if not integrity:
         try:
-            await aios.remove(partial_path)
+            await _discard_partial_download(partial_path)
         except Exception as e:
-            logger.error(f"Error removing partial file {partial_path}: {e}")
+            logger.error(f"Error removing partial download state {partial_path}: {e}")
         raise Exception(
             f"Downloaded file {target_dir / path} has hash {final_hash} but remote hash is {remote_hash}"
         )
     await aios.rename(partial_path, target_dir / path)
     # Clean up companion metadata file
-    meta_path = Path(f"{partial_path}.meta")
+    meta_path, _ = _partial_metadata_paths(partial_path)
     if await aios.path.exists(meta_path):
         await aios.remove(meta_path)
     on_progress(length, length, True)
@@ -881,10 +935,9 @@ async def _write_partial_meta(
     This small JSON file tells the peer file server how many bytes of the
     .partial file have been safely flushed to disk and are safe to serve.
     """
-    meta_path = Path(f"{partial_path}.meta")
+    meta_path, tmp_path = _partial_metadata_paths(partial_path)
     meta = json.dumps({"safe_bytes": safe_bytes, "total": total, "etag": etag})
     # Write to temp then rename for atomicity
-    tmp_path = Path(f"{partial_path}.meta.tmp")
     async with aiofiles.open(tmp_path, "w") as f:
         await f.write(meta)
     await aios.rename(tmp_path, meta_path)

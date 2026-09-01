@@ -297,20 +297,44 @@ def test_get_mlx_jaccl_coordinators():
 
     network_a = NodeNetworkInfo(
         interfaces=[
-            NetworkInterfaceInfo(name="en0", ip_address="169.254.0.5"),
-            NetworkInterfaceInfo(name="en0", ip_address="169.254.0.2"),
+            NetworkInterfaceInfo(
+                name="en0",
+                ip_address="169.254.0.5",
+                interface_type="apple_usb_ncm",
+            ),
+            NetworkInterfaceInfo(
+                name="en0",
+                ip_address="169.254.0.2",
+                interface_type="apple_usb_ncm",
+            ),
         ]
     )
     network_b = NodeNetworkInfo(
         interfaces=[
-            NetworkInterfaceInfo(name="en0", ip_address="169.254.0.1"),
-            NetworkInterfaceInfo(name="en0", ip_address="169.254.0.4"),
+            NetworkInterfaceInfo(
+                name="en0",
+                ip_address="169.254.0.1",
+                interface_type="apple_usb_ncm",
+            ),
+            NetworkInterfaceInfo(
+                name="en0",
+                ip_address="169.254.0.4",
+                interface_type="apple_usb_ncm",
+            ),
         ]
     )
     network_c = NodeNetworkInfo(
         interfaces=[
-            NetworkInterfaceInfo(name="en0", ip_address="169.254.0.3"),
-            NetworkInterfaceInfo(name="en0", ip_address="169.254.0.6"),
+            NetworkInterfaceInfo(
+                name="en0",
+                ip_address="169.254.0.3",
+                interface_type="apple_usb_ncm",
+            ),
+            NetworkInterfaceInfo(
+                name="en0",
+                ip_address="169.254.0.6",
+                interface_type="apple_usb_ncm",
+            ),
         ]
     )
     node_network = {
@@ -427,6 +451,251 @@ def test_jaccl_coordinator_prefers_lan_over_thunderbolt():
             ring=False,
         )
         == "192.168.1.11"
+    )
+
+
+def test_ring_prefers_ethernet_then_apple_usb_ncm_then_wifi():
+    source = NodeId()
+    sink = NodeId()
+    topology = Topology()
+    topology.add_node(source)
+    topology.add_node(sink)
+    for ip in ("192.168.1.21", "169.254.49.224", "192.168.1.121"):
+        topology.add_connection(
+            Connection(
+                source=source,
+                sink=sink,
+                edge=SocketConnection(
+                    sink_multiaddr=Multiaddr(address=f"/ip4/{ip}/tcp/5000")
+                ),
+            )
+        )
+
+    network = {
+        sink: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.21",
+                    interface_type="ethernet",
+                ),
+                NetworkInterfaceInfo(
+                    name="en9",
+                    ip_address="169.254.49.224",
+                    interface_type="apple_usb_ncm",
+                ),
+                NetworkInterfaceInfo(
+                    name="en1",
+                    ip_address="192.168.1.121",
+                    interface_type="wifi",
+                ),
+            ]
+        )
+    }
+
+    assert find_ip_prioritised(source, sink, topology, network, ring=True) == (
+        "192.168.1.21"
+    )
+
+    topology.remove_connection(
+        Connection(
+            source=source,
+            sink=sink,
+            edge=SocketConnection(
+                sink_multiaddr=Multiaddr(address="/ip4/192.168.1.21/tcp/5000")
+            ),
+        )
+    )
+    assert find_ip_prioritised(source, sink, topology, network, ring=True) == (
+        "169.254.49.224"
+    )
+
+
+def test_control_plane_prefers_wifi_lan_over_apple_usb_ncm():
+    source = NodeId()
+    sink = NodeId()
+    topology = Topology()
+    topology.add_node(source)
+    topology.add_node(sink)
+    for ip in ("169.254.49.224", "192.168.1.121"):
+        topology.add_connection(
+            Connection(
+                source=source,
+                sink=sink,
+                edge=SocketConnection(
+                    sink_multiaddr=Multiaddr(address=f"/ip4/{ip}/tcp/5000")
+                ),
+            )
+        )
+
+    network = {
+        sink: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en9",
+                    ip_address="169.254.49.224",
+                    interface_type="apple_usb_ncm",
+                ),
+                NetworkInterfaceInfo(
+                    name="en1",
+                    ip_address="192.168.1.121",
+                    interface_type="wifi",
+                ),
+            ]
+        )
+    }
+
+    assert find_ip_prioritised(source, sink, topology, network, ring=False) == (
+        "192.168.1.121"
+    )
+
+
+def test_fallback_respects_reachability_cidr(monkeypatch: pytest.MonkeyPatch):
+    source = NodeId()
+    sink = NodeId()
+    topology = Topology()
+    topology.add_node(source)
+    topology.add_node(sink)
+    network = {
+        sink: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="enP7s7",
+                    ip_address="192.168.1.150",
+                    interface_type="ethernet",
+                ),
+                NetworkInterfaceInfo(
+                    name="enx3a524871d6c5",
+                    ip_address="169.254.49.225",
+                    interface_type="apple_usb_ncm",
+                ),
+            ]
+        )
+    }
+
+    monkeypatch.setenv("EXO_REACHABILITY_ALLOWED_CIDRS", "192.168.1.0/24")
+    assert find_ip_prioritised(source, sink, topology, network, ring=True) == (
+        "192.168.1.150"
+    )
+
+    monkeypatch.setenv("EXO_REACHABILITY_ALLOWED_CIDRS", "169.254.0.0/16")
+    assert find_ip_prioritised(source, sink, topology, network, ring=True) == (
+        "169.254.49.225"
+    )
+
+
+def test_socket_edges_respect_reachability_cidr(monkeypatch: pytest.MonkeyPatch):
+    source = NodeId()
+    sink = NodeId()
+    topology = Topology()
+    topology.add_node(source)
+    topology.add_node(sink)
+    for ip in ("192.168.1.150", "169.254.49.225"):
+        topology.add_connection(
+            Connection(
+                source=source,
+                sink=sink,
+                edge=SocketConnection(
+                    sink_multiaddr=Multiaddr(address=f"/ip4/{ip}/tcp/5000")
+                ),
+            )
+        )
+    network = {
+        sink: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="enP7s7",
+                    ip_address="192.168.1.150",
+                    interface_type="ethernet",
+                ),
+                NetworkInterfaceInfo(
+                    name="enx3a524871d6c5",
+                    ip_address="169.254.49.225",
+                    interface_type="apple_usb_ncm",
+                ),
+            ]
+        )
+    }
+
+    monkeypatch.setenv("EXO_REACHABILITY_ALLOWED_CIDRS", "169.254.0.0/16")
+    assert find_ip_prioritised(source, sink, topology, network, ring=True) == (
+        "169.254.49.225"
+    )
+
+
+def test_global_ethernet_precedes_apple_usb_ncm_for_ring():
+    source = NodeId()
+    sink = NodeId()
+    topology = Topology()
+    topology.add_node(source)
+    topology.add_node(sink)
+    for ip in ("172.32.0.20", "169.254.49.225"):
+        topology.add_connection(
+            Connection(
+                source=source,
+                sink=sink,
+                edge=SocketConnection(
+                    sink_multiaddr=Multiaddr(address=f"/ip4/{ip}/tcp/5000")
+                ),
+            )
+        )
+    network = {
+        sink: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="enP7s7",
+                    ip_address="172.32.0.20",
+                    interface_type="ethernet",
+                ),
+                NetworkInterfaceInfo(
+                    name="enx3a524871d6c5",
+                    ip_address="169.254.49.225",
+                    interface_type="apple_usb_ncm",
+                ),
+            ]
+        )
+    }
+
+    assert find_ip_prioritised(source, sink, topology, network, ring=True) == (
+        "172.32.0.20"
+    )
+
+
+def test_control_plane_does_not_promote_apple_usb_link_local():
+    source = NodeId()
+    sink = NodeId()
+    topology = Topology()
+    topology.add_node(source)
+    topology.add_node(sink)
+    for ip in ("203.0.113.20", "169.254.49.225"):
+        topology.add_connection(
+            Connection(
+                source=source,
+                sink=sink,
+                edge=SocketConnection(
+                    sink_multiaddr=Multiaddr(address=f"/ip4/{ip}/tcp/5000")
+                ),
+            )
+        )
+    network = {
+        sink: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en1",
+                    ip_address="203.0.113.20",
+                    interface_type="wifi",
+                ),
+                NetworkInterfaceInfo(
+                    name="en9",
+                    ip_address="169.254.49.225",
+                    interface_type="apple_usb_ncm",
+                ),
+            ]
+        )
+    }
+
+    assert find_ip_prioritised(source, sink, topology, network, ring=False) == (
+        "203.0.113.20"
     )
 
 

@@ -6,7 +6,7 @@ from exo.shared.models.model_cards import ModelCard
 from exo.shared.topology import Topology
 from exo.shared.types.common import Host, NodeId
 from exo.shared.types.memory import Memory
-from exo.shared.types.profiling import MemoryUsage, NodeNetworkInfo
+from exo.shared.types.profiling import InterfaceType, MemoryUsage, NodeNetworkInfo
 from exo.shared.types.topology import Cycle, RDMAConnection, SocketConnection
 from exo.shared.types.worker.runners import RunnerId, ShardAssignments, ShardWithId
 from exo.shared.types.worker.shards import (
@@ -16,6 +16,7 @@ from exo.shared.types.worker.shards import (
     Sharding,
     TensorShardMetadata,
 )
+from exo.utils.info_gatherer.net_profile import is_probeable_interface
 
 
 def filter_cycles_by_memory(
@@ -424,11 +425,22 @@ def find_ip_prioritised(
     direct link. ``ring=False`` is for socket/control-plane paths that
     should stay on broadly reachable LAN addresses.
     """
-    ips = list(_find_connection_ip(node_id, other_node_id, cycle_digraph))
     other_network = node_network.get(other_node_id, NodeNetworkInfo())
-    ip_to_type = {
+    ip_to_interface = {iface.ip_address: iface for iface in other_network.interfaces}
+    ip_to_type: dict[str, InterfaceType] = {
         iface.ip_address: iface.interface_type for iface in other_network.interfaces
     }
+    ips = [
+        ip
+        for ip in _find_connection_ip(node_id, other_node_id, cycle_digraph)
+        if (
+            (iface := ip_to_interface.get(ip)) is not None
+            and is_probeable_interface(
+                iface.name, iface.ip_address, iface.interface_type
+            )
+        )
+        or (iface is None and is_probeable_interface("", ip, "unknown"))
+    ]
 
     if not ips:
         ips = _fallback_interface_ips(other_network)
@@ -440,8 +452,9 @@ def find_ip_prioritised(
             "thunderbolt": 0,
             "maybe_ethernet": 1,
             "ethernet": 2,
-            "wifi": 3,
-            "unknown": 4,
+            "apple_usb_ncm": 3,
+            "wifi": 4,
+            "unknown": 5,
         }
 
     else:
@@ -450,13 +463,18 @@ def find_ip_prioritised(
             "ethernet": 1,
             "wifi": 2,
             "unknown": 3,
-            "thunderbolt": 4,
+            "apple_usb_ncm": 4,
+            "thunderbolt": 5,
         }
 
     return min(
         ips,
         key=lambda ip: (
-            _address_priority(ip),
+            _address_priority(
+                ip,
+                ip_to_type.get(ip, "unknown"),
+                promote_apple_usb_ncm=ring,
+            ),
             type_priority.get(ip_to_type.get(ip, "unknown"), 5),
         ),
     )
@@ -468,6 +486,7 @@ def _fallback_interface_ips(node_network: NodeNetworkInfo) -> list[str]:
         iface.ip_address
         for iface in node_network.interfaces
         if _is_candidate_host_ip(iface.ip_address)
+        and is_probeable_interface(iface.name, iface.ip_address, iface.interface_type)
     ]
 
 
@@ -477,7 +496,12 @@ def _is_candidate_host_ip(ip: str) -> bool:
     return not (ip.startswith("127.") or ip == "0.0.0.0")
 
 
-def _address_priority(ip: str) -> int:
+def _address_priority(
+    ip: str,
+    interface_type: InterfaceType = "unknown",
+    *,
+    promote_apple_usb_ncm: bool = False,
+) -> int:
     if ip.startswith(("192.168.", "10.")):
         return 0
     if ip.startswith("172."):
@@ -487,9 +511,13 @@ def _address_priority(ip: str) -> int:
             return 3
         if 16 <= second_octet <= 31:
             return 0
+    if interface_type in {"ethernet", "maybe_ethernet", "thunderbolt"}:
+        return 0
     if ip.startswith("100."):
         return 2
     if ip.startswith("169.254."):
+        if interface_type == "apple_usb_ncm" and promote_apple_usb_ncm:
+            return 0
         return 3
     return 1
 

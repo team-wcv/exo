@@ -10,7 +10,7 @@ from loguru import logger
 
 from exo.shared.topology import Topology
 from exo.shared.types.common import NodeId
-from exo.shared.types.profiling import NodeNetworkInfo
+from exo.shared.types.profiling import InterfaceType, NodeNetworkInfo
 from exo.utils.channels import Sender, channel
 
 REACHABILITY_ATTEMPTS = 3
@@ -53,7 +53,9 @@ def _parse_allowed_ips() -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address,
     return tuple(ips)
 
 
-def _probeable_interface(name: str, ip_address: str) -> bool:
+def is_probeable_interface(
+    name: str, ip_address: str, interface_type: InterfaceType = "unknown"
+) -> bool:
     if name.startswith(_IGNORED_INTERFACE_PREFIXES):
         return False
 
@@ -62,7 +64,11 @@ def _probeable_interface(name: str, ip_address: str) -> bool:
     except ValueError:
         return False
 
-    if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+    if ip.is_loopback or ip.is_multicast or ip.is_unspecified:
+        return False
+    if ip.is_link_local and not (
+        isinstance(ip, ipaddress.IPv4Address) and interface_type == "apple_usb_ncm"
+    ):
         return False
     if ip in _TAILSCALE_IPV4 or ip in _TAILSCALE_IPV6:
         return False
@@ -180,7 +186,9 @@ async def check_reachable(
             if node_id == self_node_id:
                 continue
             for iface in node_network[node_id].interfaces:
-                if not _probeable_interface(iface.name, iface.ip_address):
+                if not is_probeable_interface(
+                    iface.name, iface.ip_address, iface.interface_type
+                ):
                     continue
                 tg.start_soon(_probe, iface.ip_address, node_id, client, send.clone())
         send.close()
