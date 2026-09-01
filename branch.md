@@ -1,17 +1,17 @@
 ---
-branch: chore/6a96f375-bigbrain-endpoints
+branch: chore/6a96fa36-bmbp-bigbrain-endpoint
 created: 2026-09-01
 owner: codex-agent
 status: active
-scope: "Add durable isolated Bigbrain endpoint profiles for Twins, Studio, and Spark"
+scope: "Add a durable isolated Bigbrain endpoint profile for wc-bmbp and revalidate every host"
 orchestraitor:
-  ticket: 6a96f375e6b6efd51fc86192
+  ticket: 6a96fa36e6b6efd51fc86202
 pr:
-  url: https://github.com/team-wcv/exo/pull/45
+  url: https://github.com/team-wcv/exo/pull/46
   state: open
 ---
 
-- Why this branch exists: Keep the Twin cluster on svc:bigbrain while Studio and Spark expose independent Exo control planes and Tailscale Services.
-- Changed paths: `ops/team-wcv/bigbrain/` host service profiles and endpoint-isolation runbook.
-- Validation run: Studio and Spark each report one isolated topology node and 124 models; all three dashboard roots return HTTP 200; Studio LaunchAgent is RunAtLoad/KeepAlive and running; Spark systemd unit is enabled/active with zero restarts; Twin topology contains only smbp/smbpt with two RunnerReady runners; post-detach Twin decode is 41.29 tok/s; Spark Laguna remains active with zero restarts.
-- Known follow-ups: Spark cannot load another large model while Laguna occupies most unified memory; endpoint availability and simultaneous heavyweight inference are separate constraints.
+- Why this branch exists: Give wc-bmbp a persistent solo Exo control plane for local runtimes without changing the Twin, Studio, or Spark namespaces.
+- Changed paths: `ops/team-wcv/bigbrain/bmbp/` LaunchAgent profile and endpoint-isolation runbook update.
+- Validation run: all four dashboard roots return HTTP 200 from peer devices; Twins remain exactly smbp/smbpt with two RunnerReady runners; Studio, Spark, and BMBP each report one isolated topology node and 124 models; all persistent services are running; Spark Laguna remains active with zero restarts.
+- Known follow-ups: BMBP should use localhost for same-host runtimes because its own Tailnet hostname does not hairpin from the host; peer devices reach the Tailnet URL normally.
