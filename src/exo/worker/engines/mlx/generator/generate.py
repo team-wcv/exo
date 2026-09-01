@@ -1448,7 +1448,9 @@ def mlx_generate(
         else:
             # Trim whichever cache overshoots so both start at ``aligned_hit``.
             if target_hit > aligned_hit:
-                mlx_trim_prompt_cache(cast(list[object], caches), target_hit - aligned_hit)  # type: ignore[reportArgumentType]
+                mlx_trim_prompt_cache(
+                    cast("list[Any]", caches), target_hit - aligned_hit
+                )
                 prompt_tokens = all_prompt_tokens[aligned_hit:]
                 prefix_hit_length = aligned_hit
                 if matched_index is not None and aligned_hit < target_hit:

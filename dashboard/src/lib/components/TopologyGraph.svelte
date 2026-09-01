@@ -102,7 +102,10 @@
             continue;
           }
 
-          shares.set(nodeId, (shard.endLayer - shard.startLayer) / shard.nLayers);
+          shares.set(
+            nodeId,
+            (shard.endLayer - shard.startLayer) / shard.nLayers,
+          );
         }
       }
     }

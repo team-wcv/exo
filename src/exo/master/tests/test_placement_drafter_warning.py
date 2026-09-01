@@ -229,6 +229,5 @@ def test_drafter_aware_card_no_warning_when_asymmetric_drafter_placed(
     assert instance.drafter_placement.drafter_node_id == drafter_node
     joined = "\n".join(loguru_capture).lower()
     assert "speculative decoding is single-device only" not in joined, (
-        f"misleading warning fired despite asymmetric drafter being placed: "
-        f"{joined}"
+        f"misleading warning fired despite asymmetric drafter being placed: {joined}"
     )

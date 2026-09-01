@@ -63,6 +63,7 @@ from mlx_lm.models.step3p5 import Step3p5Model as Step35InnerModel
 
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
 from exo.shared.types.worker.shards import PipelineShardMetadata
+from exo.worker.engines.mlx.sharding_policy import should_replicate_tensor_parameter
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
@@ -93,6 +94,79 @@ class _LayerCallable(Protocol):
     """
 
     def __call__(self, x: mx.array, *args: object, **kwargs: object) -> mx.array: ...
+
+
+class _Qwen4ExpConv1d(Protocol):
+    weight: mx.array
+    groups: int
+
+
+class _Qwen4ExpLinearAttention(Protocol):
+    key_dim: int
+    value_dim: int
+    n_k: int
+    n_v: int
+    dk: int
+    dv: int
+    conv_dim: int
+    in_proj_qkv: nn.Module
+    in_proj_z: nn.Module
+    in_proj_b: nn.Module
+    in_proj_a: nn.Module
+    out_proj: nn.Module
+    conv1d: _Qwen4ExpConv1d
+    A_log: mx.array
+    dt_bias: mx.array
+
+
+class _Qwen4ExpAttention(Protocol):
+    n_heads: int
+    n_kv_heads: int
+    q_proj: nn.Module
+    k_proj: nn.Module
+    v_proj: nn.Module
+    o_proj: nn.Module
+
+
+class _Qwen4ExpProjectionSet(Protocol):
+    gate_proj: nn.Module
+    down_proj: nn.Module
+    up_proj: nn.Module
+
+
+class _Qwen4ExpMoe(Protocol):
+    switch_mlp: _Qwen4ExpProjectionSet
+    shared_expert: _Qwen4ExpProjectionSet
+
+
+class _Qwen4ExpEmbeddingTable(Protocol):
+    rows: int
+    n_shards: int
+
+    def __contains__(self, name: object) -> bool: ...
+
+    def __delitem__(self, name: str) -> None: ...
+
+
+class _Qwen4ExpNGramEmbedding(Protocol):
+    ngram_heads: int
+    head_vocab_sizes: list[int]
+    ngram_embedding: nn.Module
+
+
+class _Qwen4ExpPle(Protocol):
+    ple_embedding: _Qwen4ExpNGramEmbedding
+    key_proj: nn.Module
+    value_proj: nn.Module
+
+
+class _Qwen4ExpLayer(Protocol):
+    mlp: object
+    ple: object | None
+
+
+class _Qwen4ExpInnerModel(Protocol):
+    ple_layers: list[int]
 
 
 class CustomMlxLayer(nn.Module):
@@ -230,6 +304,14 @@ def get_inner_model(model: nn.Module) -> nn.Module:
     )
 
 
+def _is_qwen4_exp_model(model: nn.Module) -> bool:
+    """Identify repo-supplied Qwen4-Exp models without importing their module."""
+    if cast(object, getattr(model, "model_type", None)) == "qwen4_exp":
+        return True
+    args = cast(object, getattr(model, "args", None))
+    return cast(object, getattr(args, "model_type", None)) == "qwen4_exp"
+
+
 def get_layers(inner_model_instance: nn.Module) -> list[_LayerCallable]:
     # Handle both model.layers and model.h cases
     layers: list[_LayerCallable]
@@ -271,6 +353,42 @@ def _patch_hybrid_cache(
         return cache
 
     model.make_cache = patched
+
+
+def _patch_qwen4_exp_pipeline_state(
+    model: nn.Module,
+    inner_model: nn.Module,
+    layers: list[_LayerCallable],
+    start_layer: int,
+    end_layer: int,
+) -> None:
+    """Align a repo-supplied Qwen4-Exp cache with its live pipeline slice."""
+    make_cache = cast(object, getattr(model, "make_cache", None))
+    if not callable(make_cache):
+        raise ValueError("Qwen4-Exp model must provide make_cache for pipeline use")
+    typed_make_cache = cast(Callable[[], list[object]], make_cache)
+
+    def patched_make_cache() -> list[object]:
+        caches = typed_make_cache()
+        local_layer_count = end_layer - start_layer
+        if len(caches) == local_layer_count:
+            return caches
+        if len(caches) >= end_layer:
+            return caches[start_layer:end_layer]
+        raise ValueError(
+            "Qwen4-Exp cache count does not match the local or global layer "
+            f"layout: got {len(caches)}, expected {local_layer_count} local "
+            f"entries or at least {end_layer} global entries"
+        )
+
+    model.make_cache = patched_make_cache
+    if hasattr(inner_model, "ple_layers"):
+        typed_inner_model = cast(_Qwen4ExpInnerModel, cast(object, inner_model))
+        typed_inner_model.ple_layers = [
+            index
+            for index, layer in enumerate(layers)
+            if getattr(layer, "ple", None) is not None
+        ]
 
 
 def pipeline_auto_parallel(
@@ -355,6 +473,15 @@ def pipeline_auto_parallel(
                 ssm_idx=inner_model_instance.ssm_idx,
                 has_linear=bool(linear_layers),
             )
+
+    if _is_qwen4_exp_model(model):
+        _patch_qwen4_exp_pipeline_state(
+            model,
+            inner_model_instance,
+            layers,
+            start_layer,
+            end_layer,
+        )
 
     if isinstance(inner_model_instance, NemotronHInnerModel):
         # NemotronH uses block_type: "M" (Mamba/SSM), "*" (Attention), "E" (MoE), "-" (MLP)
@@ -471,6 +598,8 @@ def tensor_auto_parallel(
     segments: int = 1
 
     def _all_to_sharded(path: str, weight: mx.array):
+        if should_replicate_tensor_parameter(path):
+            return None
         if path.endswith("bias"):
             logger.info(f"Sharding bias for {path} - all to sharded")
             return weight.ndim - 1, segments
@@ -485,6 +614,8 @@ def tensor_auto_parallel(
     n = group.size()
 
     def _sharded_to_all(path: str, weight: mx.array):
+        if should_replicate_tensor_parameter(path):
+            return None
         if path.endswith("bias"):
             logger.info(f"Sharding bias for {path} - sharded to all")
             weight /= n
@@ -539,6 +670,14 @@ def tensor_auto_parallel(
         )
     elif isinstance(model, Glm4MoeModel):
         tensor_parallel_sharding_strategy = Glm4MoeShardingStrategy(
+            group,
+            all_to_sharded_linear,
+            sharded_to_all_linear,
+            all_to_sharded_linear_in_place,
+            sharded_to_all_linear_in_place,
+        )
+    elif _is_qwen4_exp_model(model):
+        tensor_parallel_sharding_strategy = Qwen4ExpShardingStrategy(
             group,
             all_to_sharded_linear,
             sharded_to_all_linear,
@@ -765,6 +904,19 @@ class ShardedMoE(CustomMlxLayer):
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
         return y
+
+
+class _Qwen4ExpHeadShardedEmbedding(nn.Module):
+    """Expose one rank's n-gram heads while retaining only their weight shards."""
+
+    def __init__(self, embedding: nn.Module, head_start: int, head_end: int):
+        super().__init__()
+        self.embedding = embedding
+        self.head_start = head_start
+        self.head_end = head_end
+
+    def __call__(self, global_ids: mx.array) -> mx.array:
+        return self.embedding(global_ids[..., self.head_start : self.head_end])
 
 
 class ShardedMoEV4(CustomMlxLayer):
@@ -1115,6 +1267,174 @@ class MiniMaxShardingStrategy(TensorParallelShardingStrategy):
             mx.clear_cache()
 
             yield ModelLoadingResponse(layers_loaded=i, total=total)
+        return model
+
+
+class Qwen4ExpShardingStrategy(TensorParallelShardingStrategy):
+    """Tensor-shard repo-supplied Qwen4-Exp modules by structural contract."""
+
+    def _shard_linear_attention(
+        self, linear_attention: _Qwen4ExpLinearAttention
+    ) -> None:
+        key_dim = int(linear_attention.key_dim)
+        value_dim = int(linear_attention.value_dim)
+        if linear_attention.n_k % self.N or linear_attention.n_v % self.N:
+            raise ValueError(
+                "Qwen4-Exp linear attention heads must divide evenly across ranks"
+            )
+
+        linear_attention.in_proj_qkv = shard_linear(
+            linear_attention.in_proj_qkv,
+            "all-to-sharded",
+            segments=[key_dim, 2 * key_dim],
+            group=self.group,
+        )
+        linear_attention.in_proj_z = self.all_to_sharded_linear(
+            linear_attention.in_proj_z
+        )
+        linear_attention.in_proj_b = self.all_to_sharded_linear(
+            linear_attention.in_proj_b
+        )
+        linear_attention.in_proj_a = self.all_to_sharded_linear(
+            linear_attention.in_proj_a
+        )
+        linear_attention.out_proj = self.sharded_to_all_linear(
+            linear_attention.out_proj
+        )
+
+        rank = self.group.rank()
+        key_dim_shard = key_dim // self.N
+        value_dim_shard = value_dim // self.N
+        q_indices = mx.arange(rank * key_dim_shard, (rank + 1) * key_dim_shard)
+        k_indices = mx.arange(
+            key_dim + rank * key_dim_shard,
+            key_dim + (rank + 1) * key_dim_shard,
+        )
+        v_indices = mx.arange(
+            2 * key_dim + rank * value_dim_shard,
+            2 * key_dim + (rank + 1) * value_dim_shard,
+        )
+        conv_indices = mx.concatenate([q_indices, k_indices, v_indices])
+        linear_attention.conv1d.weight = linear_attention.conv1d.weight[conv_indices]
+
+        value_heads_per_rank = linear_attention.n_v // self.N
+        value_start = rank * value_heads_per_rank
+        value_end = value_start + value_heads_per_rank
+        linear_attention.A_log = linear_attention.A_log[value_start:value_end]
+        linear_attention.dt_bias = linear_attention.dt_bias[value_start:value_end]
+
+        linear_attention.n_k //= self.N
+        linear_attention.n_v //= self.N
+        linear_attention.key_dim = linear_attention.dk * linear_attention.n_k
+        linear_attention.value_dim = linear_attention.dv * linear_attention.n_v
+        linear_attention.conv_dim = (
+            2 * linear_attention.key_dim + linear_attention.value_dim
+        )
+        linear_attention.conv1d.groups = linear_attention.conv_dim
+
+    def _shard_attention(self, attention: _Qwen4ExpAttention) -> None:
+        if attention.n_heads % self.N or attention.n_kv_heads % self.N:
+            raise ValueError(
+                "Qwen4-Exp attention heads must divide evenly across ranks"
+            )
+        attention.q_proj = self.all_to_sharded_linear(attention.q_proj)
+        attention.k_proj = self.all_to_sharded_linear(attention.k_proj)
+        attention.v_proj = self.all_to_sharded_linear(attention.v_proj)
+        attention.o_proj = self.sharded_to_all_linear(attention.o_proj)
+        attention.n_heads //= self.N
+        attention.n_kv_heads //= self.N
+
+    def _shard_ple(self, ple: _Qwen4ExpPle) -> None:
+        ngram = ple.ple_embedding
+        table = cast(_Qwen4ExpEmbeddingTable, cast(object, ngram.ngram_embedding))
+        head_count = int(ngram.ngram_heads)
+        if head_count % self.N:
+            raise ValueError("Qwen4-Exp n-gram heads must divide evenly across ranks")
+
+        heads_per_rank = head_count // self.N
+        head_start = self.group.rank() * heads_per_rank
+        head_end = head_start + heads_per_rank
+        head_sizes = list(ngram.head_vocab_sizes)
+        if len(head_sizes) != head_count:
+            raise ValueError(
+                "Qwen4-Exp n-gram head metadata does not match the configured head count"
+            )
+
+        first_global_row = sum(head_sizes[:head_start])
+        last_global_row = sum(head_sizes[:head_end]) - 1
+        rows_per_shard = int(table.rows)
+        first_weight_shard = first_global_row // rows_per_shard
+        last_weight_shard = last_global_row // rows_per_shard
+
+        for shard_index in range(int(table.n_shards)):
+            if first_weight_shard <= shard_index <= last_weight_shard:
+                continue
+            shard_name = f"shard_{shard_index}"
+            if shard_name in table:
+                del table[shard_name]
+
+        ngram.ngram_embedding = _Qwen4ExpHeadShardedEmbedding(
+            cast(nn.Module, cast(object, table)),
+            head_start,
+            head_end,
+        )
+        ple.key_proj = self.sharded_to_all_linear(ple.key_proj)
+        ple.value_proj = self.sharded_to_all_linear(ple.value_proj)
+        logger.info(
+            f"Qwen4-Exp rank {self.group.rank()} retained n-gram heads "
+            f"[{head_start}, {head_end}) and weight shards "
+            f"[{first_weight_shard}, {last_weight_shard}]"
+        )
+
+    def _shard_moe(self, layer: nn.Module) -> None:
+        typed_layer = cast(_Qwen4ExpLayer, cast(object, layer))
+        moe = cast(_Qwen4ExpMoe, typed_layer.mlp)
+        self.all_to_sharded_linear_in_place(moe.switch_mlp.gate_proj)
+        self.sharded_to_all_linear_in_place(moe.switch_mlp.down_proj)
+        self.all_to_sharded_linear_in_place(moe.switch_mlp.up_proj)
+        self.all_to_sharded_linear_in_place(moe.shared_expert.gate_proj)
+        self.sharded_to_all_linear_in_place(moe.shared_expert.down_proj)
+        self.all_to_sharded_linear_in_place(moe.shared_expert.up_proj)
+        sharded_moe = ShardedMoE(cast(_LayerCallable, cast(object, moe)))
+        sharded_moe.sharding_group = self.group
+        typed_layer.mlp = sharded_moe
+
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        if not _is_qwen4_exp_model(model):
+            raise ValueError(f"Expected Qwen4-Exp model, got {type(model)}")
+
+        layers_value = cast(object, getattr(model, "layers", None))
+        if not isinstance(layers_value, list):
+            raise ValueError("Qwen4-Exp model must expose a list of layers")
+        layers = cast(list[nn.Module], layers_value)
+        total = len(layers)
+        for index, layer in enumerate(layers):
+            mx.eval(layer.parameters())
+            linear_attention = cast(object, getattr(layer, "linear_attn", None))
+            if linear_attention is not None:
+                self._shard_linear_attention(
+                    cast(_Qwen4ExpLinearAttention, linear_attention)
+                )
+            else:
+                attention = cast(object, getattr(layer, "self_attn", None))
+                if attention is None:
+                    raise ValueError(
+                        f"Qwen4-Exp layer {index} has neither linear nor sparse attention"
+                    )
+                self._shard_attention(cast(_Qwen4ExpAttention, attention))
+
+            self._shard_moe(layer)
+            typed_layer = cast(_Qwen4ExpLayer, cast(object, layer))
+            ple = typed_layer.ple
+            if ple is not None:
+                self._shard_ple(cast(_Qwen4ExpPle, ple))
+
+            mx.eval(layer)
+            mx.clear_cache()
+            yield ModelLoadingResponse(layers_loaded=index, total=total)
         return model
 
 

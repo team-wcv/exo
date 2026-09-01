@@ -1,4 +1,4 @@
-from exo_pyo3_bindings import PyFromSwarm
+from exo_rs import FromSwarm
 
 from exo.shared.types.common import NodeId
 from exo.utils.pydantic_ext import FrozenModel
@@ -7,9 +7,9 @@ from exo.utils.pydantic_ext import FrozenModel
 
 
 class ConnectionMessage(FrozenModel):
-    node_id: NodeId
     connected: bool
+    peer_id: NodeId | None = None
 
     @classmethod
-    def from_update(cls, update: PyFromSwarm.Connection) -> "ConnectionMessage":
-        return cls(node_id=NodeId(update.peer_id), connected=update.connected)
+    def from_update(cls, update: FromSwarm.Connection) -> "ConnectionMessage":
+        return cls(connected=update.connected, peer_id=NodeId(update.peer_id))

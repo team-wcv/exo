@@ -1400,9 +1400,7 @@ class TestRemoteTransportSubmitEndSessionShutdownRace:
         interpreter-level message and ``_submit_end_session`` must
         return cleanly."""
 
-        err = RuntimeError(
-            "cannot schedule new futures after interpreter shutdown"
-        )
+        err = RuntimeError("cannot schedule new futures after interpreter shutdown")
         transport = self._build_transport(err)
         self._call_submit_end_session(transport, 123)
 

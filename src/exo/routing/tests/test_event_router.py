@@ -3,15 +3,33 @@
 import anyio
 import pytest
 
-from exo.routing.event_router import EventRouter
+from exo.routing.event_router import (
+    EventDeliveryStalledError,
+    EventRouter,
+    _PendingDelivery,
+)
 from exo.shared.types.commands import ForwarderCommand, RequestEventLog
-from exo.shared.types.common import NodeId, SessionId
+from exo.shared.types.common import NodeId, SessionId, SystemId
 from exo.shared.types.events import (
     GlobalForwarderEvent,
     LocalForwarderEvent,
     TestEvent,
 )
 from exo.utils.channels import channel
+
+
+def _pending_test_event(session_id: SessionId) -> _PendingDelivery:
+    event = TestEvent()
+    return _PendingDelivery(
+        first_sent_at=10.0,
+        last_sent_at=24.0,
+        event=LocalForwarderEvent(
+            origin_idx=0,
+            origin=SystemId("worker"),
+            session=session_id,
+            event=event,
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -128,3 +146,42 @@ async def test_gap_replay_batches_are_capped() -> None:
 
     global_sender.close()
     local_receiver.close()
+
+
+def test_delivery_watchdog_uses_original_send_time() -> None:
+    command_sender, _ = channel[ForwarderCommand]()
+    _, global_receiver = channel[GlobalForwarderEvent]()
+    local_sender, _ = channel[LocalForwarderEvent]()
+    session_id = SessionId(master_node_id=NodeId("master"), election_clock=0)
+    router = EventRouter(
+        session_id=session_id,
+        command_sender=command_sender,
+        external_inbound=global_receiver,
+        external_outbound=local_sender,
+    )
+    router._delivery_stall_seconds = 15.0
+    pending = _pending_test_event(session_id)
+    router.out_for_delivery[pending.event.event.event_id] = pending
+
+    with pytest.raises(EventDeliveryStalledError, match="half-open routing session"):
+        router._raise_if_delivery_stalled(now=25.0)
+
+
+def test_delivery_watchdog_allows_recent_or_disabled_events() -> None:
+    command_sender, _ = channel[ForwarderCommand]()
+    _, global_receiver = channel[GlobalForwarderEvent]()
+    local_sender, _ = channel[LocalForwarderEvent]()
+    session_id = SessionId(master_node_id=NodeId("master"), election_clock=0)
+    router = EventRouter(
+        session_id=session_id,
+        command_sender=command_sender,
+        external_inbound=global_receiver,
+        external_outbound=local_sender,
+    )
+    pending = _pending_test_event(session_id)
+    router.out_for_delivery[pending.event.event.event_id] = pending
+
+    router._delivery_stall_seconds = 15.0
+    router._raise_if_delivery_stalled(now=24.9)
+    router._delivery_stall_seconds = 0.0
+    router._raise_if_delivery_stalled(now=100.0)

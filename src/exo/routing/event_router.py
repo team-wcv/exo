@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from random import random
 
@@ -15,9 +16,49 @@ from exo.shared.types.events import (
     IndexedEvent,
     LocalForwarderEvent,
 )
+from exo.utils import channels
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.event_buffer import OrderedBuffer
 from exo.utils.task_group import TaskGroup
+
+
+class EventRouterClosedResourceError(ClosedResourceError):
+    pass
+
+
+class EventRouterBrokenResourceError(BrokenResourceError):
+    pass
+
+
+# Event Router is created and destroyed before consumers of its channels are,
+# so tag its channel-closure errors for consumers that need to distinguish them.
+_ERROR_CFG = channels.ErrorOverride(
+    closed_resource_error=EventRouterClosedResourceError,
+    broken_resource_error=EventRouterBrokenResourceError,
+)
+
+
+class EventDeliveryStalledError(RuntimeError):
+    """Raised when pubsub stays half-open long enough to require a restart."""
+
+
+@dataclass(frozen=True)
+class _PendingDelivery:
+    first_sent_at: float
+    last_sent_at: float
+    event: LocalForwarderEvent
+
+
+def _delivery_stall_seconds() -> float:
+    raw_value = os.getenv("EXO_EVENT_DELIVERY_STALL_SECONDS", "0")
+    try:
+        return max(0.0, float(raw_value))
+    except ValueError:
+        logger.warning(
+            "Invalid EXO_EVENT_DELIVERY_STALL_SECONDS value "
+            f"{raw_value!r}; delivery watchdog disabled"
+        )
+        return 0.0
 
 
 @dataclass
@@ -33,7 +74,7 @@ class EventRouter:
     event_buffer: OrderedBuffer[Event] = field(
         init=False, default_factory=OrderedBuffer
     )
-    out_for_delivery: dict[EventId, tuple[float, LocalForwarderEvent]] = field(
+    out_for_delivery: dict[EventId, _PendingDelivery] = field(
         init=False, default_factory=dict
     )
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
@@ -44,6 +85,9 @@ class EventRouter:
     _nack_cap_seconds: float = field(init=False, default=10.0)
     _nack_max_events: int = field(init=False, default=64)
     _last_outbound_warning_size: int = field(init=False, default=0)
+    _delivery_stall_seconds: float = field(
+        init=False, default_factory=_delivery_stall_seconds
+    )
 
     async def run(self):
         try:
@@ -59,20 +103,45 @@ class EventRouter:
     async def _simple_retry(self):
         while True:
             await anyio.sleep(1 + random())
+            now = anyio.current_time()
+            self._raise_if_delivery_stalled(now)
             # list here is a shallow clone for shared mutation
-            for e_id, (time, event) in list(self.out_for_delivery.items()):
-                if anyio.current_time() > time + 5:
-                    self.out_for_delivery[e_id] = (anyio.current_time(), event)
+            for e_id, pending in list(self.out_for_delivery.items()):
+                if now > pending.last_sent_at + 5:
+                    self.out_for_delivery[e_id] = _PendingDelivery(
+                        first_sent_at=pending.first_sent_at,
+                        last_sent_at=now,
+                        event=pending.event,
+                    )
                     logger.debug(
                         "Retrying unacknowledged local event "
-                        f"event_id={e_id} origin_idx={event.origin_idx} "
-                        f"event_type={type(event.event).__name__} "
+                        f"event_id={e_id} origin_idx={pending.event.origin_idx} "
+                        f"event_type={type(pending.event.event).__name__} "
                         f"out_for_delivery={len(self.out_for_delivery)}"
                     )
-                    await self.external_outbound.send(event)
+                    await self.external_outbound.send(pending.event)
+
+    def _raise_if_delivery_stalled(self, now: float) -> None:
+        if self._delivery_stall_seconds <= 0:
+            return
+        for event_id, pending in self.out_for_delivery.items():
+            age_seconds = now - pending.first_sent_at
+            if age_seconds < self._delivery_stall_seconds:
+                continue
+            message = (
+                "Event delivery stalled; terminating Exo so the service supervisor "
+                "can rebuild the half-open routing session "
+                f"event_id={event_id} "
+                f"event_type={type(pending.event.event).__name__} "
+                f"age_seconds={age_seconds:.3f} "
+                f"out_for_delivery={len(self.out_for_delivery)} "
+                f"threshold_seconds={self._delivery_stall_seconds:.3f}"
+            )
+            logger.critical(message)
+            raise EventDeliveryStalledError(message)
 
     def sender(self) -> Sender[Event]:
-        send, recv = channel[Event]()
+        send, recv = channel[Event](error_override_config=_ERROR_CFG)
         if self._tg.is_running():
             self._tg.start_soon(self._ingest, SystemId(), recv)
         else:
@@ -81,7 +150,7 @@ class EventRouter:
 
     def receiver(self) -> Receiver[IndexedEvent]:
         assert not self._tg.is_running()
-        send, recv = channel[IndexedEvent]()
+        send, recv = channel[IndexedEvent](error_override_config=_ERROR_CFG)
         self.internal_outbound.append(send)
         return recv
 
@@ -100,7 +169,12 @@ class EventRouter:
                 )
                 idx += 1
                 await self.external_outbound.send(f_ev)
-                self.out_for_delivery[event.event_id] = (anyio.current_time(), f_ev)
+                now = anyio.current_time()
+                self.out_for_delivery[event.event_id] = _PendingDelivery(
+                    first_sent_at=now,
+                    last_sent_at=now,
+                    event=f_ev,
+                )
                 self._log_outbound_pressure()
 
     async def _run_ext_in(self):

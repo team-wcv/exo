@@ -1,3 +1,5 @@
+# pyright: reportPrivateUsage=false
+
 import anyio
 import pytest
 from anyio import create_task_group, fail_after, move_on_after
@@ -6,7 +8,7 @@ from exo.routing.connection_message import ConnectionMessage
 from exo.shared.election import Election, ElectionMessage, ElectionResult
 from exo.shared.types.commands import ForwarderCommand, TestCommand
 from exo.shared.types.common import NodeId, SessionId, SystemId
-from exo.utils.channels import channel
+from exo.utils.channels import Receiver, Sender, channel
 
 # ======= #
 # Helpers #
@@ -103,6 +105,35 @@ async def test_single_round_broadcasts_and_updates_seniority_on_self_win() -> No
 
     # We should have updated seniority to 2 (A + B).
     assert election.seniority == 2
+
+
+def test_each_peer_membership_change_updates_election_state() -> None:
+    em_out_tx, _ = channel[ElectionMessage]()
+    _, em_in_rx = channel[ElectionMessage]()
+    er_tx, _ = channel[ElectionResult]()
+    _, cm_rx = channel[ConnectionMessage]()
+    _, co_rx = channel[ForwarderCommand]()
+    election = Election(
+        node_id=NodeId("ME"),
+        election_message_receiver=em_in_rx,
+        election_message_sender=em_out_tx,
+        election_result_sender=er_tx,
+        connection_message_receiver=cm_rx,
+        command_receiver=co_rx,
+    )
+
+    peer_a = NodeId("A")
+    peer_b = NodeId("B")
+    apply_messages = election._apply_connection_messages
+
+    assert apply_messages([ConnectionMessage(connected=True, peer_id=peer_a)])
+    election._peer_seniority[peer_a] = 1_000_000
+    election._refresh_max_observed_seniority()
+    assert apply_messages([ConnectionMessage(connected=True, peer_id=peer_b)])
+    assert not apply_messages([ConnectionMessage(connected=True, peer_id=peer_b)])
+    assert apply_messages([ConnectionMessage(connected=False, peer_id=peer_a)])
+    assert election._max_observed_seniority == election.seniority
+    assert apply_messages([ConnectionMessage(connected=False, peer_id=peer_b)])
 
 
 @pytest.mark.anyio
@@ -330,7 +361,7 @@ async def test_connection_message_triggers_new_round_broadcast() -> None:
             tg.start_soon(election.run)
 
             # Send any connection message object; we close quickly to cancel before result creation
-            await cm_tx.send(ConnectionMessage(node_id=NodeId(), connected=True))
+            await cm_tx.send(ConnectionMessage(connected=True))
 
             # Expect a broadcast for the new round at clock=1
             while True:
@@ -346,6 +377,112 @@ async def test_connection_message_triggers_new_round_broadcast() -> None:
             co_tx.close()
 
     # After cancellation (before election finishes), no seniority changes asserted here.
+
+
+@pytest.mark.anyio
+async def test_post_settle_campaign_advances_clock() -> None:
+    """A startup peer race gets a higher-clock campaign after router settling."""
+    em_out_tx, em_out_rx = channel[ElectionMessage]()
+    em_in_tx, em_in_rx = channel[ElectionMessage]()
+    er_tx, _er_rx = channel[ElectionResult]()
+    cm_tx, cm_rx = channel[ConnectionMessage]()
+    co_tx, co_rx = channel[ForwarderCommand]()
+
+    election = Election(
+        node_id=NodeId("RESTARTED_WORKER"),
+        election_message_receiver=em_in_rx,
+        election_message_sender=em_out_tx,
+        election_result_sender=er_tx,
+        connection_message_receiver=cm_rx,
+        command_receiver=co_rx,
+        is_candidate=True,
+    )
+    election._router_settle_seconds = 0.01
+
+    async with create_task_group() as tg:
+        with fail_after(2):
+            tg.start_soon(election.run)
+
+            while True:
+                message = await em_out_rx.receive()
+                if message.clock == 1:
+                    assert message.proposed_session.master_node_id == NodeId(
+                        "RESTARTED_WORKER"
+                    )
+                    break
+
+            em_in_tx.close()
+            cm_tx.close()
+            co_tx.close()
+
+
+@pytest.mark.anyio
+async def test_post_settle_campaign_rejoins_running_forced_master() -> None:
+    master_out_tx, master_out_rx = channel[ElectionMessage]()
+    master_in_tx, master_in_rx = channel[ElectionMessage]()
+    master_result_tx, master_result_rx = channel[ElectionResult]()
+    master_connection_tx, master_connection_rx = channel[ConnectionMessage]()
+    master_command_tx, master_command_rx = channel[ForwarderCommand]()
+    master = Election(
+        node_id=NodeId("MASTER"),
+        election_message_receiver=master_in_rx,
+        election_message_sender=master_out_tx,
+        election_result_sender=master_result_tx,
+        connection_message_receiver=master_connection_rx,
+        command_receiver=master_command_rx,
+        seniority=1_000_000,
+    )
+    master._router_settle_seconds = 0.0
+
+    worker_out_tx, worker_out_rx = channel[ElectionMessage]()
+    worker_in_tx, worker_in_rx = channel[ElectionMessage]()
+    worker_result_tx, worker_result_rx = channel[ElectionResult]()
+    worker_connection_tx, worker_connection_rx = channel[ConnectionMessage]()
+    worker_command_tx, worker_command_rx = channel[ForwarderCommand]()
+    worker = Election(
+        node_id=NodeId("WORKER"),
+        election_message_receiver=worker_in_rx,
+        election_message_sender=worker_out_tx,
+        election_result_sender=worker_result_tx,
+        connection_message_receiver=worker_connection_rx,
+        command_receiver=worker_command_rx,
+    )
+    worker._router_settle_seconds = 0.01
+
+    async def forward_messages(
+        source: Receiver[ElectionMessage],
+        destination: Sender[ElectionMessage],
+    ) -> None:
+        with source:
+            async for message in source:
+                await destination.send(message)
+
+    async with create_task_group() as tg:
+        with fail_after(2):
+            tg.start_soon(master.run)
+            initial_master = await master_result_rx.receive()
+            assert initial_master.session_id.master_node_id == NodeId("MASTER")
+
+            # The worker starts after the master's clock-0 broadcasts are gone.
+            # Only the delayed higher-clock round can make the established
+            # bootstrap connection converge on the forced master.
+            master_out_rx.collect()
+            tg.start_soon(forward_messages, master_out_rx, worker_in_tx)
+            tg.start_soon(forward_messages, worker_out_rx, master_in_tx)
+            tg.start_soon(worker.run)
+
+            while True:
+                result = await worker_result_rx.receive()
+                if result.session_id.master_node_id == NodeId("MASTER"):
+                    assert result.won_clock == 1
+                    break
+
+            tg.cancel_scope.cancel()
+
+    master_connection_tx.close()
+    master_command_tx.close()
+    worker_connection_tx.close()
+    worker_command_tx.close()
 
 
 @pytest.mark.anyio
@@ -370,14 +507,13 @@ async def test_duplicate_connection_message_does_not_start_new_round() -> None:
         with fail_after(2):
             tg.start_soon(election.run)
 
-            peer_id = NodeId("PEER")
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            await cm_tx.send(ConnectionMessage(connected=True))
             while True:
                 got = await em_out_rx.receive()
                 if got.clock == 1:
                     break
 
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            await cm_tx.send(ConnectionMessage(connected=True))
             got_duplicate_round = False
             with move_on_after(0.3):
                 while True:
@@ -414,15 +550,14 @@ async def test_transient_disconnect_reconnect_does_not_start_new_round() -> None
         with fail_after(2):
             tg.start_soon(election.run)
 
-            peer_id = NodeId("PEER")
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            await cm_tx.send(ConnectionMessage(connected=True))
             while True:
                 got = await em_out_rx.receive()
                 if got.clock == 1:
                     break
 
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=False))
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            await cm_tx.send(ConnectionMessage(connected=False))
+            await cm_tx.send(ConnectionMessage(connected=True))
 
             got_flap_round = False
             with move_on_after(0.3):
@@ -464,16 +599,15 @@ async def test_transient_disconnect_uses_configured_grace(
         with fail_after(2):
             tg.start_soon(election.run)
 
-            peer_id = NodeId("PEER")
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            await cm_tx.send(ConnectionMessage(connected=True))
             while True:
                 got = await em_out_rx.receive()
                 if got.clock == 1:
                     break
 
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=False))
+            await cm_tx.send(ConnectionMessage(connected=False))
             await anyio.sleep(0.1)
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            await cm_tx.send(ConnectionMessage(connected=True))
 
             got_flap_round = False
             with move_on_after(0.3):
@@ -511,14 +645,13 @@ async def test_sustained_disconnect_starts_new_round_after_grace_period() -> Non
         with fail_after(2):
             tg.start_soon(election.run)
 
-            peer_id = NodeId("PEER")
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=True))
+            await cm_tx.send(ConnectionMessage(connected=True))
             while True:
                 got = await em_out_rx.receive()
                 if got.clock == 1:
                     break
 
-            await cm_tx.send(ConnectionMessage(node_id=peer_id, connected=False))
+            await cm_tx.send(ConnectionMessage(connected=False))
             while True:
                 got = await em_out_rx.receive()
                 if got.clock == 2:

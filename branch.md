@@ -13,5 +13,5 @@ pr:
 
 - Why this branch exists: parse both legacy and current shard-assignment wire formats in the dashboard.
 - Changed paths: dashboard instance metadata, readiness, download, and topology parsing.
-- Validation run: pending refresh against current main and current-head review.
-- Known follow-ups: include the asymmetric drafter runner in readiness checks before requesting review.
+- Validation run: merged `team-wcv/main` at `9e1b8ef4`; Svelte check reports 0 errors/warnings; production build and Prettier checks pass.
+- Known follow-ups: current-head CI and Codex review.

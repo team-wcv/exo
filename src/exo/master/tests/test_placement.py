@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+
 import pytest
 
 from exo.master.placement import (
@@ -13,6 +15,7 @@ from exo.master.tests.conftest import (
 )
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
 from exo.shared.topology import Topology
+from exo.shared.types.backends import Backend
 from exo.shared.types.commands import PlaceInstance
 from exo.shared.types.common import CommandId, NodeId
 from exo.shared.types.events import (
@@ -126,7 +129,14 @@ def model_card() -> ModelCard:
         hidden_size=30,
         supports_tensor=True,
         tasks=[ModelTask.TextGeneration],
+        backends=[Backend.MlxMetal],
     )
+
+
+def _metal_only(
+    node_memory: Mapping[NodeId, object],
+) -> dict[NodeId, list[Backend]]:
+    return {node_id: [Backend.MlxMetal] for node_id in node_memory}
 
 
 def place_instance_command(model_card: ModelCard) -> PlaceInstance:
@@ -219,7 +229,9 @@ def test_get_instance_placements_create_instance(
     topology.add_connection(conn_b_a)
 
     # act
-    placements = place_instance(cic, topology, {}, node_memory, node_network)
+    placements = place_instance(
+        cic, topology, {}, node_memory, node_network, _metal_only(node_memory)
+    )
 
     # assert
     assert len(placements) == 1
@@ -259,9 +271,12 @@ def test_get_instance_placements_one_node_exact_fit() -> None:
             hidden_size=1000,
             supports_tensor=True,
             tasks=[ModelTask.TextGeneration],
+            backends=[Backend.MlxMetal],
         ),
     )
-    placements = place_instance(cic, topology, {}, node_memory, node_network)
+    placements = place_instance(
+        cic, topology, {}, node_memory, node_network, _metal_only(node_memory)
+    )
 
     assert len(placements) == 1
     instance_id = list(placements.keys())[0]
@@ -286,9 +301,12 @@ def test_get_instance_placements_one_node_fits_with_extra_memory() -> None:
             hidden_size=1000,
             supports_tensor=True,
             tasks=[ModelTask.TextGeneration],
+            backends=[Backend.MlxMetal],
         ),
     )
-    placements = place_instance(cic, topology, {}, node_memory, node_network)
+    placements = place_instance(
+        cic, topology, {}, node_memory, node_network, _metal_only(node_memory)
+    )
 
     assert len(placements) == 1
     instance_id = list(placements.keys())[0]
@@ -313,11 +331,14 @@ def test_get_instance_placements_one_node_not_fit() -> None:
             hidden_size=1000,
             supports_tensor=True,
             tasks=[ModelTask.TextGeneration],
+            backends=[Backend.MlxMetal],
         ),
     )
 
     with pytest.raises(ValueError, match="No cycles found with sufficient memory"):
-        place_instance(cic, topology, {}, node_memory, node_network)
+        place_instance(
+            cic, topology, {}, node_memory, node_network, _metal_only(node_memory)
+        )
 
 
 def test_filtered_single_node_placement_can_use_total_memory_capacity() -> None:
@@ -512,7 +533,9 @@ def test_placement_uses_leaf_nodes_as_tie_breaker(
     cic = place_instance_command(model_card=model_card)
 
     # act
-    placements = place_instance(cic, topology, {}, node_memory, node_network)
+    placements = place_instance(
+        cic, topology, {}, node_memory, node_network, _metal_only(node_memory)
+    )
 
     # assert
     assert len(placements) == 1
@@ -1872,7 +1895,13 @@ def test_placement_prefers_cycle_with_downloaded_model(
 
     cic = place_instance_command(model_card)
     placements = place_instance(
-        cic, topology, {}, node_memory, node_network, download_status=download_status
+        cic,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+        download_status=download_status,
     )
 
     assert len(placements) == 1
@@ -1944,7 +1973,13 @@ def test_placement_prefers_cycle_with_higher_download_progress(
 
     cic = place_instance_command(model_card)
     placements = place_instance(
-        cic, topology, {}, node_memory, node_network, download_status=download_status
+        cic,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+        download_status=download_status,
     )
 
     assert len(placements) == 1
@@ -1992,7 +2027,13 @@ def test_placement_does_not_prefer_cycle_with_failed_download(
 
     cic = place_instance_command(model_card)
     placements = place_instance(
-        cic, topology, {}, node_memory, node_network, download_status=download_status
+        cic,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+        download_status=download_status,
     )
 
     assert len(placements) == 1

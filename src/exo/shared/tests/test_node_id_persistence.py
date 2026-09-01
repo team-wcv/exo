@@ -6,14 +6,67 @@ from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue as QueueT
 from multiprocessing.synchronize import Event as EventT
 from multiprocessing.synchronize import Semaphore as SemaphoreT
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 from loguru import logger
-from pytest import LogCaptureFixture, mark
+from pytest import LogCaptureFixture, MonkeyPatch, mark
 
-from exo.routing.router import get_node_id_keypair
-from exo.shared.constants import EXO_NODE_ID_KEYPAIR
+from exo.routing.router import get_node_zid
+from exo.shared.constants import EXO_NODE_ZID
 
 NUM_CONCURRENT_PROCS = 10
+
+
+def test_node_id_regenerates_zenoh_invalid_leading_zero(tmp_path: Path) -> None:
+    path = tmp_path / "node_zid"
+    path.write_text("0" + "1" * 31 + "\n")
+    valid_bytes = bytes.fromhex("1" + "2" * 31)
+
+    with patch("exo.routing.router.os.urandom", return_value=valid_bytes):
+        node_id = get_node_zid(path)
+
+    assert node_id == "1" + "2" * 31
+    assert path.read_text() == "1" + "2" * 31 + "\n"
+
+
+def test_node_id_generation_retries_invalid_random_value(tmp_path: Path) -> None:
+    path = tmp_path / "node_zid"
+    valid_bytes = bytes.fromhex("a" + "3" * 31)
+
+    with patch(
+        "exo.routing.router.os.urandom",
+        side_effect=[bytes(16), valid_bytes],
+    ):
+        node_id = get_node_zid(path)
+
+    assert node_id == "a" + "3" * 31
+
+
+def test_node_zid_rejects_a_persisted_leading_zero(tmp_path: Path) -> None:
+    path = tmp_path / "node_zid"
+    path.write_text("0" + "a" * 31)
+
+    node_id = get_node_zid(path=path)
+
+    assert len(node_id) == 32
+    assert node_id[0] != "0"
+    assert path.read_text().strip() == node_id
+
+
+def test_node_zid_retries_random_leading_zero(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "node_zid"
+    random_bytes = Mock(
+        side_effect=[bytes.fromhex("0" + "a" * 31), bytes.fromhex("1" + "b" * 31)]
+    )
+    monkeypatch.setattr("exo.routing.router.os.urandom", random_bytes)
+
+    node_id = get_node_zid(path=path)
+
+    assert node_id == "1" + "b" * 31
+    assert random_bytes.call_count == 2
 
 
 def _get_keypair_concurrent_subprocess_task(
@@ -23,7 +76,7 @@ def _get_keypair_concurrent_subprocess_task(
     sem.release()
     # wait to be told to begin simultaneous read
     ev.wait()
-    queue.put(get_node_id_keypair().to_bytes())
+    queue.put(get_node_zid().encode())
 
 
 def _get_keypair_concurrent(num_procs: int) -> bytes:
@@ -79,7 +132,7 @@ def test_node_id_fetching(caplog: LogCaptureFixture):
     reps = 10
 
     # delete current file and write a new one
-    _delete_if_exists(EXO_NODE_ID_KEYPAIR)
+    _delete_if_exists(EXO_NODE_ZID)
     kp = _get_keypair_concurrent(NUM_CONCURRENT_PROCS)
 
     with caplog.at_level(101):  # supress logs
@@ -88,6 +141,6 @@ def test_node_id_fetching(caplog: LogCaptureFixture):
             assert kp == _get_keypair_concurrent(NUM_CONCURRENT_PROCS)
 
         # make sure that after deleting, we are not fetching the same value
-        _delete_if_exists(EXO_NODE_ID_KEYPAIR)
+        _delete_if_exists(EXO_NODE_ZID)
         for _ in range(reps):
             assert kp != _get_keypair_concurrent(NUM_CONCURRENT_PROCS)

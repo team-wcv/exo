@@ -12,7 +12,7 @@ drafter_model_ids = ["mlx-community/gemma-4-e2b-it-bf16", "mlx-community/gemma-4
 coupled_drafter = "mlx-community/gemma-4-26B-A4B-it-assistant-bf16"
 
 context_length = 262144
-
+backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
 [storage_size]
 in_bytes = 51611872412
 

@@ -996,6 +996,47 @@
   // Computed: Check if filter is active (from store)
   const isFilterActive = $derived(() => nodeFilter.size > 0);
 
+  interface ShardEntry {
+    nodeId: string;
+    runnerId: string;
+    shard: unknown;
+  }
+
+  function getShardEntries(shardAssignments: unknown): ShardEntry[] {
+    if (!shardAssignments || typeof shardAssignments !== "object") return [];
+
+    const assignments = shardAssignments as {
+      shards?: unknown[];
+      nodeToRunner?: Record<string, string>;
+      runnerToShard?: Record<string, unknown>;
+    };
+    if (Array.isArray(assignments.shards)) {
+      return assignments.shards.flatMap((entry) => {
+        if (
+          !Array.isArray(entry) ||
+          entry.length < 3 ||
+          typeof entry[0] !== "string" ||
+          typeof entry[1] !== "string"
+        ) {
+          return [];
+        }
+        return [{ nodeId: entry[0], runnerId: entry[1], shard: entry[2] }];
+      });
+    }
+
+    const runnerToNode = new Map(
+      Object.entries(assignments.nodeToRunner || {}).map(
+        ([nodeId, runnerId]) => [runnerId, nodeId],
+      ),
+    );
+    return Object.entries(assignments.runnerToShard || {}).flatMap(
+      ([runnerId, shard]) => {
+        const nodeId = runnerToNode.get(runnerId);
+        return nodeId ? [{ nodeId, runnerId, shard }] : [];
+      },
+    );
+  }
+
   // Helper to unwrap tagged instance for hover highlighting
   function unwrapInstanceNodes(instanceWrapped: unknown): Set<string> {
     if (!instanceWrapped || typeof instanceWrapped !== "object")
@@ -1004,11 +1045,10 @@
     if (keys.length !== 1) return new Set();
     const instance = (instanceWrapped as Record<string, unknown>)[keys[0]];
     if (!instance || typeof instance !== "object") return new Set();
-    const inst = instance as {
-      shardAssignments?: { nodeToRunner?: Record<string, string> };
-    };
-    if (!inst.shardAssignments?.nodeToRunner) return new Set();
-    return new Set(Object.keys(inst.shardAssignments.nodeToRunner));
+    const inst = instance as { shardAssignments?: unknown };
+    return new Set(
+      getShardEntries(inst.shardAssignments).map((entry) => entry.nodeId),
+    );
   }
 
   function toggleInstanceDownloadDetails(nodeId: string): void {
@@ -1477,6 +1517,9 @@
         addToast({ type: "info", message: `Launching model...` });
         // Always auto-select the newly launched model so the user chats to what they just launched
         setSelectedChatModel(modelId);
+        userForcedIdle = false;
+        pendingChatModelId = modelId;
+        chatLaunchState = "launching";
 
         // Record the launch in recent models history
         recordRecentLaunch(modelId);
@@ -1800,6 +1843,9 @@
     const inst = instance as {
       shardAssignments?: {
         modelId?: string;
+        shards?: unknown[];
+        nodeToRunner?: Record<string, string>;
+        runnerToShard?: Record<string, unknown>;
       };
     };
     const instanceModelId = inst.shardAssignments?.modelId;
@@ -1816,10 +1862,12 @@
       };
     }
 
-    // Get node IDs assigned to this instance.
-    const instanceNodeIds = getInstanceShardEntries(instance)
-      .map((entry) => entry.nodeId)
-      .filter((nodeId): nodeId is string => Boolean(nodeId));
+    // Get node IDs assigned to this instance
+    const instanceNodeIds = Array.from(
+      new Set(
+        getShardEntries(inst.shardAssignments).map((entry) => entry.nodeId),
+      ),
+    );
 
     const result = collectDownloadStatus(instanceModelId, instanceNodeIds);
 
@@ -1892,9 +1940,24 @@
       return { statusText: "PREPARING", statusClass: "inactive" };
     }
 
-    const runnerIds = getInstanceShardEntries(instance).map(
-      (entry) => entry.runnerId,
+    const inst = instance as {
+      shardAssignments?: unknown;
+      drafterPlacement?: { drafterRunnerId?: string };
+    };
+    const runnerIds = Array.from(
+      new Set([
+        ...getShardEntries(inst.shardAssignments).map(
+          (entry) => entry.runnerId,
+        ),
+        ...(inst.drafterPlacement?.drafterRunnerId
+          ? [inst.drafterPlacement.drafterRunnerId]
+          : []),
+      ]),
     );
+
+    if (runnerIds.some((runnerId) => !runnersData[runnerId])) {
+      return { statusText: "PREPARING", statusClass: "inactive" };
+    }
 
     const statuses = runnerIds
       .map((rid) => {
@@ -2039,57 +2102,6 @@
     return [null, null];
   }
 
-  function getInstanceShardEntries(instance: unknown): Array<{
-    nodeId: string | null;
-    runnerId: string;
-    shard: unknown;
-  }> {
-    if (!instance || typeof instance !== "object") return [];
-    const inst = instance as {
-      shardAssignments?: {
-        nodeToRunner?: Record<string, string>;
-        runnerToShard?: Record<string, unknown>;
-        shards?: unknown[];
-      };
-    };
-    const assignments = inst.shardAssignments;
-    if (!assignments) return [];
-
-    const runnerToNode = new Map<string, string>();
-    for (const [nodeId, runnerId] of Object.entries(
-      assignments.nodeToRunner || {},
-    )) {
-      runnerToNode.set(runnerId, nodeId);
-    }
-
-    const oldWireEntries = Object.entries(assignments.runnerToShard || {}).map(
-      ([runnerId, shard]) => ({
-        nodeId: runnerToNode.get(runnerId) ?? null,
-        runnerId,
-        shard,
-      }),
-    );
-    if (oldWireEntries.length > 0) return oldWireEntries;
-
-    return (assignments.shards || [])
-      .map((entry) => {
-        if (!Array.isArray(entry) || entry.length < 3) return null;
-        const [nodeId, runnerId, shard] = entry;
-        if (typeof runnerId !== "string") return null;
-        return {
-          nodeId: typeof nodeId === "string" ? nodeId : null,
-          runnerId,
-          shard,
-        };
-      })
-      .filter(
-        (
-          entry,
-        ): entry is { nodeId: string | null; runnerId: string; shard: unknown } =>
-          entry !== null,
-      );
-  }
-
   // Get model ID from an instance
   function getInstanceModelId(instanceWrapped: unknown): string {
     const [, instance] = getTagged(instanceWrapped);
@@ -2122,12 +2134,20 @@
     if (instanceTag === "MlxRingInstance") instanceType = "MLX Ring";
     else if (instanceTag === "MlxJacclInstance") instanceType = "MLX RDMA";
 
+    const inst = instance as {
+      shardAssignments?: {
+        shards?: unknown[];
+        nodeToRunner?: Record<string, string>;
+        runnerToShard?: Record<string, unknown>;
+      };
+    };
+
     // Sharding strategy from first shard
     let sharding = "Unknown";
-    const shardEntries = getInstanceShardEntries(instance);
-    const firstShard = shardEntries[0]?.shard;
-    if (firstShard) {
-      const [shardTag] = getTagged(firstShard);
+    const shardEntries = getShardEntries(inst.shardAssignments);
+    const firstShardWrapped = shardEntries[0]?.shard;
+    if (firstShardWrapped) {
+      const [shardTag] = getTagged(firstShardWrapped);
       if (shardTag === "PipelineShardMetadata") sharding = "Pipeline";
       else if (shardTag === "TensorShardMetadata") sharding = "Tensor";
       else if (shardTag === "AsymmetricTensorShardMetadata")
@@ -2138,11 +2158,7 @@
 
     // Node names from topology
     const nodeIds = Array.from(
-      new Set(
-        shardEntries
-          .map((entry) => entry.nodeId)
-          .filter((nodeId): nodeId is string => Boolean(nodeId)),
-      ),
+      new Set(shardEntries.map((entry) => entry.nodeId)),
     );
     const nodeNames = nodeIds.map((nodeId) => {
       const node = data?.nodes?.[nodeId];
@@ -2250,23 +2266,12 @@
     instance: Record<string, unknown>,
     shardType: "Pipeline" | "Tensor",
   ) {
-    const runnerToShard =
-      (
-        instance.shardAssignments as
-          | { runnerToShard?: Record<string, unknown> }
-          | undefined
-      )?.runnerToShard || {};
-    const nodeToRunner =
-      (
-        instance.shardAssignments as
-          | { nodeToRunner?: Record<string, string> }
-          | undefined
-      )?.nodeToRunner || {};
-    const runnerEntries = Object.entries(runnerToShard).map(
-      ([runnerId, shardWrapped]) => {
+    const runnerEntries = getShardEntries(instance.shardAssignments).map(
+      ({ nodeId, runnerId, shard: shardWrapped }) => {
         const [tag, shard] = getTagged(shardWrapped);
         const meta = shard as
           | {
+              deviceRank?: number;
               modelMeta?: {
                 worldSize?: number;
                 nLayers?: number;
@@ -2274,8 +2279,8 @@
               };
             }
           | undefined;
-        const deviceRank = meta?.modelMeta?.deviceRank ?? 0;
-        return { runnerId, tag, deviceRank };
+        const deviceRank = meta?.deviceRank ?? meta?.modelMeta?.deviceRank ?? 0;
+        return { nodeId, runnerId, tag, deviceRank };
       },
     );
 
@@ -2286,13 +2291,11 @@
           : r.tag === "TensorShardMetadata",
       )
       .sort((a, b) => a.deviceRank - b.deviceRank)
-      .map((r, idx) => {
-        const nodeId = Object.entries(nodeToRunner).find(
-          ([, rid]) => rid === r.runnerId,
-        )?.[0];
-        return { nodeId, runnerId: r.runnerId, order: idx };
-      })
-      .filter((item) => item.nodeId);
+      .map((entry, index) => ({
+        nodeId: entry.nodeId,
+        runnerId: entry.runnerId,
+        order: index,
+      }));
 
     return ordered as Array<{
       nodeId: string;
@@ -2605,12 +2608,10 @@
   ];
 
   // ── Seamless chat: launch models from chat view ──
-  type ChatLaunchState =
-    | "idle"
-    | "launching"
-    | "downloading"
-    | "loading"
-    | "ready";
+  type InFlightChatLaunchState = "launching" | "downloading" | "loading";
+  type ReadyLikeChatLaunchState = "idle" | "ready";
+  type ChatLaunchState = InFlightChatLaunchState | ReadyLikeChatLaunchState;
+
   let chatLaunchState = $state<ChatLaunchState>("idle");
   let pendingChatModelId = $state<string | null>(null);
   let selectedChatCategory = $state<string | null>(null);
@@ -3187,6 +3188,15 @@
     if (model) {
       pendingAutoMessage = { content, files };
       userForcedIdle = false;
+      // The selected model is already being placed or loaded; keep the queued
+      // message and let the existing launch state effects send it once ready.
+      if (
+        pendingChatModelId === model &&
+        chatLaunchState !== "idle" &&
+        chatLaunchState !== "ready"
+      ) {
+        return;
+      }
       launchModelForChat(model, "picker", messages().length > 0);
       return;
     }
@@ -4661,7 +4671,7 @@
                 type="button"
                 onclick={() => {
                   completeOnboarding();
-                  sendMessage(chip, undefined, thinkingEnabled());
+                  handleChatSend(chip);
                 }}
                 class="px-4 py-2 rounded-full border border-white/10 bg-white/5 text-sm text-white/60 hover:bg-white/10 hover:text-white/80 hover:border-white/20 transition-all duration-200 cursor-pointer"
               >
@@ -6159,7 +6169,7 @@
                           onclick={() => {
                             chatLaunchState = "idle";
                             selectedChatCategory = null;
-                            sendMessage(prompt, undefined, thinkingEnabled());
+                            handleChatSend(prompt);
                           }}
                           class="text-left px-3 py-2.5 text-xs text-exo-light-gray hover:text-white font-mono rounded-lg border border-exo-medium-gray/30 hover:border-exo-yellow/30 bg-exo-dark-gray/30 hover:bg-exo-dark-gray/60 transition-all duration-200 cursor-pointer"
                         >

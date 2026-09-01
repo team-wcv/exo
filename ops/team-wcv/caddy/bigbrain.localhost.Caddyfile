@@ -1,0 +1,21 @@
+{
+	auto_https off
+	admin localhost:2019
+}
+
+# Big Brain EXO dashboard alias for wc-studio.
+#
+# Keep this pinned to the LAN/control address for the EXO master. Do not use
+# wc-smbp, wc-smbp.local, or any other hostname here: the system resolver can
+# select Tailscale MagicDNS and route the dashboard/API proxy away from the
+# local EXO LAN/TB5 cluster path.
+http://bigbrain.localhost:18888, http://bigbrain-local.localhost:18888 {
+	reverse_proxy 192.168.1.63:52415
+
+	log {
+		output file /Users/JJ/.config/caddy/bigbrain.log {
+			roll_size 10mb
+			roll_keep 3
+		}
+	}
+}
