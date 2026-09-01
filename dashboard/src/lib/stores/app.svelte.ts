@@ -983,6 +983,28 @@ class AppStore {
     return inst.shardAssignments?.modelId ?? null;
   }
 
+  private getInstanceShardMetadata(instance: unknown): unknown[] {
+    if (!instance || typeof instance !== "object") return [];
+    const inst = instance as {
+      shardAssignments?: {
+        runnerToShard?: Record<string, unknown>;
+        shards?: unknown[];
+      };
+    };
+    const assignments = inst.shardAssignments;
+    if (!assignments) return [];
+
+    const runnerToShard = assignments.runnerToShard || {};
+    const oldWireShards = Object.values(runnerToShard);
+    if (oldWireShards.length > 0) return oldWireShards;
+
+    return (assignments.shards || [])
+      .map((entry) =>
+        Array.isArray(entry) && entry.length >= 3 ? entry[2] : null,
+      )
+      .filter((entry): entry is unknown => entry !== null);
+  }
+
   private describeInstance(instanceWrapped: unknown): {
     sharding: string | null;
     instanceType: string | null;
@@ -997,11 +1019,7 @@ class AppStore {
     else if (instanceTag === "MlxJacclInstance") instanceType = "MLX RDMA";
 
     let sharding: string | null = null;
-    const inst = instance as {
-      shardAssignments?: { runnerToShard?: Record<string, unknown> };
-    };
-    const runnerToShard = inst.shardAssignments?.runnerToShard || {};
-    const firstShardWrapped = Object.values(runnerToShard)[0];
+    const firstShardWrapped = this.getInstanceShardMetadata(instance)[0];
     if (firstShardWrapped) {
       const [shardTag] = this.getTaggedValue(firstShardWrapped);
       if (shardTag === "PipelineShardMetadata") sharding = "Pipeline";

@@ -618,11 +618,7 @@
         // Only check instances for the model we launched during onboarding
         if (getInstanceModelId(inst) !== onboardingModelId) continue;
         const runnerStatus = deriveInstanceStatus(inst);
-        if (
-          runnerStatus.statusText === "READY" ||
-          runnerStatus.statusText === "LOADED" ||
-          runnerStatus.statusText === "RUNNING"
-        ) {
+        if (isInstanceUsableStatus(runnerStatus.statusText)) {
           anyReady = true;
         } else if (runnerStatus.statusText === "DOWNLOADING") {
           anyDownloading = true;
@@ -659,11 +655,7 @@
       for (const [, inst] of Object.entries(instanceData)) {
         if (getInstanceModelId(inst) !== onboardingModelId) continue;
         const runnerStatus = deriveInstanceStatus(inst);
-        if (
-          runnerStatus.statusText === "READY" ||
-          runnerStatus.statusText === "LOADED" ||
-          runnerStatus.statusText === "RUNNING"
-        ) {
+        if (isInstanceUsableStatus(runnerStatus.statusText)) {
           onboardingStep = 9;
           break;
         }
@@ -1929,6 +1921,10 @@
     }
   }
 
+  function isInstanceUsableStatus(statusText: string): boolean {
+    return statusText === "READY" || statusText === "RUNNING";
+  }
+
   function deriveInstanceStatus(instanceWrapped: unknown): {
     statusText: string;
     statusClass: string;
@@ -1940,31 +1936,39 @@
       return { statusText: "PREPARING", statusClass: "inactive" };
     }
 
-    const inst = instance as { shardAssignments?: unknown };
-    const runnerIds = getShardEntries(inst.shardAssignments).map(
-      (entry) => entry.runnerId,
+    const inst = instance as {
+      shardAssignments?: unknown;
+      drafterPlacement?: { drafterRunnerId?: string };
+    };
+    const runnerIds = Array.from(
+      new Set([
+        ...getShardEntries(inst.shardAssignments).map(
+          (entry) => entry.runnerId,
+        ),
+        ...(inst.drafterPlacement?.drafterRunnerId
+          ? [inst.drafterPlacement.drafterRunnerId]
+          : []),
+      ]),
     );
 
-    const statuses = runnerIds
-      .map((rid) => {
-        const r = runnersData[rid];
-        if (!r) return null;
-        const [kind] = getTagged(r);
-        const statusMap: Record<string, string> = {
-          RunnerWaitingForInitialization: "WaitingForInitialization",
-          RunnerInitializingBackend: "InitializingBackend",
-          RunnerWaitingForModel: "WaitingForModel",
-          RunnerLoading: "Loading",
-          RunnerLoaded: "Loaded",
-          RunnerWarmingUp: "WarmingUp",
-          RunnerReady: "Ready",
-          RunnerRunning: "Running",
-          RunnerShutdown: "Shutdown",
-          RunnerFailed: "Failed",
-        };
-        return kind ? statusMap[kind] || null : null;
-      })
-      .filter((s): s is string => s !== null);
+    const statuses = runnerIds.map((rid) => {
+      const r = runnersData[rid];
+      if (!r) return null;
+      const [kind] = getTagged(r);
+      const statusMap: Record<string, string> = {
+        RunnerWaitingForInitialization: "WaitingForInitialization",
+        RunnerInitializingBackend: "InitializingBackend",
+        RunnerWaitingForModel: "WaitingForModel",
+        RunnerLoading: "Loading",
+        RunnerLoaded: "Loaded",
+        RunnerWarmingUp: "WarmingUp",
+        RunnerReady: "Ready",
+        RunnerRunning: "Running",
+        RunnerShutdown: "Shutdown",
+        RunnerFailed: "Failed",
+      };
+      return kind ? statusMap[kind] || null : null;
+    });
 
     const has = (s: string) => statuses.includes(s);
 
@@ -1973,6 +1977,8 @@
     if (has("Failed")) return { statusText: "FAILED", statusClass: "failed" };
     if (has("Shutdown"))
       return { statusText: "SHUTDOWN", statusClass: "inactive" };
+    if (statuses.some((status) => status === null))
+      return { statusText: "PREPARING", statusClass: "inactive" };
     if (has("Loading")) {
       // Tensor parallel: each runner loads all layers — use max/min (bottleneck)
       // Pipeline parallel: each runner loads a disjoint slice — use sum
@@ -2008,18 +2014,23 @@
     }
     if (has("WarmingUp"))
       return { statusText: "WARMING UP", statusClass: "starting" };
-    if (has("Running"))
-      return { statusText: "RUNNING", statusClass: "running" };
-    if (has("Ready")) return { statusText: "READY", statusClass: "loaded" };
-    if (has("Loaded")) return { statusText: "LOADED", statusClass: "loaded" };
     if (has("WaitingForModel"))
       return { statusText: "WAITING", statusClass: "starting" };
     if (has("InitializingBackend"))
       return { statusText: "INITIALIZING", statusClass: "starting" };
     if (has("WaitingForInitialization"))
       return { statusText: "INITIALIZING", statusClass: "starting" };
+    if (has("Loaded")) return { statusText: "LOADED", statusClass: "loaded" };
 
-    return { statusText: "RUNNING", statusClass: "active" };
+    const allUsable = statuses.every(
+      (status) => status === "Ready" || status === "Running",
+    );
+    if (allUsable && has("Running"))
+      return { statusText: "RUNNING", statusClass: "running" };
+    if (allUsable && has("Ready"))
+      return { statusText: "READY", statusClass: "loaded" };
+
+    return { statusText: "PREPARING", statusClass: "inactive" };
   }
 
   function getBytes(value: unknown): number {
@@ -2170,11 +2181,7 @@
       const dlStatus = getInstanceDownloadStatus(id, inst);
       const statusText = dlStatus.statusText;
       let statusClass = "inactive";
-      if (
-        statusText === "READY" ||
-        statusText === "RUNNING" ||
-        statusText === "LOADED"
-      ) {
+      if (isInstanceUsableStatus(statusText)) {
         statusClass = "ready";
       } else if (statusText === "DOWNLOADING") {
         statusClass = "downloading";
@@ -2721,11 +2728,7 @@
       const id = getInstanceModelId(inst);
       if (id === modelId) {
         const status = deriveInstanceStatus(inst);
-        if (
-          status.statusText === "READY" ||
-          status.statusText === "LOADED" ||
-          status.statusText === "RUNNING"
-        ) {
+        if (isInstanceUsableStatus(status.statusText)) {
           return true;
         }
       }
@@ -3111,11 +3114,7 @@
   const hasAnyRunningInstance = $derived(() => {
     for (const [, inst] of Object.entries(instanceData)) {
       const status = deriveInstanceStatus(inst);
-      if (
-        status.statusText === "READY" ||
-        status.statusText === "LOADED" ||
-        status.statusText === "RUNNING"
-      ) {
+      if (isInstanceUsableStatus(status.statusText)) {
         return true;
       }
     }
@@ -5154,8 +5153,7 @@
                   {@const isLoading = statusText === "LOADING"}
                   {@const isWarmingUp =
                     statusText === "WARMING UP" || statusText === "WAITING"}
-                  {@const isReady =
-                    statusText === "READY" || statusText === "LOADED"}
+                  {@const isReady = isInstanceUsableStatus(statusText)}
                   {@const isRunning = statusText === "RUNNING"}
                   <!-- Instance Card -->
                   {@const instanceModelId = getInstanceModelId(instance)}
@@ -6290,8 +6288,7 @@
                     {@const isLoading = statusText === "LOADING"}
                     {@const isWarmingUp =
                       statusText === "WARMING UP" || statusText === "WAITING"}
-                    {@const isReady =
-                      statusText === "READY" || statusText === "LOADED"}
+                    {@const isReady = isInstanceUsableStatus(statusText)}
                     {@const isRunning = statusText === "RUNNING"}
                     <!-- Instance Card -->
                     {@const instanceModelId = getInstanceModelId(instance)}
