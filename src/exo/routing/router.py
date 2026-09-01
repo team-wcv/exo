@@ -246,13 +246,19 @@ def get_node_zid(
     with FileLock(str(resolved_path) + ".lock"):
         if resolved_path.exists():
             value = resolved_path.read_text().strip().lower()
-            if len(value) == 32 and all(char in "0123456789abcdef" for char in value):
+            if (
+                len(value) == 32
+                and value[0] != "0"
+                and all(char in "0123456789abcdef" for char in value)
+            ):
                 return NodeId(value)
             logger.warning(
                 f"Ignoring invalid Zenoh node identity at {resolved_path}; regenerating"
             )
 
-        value = os.urandom(16).hex()
+        value = "0"
+        while value[0] == "0":
+            value = os.urandom(16).hex()
         temporary_path = resolved_path.with_name(
             f".{resolved_path.name}.{os.getpid()}.tmp"
         )

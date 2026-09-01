@@ -996,6 +996,47 @@
   // Computed: Check if filter is active (from store)
   const isFilterActive = $derived(() => nodeFilter.size > 0);
 
+  interface ShardEntry {
+    nodeId: string;
+    runnerId: string;
+    shard: unknown;
+  }
+
+  function getShardEntries(shardAssignments: unknown): ShardEntry[] {
+    if (!shardAssignments || typeof shardAssignments !== "object") return [];
+
+    const assignments = shardAssignments as {
+      shards?: unknown[];
+      nodeToRunner?: Record<string, string>;
+      runnerToShard?: Record<string, unknown>;
+    };
+    if (Array.isArray(assignments.shards)) {
+      return assignments.shards.flatMap((entry) => {
+        if (
+          !Array.isArray(entry) ||
+          entry.length < 3 ||
+          typeof entry[0] !== "string" ||
+          typeof entry[1] !== "string"
+        ) {
+          return [];
+        }
+        return [{ nodeId: entry[0], runnerId: entry[1], shard: entry[2] }];
+      });
+    }
+
+    const runnerToNode = new Map(
+      Object.entries(assignments.nodeToRunner || {}).map(
+        ([nodeId, runnerId]) => [runnerId, nodeId],
+      ),
+    );
+    return Object.entries(assignments.runnerToShard || {}).flatMap(
+      ([runnerId, shard]) => {
+        const nodeId = runnerToNode.get(runnerId);
+        return nodeId ? [{ nodeId, runnerId, shard }] : [];
+      },
+    );
+  }
+
   // Helper to unwrap tagged instance for hover highlighting
   function unwrapInstanceNodes(instanceWrapped: unknown): Set<string> {
     if (!instanceWrapped || typeof instanceWrapped !== "object")
@@ -1004,11 +1045,10 @@
     if (keys.length !== 1) return new Set();
     const instance = (instanceWrapped as Record<string, unknown>)[keys[0]];
     if (!instance || typeof instance !== "object") return new Set();
-    const inst = instance as {
-      shardAssignments?: { nodeToRunner?: Record<string, string> };
-    };
-    if (!inst.shardAssignments?.nodeToRunner) return new Set();
-    return new Set(Object.keys(inst.shardAssignments.nodeToRunner));
+    const inst = instance as { shardAssignments?: unknown };
+    return new Set(
+      getShardEntries(inst.shardAssignments).map((entry) => entry.nodeId),
+    );
   }
 
   function toggleInstanceDownloadDetails(nodeId: string): void {
@@ -1802,9 +1842,10 @@
 
     const inst = instance as {
       shardAssignments?: {
+        modelId?: string;
+        shards?: unknown[];
         nodeToRunner?: Record<string, string>;
         runnerToShard?: Record<string, unknown>;
-        modelId?: string;
       };
     };
     const instanceModelId = inst.shardAssignments?.modelId;
@@ -1822,15 +1863,11 @@
     }
 
     // Get node IDs assigned to this instance
-    const nodeToRunner = inst.shardAssignments?.nodeToRunner || {};
-    const runnerToShard = inst.shardAssignments?.runnerToShard || {};
-    const runnerToNode: Record<string, string> = {};
-    for (const [nodeId, runnerId] of Object.entries(nodeToRunner)) {
-      runnerToNode[runnerId] = nodeId;
-    }
-    const instanceNodeIds = Object.keys(runnerToShard)
-      .map((runnerId) => runnerToNode[runnerId])
-      .filter(Boolean);
+    const instanceNodeIds = Array.from(
+      new Set(
+        getShardEntries(inst.shardAssignments).map((entry) => entry.nodeId),
+      ),
+    );
 
     const result = collectDownloadStatus(instanceModelId, instanceNodeIds);
 
@@ -1903,10 +1940,10 @@
       return { statusText: "PREPARING", statusClass: "inactive" };
     }
 
-    const inst = instance as {
-      shardAssignments?: { runnerToShard?: Record<string, unknown> };
-    };
-    const runnerIds = Object.keys(inst.shardAssignments?.runnerToShard || {});
+    const inst = instance as { shardAssignments?: unknown };
+    const runnerIds = getShardEntries(inst.shardAssignments).map(
+      (entry) => entry.runnerId,
+    );
 
     const statuses = runnerIds
       .map((rid) => {
@@ -2085,6 +2122,7 @@
 
     const inst = instance as {
       shardAssignments?: {
+        shards?: unknown[];
         nodeToRunner?: Record<string, string>;
         runnerToShard?: Record<string, unknown>;
       };
@@ -2092,8 +2130,8 @@
 
     // Sharding strategy from first shard
     let sharding = "Unknown";
-    const runnerToShard = inst.shardAssignments?.runnerToShard || {};
-    const firstShardWrapped = Object.values(runnerToShard)[0];
+    const shardEntries = getShardEntries(inst.shardAssignments);
+    const firstShardWrapped = shardEntries[0]?.shard;
     if (firstShardWrapped) {
       const [shardTag] = getTagged(firstShardWrapped);
       if (shardTag === "PipelineShardMetadata") sharding = "Pipeline";
@@ -2105,8 +2143,9 @@
     }
 
     // Node names from topology
-    const nodeToRunner = inst.shardAssignments?.nodeToRunner || {};
-    const nodeIds = Object.keys(nodeToRunner);
+    const nodeIds = Array.from(
+      new Set(shardEntries.map((entry) => entry.nodeId)),
+    );
     const nodeNames = nodeIds.map((nodeId) => {
       const node = data?.nodes?.[nodeId];
       return node?.friendly_name || nodeId.slice(0, 8);
@@ -2213,23 +2252,12 @@
     instance: Record<string, unknown>,
     shardType: "Pipeline" | "Tensor",
   ) {
-    const runnerToShard =
-      (
-        instance.shardAssignments as
-          | { runnerToShard?: Record<string, unknown> }
-          | undefined
-      )?.runnerToShard || {};
-    const nodeToRunner =
-      (
-        instance.shardAssignments as
-          | { nodeToRunner?: Record<string, string> }
-          | undefined
-      )?.nodeToRunner || {};
-    const runnerEntries = Object.entries(runnerToShard).map(
-      ([runnerId, shardWrapped]) => {
+    const runnerEntries = getShardEntries(instance.shardAssignments).map(
+      ({ nodeId, runnerId, shard: shardWrapped }) => {
         const [tag, shard] = getTagged(shardWrapped);
         const meta = shard as
           | {
+              deviceRank?: number;
               modelMeta?: {
                 worldSize?: number;
                 nLayers?: number;
@@ -2237,8 +2265,8 @@
               };
             }
           | undefined;
-        const deviceRank = meta?.modelMeta?.deviceRank ?? 0;
-        return { runnerId, tag, deviceRank };
+        const deviceRank = meta?.deviceRank ?? meta?.modelMeta?.deviceRank ?? 0;
+        return { nodeId, runnerId, tag, deviceRank };
       },
     );
 
@@ -2249,13 +2277,11 @@
           : r.tag === "TensorShardMetadata",
       )
       .sort((a, b) => a.deviceRank - b.deviceRank)
-      .map((r, idx) => {
-        const nodeId = Object.entries(nodeToRunner).find(
-          ([, rid]) => rid === r.runnerId,
-        )?.[0];
-        return { nodeId, runnerId: r.runnerId, order: idx };
-      })
-      .filter((item) => item.nodeId);
+      .map((entry, index) => ({
+        nodeId: entry.nodeId,
+        runnerId: entry.runnerId,
+        order: index,
+      }));
 
     return ordered as Array<{
       nodeId: string;
