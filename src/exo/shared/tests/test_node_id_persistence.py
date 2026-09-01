@@ -7,8 +7,7 @@ from multiprocessing.queues import Queue as QueueT
 from multiprocessing.synchronize import Event as EventT
 from multiprocessing.synchronize import Semaphore as SemaphoreT
 from pathlib import Path
-from unittest.mock import patch
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from loguru import logger
 from pytest import LogCaptureFixture, MonkeyPatch, mark
@@ -42,6 +41,8 @@ def test_node_id_generation_retries_invalid_random_value(tmp_path: Path) -> None
         node_id = get_node_zid(path)
 
     assert node_id == "a" + "3" * 31
+
+
 def test_node_zid_rejects_a_persisted_leading_zero(tmp_path: Path) -> None:
     path = tmp_path / "node_zid"
     path.write_text("0" + "a" * 31)
