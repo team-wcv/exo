@@ -6,6 +6,8 @@ from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue as QueueT
 from multiprocessing.synchronize import Event as EventT
 from multiprocessing.synchronize import Semaphore as SemaphoreT
+from pathlib import Path
+from unittest.mock import patch
 
 from loguru import logger
 from pytest import LogCaptureFixture, mark
@@ -14,6 +16,31 @@ from exo.routing.router import get_node_zid
 from exo.shared.constants import EXO_NODE_ZID
 
 NUM_CONCURRENT_PROCS = 10
+
+
+def test_node_id_regenerates_zenoh_invalid_leading_zero(tmp_path: Path) -> None:
+    path = tmp_path / "node_zid"
+    path.write_text("0" + "1" * 31 + "\n")
+    valid_bytes = bytes.fromhex("1" + "2" * 31)
+
+    with patch("exo.routing.router.os.urandom", return_value=valid_bytes):
+        node_id = get_node_zid(path)
+
+    assert node_id == "1" + "2" * 31
+    assert path.read_text() == "1" + "2" * 31 + "\n"
+
+
+def test_node_id_generation_retries_invalid_random_value(tmp_path: Path) -> None:
+    path = tmp_path / "node_zid"
+    valid_bytes = bytes.fromhex("a" + "3" * 31)
+
+    with patch(
+        "exo.routing.router.os.urandom",
+        side_effect=[bytes(16), valid_bytes],
+    ):
+        node_id = get_node_zid(path)
+
+    assert node_id == "a" + "3" * 31
 
 
 def _get_keypair_concurrent_subprocess_task(

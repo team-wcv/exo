@@ -246,13 +246,15 @@ def get_node_zid(
     with FileLock(str(resolved_path) + ".lock"):
         if resolved_path.exists():
             value = resolved_path.read_text().strip().lower()
-            if len(value) == 32 and all(char in "0123456789abcdef" for char in value):
+            if _is_valid_persisted_zid(value):
                 return NodeId(value)
             logger.warning(
                 f"Ignoring invalid Zenoh node identity at {resolved_path}; regenerating"
             )
 
         value = os.urandom(16).hex()
+        while not _is_valid_persisted_zid(value):
+            value = os.urandom(16).hex()
         temporary_path = resolved_path.with_name(
             f".{resolved_path.name}.{os.getpid()}.tmp"
         )
@@ -260,6 +262,15 @@ def get_node_zid(
         temporary_path.chmod(0o600)
         temporary_path.replace(resolved_path)
         return NodeId(value)
+
+
+def _is_valid_persisted_zid(value: str) -> bool:
+    """Match Zenoh's identity constraints before persisting an ID."""
+    return (
+        len(value) == 32
+        and value[0] in "123456789abcdef"
+        and all(char in "0123456789abcdef" for char in value[1:])
+    )
 
 
 def _scoped_zid_path(path: Path, process_scope: str | None) -> Path:
