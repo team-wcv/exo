@@ -7,8 +7,8 @@ scope: "Add a durable isolated Bigbrain endpoint profile for wc-bmbp and revalid
 orchestraitor:
   ticket: 6a96fa36e6b6efd51fc86202
 pr:
-  url: pending
-  state: pending
+  url: https://github.com/team-wcv/exo/pull/46
+  state: open
 ---
 
 - Why this branch exists: Give wc-bmbp a persistent solo Exo control plane for local runtimes without changing the Twin, Studio, or Spark namespaces.
