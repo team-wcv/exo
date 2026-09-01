@@ -66,7 +66,14 @@ class SystemPerformanceProfile(FrozenModel):
     ecpu_usage: float = 0.0
 
 
-InterfaceType = Literal["wifi", "ethernet", "maybe_ethernet", "thunderbolt", "unknown"]
+InterfaceType = Literal[
+    "wifi",
+    "ethernet",
+    "maybe_ethernet",
+    "thunderbolt",
+    "apple_usb_ncm",
+    "unknown",
+]
 
 
 class NetworkInterfaceInfo(FrozenModel):

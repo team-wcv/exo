@@ -4,7 +4,8 @@ from datetime import datetime
 
 from loguru import logger
 
-from exo.shared.types.common import NodeId
+from exo.shared.models.model_cards import ModelCard
+from exo.shared.types.common import ModelId, NodeId
 from exo.shared.types.events import (
     ChunkGenerated,
     CustomModelCardAdded,
@@ -57,6 +58,7 @@ from exo.utils.info_gatherer.info_gatherer import (
     MacThunderboltIdentifiers,
     MemoryUsage,
     MiscData,
+    NodeBackends,
     NodeConfig,
     NodeDiskUsage,
     NodeNetworkInterfaces,
@@ -83,11 +85,13 @@ def event_apply(event: Event, state: State) -> State:
             | InputChunkReceived()
             | TracesCollected()
             | TracesMerged()
-            | CustomModelCardAdded()
-            | CustomModelCardDeleted()
             | DrafterPlacementDegraded()
         ):  # Pass-through events that don't modify state
             return state
+        case CustomModelCardAdded():
+            return apply_custom_model_card_added(event, state)
+        case CustomModelCardDeleted():
+            return apply_custom_model_card_deleted(event, state)
         case InstanceCreated():
             return apply_instance_created(event, state)
         case InstanceDeleted():
@@ -498,6 +502,11 @@ def apply_node_gathered_info(event: NodeGatheredInfo, state: State) -> State:
             }
             if not info.enabled:
                 topology.remove_all_rdma_connections_touching(event.node_id)
+        case NodeBackends():
+            update["node_backends"] = {
+                **state.node_backends,
+                event.node_id: info.backends,
+            }
 
     return state.model_copy(update=update)
 
@@ -513,3 +522,22 @@ def apply_topology_edge_deleted(event: TopologyEdgeDeleted, state: State) -> Sta
     topology.remove_connection(event.conn)
     # TODO: Clean up removing the reverse connection
     return state.model_copy(update={"topology": topology})
+
+
+def apply_custom_model_card_added(event: CustomModelCardAdded, state: State) -> State:
+    new_cards: Mapping[ModelId, ModelCard] = {
+        **state.custom_model_cards,
+        event.model_card.model_id: event.model_card,
+    }
+    return state.model_copy(update={"custom_model_cards": new_cards})
+
+
+def apply_custom_model_card_deleted(
+    event: CustomModelCardDeleted, state: State
+) -> State:
+    new_cards: Mapping[ModelId, ModelCard] = {
+        model_id: card
+        for model_id, card in state.custom_model_cards.items()
+        if model_id != event.model_id
+    }
+    return state.model_copy(update={"custom_model_cards": new_cards})

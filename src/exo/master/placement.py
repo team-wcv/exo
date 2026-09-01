@@ -18,6 +18,7 @@ from exo.master.placement_utils import (
 )
 from exo.shared.models.model_cards import ModelCard, ModelId
 from exo.shared.topology import Topology
+from exo.shared.types.backends import Backend
 from exo.shared.types.commands import (
     CancelDownload,
     CreateInstance,
@@ -64,6 +65,11 @@ from exo.shared.types.worker.shards import Sharding
 from exo.utils.ports import random_ephemeral_port, random_ephemeral_port_excluding
 
 ASYMMETRIC_TENSOR_AUTO_UPGRADE_ENV = "EXO_ENABLE_ASYMMETRIC_TP_AUTO_UPGRADE"
+
+INSTANCE_META_BACKENDS: dict[InstanceMeta, list[Backend]] = {
+    InstanceMeta.MlxRing: [Backend.MlxMetal, Backend.MlxCuda, Backend.MlxCpu],
+    InstanceMeta.MlxJaccl: [Backend.MlxMetal],
+}
 
 
 def resolve_drafter_eligible_nodes(
@@ -191,6 +197,7 @@ def place_instance(
     current_instances: Mapping[InstanceId, Instance],
     node_memory: Mapping[NodeId, MemoryUsage],
     node_network: Mapping[NodeId, NodeNetworkInfo],
+    node_backends: Mapping[NodeId, list[Backend]] | None = None,
     required_nodes: set[NodeId] | None = None,
     allowed_nodes: set[NodeId] | None = None,
     allow_single_node_total_memory: bool = False,
@@ -369,6 +376,30 @@ def place_instance(
             )
 
     smallest_cycles = get_smallest_cycles(cycles_with_sufficient_memory)
+    required_backends = set(INSTANCE_META_BACKENDS[command.instance_meta]) & set(
+        command.model_card.backends
+    )
+    if not required_backends:
+        raise ValueError(
+            f"Model {command.model_card.model_id} backends "
+            f"{sorted(b.value for b in command.model_card.backends)} cannot satisfy engine "
+            f"{command.instance_meta.value} which requires "
+            f"{sorted(b.value for b in INSTANCE_META_BACKENDS[command.instance_meta])}"
+        )
+    smallest_cycles = [
+        cycle
+        for cycle in smallest_cycles
+        if all(
+            set((node_backends or {}).get(node_id, list(Backend))) & required_backends
+            for node_id in cycle
+        )
+    ]
+    if not smallest_cycles:
+        raise ValueError(
+            f"No cycle where every node supports a backend in "
+            f"{sorted(b.value for b in required_backends)} for {command.model_card.model_id}"
+        )
+
     rdma_ctl_status = node_rdma_ctl or {}
 
     def _all_rdma_ctl_enabled(cycle: Cycle) -> bool:
@@ -1602,6 +1633,7 @@ def auto_place_prefill_siblings(
     current_instances: Mapping[InstanceId, Instance],
     node_memory: Mapping[NodeId, MemoryUsage],
     node_network: Mapping[NodeId, NodeNetworkInfo],
+    node_backends: Mapping[NodeId, list[Backend]] | None = None,
     download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
 ) -> tuple[dict[InstanceId, Instance], list[InstanceId]]:
     """Place single-rank prefill-only siblings on each viable eligible node.
@@ -1678,6 +1710,7 @@ def auto_place_prefill_siblings(
                 accumulating_instances,
                 node_memory,
                 node_network,
+                node_backends=node_backends,
                 allowed_nodes={candidate_node},
                 download_status=download_status,
             )

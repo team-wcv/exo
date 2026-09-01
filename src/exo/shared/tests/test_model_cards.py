@@ -4,7 +4,22 @@ import pytest
 from anyio import Path as AsyncPath
 
 from exo.shared.models import model_cards
-from exo.shared.models.model_cards import ModelId, get_model_cards
+from exo.shared.models.model_cards import ConfigData, ModelId, get_model_cards
+
+
+def test_qwen4_exp_configs_support_tensor_parallelism() -> None:
+    config = ConfigData.model_validate(
+        {
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "num_hidden_layers": 48,
+            "hidden_size": 2560,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 262144,
+        },
+        context={"model_id": "Qwen/Qwen3.8-Flash-Next"},
+    )
+
+    assert config.supports_tensor is True
 
 
 @pytest.mark.asyncio
@@ -46,7 +61,7 @@ in_bytes = 1
 
     monkeypatch.setattr(model_cards, "_BUILTIN_CARD_DIRS", [AsyncPath(builtin_dir)])
     monkeypatch.setattr(model_cards, "_custom_cards_dir", AsyncPath(custom_dir))
-    monkeypatch.setattr(model_cards, "_card_cache", {})
+    model_cards.card_cache.cc.clear()
 
     loaded = {card.model_id: card for card in await get_model_cards()}
 

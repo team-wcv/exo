@@ -25,7 +25,8 @@ from exo.worker.engines.mlx.disaggregated.adapter import (
     inject_rotating_kv_chunk,
 )
 
-_SOCKET_TIMEOUT_SECS = 60
+_CONNECT_TIMEOUT_SECS = 5
+_SOCKET_TIMEOUT_SECS = 300
 _RECV_BUFFER_BYTES = 4 * 1024 * 1024
 
 
@@ -48,6 +49,18 @@ def _parse_endpoint(endpoint: str) -> tuple[str, int]:
     raise ValueError(f"Invalid endpoint {endpoint}")
 
 
+def _connect_prefill(host: str, port: int, timeout_secs: float) -> socket.socket:
+    # Connecting to a missing prefill host should fall back quickly, but the
+    # first response header is emitted only after the remote model finishes
+    # prefill. Large prompts on slower accelerators can legitimately exceed a
+    # minute before sending that header.
+    sock = socket.create_connection(
+        (host, port), timeout=min(timeout_secs, _CONNECT_TIMEOUT_SECS)
+    )
+    sock.settimeout(timeout_secs)
+    return sock
+
+
 def remote_prefill_fetch(
     endpoint: str,
     request: PrefillRequest,
@@ -61,7 +74,7 @@ def remote_prefill_fetch(
         f"({len(request.token_ids)} tokens, start_pos={request.start_pos})"
     )
 
-    sock = socket.create_connection((host, port), timeout=timeout_secs)
+    sock = _connect_prefill(host, port, timeout_secs)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _RECV_BUFFER_BYTES)
     try:

@@ -1,4 +1,10 @@
+# pyright: reportPrivateUsage=false
+
+from pytest import MonkeyPatch
+
+from exo.shared.types.commands import ForwarderCommand, ForwarderDownloadCommand
 from exo.shared.types.common import NodeId
+from exo.shared.types.events import Event, IndexedEvent
 from exo.shared.types.multiaddr import Multiaddr
 from exo.shared.types.topology import Connection, SocketConnection
 from exo.utils.channels import channel
@@ -11,7 +17,7 @@ from exo.worker.main import (
 )
 
 
-def test_socket_probe_failure_threshold_env(monkeypatch):
+def test_socket_probe_failure_threshold_env(monkeypatch: MonkeyPatch):
     monkeypatch.delenv(EXO_SOCKET_PROBE_FAILURE_THRESHOLD_ENV, raising=False)
     assert _socket_probe_failure_threshold() == DEFAULT_SOCKET_PROBE_FAILURE_THRESHOLD
 
@@ -26,9 +32,10 @@ def test_socket_probe_failure_threshold_env(monkeypatch):
 
 
 def test_socket_probe_failures_are_tracked_per_socket_edge():
-    event_tx, event_rx = channel()
-    command_tx, command_rx = channel()
-    download_tx, download_rx = channel()
+    _indexed_tx, event_rx = channel[IndexedEvent]()
+    event_tx, _event_out_rx = channel[Event]()
+    command_tx, _command_rx = channel[ForwarderCommand]()
+    download_tx, _download_rx = channel[ForwarderDownloadCommand]()
 
     worker = Worker(
         node_id=NodeId("SOURCE"),

@@ -3,15 +3,36 @@
 import anyio
 import pytest
 
-from exo.routing.event_router import EventRouter
+from exo.routing.event_router import (
+    EventDeliveryStalledError,
+    EventRouter,
+    _PendingDelivery,
+)
 from exo.shared.types.commands import ForwarderCommand, RequestEventLog
 from exo.shared.types.common import NodeId, SessionId, SystemId
 from exo.shared.types.events import (
+    Event,
     GlobalForwarderEvent,
     LocalForwarderEvent,
     TestEvent,
+    TracesCollected,
 )
+from exo.shared.types.tasks import TaskId
 from exo.utils.channels import channel
+
+
+def _pending_test_event(session_id: SessionId) -> _PendingDelivery:
+    event = TestEvent()
+    return _PendingDelivery(
+        first_sent_at=10.0,
+        last_sent_at=24.0,
+        event=LocalForwarderEvent(
+            origin_idx=0,
+            origin=SystemId("worker"),
+            session=session_id,
+            event=event,
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -130,42 +151,68 @@ async def test_gap_replay_batches_are_capped() -> None:
     local_receiver.close()
 
 
-@pytest.mark.asyncio
-async def test_stalled_worker_events_request_session_recovery() -> None:
+def test_delivery_watchdog_uses_original_send_time() -> None:
     command_sender, _ = channel[ForwarderCommand]()
-    global_sender, global_receiver = channel[GlobalForwarderEvent]()
-    local_sender, local_receiver = channel[LocalForwarderEvent]()
+    _, global_receiver = channel[GlobalForwarderEvent]()
+    local_sender, _ = channel[LocalForwarderEvent]()
     session_id = SessionId(master_node_id=NodeId("master"), election_clock=0)
-    recovered = False
-
-    async def recover() -> None:
-        nonlocal recovered
-        recovered = True
-
     router = EventRouter(
         session_id=session_id,
         command_sender=command_sender,
         external_inbound=global_receiver,
         external_outbound=local_sender,
-        on_master_ack_stall=recover,
     )
-    local_event = LocalForwarderEvent(
-        origin_idx=0,
-        origin=SystemId(),
-        session=session_id,
-        event=TestEvent(),
+    router._delivery_stall_seconds = 15.0
+    pending = _pending_test_event(session_id)
+    router.out_for_delivery[pending.event.event.event_id] = pending
+
+    with pytest.raises(EventDeliveryStalledError, match="half-open routing session"):
+        router._raise_if_delivery_stalled(now=25.0)
+
+
+def test_delivery_watchdog_allows_recent_or_disabled_events() -> None:
+    command_sender, _ = channel[ForwarderCommand]()
+    _, global_receiver = channel[GlobalForwarderEvent]()
+    local_sender, _ = channel[LocalForwarderEvent]()
+    session_id = SessionId(master_node_id=NodeId("master"), election_clock=0)
+    router = EventRouter(
+        session_id=session_id,
+        command_sender=command_sender,
+        external_inbound=global_receiver,
+        external_outbound=local_sender,
     )
-    router.out_for_delivery[local_event.event.event_id] = (10.0, local_event)
-    router._outbound_first_queued_at[local_event.event.event_id] = 10.0
+    pending = _pending_test_event(session_id)
+    router.out_for_delivery[pending.event.event.event_id] = pending
 
-    await router._recover_from_master_ack_stall(10.0 + 121.0)
+    router._delivery_stall_seconds = 15.0
+    router._raise_if_delivery_stalled(now=24.9)
+    router._delivery_stall_seconds = 0.0
+    router._raise_if_delivery_stalled(now=100.0)
 
-    assert recovered
-    assert router._master_ack_stall_fired
 
-    # A stalled queue must request recovery once, not restart-loop locally.
-    await router._recover_from_master_ack_stall(10.0 + 240.0)
-    assert recovered
+@pytest.mark.asyncio
+async def test_trace_only_events_are_not_tracked_for_acknowledgement() -> None:
+    command_sender, command_receiver = channel[ForwarderCommand]()
+    global_sender, global_receiver = channel[GlobalForwarderEvent]()
+    local_sender, local_receiver = channel[LocalForwarderEvent]()
+    event_sender, event_receiver = channel[Event]()
+    session_id = SessionId(master_node_id=NodeId("master"), election_clock=0)
+    router = EventRouter(
+        session_id=session_id,
+        command_sender=command_sender,
+        external_inbound=global_receiver,
+        external_outbound=local_sender,
+    )
+    trace_event = TracesCollected(task_id=TaskId(), rank=0, traces=[])
 
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(router._ingest, SystemId("worker"), event_receiver)
+        await event_sender.send(trace_event)
+        forwarded = await local_receiver.receive()
+        assert forwarded.event == trace_event
+        assert not router.out_for_delivery
+        event_sender.close()
+
+    command_receiver.close()
     global_sender.close()
     local_receiver.close()

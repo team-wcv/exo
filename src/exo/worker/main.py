@@ -10,9 +10,13 @@ from loguru import logger
 from exo.api.types import ImageEditsTaskParams
 from exo.download.download_utils import is_read_only_model_dir, resolve_existing_model
 from exo.download.peer_state import discover_peers_for_model
+from exo.routing.event_router import (
+    EventRouterBrokenResourceError,
+    EventRouterClosedResourceError,
+)
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_MAX_INSTANCE_RETRIES
-from exo.shared.models.model_cards import ModelId, add_to_card_cache, delete_custom_card
+from exo.shared.models.model_cards import ModelId, card_cache
 from exo.shared.types.chunks import InputImageChunk
 from exo.shared.types.commands import (
     DeleteInstance,
@@ -23,7 +27,6 @@ from exo.shared.types.commands import (
 from exo.shared.types.common import CommandId, NodeId, SystemId
 from exo.shared.types.events import (
     CustomModelCardAdded,
-    CustomModelCardDeleted,
     Event,
     IndexedEvent,
     InputChunkReceived,
@@ -190,6 +193,10 @@ class Worker:
                 tg.start_soon(self._event_applier)
                 tg.start_soon(self._reconcile_instance_backoff)
                 tg.start_soon(self._poll_connection_updates)
+                tg.start_soon(self._reconcile_custom_cards)
+        except* (EventRouterBrokenResourceError, EventRouterClosedResourceError):
+            # Event router has been closed (try-star syntax handles error groups)
+            pass
         finally:
             # Actual shutdown code - waits for all tasks to complete before executing.
             logger.info("Stopping Worker")
@@ -231,7 +238,6 @@ class Worker:
                     self.input_chunk_buffer[cmd_id][event.chunk.chunk_index] = (
                         event.chunk
                     )
-
                     if (
                         len(self.input_chunk_buffer[cmd_id])
                         == self.input_chunk_counts[cmd_id]
@@ -252,12 +258,38 @@ class Worker:
                                 )
                             ] = img
 
-                if isinstance(event, CustomModelCardAdded):
-                    await event.model_card.save_to_custom_dir()
-                    add_to_card_cache(event.model_card)
+    async def _reconcile_custom_cards(self) -> None:
+        pending_startup_cards = await self._publish_persisted_custom_cards()
+        while True:
+            await anyio.sleep(1)
+            await self._reconcile_custom_cards_once(pending_startup_cards)
 
-                if isinstance(event, CustomModelCardDeleted):
-                    await delete_custom_card(event.model_id)
+    async def _publish_persisted_custom_cards(self) -> set[ModelId]:
+        persisted = [card for card in await card_cache.list_all() if card.is_custom]
+        for card in persisted:
+            await self.event_sender.send(CustomModelCardAdded(model_card=card))
+        return {card.model_id for card in persisted}
+
+    async def _reconcile_custom_cards_once(
+        self, pending_startup_cards: set[ModelId]
+    ) -> None:
+        target = dict(self.state.custom_model_cards)
+        pending_startup_cards.difference_update(target)
+
+        for model_id, card in target.items():
+            if card_cache.get(model_id) == card and await card_cache.is_persisted(
+                model_id
+            ):
+                continue
+            await card_cache.save(card)
+
+        for card in await card_cache.list_all():
+            if (
+                card.is_custom
+                and card.model_id not in target
+                and card.model_id not in pending_startup_cards
+            ):
+                await card_cache.pop(card.model_id)
 
     async def _reconcile_instance_backoff(self) -> None:
         while True:
@@ -309,7 +341,7 @@ class Worker:
             # lets not kill the worker if a runner is unresponsive
             match task:
                 case CreateRunner():
-                    self._create_supervisor(task)
+                    await self._create_supervisor(task)
                     self._instance_backoff.record_attempt(task.instance_id)
                     await self.event_sender.send(
                         TaskStatusUpdated(
@@ -512,9 +544,9 @@ class Worker:
                 continue
             await self.runners[runner_id].start_task(task)
 
-    def _create_supervisor(self, task: CreateRunner) -> RunnerSupervisor:
+    async def _create_supervisor(self, task: CreateRunner) -> RunnerSupervisor:
         """Creates and stores a new AssignedRunner with initial downloading status."""
-        runner = RunnerSupervisor.create(
+        runner = await RunnerSupervisor.create(
             bound_instance=task.bound_instance,
             event_sender=self.event_sender.clone(),
         )

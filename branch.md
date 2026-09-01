@@ -12,6 +12,6 @@ pr:
 ---
 
 - Why this branch exists: recover workers that remain bound to a stalled master session.
-- Changed paths: event router recovery logic, node callback wiring, and focused tests.
-- Validation run: pending refresh against current main and current-head review.
-- Known follow-ups: resolve the acknowledgement-race and trace-only-event findings before requesting review.
+- Changed paths: current event-delivery watchdog hardening and focused trace-only acknowledgement coverage.
+- Validation run: merged `team-wcv/main` at `9e1b8ef4`; 6 focused event-router tests pass; Ruff and BasedPyright pass.
+- Known follow-ups: current-head CI and Codex review.

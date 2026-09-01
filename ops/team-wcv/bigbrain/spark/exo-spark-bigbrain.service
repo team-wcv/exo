@@ -1,0 +1,21 @@
+[Unit]
+Description=Exo standalone Spark Bigbrain endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=EXO_HOME=.exo-spark-bigbrain
+Environment=EXO_DEFAULT_MODELS_DIR=/home/wc-spark/.exo-pr44-benchmark-models
+Environment=EXO_DASHBOARD_DIR=/home/wc-spark/.orchestraitor/worktrees/exo/pr42-a9e76583-test/dashboard/build
+Environment=EXO_ROUTER_SETTLE_SECONDS=2
+Environment=EXO_DIAGNOSTIC_SNAPSHOT_SECONDS=10
+ExecStart=/home/wc-spark/.orchestraitor/worktrees/exo/pr44-5380af3e/.venv/bin/exo --force-master --namespace bigbrain-spark --api-port 52615 --libp2p-port 52618 --discovery-port 52613 --peer-download-port 52616 --offline --trust-remote-code
+Restart=on-failure
+RestartSec=10
+OOMScoreAdjust=500
+LimitNOFILE=1048576
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

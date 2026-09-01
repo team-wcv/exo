@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.team-wcv.exo-bmbp-bigbrain</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>EXO_HOME=.exo-bmbp-bigbrain</string>
+    <string>EXO_DEFAULT_MODELS_DIR=/Users/JJ/.exo/models</string>
+    <string>EXO_DASHBOARD_DIR=/Users/JJ/.local/share/bigbrain-endpoints/bmbp/exo-current/dashboard/build</string>
+    <string>EXO_ROUTER_SETTLE_SECONDS=2</string>
+    <string>EXO_DIAGNOSTIC_SNAPSHOT_SECONDS=10</string>
+    <string>/Users/JJ/.local/share/bigbrain-endpoints/bmbp/exo-current/.venv/bin/exo</string>
+    <string>--force-master</string>
+    <string>--namespace</string>
+    <string>bigbrain-bmbp</string>
+    <string>--api-port</string>
+    <string>52615</string>
+    <string>--libp2p-port</string>
+    <string>52618</string>
+    <string>--discovery-port</string>
+    <string>52613</string>
+    <string>--peer-download-port</string>
+    <string>52616</string>
+    <string>--offline</string>
+    <string>--trust-remote-code</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/JJ/.cache/exo/bmbp-bigbrain.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/JJ/.cache/exo/bmbp-bigbrain.err.log</string>
+</dict>
+</plist>

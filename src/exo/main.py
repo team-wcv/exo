@@ -11,27 +11,32 @@ from datetime import datetime, timezone
 from typing import Self
 
 import anyio
+from daemon import DaemonContext  # pyright: ignore[reportMissingTypeStubs]
+from exo_rs import Pidfile, PidfileError
 from loguru import logger
 from pydantic import PositiveInt
 
 import exo.routing.topics as topics
+from exo import __version__
 from exo.api.main import API
 from exo.download.coordinator import DownloadCoordinator
 from exo.download.impl_shard_downloader import exo_shard_downloader
 from exo.download.peer_file_server import PeerFileServer
 from exo.master.main import Master
 from exo.routing.event_router import EventRouter
-from exo.routing.router import Router, get_node_id_keypair
+from exo.routing.router import Router, get_node_zid
 from exo.shared.constants import (
     EXO_LOG,
     EXO_MODELS_DIRS,
     EXO_MODELS_READ_ONLY_DIRS,
     EXO_PEER_DOWNLOAD_PORT,
+    EXO_PID_FILE,
 )
 from exo.shared.election import Election, ElectionResult
 from exo.shared.logging import logger_cleanup, logger_set_context, logger_setup
 from exo.shared.types.common import NodeId, SessionId
 from exo.shared.types.state import State
+from exo.utils import STDIO_FDS
 from exo.utils.channels import Receiver, channel
 from exo.utils.pydantic_ext import FrozenModel
 from exo.utils.task_group import TaskGroup
@@ -52,40 +57,21 @@ class Node:
     node_id: NodeId
     offline: bool
     _api_port: int
-    _libp2p_port: int
+    _zenoh_port: int
     _peer_download_port: int
     peer_file_server: PeerFileServer | None = None
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
 
     @classmethod
     async def create(cls, args: "Args") -> Self:
-        # Codex P1 (PR #16 round-(N+3), main.py:74): scope the on-disk
-        # node-ID keypair by the *combination* of ports the operator
-        # has chosen, not just ``--peer-download-port``. The earlier
-        # peer-download-only scope leaked identity collisions when
-        # ``--no-downloads`` / ``--no-peer-download`` is set: that
-        # mode doesn't bind the peer file server, so two same-host
-        # processes can legitimately keep the default
-        # ``peer_download_port`` and would then load the same scoped
-        # keypair file -- producing identical ``NodeId``s and
-        # breaking election/routing's unique-NodeId invariants.
-        #
-        # Combined-port scoping is robust against every same-host
-        # multi-process configuration: at least one of the listening
-        # ports MUST differ between processes (libp2p, peer-download,
-        # api -- each is a distinct local socket bind), so the scope
-        # tuple differs whenever the actual configuration differs.
-        # Single-process deployments on default ports keep a stable
-        # filename (e.g. ``node_id.libp2p-0.api-52415.peer-52416.keypair``)
-        # so identity persists across restarts.
-        process_scope = _node_id_keypair_scope(args)
-        keypair = get_node_id_keypair(process_scope=process_scope)
-        node_id = NodeId(keypair.to_node_id())
+        node_id = get_node_zid(process_scope=_node_zid_scope(args))
         session_id = SessionId(master_node_id=node_id, election_clock=0)
         router = Router.create(
-            keypair,
-            bootstrap_peers=args.bootstrap_peers,
-            listen_port=args.libp2p_port,
+            node_id,
+            namespace=args.namespace,
+            listen_port=args.zenoh_port,
+            discovery_service_port=args.discovery_port,
+            connect_endpoints=_zenoh_bootstrap_endpoints(args.bootstrap_peers),
         )
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
@@ -203,7 +189,7 @@ class Node:
             node_id,
             args.offline,
             args.api_port,
-            args.libp2p_port,
+            args.zenoh_port,
             args.peer_download_port,
             peer_file_server,
         )
@@ -212,7 +198,7 @@ class Node:
         )
         logger.info(
             f"Node components created node_id={node_id} api_port={args.api_port} "
-            f"libp2p_port={args.libp2p_port} bootstrap_peers={args.bootstrap_peers}"
+            f"zenoh_port={args.zenoh_port} bootstrap_peers={args.bootstrap_peers}"
         )
         return self
 
@@ -233,12 +219,6 @@ class Node:
                 tg.start_soon(self.master.run)
             if self.api:
                 tg.start_soon(self.api.run)
-            if sys.platform == "darwin" and self._libp2p_port != 0:
-                tg.start_soon(
-                    _darwin_mdns_broadcast_announcer,
-                    self.node_id,
-                    self._libp2p_port,
-                )
             tg.start_soon(self._elect_loop)
             tg.start_soon(self._diagnostic_snapshot_loop)
 
@@ -249,31 +229,6 @@ class Node:
 
             sys.exit(1)
         self._tg.cancel_tasks()
-
-    async def _restart_stalled_worker_session(self) -> None:
-        """Exit cleanly so the service manager can bootstrap a fresh session.
-
-        This callback is installed only on non-master event routers. A worker
-        that misses master acknowledgements for the configured timeout has a
-        stale cluster session; restarting it is safer than retaining an
-        unbounded local event queue that can never be applied by a new master.
-        """
-        logger.error(
-            "Worker master session is stale; shutting down for service-managed restart"
-        )
-        self.shutdown()
-
-    def _create_event_router(self, session_id: SessionId) -> EventRouter:
-        is_worker_session = session_id.master_node_id != self.node_id
-        return EventRouter(
-            session_id,
-            self.router.sender(topics.COMMANDS),
-            self.router.receiver(topics.GLOBAL_EVENTS),
-            self.router.sender(topics.LOCAL_EVENTS),
-            on_master_ack_stall=(
-                self._restart_stalled_worker_session if is_worker_session else None
-            ),
-        )
 
     async def _elect_loop(self):
         with self.election_result_receiver as results:
@@ -296,7 +251,12 @@ class Node:
                         await self.master.shutdown()
                         self.master = None
                     self.event_router.shutdown()
-                    self.event_router = self._create_event_router(result.session_id)
+                    self.event_router = EventRouter(
+                        result.session_id,
+                        self.router.sender(topics.COMMANDS),
+                        self.router.receiver(topics.GLOBAL_EVENTS),
+                        self.router.sender(topics.LOCAL_EVENTS),
+                    )
 
                 if (
                     result.session_id.master_node_id == self.node_id
@@ -455,144 +415,77 @@ class Node:
         return ages
 
 
-def _node_id_keypair_scope(args: "Args") -> str:
-    """Produce a stable per-process scope for the node-ID keypair file.
-
-    Combines every listening port the operator could plausibly
-    distinguish between same-host processes: ``--libp2p-port``,
-    ``--api-port``, and ``--peer-download-port``. At least one of
-    these MUST differ between two processes that share a host (each
-    is a distinct local socket bind), so the resulting scope is
-    always unique per process while remaining stable across
-    restarts of the same configuration.
-
-    Used by :func:`get_node_id_keypair` to avoid two same-host
-    processes loading the same scoped keypair file when peer
-    download is disabled (which would otherwise let them collide
-    on the default ``peer_download_port`` since no socket is
-    actually being bound). See Codex P1 (PR #16 round-(N+3),
-    main.py:74).
-
-    Codex P1 (PR #16 round-(N+8), main.py:457): when
-    ``--libp2p-port 0`` is set, the configured value is the literal
-    ``0`` even though each process actually binds a different
-    ephemeral port at runtime. Two same-host worker-only processes
-    (no API, no peer download) sharing the default
-    ``peer_download_port`` and ``api_port`` -- but each binding
-    ``libp2p_port=0`` -- would otherwise produce identical scope
-    strings ``"libp2p-0.api-...peer-..."`` and load the same
-    keypair file, breaking the unique-NodeId invariant.
-    Stability across restarts is impossible in this configuration
-    anyway (the OS hands out a different ephemeral port on every
-    bind), so fold in ``os.getpid()`` as a per-process
-    discriminator. The trade-off (ephemeral identity for
-    ephemeral ports) is the right semantic: the operator opted
-    into ephemeral binding by setting ``libp2p_port=0``.
-    """
-    if args.libp2p_port == 0:
+def _node_zid_scope(args: "Args") -> str:
+    """Produce a stable, collision-free identity scope from bound ports."""
+    if args.zenoh_port == 0:
         return (
-            f"libp2p-pid-{os.getpid()}."
+            f"zenoh-pid-{os.getpid()}."
             f"api-{args.api_port}.peer-{args.peer_download_port}"
         )
-    return (
-        f"libp2p-{args.libp2p_port}.api-{args.api_port}.peer-{args.peer_download_port}"
-    )
-
-
-def _darwin_interface_ip_address(interface_name: str) -> str | None:
-    try:
-        return subprocess.check_output(
-            ["ipconfig", "getifaddr", interface_name],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-    except (OSError, subprocess.CalledProcessError):
-        return None
-
-
-def _darwin_interface_broadcast_address(
-    interface_name: str, ip_address: str
-) -> str | None:
-    try:
-        subnet_mask = subprocess.check_output(
-            ["ipconfig", "getoption", interface_name, "subnet_mask"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-        interface = ipaddress.IPv4Interface(f"{ip_address}/{subnet_mask}")
-        return str(interface.network.broadcast_address)
-    except (OSError, ValueError, subprocess.CalledProcessError):
-        return None
-
-
-def _darwin_mdns_advertise_address() -> tuple[str, str | None] | None:
-    interface_name = os.getenv("EXO_MDNS_INTERFACE", "en0")
-    ip_address = os.getenv("EXO_MDNS_IP_ADDRESS") or _darwin_interface_ip_address(
-        interface_name
-    )
-    if not ip_address:
-        logger.debug(
-            f"Darwin mDNS broadcast announcer disabled: no {interface_name} IPv4 address"
-        )
-        return None
-
-    broadcast_address = os.getenv(
-        "EXO_MDNS_BROADCAST_ADDRESS"
-    ) or _darwin_interface_broadcast_address(interface_name, ip_address)
-    return ip_address, broadcast_address
-
-
-async def _darwin_mdns_broadcast_announcer(node_id: NodeId, libp2p_port: int) -> None:
-    advertise_address = _darwin_mdns_advertise_address()
-    if advertise_address is None:
-        return
-
-    ip_address, broadcast_address = advertise_address
-    logger.debug(
-        f"Darwin mDNS announcer advertising {node_id} at {ip_address}:{libp2p_port}"
-    )
-    command = [
-        sys.executable,
-        "-m",
-        "exo.routing.mdns_announcer",
-        "--node-id",
-        str(node_id),
-        "--ip-address",
-        ip_address,
-        "--libp2p-port",
-        str(libp2p_port),
-    ]
-    if broadcast_address is not None:
-        command.extend(["--broadcast-address", broadcast_address])
-    process = subprocess.Popen(
-        command,
-        start_new_session=True,
-        stdout=subprocess.DEVNULL,
-    )
-    try:
-        while process.poll() is None:
-            await anyio.sleep(60)
-        logger.debug(
-            f"Darwin mDNS announcer subprocess exited with {process.returncode}"
-        )
-    finally:
-        if process.poll() is None:
-            process.terminate()
-            with anyio.move_on_after(2):
-                while process.poll() is None:
-                    await anyio.sleep(0.1)
-            if process.poll() is None:
-                process.kill()
-                await anyio.sleep(0)
+    return f"zenoh-{args.zenoh_port}.api-{args.api_port}.peer-{args.peer_download_port}"
 
 
 def main():
+    # Parse args first => --help or bad args don't require PID-locking
     args = Args.parse()
+
+    # Exit early if cannot acquire PID file
+    try:
+        pidfile = Pidfile(EXO_PID_FILE, 0o0600)
+    except PidfileError as e:
+        print(e, file=sys.stderr)
+        raise SystemExit(1) from e
+
+    try:
+        if args.legacy_daemon:
+            # keep stdio backed by explicit /dev/null streams. multiprocessing spawn expects
+            # valid stdio FDs; letting DaemonContext close/reopen them can break runner startup.
+            for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
+                if stream is not None:
+                    stream.flush()
+            stdin = open(os.devnull, "r")  # noqa: SIM115
+            stdout = open(os.devnull, "w")  # noqa: SIM115
+            stderr = open(os.devnull, "w")  # noqa: SIM115
+
+            with DaemonContext(
+                detach_process=True,
+                files_preserve=[pidfile.as_raw_fd()],
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+            ):
+                # cleanup loose file descriptors (as long as they aren't stdio)
+                for f in (
+                    f for f in (stdin, stdout, stderr) if f.fileno() not in STDIO_FDS
+                ):
+                    f.close()
+
+                # 1) if daemonizing => fork then write PID
+                try:
+                    pidfile.write()
+                except PidfileError as e:
+                    print(e, file=sys.stderr)
+                    raise SystemExit(1) from e
+                main_inner(args)
+        else:
+            # 2) otherwise      => just write PID
+            try:
+                pidfile.write()
+            except PidfileError as e:
+                print(e, file=sys.stderr)
+                raise SystemExit(1) from e
+            main_inner(args)
+    finally:
+        pidfile.close()
+
+
+def main_inner(args: "Args"):
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     target = min(max(soft, 65535), hard)
     resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
 
     mp.set_start_method("spawn", force=True)
+
     # TODO: Refactor the current verbosity system
     logger_setup(EXO_LOG, args.verbosity)
     logger_set_context(git_commit=_git_commit())
@@ -603,9 +496,6 @@ def main():
 
     if args.offline:
         logger.info("Running in OFFLINE mode — no internet checks, local models only")
-
-    if args.bootstrap_peers:
-        logger.info(f"Bootstrap peers: {args.bootstrap_peers}")
 
     if args.no_batch:
         os.environ["EXO_NO_BATCH"] = "1"
@@ -654,6 +544,45 @@ def _git_commit() -> str:
     return commit if result.returncode == 0 and commit else "unknown"
 
 
+def _zenoh_bootstrap_endpoints(bootstrap_peers: list[str]) -> list[str]:
+    if not bootstrap_peers:
+        return []
+
+    endpoints: list[str] = []
+    for peer in bootstrap_peers:
+        parts = peer.removeprefix("/").split("/")
+        if len(parts) < 4 or parts[0] not in {"ip4", "ip6"} or parts[2] != "tcp":
+            raise ValueError(
+                "Legacy bootstrap peers must use /ip4/<address>/tcp/<port> "
+                "or /ip6/<address>/tcp/<port> multiaddrs"
+            )
+
+        address = ipaddress.ip_address(parts[1])
+        expected_version = 4 if parts[0] == "ip4" else 6
+        if address.version != expected_version:
+            raise ValueError(
+                f"Bootstrap peer address {parts[1]!r} does not match {parts[0]}"
+            )
+
+        try:
+            port = int(parts[3])
+        except ValueError as exception:
+            raise ValueError(
+                f"Bootstrap peer port must be an integer, got {parts[3]!r}"
+            ) from exception
+        if not 1 <= port <= 65535:
+            raise ValueError(f"Bootstrap peer port must be 1-65535, got {port}")
+
+        host = f"[{address}]" if address.version == 6 else str(address)
+        endpoints.append(f"tcp/{host}:{port}")
+
+    logger.warning(
+        f"Translated {len(endpoints)} legacy --bootstrap-peers multiaddr(s) "
+        "to explicit Zenoh TCP endpoint(s)"
+    )
+    return endpoints
+
+
 class Args(FrozenModel):
     verbosity: int = 0
     force_master: bool = False
@@ -666,8 +595,11 @@ class Args(FrozenModel):
     offline: bool = os.getenv("EXO_OFFLINE", "false").lower() == "true"
     no_batch: bool = False
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
+    legacy_daemon: bool = False
     bootstrap_peers: list[str] = []
-    libp2p_port: int
+    namespace: str
+    zenoh_port: int
+    discovery_port: int
     # Per-process listener port for peer-to-peer model file serving.
     # Defaults to ``EXO_PEER_DOWNLOAD_PORT`` so existing single-node-per-
     # host deployments keep working unchanged. Operators running
@@ -757,11 +689,29 @@ class Args(FrozenModel):
             help="Comma-separated libp2p multiaddrs to dial on startup (env: EXO_BOOTSTRAP_PEERS)",
         )
         parser.add_argument(
+            "--namespace",
+            type=str,
+            default=os.getenv("EXO_ZENOH_NAMESPACE", __version__),
+            dest="namespace",
+            help=(
+                "Discovery namespace, nodes with different namespaces will not "
+                "connect (env: EXO_ZENOH_NAMESPACE)."
+            ),
+        )
+        parser.add_argument(
+            "--zenoh-port",
             "--libp2p-port",
             type=int,
-            default=0,
-            dest="libp2p_port",
-            help="Fixed TCP port for libp2p to listen on (0 = OS-assigned).",
+            default=52414,
+            dest="zenoh_port",
+            help="Fixed TCP port for Zenoh to listen (legacy alias: --libp2p-port).",
+        )
+        parser.add_argument(
+            "--discovery-port",
+            type=int,
+            default=52413,
+            dest="discovery_port",
+            help="Fixed UDP port for the discovery service.",
         )
         parser.add_argument(
             "--peer-download-port",

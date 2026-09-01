@@ -6,27 +6,6 @@ from pathlib import Path
 import anyio
 from loguru import logger
 
-NODE_INACTIVITY_TIMEOUT_SECONDS_ENV = "EXO_NODE_INACTIVITY_TIMEOUT_SECONDS"
-
-
-def _node_inactivity_timeout_seconds() -> float:
-    value = os.getenv(NODE_INACTIVITY_TIMEOUT_SECONDS_ENV)
-    if value is None:
-        return 30.0
-    try:
-        timeout = float(value)
-    except ValueError:
-        logger.warning(
-            f"Ignoring invalid {NODE_INACTIVITY_TIMEOUT_SECONDS_ENV}={value!r}; using 30s"
-        )
-        return 30.0
-    if timeout <= 0:
-        logger.warning(
-            f"Ignoring non-positive {NODE_INACTIVITY_TIMEOUT_SECONDS_ENV}={value!r}; using 30s"
-        )
-        return 30.0
-    return timeout
-
 from exo.master.placement import (
     add_instance_to_placements,
     auto_place_prefill_siblings,
@@ -36,6 +15,10 @@ from exo.master.placement import (
     place_instance,
 )
 from exo.master.placement_utils import find_ip_prioritised
+from exo.routing.event_router import (
+    EventRouterBrokenResourceError,
+    EventRouterClosedResourceError,
+)
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_EVENT_LOG_DIR, EXO_TRACING_ENABLED
 from exo.shared.types.commands import (
@@ -100,7 +83,27 @@ from exo.utils.disk_event_log import DiskEventLog
 from exo.utils.event_buffer import MultiSourceBuffer
 from exo.utils.task_group import TaskGroup
 
+NODE_INACTIVITY_TIMEOUT_SECONDS_ENV = "EXO_NODE_INACTIVITY_TIMEOUT_SECONDS"
 _MAX_MASTER_SESSION_LOG_DIRS = 5
+
+
+def _node_inactivity_timeout_seconds() -> float:
+    value = os.getenv(NODE_INACTIVITY_TIMEOUT_SECONDS_ENV)
+    if value is None:
+        return 30.0
+    try:
+        timeout = float(value)
+    except ValueError:
+        logger.warning(
+            f"Ignoring invalid {NODE_INACTIVITY_TIMEOUT_SECONDS_ENV}={value!r}; using 30s"
+        )
+        return 30.0
+    if timeout <= 0:
+        logger.warning(
+            f"Ignoring non-positive {NODE_INACTIVITY_TIMEOUT_SECONDS_ENV}={value!r}; using 30s"
+        )
+        return 30.0
+    return timeout
 
 
 def _prefill_endpoint_for(state: State, decode_instance_id: InstanceId) -> str | None:
@@ -185,6 +188,9 @@ class Master:
                 tg.start_soon(self._event_processor)
                 tg.start_soon(self._command_processor)
                 tg.start_soon(self._plan)
+        except* (EventRouterBrokenResourceError, EventRouterClosedResourceError):
+            # Event router has been closed (try-star syntax handles error groups)
+            pass
         finally:
             self._event_log.close()
             self.global_event_sender.close()
@@ -414,6 +420,7 @@ class Master:
                                 self.state.instances,
                                 self.state.node_memory,
                                 self.state.node_network,
+                                self.state.node_backends,
                                 download_status=self.state.downloads,
                                 node_rdma_ctl=self.state.node_rdma_ctl,
                                 node_identities=self.state.node_identities,
@@ -547,7 +554,7 @@ class Master:
                             )
                     for event in generated_events:
                         await self.event_sender.send(event)
-                except ValueError as e:
+                except Exception as e:
                     logger.opt(exception=e).warning("Error in command processor")
 
     # These plan loops are the cracks showing in our event sourcing architecture - more things could be commands
@@ -563,9 +570,7 @@ class Master:
         # unnecessary instance churn. Restore the upstream-safe
         # 30s budget while keeping the 1s tick so the master still
         # reacts quickly when a node *does* genuinely time out.
-        node_inactivity_timeout = timedelta(
-            seconds=_node_inactivity_timeout_seconds()
-        )
+        node_inactivity_timeout = timedelta(seconds=_node_inactivity_timeout_seconds())
         tick_interval_seconds = 1.0
 
         while True:
@@ -659,10 +664,10 @@ class Master:
                     self.state = apply(self.state, indexed)
 
                     self._event_log.append(event)
-                    await self._send_event(indexed)
+                    await self._send_indexed_event(indexed)
 
     # This function is re-entrant, take care!
-    async def _send_event(self, event: IndexedEvent):
+    async def _send_indexed_event(self, event: IndexedEvent):
         # Convenience method since this line is ugly
         await self.global_event_sender.send(
             GlobalForwarderEvent(
@@ -679,7 +684,7 @@ class Master:
             self._event_log.read_range(since_idx, end),
             start=since_idx,
         ):
-            await self._send_event(IndexedEvent(idx=i, event=event))
+            await self._send_indexed_event(IndexedEvent(idx=i, event=event))
 
     def _friendly_name(self, node_id: NodeId) -> str:
         identity = self.state.node_identities.get(node_id)
