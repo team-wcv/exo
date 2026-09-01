@@ -8,8 +8,8 @@ orchestraitor:
   ticket: 6a961781e6b6efd51fc859bf
   task_url: orchestraitor://task/6a961781e6b6efd51fc859bf
 pr:
-  url: null
-  state: not-created
+  url: https://github.com/team-wcv/exo/pull/44
+  state: open
 cleanup:
   merged_into: team-wcv/fix/6a95c4b0-resilient-downloads-vq
   archived_after: null
