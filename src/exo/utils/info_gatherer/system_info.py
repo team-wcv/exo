@@ -1,12 +1,19 @@
 import platform
+import re
 import socket
 import sys
+from pathlib import Path
 from subprocess import CalledProcessError
 
 import psutil
 from anyio import run_process
 
 from exo.shared.types.profiling import InterfaceType, NetworkInterfaceInfo
+
+_APPLE_USB_NCM_IOREG_CLASS = "AppleUSBDeviceNCMData"
+_APPLE_USB_VENDOR_ID = "05ac"
+_APPLE_USB_NCM_PRODUCT_ID = "1905"
+_LINUX_SYS_CLASS_NET = Path("/sys/class/net")
 
 
 def get_os_version() -> str:
@@ -120,6 +127,60 @@ async def _get_interface_types_from_networksetup() -> dict[str, InterfaceType]:
     return types
 
 
+async def _get_apple_usb_ncm_interfaces_from_ioreg() -> set[str]:
+    """Return macOS interfaces backed by Apple's USB-device NCM driver."""
+    if sys.platform != "darwin":
+        return set()
+
+    try:
+        result = await run_process(
+            ["ioreg", "-r", "-c", _APPLE_USB_NCM_IOREG_CLASS, "-l", "-w0"]
+        )
+    except CalledProcessError:
+        return set()
+
+    output = result.stdout.decode("utf-8", errors="replace")
+    return set(re.findall(r'"BSD Name"\s*=\s*"([^"\s]+)"', output))
+
+
+def _read_sysfs_value(path: Path) -> str | None:
+    try:
+        return path.read_text().strip().lower()
+    except OSError:
+        return None
+
+
+def _get_apple_usb_ncm_interfaces_from_sysfs(
+    sys_class_net: Path = _LINUX_SYS_CLASS_NET,
+) -> set[str]:
+    """Return Linux interfaces matching cdc_ncm on Apple USB 05ac:1905."""
+    try:
+        interfaces = list(sys_class_net.iterdir())
+    except OSError:
+        return set()
+
+    matched: set[str] = set()
+    for interface in interfaces:
+        try:
+            device = (interface / "device").resolve(strict=True)
+            driver = (device / "driver").resolve(strict=True).name
+        except OSError:
+            continue
+        if driver != "cdc_ncm":
+            continue
+
+        for ancestor in (device, *device.parents):
+            if (
+                _read_sysfs_value(ancestor / "idVendor") == _APPLE_USB_VENDOR_ID
+                and _read_sysfs_value(ancestor / "idProduct")
+                == _APPLE_USB_NCM_PRODUCT_ID
+            ):
+                matched.add(interface.name)
+                break
+
+    return matched
+
+
 async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     """
     Retrieves detailed network interface information on macOS.
@@ -129,16 +190,27 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     """
     interfaces_info: list[NetworkInterfaceInfo] = []
     interface_types = await _get_interface_types_from_networksetup()
+    if sys.platform == "darwin":
+        apple_usb_ncm_interfaces = await _get_apple_usb_ncm_interfaces_from_ioreg()
+    elif sys.platform == "linux":
+        apple_usb_ncm_interfaces = _get_apple_usb_ncm_interfaces_from_sysfs()
+    else:
+        apple_usb_ncm_interfaces = set()
 
     for iface, services in psutil.net_if_addrs().items():
         for service in services:
             match service.family:
                 case socket.AF_INET | socket.AF_INET6:
+                    interface_type: InterfaceType = interface_types.get(
+                        iface, "unknown"
+                    )
+                    if iface in apple_usb_ncm_interfaces:
+                        interface_type = "apple_usb_ncm"
                     interfaces_info.append(
                         NetworkInterfaceInfo(
                             name=iface,
                             ip_address=service.address,
-                            interface_type=interface_types.get(iface, "unknown"),
+                            interface_type=interface_type,
                         )
                     )
                 case _:

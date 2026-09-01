@@ -430,6 +430,102 @@ def test_jaccl_coordinator_prefers_lan_over_thunderbolt():
     )
 
 
+def test_ring_prefers_ethernet_then_apple_usb_ncm_then_wifi():
+    source = NodeId()
+    sink = NodeId()
+    topology = Topology()
+    topology.add_node(source)
+    topology.add_node(sink)
+    for ip in ("192.168.1.21", "169.254.49.224", "192.168.1.121"):
+        topology.add_connection(
+            Connection(
+                source=source,
+                sink=sink,
+                edge=SocketConnection(
+                    sink_multiaddr=Multiaddr(address=f"/ip4/{ip}/tcp/5000")
+                ),
+            )
+        )
+
+    network = {
+        sink: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en0",
+                    ip_address="192.168.1.21",
+                    interface_type="ethernet",
+                ),
+                NetworkInterfaceInfo(
+                    name="en9",
+                    ip_address="169.254.49.224",
+                    interface_type="apple_usb_ncm",
+                ),
+                NetworkInterfaceInfo(
+                    name="en1",
+                    ip_address="192.168.1.121",
+                    interface_type="wifi",
+                ),
+            ]
+        )
+    }
+
+    assert find_ip_prioritised(source, sink, topology, network, ring=True) == (
+        "192.168.1.21"
+    )
+
+    topology.remove_connection(
+        Connection(
+            source=source,
+            sink=sink,
+            edge=SocketConnection(
+                sink_multiaddr=Multiaddr(address="/ip4/192.168.1.21/tcp/5000")
+            ),
+        )
+    )
+    assert find_ip_prioritised(source, sink, topology, network, ring=True) == (
+        "169.254.49.224"
+    )
+
+
+def test_control_plane_prefers_wifi_lan_over_apple_usb_ncm():
+    source = NodeId()
+    sink = NodeId()
+    topology = Topology()
+    topology.add_node(source)
+    topology.add_node(sink)
+    for ip in ("169.254.49.224", "192.168.1.121"):
+        topology.add_connection(
+            Connection(
+                source=source,
+                sink=sink,
+                edge=SocketConnection(
+                    sink_multiaddr=Multiaddr(address=f"/ip4/{ip}/tcp/5000")
+                ),
+            )
+        )
+
+    network = {
+        sink: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en9",
+                    ip_address="169.254.49.224",
+                    interface_type="apple_usb_ncm",
+                ),
+                NetworkInterfaceInfo(
+                    name="en1",
+                    ip_address="192.168.1.121",
+                    interface_type="wifi",
+                ),
+            ]
+        )
+    }
+
+    assert find_ip_prioritised(source, sink, topology, network, ring=False) == (
+        "192.168.1.121"
+    )
+
+
 class TestAllocateLayersProportionally:
     def test_empty_node_list_raises(self):
         with pytest.raises(ValueError, match="empty node list"):

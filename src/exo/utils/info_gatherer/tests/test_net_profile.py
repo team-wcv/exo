@@ -16,6 +16,30 @@ def test_probeable_interface_rejects_non_lan_paths(monkeypatch: MonkeyPatch):
     assert not _probeable_interface("awdl0", "fe80::1406:6dff:fed0:b945%awdl0")
 
 
+def test_probeable_interface_admits_only_verified_apple_ncm_link_local(
+    monkeypatch: MonkeyPatch,
+):
+    monkeypatch.delenv("EXO_REACHABILITY_ALLOWED_IPS", raising=False)
+    monkeypatch.delenv("EXO_REACHABILITY_ALLOWED_CIDRS", raising=False)
+
+    assert _probeable_interface("en9", "169.254.49.224", interface_type="apple_usb_ncm")
+    assert not _probeable_interface("en9", "169.254.49.224", interface_type="ethernet")
+    assert not _probeable_interface(
+        "en9", "fe80::c4f:acbe:e0e0:9c3b%en9", interface_type="apple_usb_ncm"
+    )
+
+
+def test_apple_ncm_link_local_still_honors_operator_cidr(
+    monkeypatch: MonkeyPatch,
+):
+    monkeypatch.delenv("EXO_REACHABILITY_ALLOWED_IPS", raising=False)
+    monkeypatch.setenv("EXO_REACHABILITY_ALLOWED_CIDRS", "192.168.1.0/24")
+
+    assert not _probeable_interface(
+        "en9", "169.254.49.224", interface_type="apple_usb_ncm"
+    )
+
+
 def test_probeable_interface_honors_allowed_cidrs(monkeypatch: MonkeyPatch):
     monkeypatch.delenv("EXO_REACHABILITY_ALLOWED_IPS", raising=False)
     monkeypatch.setenv("EXO_REACHABILITY_ALLOWED_CIDRS", "192.168.1.0/24")

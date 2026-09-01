@@ -45,11 +45,14 @@ physical bus.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from exo.utils.info_gatherer.system_info import (
+    _get_apple_usb_ncm_interfaces_from_ioreg,  # pyright: ignore[reportPrivateUsage]
+    _get_apple_usb_ncm_interfaces_from_sysfs,  # pyright: ignore[reportPrivateUsage]
     _get_interface_types_from_networksetup,  # pyright: ignore[reportPrivateUsage]
 )
 
@@ -113,6 +116,51 @@ Hardware Port: Thunderbolt 3
 Device: en2
 Ethernet Address: 36:79:2c:66:09:88
 """
+
+_APPLE_USB_NCM_IOREG_OUTPUT = """\
++-o AppleUSBDeviceNCMData  <class AppleUSBDeviceNCMData, registered, active>
+  |   "CFBundleIdentifier" = "com.apple.driver.AppleUSBDeviceNCM"
+    |   "BSD Name" = "en8"
++-o AppleUSBDeviceNCMData  <class AppleUSBDeviceNCMData, registered, active>
+  |   "CFBundleIdentifier" = "com.apple.driver.AppleUSBDeviceNCM"
+    |   "BSD Name" = "anpi0"
++-o AppleUSBDeviceNCMData  <class AppleUSBDeviceNCMData, registered, active>
+  |   "CFBundleIdentifier" = "com.apple.driver.AppleUSBDeviceNCM"
+    |   "BSD Name" = "en9"
+"""
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="ioreg classifier only runs on macOS",
+)
+async def test_apple_usb_ncm_interfaces_come_from_exact_ioreg_driver() -> None:
+    with patch(
+        "exo.utils.info_gatherer.system_info.run_process",
+        return_value=_make_completed_process_stdout(_APPLE_USB_NCM_IOREG_OUTPUT),
+    ):
+        interfaces = await _get_apple_usb_ncm_interfaces_from_ioreg()
+
+    assert interfaces == {"en8", "en9", "anpi0"}
+
+
+def test_linux_apple_usb_ncm_requires_driver_and_usb_identity(tmp_path: Path) -> None:
+    sys_class_net = tmp_path / "sys" / "class" / "net"
+    device = sys_class_net / "enx3a524871d6c5" / "device"
+    driver = tmp_path / "sys" / "drivers" / "cdc_ncm"
+    device.mkdir(parents=True)
+    driver.mkdir(parents=True)
+    (device / "driver").symlink_to(driver, target_is_directory=True)
+    (device / "idVendor").write_text("05ac\n")
+    (device / "idProduct").write_text("1905\n")
+
+    assert _get_apple_usb_ncm_interfaces_from_sysfs(sys_class_net) == {
+        "enx3a524871d6c5"
+    }
+
+    (device / "idProduct").write_text("1904\n")
+    assert _get_apple_usb_ncm_interfaces_from_sysfs(sys_class_net) == set()
 
 
 @pytest.mark.anyio
