@@ -13,5 +13,5 @@ pr:
 
 - Why this branch exists: Qwen3.8 prefix reuse trims the normal KV cache but leaves its sparse-attention indexer at the old prompt length, producing incompatible attention-mask shapes and an empty HTTP 200 response.
 - Changed paths: `src/exo/worker/engines/mlx/cache.py`, `src/exo/worker/engines/mlx/generator/generate.py`, `src/exo/worker/tests/unittests/test_mlx/test_auxiliary_cache_trim.py`, and `dashboard/src/lib/stores/app.svelte.ts`.
-- Validation run: reproduce the 2,114-vs-1,612 mask mismatch, reload the Twin Tensor/JACCL instance, and verify the exact 1,847-token continuation plus repeated divergent-prefix prompts.
+- Validation run: 14 focused cache tests pass on Metal; BasedPyright reports zero errors/warnings; Svelte check reports zero errors/warnings; the exact 1,805-token conversation and cached follow-up return visible answers at 40.8–41.0 tok/s on Twin Tensor/JACCL.
 - Known follow-ups: none.
