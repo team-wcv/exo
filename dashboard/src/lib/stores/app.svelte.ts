@@ -695,7 +695,9 @@ class AppStore {
         this.conversations = parsed.map((conversation) => ({
           id: conversation.id ?? generateUUID(),
           name: conversation.name ?? "Chat",
-          messages: conversation.messages ?? [],
+          messages: (conversation.messages ?? []).filter((message) =>
+            this.shouldIncludeApiHistoryMessage(message),
+          ),
           createdAt: conversation.createdAt ?? Date.now(),
           updatedAt: conversation.updatedAt ?? Date.now(),
           modelId: conversation.modelId ?? null,
@@ -1233,6 +1235,14 @@ class AppStore {
     return this.conversations.some((c) => c.id === conversationId);
   }
 
+  private shouldIncludeApiHistoryMessage(message: Message): boolean {
+    // An interrupted or empty response is not a valid assistant turn. Keeping
+    // it in history can make the model finish after reasoning without ever
+    // emitting visible content, so exclude it from storage recovery and every
+    // subsequent request while retaining all user/system messages.
+    return message.role !== "assistant" || message.content.trim().length > 0;
+  }
+
   /**
    * Persist a specific conversation to storage.
    */
@@ -1766,9 +1776,12 @@ class AppStore {
           "You are a helpful AI assistant. Respond directly and concisely. Do not show your reasoning or thought process.",
       };
 
+      const apiHistory = this.messages.filter((message) =>
+        this.shouldIncludeApiHistoryMessage(message),
+      );
       const apiMessages = [
         systemPrompt,
-        ...this.messages.map((m) => {
+        ...apiHistory.map((m) => {
           let msgContent = m.content;
           if (m.attachments) {
             for (const attachment of m.attachments) {
@@ -1994,9 +2007,12 @@ class AppStore {
           "You are a helpful AI assistant. Respond directly and concisely. Do not show your reasoning or thought process.",
       };
 
+      const apiHistory = targetConversation.messages
+        .slice(0, -1)
+        .filter((message) => this.shouldIncludeApiHistoryMessage(message));
       const apiMessages = [
         systemPrompt,
-        ...targetConversation.messages.slice(0, -1).map((m) => {
+        ...apiHistory.map((m) => {
           const out: {
             role: string;
             content: string;
@@ -2497,9 +2513,12 @@ class AppStore {
       };
 
       // Build API messages from the target conversation - include file content for text files
+      const apiHistory = targetConversation.messages
+        .slice(0, -1)
+        .filter((message) => this.shouldIncludeApiHistoryMessage(message));
       const apiMessages = [
         systemPrompt,
-        ...targetConversation.messages.slice(0, -1).map((m) => {
+        ...apiHistory.map((m) => {
           // Check if this message has image or PDF attachments
           const visualAttachments = m.attachments?.filter(
             (a) =>

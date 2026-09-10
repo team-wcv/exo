@@ -51,6 +51,7 @@ from exo.worker.engines.mlx.cache import (
     is_non_trimmable_cache_entry,
     make_kv_cache,
     snapshot_ssm_states,
+    trim_trimmable_cache_entry,
 )
 from exo.worker.engines.mlx.constants import (
     DEFAULT_TOP_LOGPROBS,
@@ -461,7 +462,7 @@ def prefill(
                 cache[i] = restored  # type: ignore
         else:
             assert not non_trimmable
-            c.trim(2)
+            trim_trimmable_cache_entry(c, 2)
 
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = num_tokens / elapsed if elapsed > 0 else 0.0

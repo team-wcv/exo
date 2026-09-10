@@ -1,7 +1,8 @@
 import gc
 import os
+from collections.abc import Callable
 from copy import deepcopy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import mlx.core as mx
 import numpy as np
@@ -227,6 +228,29 @@ def is_non_trimmable_cache_entry(c: object) -> bool:
 def has_non_kv_caches(cache: KVCacheType) -> bool:
     """Check if a cache contains any ArraysCache (SSM) entries."""
     return any(is_non_trimmable_cache_entry(c) for c in cache)
+
+
+def trim_trimmable_cache_entry(
+    cache: object,
+    num_tokens: int,
+) -> int:
+    """Trim a cache entry and any token-aligned auxiliary indexer state.
+
+    Custom attention caches may subclass ``KVCache`` while keeping sparse
+    attention keys in an ``indexer`` sidecar. ``KVCache.trim`` only adjusts
+    its own key/value offset, so prefix reuse otherwise leaves the indexer at
+    the old prompt length and produces an incompatible sparse mask.
+    """
+    trim = cast(Callable[[int], int] | None, getattr(cache, "trim", None))
+    if trim is None:
+        raise TypeError(f"Cache entry {type(cache).__name__} does not support trim()")
+    trimmed = int(trim(num_tokens))
+    indexer = getattr(cache, "indexer", None)
+    state = getattr(indexer, "state", None)
+    if isinstance(state, mx.array) and state.ndim >= 2:
+        retained = max(0, int(state.shape[1]) - trimmed)
+        setattr(indexer, "state", state[:, :retained])
+    return trimmed
 
 
 class KVPrefixCache:
@@ -508,7 +532,7 @@ def trim_cache(
                             inner.offset = 0
                             inner._idx = 0
         else:
-            c.trim(num_tokens)
+            trim_trimmable_cache_entry(c, num_tokens)
 
 
 def encode_prompt(tokenizer: TokenizerWrapper, prompt: str) -> mx.array:
