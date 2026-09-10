@@ -1,17 +1,17 @@
 ---
-branch: chore/6a96fa36-bmbp-bigbrain-endpoint
-created: 2026-09-01
+branch: fix/6aa208b9-twin-mx-task-agreement
+created: 2026-09-09
 owner: codex-agent
 status: active
-scope: "Add a durable isolated Bigbrain endpoint profile for wc-bmbp and revalidate every host"
+scope: "Replace the JACCL point-to-point task-admission broadcast that crashed the Twin Qwen runner"
 orchestraitor:
-  ticket: 6a96fa36e6b6efd51fc86202
+  ticket: 6aa208b9559bc082bf61ea61
 pr:
-  url: https://github.com/team-wcv/exo/pull/46
-  state: open
+  url: pending
+  state: pending
 ---
 
-- Why this branch exists: Give wc-bmbp a persistent solo Exo control plane for local runtimes without changing the Twin, Studio, or Spark namespaces.
-- Changed paths: `ops/team-wcv/bigbrain/bmbp/` LaunchAgent profile and endpoint-isolation runbook update.
-- Validation run: all four dashboard roots return HTTP 200 from peer devices; Twins remain exactly smbp/smbpt with two RunnerReady runners; Studio, Spark, and BMBP each report one isolated topology node and 124 models; all persistent services are running; Spark Laguna remains active with zero restarts.
-- Known follow-ups: BMBP should use localhost for same-host runtimes because its own Tailnet hostname does not hairpin from the host; peer devices reach the Tailnet URL normally.
+- Why this branch exists: the 2026-09-09 first generation request crashed the non-root Twin runner with SIGSEGV in `mx_broadcast_int_list` / `mx_all_gather_tasks`.
+- Changed paths: planned MLX task-agreement broadcast implementation, focused tests, and operational crash documentation.
+- Validation run: pending unit, static, two-host load, generation, and soak checks.
+- Known follow-ups: deploy only after review and a restart-consensus poll.
