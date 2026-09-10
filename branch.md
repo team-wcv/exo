@@ -1,17 +1,17 @@
 ---
-branch: fix/6aa208b9-twin-mx-task-agreement
-created: 2026-09-09
+branch: fix/6aa208b9-qwen4-long-prefill
+created: 2026-09-10
 owner: codex-agent
 status: active
-scope: "Replace the JACCL point-to-point task-admission broadcast that crashed the Twin Qwen runner"
+scope: "Fix Qwen4 hybrid-cache long-context prefill on Twin Tensor/RDMA instances"
 orchestraitor:
   ticket: 6aa208b9559bc082bf61ea61
 pr:
-  url: https://github.com/team-wcv/exo/pull/47
-  state: open
+  url: pending
+  state: pending
 ---
 
-- Why this branch exists: the 2026-09-09 first generation request crashed the non-root Twin runner with SIGSEGV in `mx_broadcast_int_list` / `mx_all_gather_tasks`.
-- Changed paths: MLX task-agreement broadcast implementation and focused transport regression coverage.
-- Validation run: Ruff and BasedPyright pass locally; 30/30 focused tests pass on wc-smbpt with a real Metal device; live two-host load, generation, and soak checks remain.
-- Known follow-ups: deploy only after review and a restart-consensus poll.
+- Why this branch exists: Qwen3.8 returns an immediate empty completion once recurrent-cache prefills exceed roughly 900 tokens.
+- Changed paths: `src/exo/worker/engines/mlx/generator/generate.py` and focused tests.
+- Validation run: reproduce at 913/1013/1847 tokens, reload the Twin Tensor/JACCL instance, and verify the exact 1847-token continuation plus short-chat throughput.
+- Known follow-ups: none.
