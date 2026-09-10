@@ -51,6 +51,7 @@ from exo.worker.engines.mlx.cache import (
     is_non_trimmable_cache_entry,
     make_kv_cache,
     snapshot_ssm_states,
+    trim_trimmable_cache_entry,
 )
 from exo.worker.engines.mlx.constants import (
     DEFAULT_TOP_LOGPROBS,
@@ -96,26 +97,6 @@ from exo.worker.engines.mlx.vision import (
     prepare_vision,
 )
 from exo.worker.runner.bootstrap import logger
-
-
-_DEFAULT_PREFILL_STEP_SIZE = 4096
-_RECURRENT_PREFILL_STEP_SIZE = 512
-
-
-def _prefill_step_size(has_recurrent_state: bool) -> int:
-    """Bound recurrent Metal kernels so long prompts finish prefill.
-
-    Hybrid models such as Qwen4 run a time-step loop inside their gated-delta
-    Metal kernel. Passing the ordinary 4K-token prefill chunk can exceed the
-    kernel's reliable execution window and return an immediate EOS without
-    completing prefill. Smaller chunks preserve the recurrent state between
-    calls while keeping ordinary KV-only attention on the faster 4K path.
-    """
-    return (
-        _RECURRENT_PREFILL_STEP_SIZE
-        if has_recurrent_state
-        else _DEFAULT_PREFILL_STEP_SIZE
-    )
 
 
 def _broadcast_clamped_num_draft_tokens(
@@ -428,7 +409,7 @@ def prefill(
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
-    prefill_step_size = _prefill_step_size(has_ssm)
+    prefill_step_size = 4096
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:
@@ -481,7 +462,7 @@ def prefill(
                 cache[i] = restored  # type: ignore
         else:
             assert not non_trimmable
-            c.trim(2)
+            trim_trimmable_cache_entry(c, 2)
 
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = num_tokens / elapsed if elapsed > 0 else 0.0
