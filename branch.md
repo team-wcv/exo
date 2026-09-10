@@ -7,8 +7,8 @@ scope: "Keep Qwen4 prefix state aligned and prevent empty assistant turns from p
 orchestraitor:
   ticket: 6aa208b9559bc082bf61ea61
 pr:
-  url: pending
-  state: pending
+  url: https://github.com/team-wcv/exo/pull/48
+  state: open
 ---
 
 - Why this branch exists: Qwen3.8 prefix reuse trims the normal KV cache but leaves its sparse-attention indexer at the old prompt length, producing incompatible attention-mask shapes and an empty HTTP 200 response.
