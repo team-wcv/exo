@@ -98,6 +98,26 @@ from exo.worker.engines.mlx.vision import (
 from exo.worker.runner.bootstrap import logger
 
 
+_DEFAULT_PREFILL_STEP_SIZE = 4096
+_RECURRENT_PREFILL_STEP_SIZE = 512
+
+
+def _prefill_step_size(has_recurrent_state: bool) -> int:
+    """Bound recurrent Metal kernels so long prompts finish prefill.
+
+    Hybrid models such as Qwen4 run a time-step loop inside their gated-delta
+    Metal kernel. Passing the ordinary 4K-token prefill chunk can exceed the
+    kernel's reliable execution window and return an immediate EOS without
+    completing prefill. Smaller chunks preserve the recurrent state between
+    calls while keeping ordinary KV-only attention on the faster 4K path.
+    """
+    return (
+        _RECURRENT_PREFILL_STEP_SIZE
+        if has_recurrent_state
+        else _DEFAULT_PREFILL_STEP_SIZE
+    )
+
+
 def _broadcast_clamped_num_draft_tokens(
     *,
     effective_num_draft_tokens: int,
@@ -408,7 +428,7 @@ def prefill(
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
-    prefill_step_size = 4096
+    prefill_step_size = _prefill_step_size(has_ssm)
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:

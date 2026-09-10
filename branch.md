@@ -12,6 +12,6 @@ pr:
 ---
 
 - Why this branch exists: Qwen3.8 returns an immediate empty completion once recurrent-cache prefills exceed roughly 900 tokens.
-- Changed paths: `src/exo/worker/engines/mlx/generator/generate.py` and focused tests.
+- Changed paths: `src/exo/worker/engines/mlx/generator/generate.py` and `src/exo/worker/tests/unittests/test_mlx/test_generate_prefill_step_size.py`.
 - Validation run: reproduce at 913/1013/1847 tokens, reload the Twin Tensor/JACCL instance, and verify the exact 1847-token continuation plus short-chat throughput.
 - Known follow-ups: none.
