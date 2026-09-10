@@ -1,7 +1,8 @@
 import gc
 import os
+from collections.abc import Callable
 from copy import deepcopy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import mlx.core as mx
 import numpy as np
@@ -230,7 +231,7 @@ def has_non_kv_caches(cache: KVCacheType) -> bool:
 
 
 def trim_trimmable_cache_entry(
-    cache: KVCache | QuantizedKVCache | CacheList,
+    cache: object,
     num_tokens: int,
 ) -> int:
     """Trim a cache entry and any token-aligned auxiliary indexer state.
@@ -240,12 +241,15 @@ def trim_trimmable_cache_entry(
     its own key/value offset, so prefix reuse otherwise leaves the indexer at
     the old prompt length and produces an incompatible sparse mask.
     """
-    trimmed = int(cache.trim(num_tokens))
+    trim = cast(Callable[[int], int] | None, getattr(cache, "trim", None))
+    if trim is None:
+        raise TypeError(f"Cache entry {type(cache).__name__} does not support trim()")
+    trimmed = int(trim(num_tokens))
     indexer = getattr(cache, "indexer", None)
     state = getattr(indexer, "state", None)
     if isinstance(state, mx.array) and state.ndim >= 2:
         retained = max(0, int(state.shape[1]) - trimmed)
-        indexer.state = state[:, :retained]
+        setattr(indexer, "state", state[:, :retained])
     return trimmed
 
 
