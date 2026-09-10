@@ -1966,60 +1966,10 @@ def mx_barrier(group: mx.distributed.Group | None):
 # max) and reject negatives explicitly so a caller passing a Python
 # ``-1`` doesn't silently wrap into a 4-billion-ish "valid" int32.
 _MX_BROADCAST_MAX_VALUE: Final[int] = (1 << 31) - 1
-# Toggle to dump every broadcast call's send/recv buffers. Set via
+# Toggle to dump every broadcast call's collective result. Set via
 # ``EXO_PROBE_BROADCAST=1`` for ad-hoc diagnostics; leave off in
 # steady state because the per-token logging spam quickly dominates.
 _BROADCAST_PROBE: Final[bool] = bool(os.environ.get("EXO_PROBE_BROADCAST"))
-
-
-# Distributed backend literal -- matches the strings we pass to
-# ``mx.distributed.init(backend=...)`` in :func:`mlx_distributed_init`.
-DistributedBackend = Literal["ring", "jaccl"]
-
-
-def _detect_distributed_backend() -> DistributedBackend:
-    """Resolve the active MLX distributed backend from the env vars
-    set by :func:`mlx_distributed_init`.
-
-    Why env-var sniffing instead of asking the group: ``mx.distributed.Group``
-    only exposes ``rank()`` / ``size()`` / ``split()`` and gives no
-    public hook for the backend name. We control the init path
-    (:func:`mlx_distributed_init`) and set ``MLX_HOSTFILE`` for ring
-    and ``MLX_IBV_DEVICES`` (plus ``MLX_JACCL_COORDINATOR``) for
-    jaccl, so checking those env vars is a deterministic, in-process
-    signal that doesn't require threading a backend literal through
-    every call site.
-
-    Backend selection matters because the ring backend is built around
-    collective primitives (``all_sum`` / ``all_gather``) and does not
-    support arbitrary point-to-point ``send`` / ``recv`` between
-    non-neighbor ranks; multi-rank ring deployments would fail or
-    hang the moment :func:`mx_broadcast_int_list` issued a
-    ``send(dst=N)`` for a non-neighbor ``N``. JACCL, on the other
-    hand, supports arbitrary ``send`` / ``recv`` and we deliberately
-    use that to keep int32 broadcasts off the same all-reduce wire as
-    TP float32 collectives (see the docstring on
-    :func:`mx_broadcast_int_list` for the historical wire-conflation
-    bug).
-
-    Returns:
-      ``"ring"`` when ``MLX_HOSTFILE`` is set, else ``"jaccl"``.
-      Defaults to ``"ring"`` when neither marker is present so the
-      ring-safe code path runs in ambiguous setups (e.g. tests that
-      construct a fake group without going through
-      :func:`mlx_distributed_init`).
-
-    Raises:
-      None. Detection is best-effort by design: the caller already
-      gated multi-rank entry on ``group is not None``, and a
-      misdetected backend at most picks the slower-but-correct
-      collective path.
-    """
-    if os.environ.get("MLX_HOSTFILE"):
-        return "ring"
-    if os.environ.get("MLX_IBV_DEVICES") or os.environ.get("MLX_JACCL_COORDINATOR"):
-        return "jaccl"
-    return "ring"
 
 
 def mx_broadcast_int_list(
@@ -2031,41 +1981,24 @@ def mx_broadcast_int_list(
 ) -> list[int]:
     """Broadcast a fixed-length int list from one rank to all peers.
 
-    Backend-aware implementation:
+    Every backend uses ``all_sum`` of an int32 buffer where the root
+    contributes ``values`` and every peer contributes zeros. The
+    element-wise sum is therefore the root payload on every rank.
 
-      * ``ring``: use ``all_sum`` of an int32 buffer where non-root
-        ranks contribute zeros and root contributes ``values``. Sum
-        across the group recovers ``values`` element-wise (root's
-        contribution is the only nonzero summand). MLX's ring backend
-        is built around collective primitives and does not support
-        arbitrary point-to-point ``send`` / ``recv`` between
-        non-neighbor ranks, so this is the only ring-safe option.
-      * ``jaccl``: rank-0 fanout via :func:`mx.distributed.send` /
-        :func:`mx.distributed.recv`. Root issues one send to every
-        peer; each peer issues a single matching recv from rank 0.
+    JACCL point-to-point ``send`` / ``recv`` is deliberately not
+    used here. A long-lived Twin runner crashed with ``SIGSEGV``
+    inside JACCL ``recv`` when the first request entered
+    :func:`mx_all_gather_tasks`. Task admission already uses
+    ``all_sum`` for its second voting phase, so using the same
+    well-exercised collective for phase one removes that native crash
+    surface and keeps both phases in one ordered collective stream.
 
-    Why split by backend: under JACCL the model's TP layers issue
-    ``all_sum`` on the same target group on float32 buffers, every
-    layer, every forward. A previous revision used ``all_sum`` for
-    this broadcast on JACCL too and observed silent corruption on
-    the spec-decode hot path: with >100 in-flight ``all_sum``
-    collectives per round all on the same group, JACCL's pairing
-    logic occasionally matched our int32 "broadcast" on rank A
-    against the model's float32 TP all-reduce on rank B, scrambling
-    the int32 buffer (symptom: token ids ~10^9 emitted by the spec
-    loop, ``IndexError`` deep in the SPM detokenizer). Switching to
-    ``send`` / ``recv`` on JACCL makes this broadcast a different
-    primitive than the TP all-reduce so JACCL has no opportunity to
-    merge them. Ring lacks both the JACCL pairing pitfall and the
-    arbitrary-``send`` capability, so it stays on ``all_sum``.
-
-    Caller note: the spec-decode hot path no longer routes through
-    this function -- it uses :func:`target_peer_broadcast_int_list`
-    over a dedicated TCP fanout (see :class:`TargetPeerFanout`). The
-    only remaining caller is :func:`mx_all_gather_tasks` at admit
-    boundaries, which fires far below TP all-reduce frequency, so
-    even on JACCL the wire-conflation risk is low; the
-    ``send`` / ``recv`` path is kept for defense-in-depth.
+    The per-token speculative-decoding hot path does not use this
+    helper; it uses :func:`target_peer_broadcast_int_list` over a
+    dedicated TCP fanout. Consequently the historical int/float
+    collective cross-talk that motivated the point-to-point branch
+    cannot occur here: this helper runs only at task admission and
+    cancellation boundaries, before model forward collectives.
 
     The fixed-length contract means the caller pads to ``length`` on
     root and both ranks agree on ``length`` ahead of time, which keeps
@@ -2110,8 +2043,6 @@ def mx_broadcast_int_list(
         _validate_broadcast_values(values)
         return list(values)
 
-    group_size = group.size()
-
     if is_root and (values is None or len(values) != length):
         raise ValueError(
             "mx_broadcast_int_list root rank requires values of "
@@ -2121,47 +2052,18 @@ def mx_broadcast_int_list(
         # ``cast`` for the type-checker: validated above.
         _validate_broadcast_values(cast(list[int], values))
 
-    backend = _detect_distributed_backend()
-
-    if backend == "ring":
-        # Ring backend: collective ``all_sum``. Root contributes the
-        # values, every other rank contributes a zero buffer of the
-        # same shape, so the element-wise sum is ``values``. This is
-        # the only ring-safe broadcast primitive (ring rejects
-        # arbitrary point-to-point ``send`` / ``recv`` between
-        # non-neighbor ranks).
-        if is_root:
-            local = mx.array(cast(list[int], values), dtype=mx.int32)
-        else:
-            local = mx.zeros(shape=(length,), dtype=mx.int32)
-        summed = mx.distributed.all_sum(local, group=group)
-        mx.eval(summed)
-        out = [int(v) for v in cast(list[int], summed.tolist())]
-        if _BROADCAST_PROBE:
-            role = "ROOT" if is_root else "PEER"
-            logger.warning(
-                f"mx_broadcast_int_list[ring] {role} recovered {out} (len={length})"
-            )
-        return out
-
-    # JACCL backend: send/recv fanout from rank 0.
     if is_root:
-        send_buffer = mx.array(cast(list[int], values), dtype=mx.int32)
-        for dst in range(1, group_size):
-            sent = mx.distributed.send(send_buffer, dst=dst, group=group)
-            mx.eval(sent)
-        if _BROADCAST_PROBE:
-            logger.warning(
-                f"mx_broadcast_int_list[jaccl] ROOT sent {values} (len={length})"
-            )
-        return list(cast(list[int], values))
-
-    received = mx.distributed.recv(shape=(length,), dtype=mx.int32, src=0, group=group)
-    mx.eval(received)
-    out = [int(v) for v in cast(list[int], received.tolist())]
+        local = mx.array(cast(list[int], values), dtype=mx.int32)
+    else:
+        local = mx.zeros(shape=(length,), dtype=mx.int32)
+    summed = mx.distributed.all_sum(local, group=group)
+    mx.eval(summed)
+    out = [int(v) for v in cast(list[int], summed.tolist())]
     if _BROADCAST_PROBE:
+        role = "ROOT" if is_root else "PEER"
         logger.warning(
-            f"mx_broadcast_int_list[jaccl] PEER recvd {out} (expected len={length})"
+            f"mx_broadcast_int_list[collective] {role} recovered {out} "
+            f"(len={length})"
         )
     return out
 
