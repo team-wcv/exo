@@ -7,8 +7,8 @@ scope: "Replace the JACCL point-to-point task-admission broadcast that crashed t
 orchestraitor:
   ticket: 6aa208b9559bc082bf61ea61
 pr:
-  url: pending
-  state: pending
+  url: https://github.com/team-wcv/exo/pull/47
+  state: open
 ---
 
 - Why this branch exists: the 2026-09-09 first generation request crashed the non-root Twin runner with SIGSEGV in `mx_broadcast_int_list` / `mx_all_gather_tasks`.
