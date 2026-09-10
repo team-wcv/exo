@@ -1,13 +1,11 @@
 """Unit tests for the MLX utility primitives used by the V2 multi-target spec loop.
 
-These exercise the contracts that the asymmetric pipelined drafter
-relies on for cross-rank determinism without spinning up MLX or
-``mx.distributed``:
+These exercise the contracts that distributed MLX runners rely on
+for cross-rank determinism without initializing ``mx.distributed``:
 
   * :func:`mx_broadcast_int_list` -- length / range / root contract.
-    The single-rank short-circuit can be exercised directly; the
-    multi-rank ``all_sum`` path is covered indirectly because it
-    delegates value validation to the same helper.
+    The single-rank short-circuit and multi-rank ``all_sum``
+    transport are exercised directly.
   * :func:`_validate_broadcast_values` -- the int32 bounds are tighter
     than Python's ``int`` range, so out-of-range values from a callsite
     bug must raise rather than wrap silently.
@@ -25,6 +23,9 @@ the unittest suite.
 
 from __future__ import annotations
 
+from typing import cast
+
+import mlx.core as mx
 import pytest
 
 from exo.shared.types.common import CommandId, ModelId
@@ -35,11 +36,11 @@ from exo.shared.types.text_generation import (
     TextGenerationTaskParams,
 )
 from exo.shared.types.worker.instances import InstanceId
+from exo.worker.engines.mlx import utils_mlx
 from exo.worker.engines.mlx.utils_mlx import (
     _MX_BROADCAST_MAX_VALUE,  # pyright: ignore[reportPrivateUsage]
     _MX_TASK_ID_BYTES,  # pyright: ignore[reportPrivateUsage]
     _decode_task_id,  # pyright: ignore[reportPrivateUsage]
-    _detect_distributed_backend,  # pyright: ignore[reportPrivateUsage]
     _encode_task_id,  # pyright: ignore[reportPrivateUsage]
     _validate_broadcast_values,  # pyright: ignore[reportPrivateUsage]
     mx_all_gather_tasks,
@@ -123,74 +124,50 @@ class TestMxBroadcastIntListSingleRank:
 
 
 # ---------------------------------------------------------------------------
-# Backend detection (controls which distributed primitive we use)
+# Multi-rank transport selection
 # ---------------------------------------------------------------------------
 
 
-class TestDetectDistributedBackend:
-    """``_detect_distributed_backend`` resolves ring vs jaccl from the
-    env vars set by :func:`mlx_distributed_init`. Backend selection
-    matters because MLX's ring backend does not support arbitrary
-    point-to-point ``send`` / ``recv`` between non-neighbor ranks --
-    multi-rank ring deployments would fail or hang the moment
-    :func:`mx_broadcast_int_list` issued a ``send(dst=N)`` for a
-    non-neighbor ``N``. Confirm the helper picks the ring-safe path
-    whenever the ring marker (``MLX_HOSTFILE``) is present and the
-    JACCL path only when the JACCL markers are present in isolation."""
+class TestMxBroadcastIntListMultiRank:
+    """Task admission must stay on collectives for every MLX backend."""
 
-    def test_ring_backend_when_hostfile_set(
+    def test_uses_all_sum_and_never_point_to_point(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("MLX_HOSTFILE", "/tmp/hosts.json")
-        monkeypatch.delenv("MLX_IBV_DEVICES", raising=False)
-        monkeypatch.delenv("MLX_JACCL_COORDINATOR", raising=False)
-        assert _detect_distributed_backend() == "ring"
+        payload = [3, 11, 29]
+        fake_group = cast(mx.distributed.Group, object())
+        local_inputs: list[list[int]] = []
 
-    def test_jaccl_backend_when_ibv_devices_set(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.delenv("MLX_HOSTFILE", raising=False)
-        monkeypatch.setenv("MLX_IBV_DEVICES", "/tmp/devices.json")
-        monkeypatch.delenv("MLX_JACCL_COORDINATOR", raising=False)
-        assert _detect_distributed_backend() == "jaccl"
+        def fake_all_sum(
+            local: mx.array, *, group: mx.distributed.Group
+        ) -> mx.array:
+            assert group is fake_group
+            local_values = cast(list[int], local.tolist())
+            local_inputs.append([int(value) for value in local_values])
+            return mx.array(payload, dtype=mx.int32)
 
-    def test_jaccl_backend_when_only_coordinator_set(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # ``MLX_JACCL_COORDINATOR`` is set alongside ``MLX_IBV_DEVICES``
-        # by :func:`mlx_distributed_init`, but treat either one as a
-        # sufficient marker so a partially-populated env doesn't
-        # silently route through the slower ring path.
-        monkeypatch.delenv("MLX_HOSTFILE", raising=False)
-        monkeypatch.delenv("MLX_IBV_DEVICES", raising=False)
-        monkeypatch.setenv("MLX_JACCL_COORDINATOR", "tcp://10.0.0.1:1234")
-        assert _detect_distributed_backend() == "jaccl"
+        def reject_point_to_point(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("task agreement must not call JACCL send/recv")
 
-    def test_ring_wins_when_both_markers_set(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # Pathological env where both markers are set (e.g. an old
-        # JACCL run leaked vars into a fresh ring session). Defaulting
-        # to ring is the conservative choice: the all-sum primitive
-        # works on JACCL too (it just gives up the wire-conflation
-        # protection that ``send`` / ``recv`` provided), whereas
-        # routing through ``send`` / ``recv`` on ring is a hard
-        # failure.
-        monkeypatch.setenv("MLX_HOSTFILE", "/tmp/hosts.json")
-        monkeypatch.setenv("MLX_IBV_DEVICES", "/tmp/devices.json")
-        assert _detect_distributed_backend() == "ring"
+        monkeypatch.setattr(utils_mlx.mx.distributed, "all_sum", fake_all_sum)
+        monkeypatch.setattr(
+            utils_mlx.mx.distributed, "send", reject_point_to_point
+        )
+        monkeypatch.setattr(
+            utils_mlx.mx.distributed, "recv", reject_point_to_point
+        )
 
-    def test_defaults_to_ring_when_no_markers(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # Test fakes that build a fake ``Group`` without going through
-        # :func:`mlx_distributed_init` shouldn't crash on a missing
-        # backend marker -- pick the ring-safe path so the helper
-        # stays callable from unit tests.
-        monkeypatch.delenv("MLX_HOSTFILE", raising=False)
-        monkeypatch.delenv("MLX_IBV_DEVICES", raising=False)
-        monkeypatch.delenv("MLX_JACCL_COORDINATOR", raising=False)
-        assert _detect_distributed_backend() == "ring"
+        root_result = mx_broadcast_int_list(
+            payload, length=len(payload), group=fake_group, is_root=True
+        )
+        peer_result = mx_broadcast_int_list(
+            None, length=len(payload), group=fake_group, is_root=False
+        )
+
+        assert root_result == payload
+        assert peer_result == payload
+        assert local_inputs == [payload, [0, 0, 0]]
 
 
 # ---------------------------------------------------------------------------
