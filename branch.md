@@ -12,6 +12,6 @@ pr:
 ---
 
 - Why this branch exists: the 2026-09-09 first generation request crashed the non-root Twin runner with SIGSEGV in `mx_broadcast_int_list` / `mx_all_gather_tasks`.
-- Changed paths: planned MLX task-agreement broadcast implementation, focused tests, and operational crash documentation.
-- Validation run: pending unit, static, two-host load, generation, and soak checks.
+- Changed paths: MLX task-agreement broadcast implementation and focused transport regression coverage.
+- Validation run: Ruff and BasedPyright pass locally; 30/30 focused tests pass on wc-smbpt with a real Metal device; live two-host load, generation, and soak checks remain.
 - Known follow-ups: deploy only after review and a restart-consensus poll.
