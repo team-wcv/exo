@@ -57,12 +57,12 @@ cache import on **both** decode ranks. Repeat after a master restart and worker
 restarts. A model card or topology edge alone is not inference proof. See
 [cache transport and restart details](../docs/exo-cluster-ops.md#qwen38-spark-prefill-cache-compatibility).
 
-The older named Tailnet alias `https://bigbrain.taile43e67.ts.net` is a separate
-remaining ingress issue. Its stored Serve configuration on smbp points to
-`127.0.0.1:52415`, but Tailscale rejects it because the Mac is an untagged,
-operator-owned node. The local dashboard is verified; do not describe the named
-HTTPS alias as restored. A dedicated tagged service host would avoid changing
-the ownership/SSH identity of the operator's Macs.
+The named Tailnet alias `https://bigbrain.taile43e67.ts.net` is staged on Studio's
+existing tagged `wc-studio-gw` gateway. Its private service forwards to Studio's
+API without changing the ownership/SSH identity of the operator's Macs. The
+control plane still requires approval of this host advertisement; configuration
+alone does not prove the HTTPS endpoint is available. See the
+[gateway configuration and acceptance procedure](shared/tailscale.md).
 
 ## Legacy isolated endpoint profiles
 
