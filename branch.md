@@ -23,3 +23,10 @@ source_branches:
 - Intended changes: classify only Apple 05ac:1905 CDC-NCM interfaces, admit IPv4 link-local probing only for that verified type, prefer 10GbE over the measured USB path and USB over Wi-Fi, add focused tests and operator documentation, then benchmark the isolated Studio/Spark pair over both routes.
 - Safety boundary: do not relax link-local filtering for generic interfaces and do not alter the production smbp/smbpt services during benchmarking.
 - Validation pending: focused tests, type checking, lint/format checks, isolated route proof and A/B benchmark, production post-test health, hosted checks, and current-head Codex review.
+
+
+# Spark prefill deployment 2026-10-16
+Branch: chore/spark-prefill-20261016
+Scope: isolated deployment of existing 0e9c429f for four-node EXO cluster; no source changes
+Ticket: 6ad1cd9ae8f313d4bf1ace4c
+PR: not planned (runtime deployment ledger)
