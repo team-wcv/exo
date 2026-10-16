@@ -141,6 +141,7 @@ def patch_out_mlx(monkeypatch: pytest.MonkeyPatch):
         return (1, MockTokenizer, None, None, None, None)
 
     monkeypatch.setattr(mlx_builder, "load_mlx_items", make_nothin(lmi_gen()))
+    monkeypatch.setattr(mlx_builder, "make_kv_cache", make_nothin(()))
     monkeypatch.setattr(mlx_batch_generator, "warmup_inference", make_nothin(1))
     monkeypatch.setattr(mlx_batch_generator, "_check_for_debug_prompts", nothin)
     monkeypatch.setattr(mlx_batch_generator, "mx_any", make_nothin(False))

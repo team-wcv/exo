@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 
 import mlx.core as mx
 import pytest
+from mlx_lm.models.cache import KVCache
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.types.common import ModelId
@@ -475,3 +476,21 @@ class TestExoDraftModeNoneRespectsBatching:
             "EXO_DRAFT_MODE='model' with loaded drafter must use "
             f"SequentialGenerator; got {type(engine).__name__}"
         )
+
+
+@pytest.mark.parametrize("group_size", [1, 2])
+def test_sparse_indexer_cache_uses_engine_that_preserves_sidecars(
+    monkeypatch: pytest.MonkeyPatch, group_size: int
+) -> None:
+    monkeypatch.delenv("EXO_NO_BATCH", raising=False)
+
+    class IndexedCache(KVCache):
+        def __init__(self) -> None:
+            super().__init__()
+            self.indexer = object()
+
+    model = MagicMock()
+    model.make_cache = MagicMock(return_value=[IndexedCache()])
+    builder = _build_mlx_builder(draft_model=None, group=_fake_group(group_size))
+    builder.inference_model = cast(Model, model)
+    assert isinstance(builder.build(), SequentialGenerator)

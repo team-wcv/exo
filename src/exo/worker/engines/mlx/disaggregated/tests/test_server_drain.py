@@ -3,6 +3,7 @@ runner main thread + work queue), streams cache bytes."""
 
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import BinaryIO
 
 import mlx.core as mx
@@ -117,4 +118,46 @@ def test_server_drains_via_main_thread() -> None:
         assert _equal(dst_k, gold_k)
         assert _equal(dst_v, gold_v)
     finally:
+        server.stop()
+
+
+@pytest.mark.slow
+def test_tensor_rank_requests_wait_before_runner_admission() -> None:
+    first_started = threading.Event()
+    first_release = threading.Event()
+    second_started = threading.Event()
+
+    def resolve(job: PrefillRequest, stream: BinaryIO) -> bool:
+        if job.request_id == "rank-0":
+            first_started.set()
+            assert first_release.wait(timeout=5)
+        else:
+            second_started.set()
+        write_header(stream, Header(request_id=job.request_id, model_id="m"))
+        write_done(stream, 0)
+        return True
+
+    port = random_ephemeral_port()
+    server = PrefillServer(resolve=resolve, host="127.0.0.1", port=port)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
+                remote_prefill_fetch,
+                f"127.0.0.1:{port}",
+                PrefillRequest(request_id="rank-0", model_id="m", token_ids=[1, 2]),
+            )
+            assert first_started.wait(timeout=2)
+            second = pool.submit(
+                remote_prefill_fetch,
+                f"127.0.0.1:{port}",
+                PrefillRequest(request_id="rank-1", model_id="m", token_ids=[1, 2]),
+            )
+            try:
+                assert not second_started.wait(timeout=0.2)
+            finally:
+                first_release.set()
+            assert first.result(timeout=3).header.request_id == "rank-0"
+            assert second.result(timeout=3).header.request_id == "rank-1"
+    finally:
+        first_release.set()
         server.stop()

@@ -785,3 +785,38 @@ async def test_rejects_low_seniority_winner_when_forced_master_seen() -> None:
             em_in_tx.close()
             cm_tx.close()
             co_tx.close()
+
+
+@pytest.mark.anyio
+async def test_restarted_master_with_same_node_id_replaces_peer_session() -> None:
+    def make_election(
+        node: str, clock: int
+    ) -> tuple[Election, Receiver[ElectionResult]]:
+        _, incoming = channel[ElectionMessage]()
+        outgoing, _ = channel[ElectionMessage]()
+        results, receiver = channel[ElectionResult]()
+        _, connections = channel[ConnectionMessage]()
+        _, commands = channel[ForwarderCommand]()
+        return Election(
+            node_id=NodeId(node),
+            initial_clock=clock,
+            election_message_receiver=incoming,
+            election_message_sender=outgoing,
+            election_result_sender=results,
+            connection_message_receiver=connections,
+            command_receiver=commands,
+        ), receiver
+
+    original, _ = make_election("master", 1_000_000)
+    restarted, _ = make_election("master", 2_000_000)
+    peer, results = make_election("worker", 500_000)
+    await peer.elect(original._election_status())
+    _ = await results.receive()
+    await peer.elect(restarted._election_status())
+    result = await results.receive()
+    assert result.is_new_master
+    assert result.session_id.master_node_id == NodeId("master")
+    assert result.session_id.election_clock == 2_000_000
+    restarted.clock += 1
+    await peer.elect(restarted._election_status())
+    assert not (await results.receive()).is_new_master

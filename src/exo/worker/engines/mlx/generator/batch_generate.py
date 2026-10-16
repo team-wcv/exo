@@ -216,16 +216,20 @@ class ExoBatchGenerator:
             if use_remote and task_params.prefill_endpoint is not None:
                 try:
                     _prefill_tps, _prefill_tokens, cache_snapshots = remote_prefill(
-                        prompt_tokens[:-1],
+                        all_prompt_tokens[:-1],
                         cache,
                         on_prefill_progress,
                         endpoint=task_params.prefill_endpoint,
                         request_id=str(uuid.uuid4()),
                         model_id=str(task_params.model),
                         start_pos=prefix_hit_length,
+                        model=self.model,
+                        group=self.group,
                     )
                     remote_prefilled = True
                 except Exception:
+                    if self.group is not None and self.group.size() > 1:
+                        raise
                     logger.opt(exception=True).warning(
                         "Remote prefill failed, falling back to local prefill"
                     )

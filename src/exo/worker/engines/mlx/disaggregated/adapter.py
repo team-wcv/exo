@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import BinaryIO
 
 import mlx.core as mx
@@ -14,12 +15,14 @@ from mlx_lm.models.deepseek_v4 import DeepseekV4Cache
 from exo.worker.disaggregated.protocol import (
     DType,
     Header,
+    IndexerState,
     KVChunk,
     TensorBlob,
     write_arrays_state,
     write_done,
     write_header,
     write_kv_chunk,
+    write_message,
 )
 from exo.worker.engines.mlx.types import KVCacheType
 from exo.worker.runner.bootstrap import logger
@@ -28,6 +31,8 @@ _STR_TO_MX: dict[DType, mx.Dtype] = {
     "bfloat16": mx.bfloat16,
     "float16": mx.float16,
     "float32": mx.float32,
+    "int32": mx.int32,
+    "int64": mx.int64,
 }
 
 _MX_TO_STR: dict[mx.Dtype, DType] = {v: k for k, v in _STR_TO_MX.items()}
@@ -60,7 +65,7 @@ def array_to_bytes(t: mx.array) -> bytes:
     # bf16 has no native numpy dtype; bitcast through uint16.
     if t.dtype == mx.bfloat16:
         return np.asarray(t.view(mx.uint16)).tobytes()
-    if t.dtype in (mx.float16, mx.float32):
+    if t.dtype in (mx.float16, mx.float32, mx.int32, mx.int64):
         return np.asarray(t).tobytes()
     raise ValueError(f"Unsupported mlx dtype for wire: {t.dtype}")
 
@@ -75,6 +80,12 @@ def bytes_to_array(data: bytes, shape: tuple[int, ...], dtype: DType) -> mx.arra
             return mx.array(arr)
         case "float32":
             arr = np.frombuffer(data, dtype=np.float32).reshape(shape).copy()
+            return mx.array(arr)
+        case "int32":
+            arr = np.frombuffer(data, dtype=np.int32).reshape(shape).copy()
+            return mx.array(arr)
+        case "int64":
+            arr = np.frombuffer(data, dtype=np.int64).reshape(shape).copy()
             return mx.array(arr)
 
 
@@ -137,10 +148,29 @@ def send_mlx_kv_cache(
                         f"Unexpected number of tokens sent {num_tokens} != {tokens_sent}"
                     )
                 tokens_sent = num_tokens
+                indexer = getattr(c, "indexer", None)
+                indexer_state: object = getattr(indexer, "state", None)
+                if isinstance(indexer_state, mx.array):
+                    # The indexer is replicated in TP and needs the entire prefix,
+                    # even when the attention KV transfer contains only a suffix.
+                    indexer_keys = indexer_state[:, :offset]
+                    mx.eval(indexer_keys)
+                    write_message(
+                        stream,
+                        IndexerState(
+                            layer_idx=layer_idx,
+                            tensor=TensorBlob(
+                                dtype=mx_dtype_to_str(indexer_keys.dtype),
+                                shape=tuple(indexer_keys.shape),
+                                data=array_to_bytes(indexer_keys),
+                            ),
+                        ),
+                    )
             case ArraysCache():
-                blobs: list[TensorBlob] = []
+                blobs: list[TensorBlob | None] = []
                 for a in c.state:
                     if a is None:
+                        blobs.append(None)
                         continue
                     with mx.stream(mx.Device(mx.cpu)):
                         a_cpu = mx.array(a)
@@ -204,8 +234,8 @@ def inject_rotating_kv_chunk(
     cache._idx = int(k_bhsd.shape[2])
 
 
-def inject_arrays_cache(cache: ArraysCache, blobs: list[TensorBlob]) -> None:
-    cache.state = [blob_to_mlx(b) for b in blobs]
+def inject_arrays_cache(cache: ArraysCache, blobs: Sequence[TensorBlob | None]) -> None:
+    cache.state = [blob_to_mlx(b) if b is not None else None for b in blobs]
 
 
 def write_cache_to_wire(

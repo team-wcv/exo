@@ -6,6 +6,7 @@ import resource
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Self
@@ -65,7 +66,11 @@ class Node:
     @classmethod
     async def create(cls, args: "Args") -> Self:
         node_id = get_node_zid(process_scope=_node_zid_scope(args))
-        session_id = SessionId(master_node_id=node_id, election_clock=0)
+        # A restarted master must not reuse its old event-stream identity: peers
+        # would otherwise retain sequence numbers from the previous process.
+        # Microseconds stay exactly representable in JSON's common 53-bit range.
+        initial_clock = time.time_ns() // 1_000
+        session_id = SessionId(master_node_id=node_id, election_clock=initial_clock)
         router = Router.create(
             node_id,
             namespace=args.namespace,
@@ -166,6 +171,7 @@ class Node:
         er_send, er_recv = channel[ElectionResult]()
         election = Election(
             node_id,
+            initial_clock=initial_clock,
             # If someone manages to assemble 1 MILLION devices into an exo cluster then. well done. good job champ.
             seniority=1_000_000 if args.force_master else 0,
             # nb: this DOES feedback right now. i have thoughts on how to address this,

@@ -8,11 +8,12 @@ from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 from exo.worker.disaggregated.protocol import Header, KVChunk
 from exo.worker.disaggregated.server import PrefillRequest
 from exo.worker.engines.mlx.cache import CacheSnapshot, snapshot_ssm_states
+from exo.worker.engines.mlx.disaggregated.cache_projection import tensor_cache_layouts
 from exo.worker.engines.mlx.disaggregated.client import (
     ingest_into_mlx_cache,
     remote_prefill_fetch,
 )
-from exo.worker.engines.mlx.types import KVCacheType
+from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.runner.bootstrap import logger
 
 
@@ -25,6 +26,8 @@ def remote_prefill(
     request_id: str,
     model_id: str,
     start_pos: int = 0,
+    model: Model | None = None,
+    group: mx.distributed.Group | None = None,
 ) -> tuple[float, int, list[CacheSnapshot]]:
     t0 = time.perf_counter()
     total_prompt_tokens = int(prompt_tokens.shape[0])
@@ -51,13 +54,42 @@ def remote_prefill(
         start_pos=start_pos,
         request_id=request_id,
     )
-    result = remote_prefill_fetch(
-        endpoint, request, on_header=_on_header, on_kv_chunk=_on_chunk
-    )
-    t_received = time.perf_counter()
+    error: Exception | None = None
+    t_received = t0
+    final_offset = 0
+    try:
+        result = remote_prefill_fetch(
+            endpoint, request, on_header=_on_header, on_kv_chunk=_on_chunk
+        )
+        t_received = time.perf_counter()
+        expected_offset = max(0, total_prompt_tokens - 1)
+        if start_pos + result.total_tokens != expected_offset:
+            raise ValueError(
+                f"Remote prefill boundary is {start_pos + result.total_tokens}; "
+                f"expected {expected_offset} before decode seed tokens"
+            )
 
-    caches = cast(list[KVCache | RotatingKVCache | ArraysCache], list(cache))
-    final_offset = ingest_into_mlx_cache(result, caches, start_pos=start_pos)
+        caches = cast(list[KVCache | RotatingKVCache | ArraysCache], list(cache))
+        world_size = group.size() if group is not None else 1
+        rank = group.rank() if group is not None else 0
+        layouts = None
+        if world_size > 1:
+            if model is None:
+                raise ValueError(
+                    "Remote tensor prefill requires the sharded decoder model"
+                )
+            layouts = tensor_cache_layouts(model, cache)
+        final_offset = ingest_into_mlx_cache(
+            result,
+            caches,
+            start_pos=start_pos,
+            layouts=layouts,
+            rank=rank,
+            world_size=world_size,
+        )
+    except Exception as exc:
+        error = exc
+    synchronize_prefill_outcome(error, group)
     t_done = time.perf_counter()
 
     num_tokens = final_offset - start_pos
@@ -70,3 +102,22 @@ def remote_prefill(
         f"inject={(t_done - t_received) * 1000:.0f}ms"
     )
     return tps, num_tokens, [snapshot_ssm_states(cache)]
+
+
+def synchronize_prefill_outcome(
+    error: Exception | None, group: mx.distributed.Group | None
+) -> None:
+    """Keep every rank on the same side of the prefill/decode boundary.
+
+    One rank may receive a busy/error response while another imports its cache.
+    All ranks must agree before entering decode collectives, or the surviving
+    rank can hang forever waiting for a peer that has already raised.
+    """
+    if group is not None and group.size() > 1:
+        failed = mx.distributed.all_sum(mx.array(float(error is not None)), group=group)
+        if failed.item() > 0:
+            raise RuntimeError(
+                "Remote prefill failed on a tensor decode rank"
+            ) from error
+    if error is not None:
+        raise error

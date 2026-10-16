@@ -484,6 +484,36 @@ class Master:
                                 self.state.topology,
                                 self.state.instances,
                             )
+                            # Dashboard previews use explicit CreateInstance, so
+                            # they must retain the model's prefill policy too.
+                            model_card = command.instance.shard_assignments.shards[
+                                0
+                            ].shard.model_card
+                            if model_card.prefill_eligible_nodes:
+                                siblings, prefill_ids = auto_place_prefill_siblings(
+                                    decode_instance_id=command.instance.instance_id,
+                                    decode_instance=command.instance,
+                                    model_card=model_card,
+                                    topology=self.state.topology,
+                                    current_instances=placement,
+                                    node_memory=self.state.node_memory,
+                                    node_network=self.state.node_network,
+                                    node_backends=self.state.node_backends,
+                                    download_status=self.state.downloads,
+                                )
+                                placement = {**placement, **siblings}
+                                if prefill_ids:
+                                    generated_events.append(
+                                        InstanceLinkCreated(
+                                            link=InstanceLink(
+                                                link_id=InstanceLinkId(),
+                                                prefill_instances=prefill_ids,
+                                                decode_instances=[
+                                                    command.instance.instance_id
+                                                ],
+                                            )
+                                        )
+                                    )
                             transition_events = get_transition_events(
                                 self.state.instances, placement, self.state.tasks
                             )

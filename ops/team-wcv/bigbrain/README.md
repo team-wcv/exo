@@ -1,19 +1,77 @@
-# Isolated Bigbrain endpoints
+# Bigbrain EXO fleet
 
-This profile keeps four Exo control planes active at the same time:
+## Current shared deployment (2026-10-16)
 
-| Tailnet service | Owner | Local API | Namespace | Placement boundary |
-|---|---|---:|---|---|
-| `svc:bigbrain` | `wc-smbp` | `52415` | Twin production cluster | `wc-smbp` + `wc-smbpt` only |
-| `https://wc-studio.taile43e67.ts.net:8443` | `wc-studio` | `52615` | `bigbrain-studio` | Studio only |
-| `https://wc-spark.taile43e67.ts.net:8443` | `wc-spark` | `52615` | `bigbrain-spark` | Spark only |
-| `https://wc-bmbp.taile43e67.ts.net:8443` | `wc-bmbp` | `52615` | `bigbrain-bmbp` | BMBP only |
+The operator dashboard at `http://bigbrain.localhost:18888/` serves one shared
+`wc-bigbrain` cluster. Studio is the preferred master; smbp, smbpt, and Spark
+join the same cluster. All four APIs use port `52415`, and peer-file servers use
+`52416`. Using different API ports breaks the deployed reachability probes even
+when discovery succeeds.
 
-Spark's Laguna vLLM endpoint on port 8888 is independent of Exo and remains active. A
-Spark-local Exo endpoint can coexist with Laguna as a control plane, but the host does not
-have enough free unified memory to load another heavyweight model while Laguna is loaded.
+| Function | Host / transport |
+|---|---|
+| Dashboard/API ingress | Local Caddy, Studio preferred, health-checked MacBook fallbacks |
+| Control plane | Studio; inference/control topology uses LAN addresses |
+| Large-model prefill | Spark, MLX CUDA, cache transfer over LAN |
+| Tensor decode | smbp + smbpt, JACCL/RDMA over Thunderbolt |
+| JACCL coordinator | Reachable Thunderbolt IP, `192.168.0.1` or `192.168.0.2` |
 
-## Install the host services
+The current serving model is
+`pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit`, pinned at
+`b2c422f3c643e36f04227a64d61796b44a4b1029`. Its fleet-specific custom card names
+Spark in `prefill_eligible_nodes`; both automatic placement and explicit dashboard
+placement create or reuse a compatible prefill instance and link it to decode.
+The remote path applies to more than 1,000 uncached prompt tokens.
+
+Persisted launchd/systemd settings use `ENABLE_DISAGGREGATION=true`,
+`EXO_HOME=.exo-bigbrain-cluster`, and allowed inference CIDRs
+`192.168.1.0/24,192.168.0.0/30`. Service labels are
+`ai.team-wcv.exo-studio-bigbrain` on Studio, `com.teamwcv.exo.bigbrain` on both
+MacBooks, and `exo-spark-bigbrain.service` on Spark. MacBook jobs hold a
+`caffeinate` assertion. During a bootout/bootstrap maintenance cycle, hold a
+separate temporary assertion until the replacement job is running.
+
+The checked-in [shared startup snapshots](shared/) reproduce the verified
+startup configuration and fleet-specific model card. Compare them with live
+files and preserve local overrides; back up before replacing a startup file.
+They refer to the existing validated dependency environments and deployment
+source/native directories, so confirm those paths before installation. The
+model card belongs in `~/.exo-bigbrain-cluster/custom_model_cards/`; the worker
+publishes persisted cards to the cluster on startup.
+
+The validated deployment is under
+`~/.orchestraitor/deployments/exo-qwen38-prefill-20261016/`: `current/` contains
+source based on `2c707493` plus the recorded overlay, and `native-current/`
+contains the matching platform build. `deployment-manifest.json` records the
+source overlay hashes. Startup files select both with `PYTHONPATH`; preserve
+that pairing during upgrades. Prior startup configurations and source revisions
+are backed up alongside the deployment.
+
+The standalone Spark Laguna unit `vllm-laguna-current-256k.service` is stopped and
+disabled with operator approval to make memory available to EXO. Its restore
+configuration is recorded in the earlier `exo-qwen27b-20261016` deployment backup.
+
+Validation must use the operator URL: inspect `/state`, `/v1/feature-flags`, and
+`/v1/instance-links`, then send a long uncached prompt and verify successful remote
+cache import on **both** decode ranks. Repeat after a master restart and worker
+restarts. A model card or topology edge alone is not inference proof. See
+[cache transport and restart details](../docs/exo-cluster-ops.md#qwen38-spark-prefill-cache-compatibility).
+
+The older named Tailnet alias `https://bigbrain.taile43e67.ts.net` is a separate
+remaining ingress issue. Its stored Serve configuration on smbp points to
+`127.0.0.1:52415`, but Tailscale rejects it because the Mac is an untagged,
+operator-owned node. The local dashboard is verified; do not describe the named
+HTTPS alias as restored. A dedicated tagged service host would avoid changing
+the ownership/SSH identity of the operator's Macs.
+
+## Legacy isolated endpoint profiles
+
+The checked-in profiles below predate the shared four-node deployment. They are
+reference material for intentionally isolated endpoints, including BMBP; do not
+copy them over the active shared-cluster startup files. Their `52615` ports and
+standalone namespaces are not the current Bigbrain topology.
+
+### Install legacy host services
 
 Studio:
 
@@ -57,7 +115,7 @@ to be advanced without changing the LaunchAgent definition.
 Use `http://127.0.0.1:52615/v1` for runtimes running on BMBP itself and
 `https://wc-bmbp.taile43e67.ts.net:8443/v1` for runtimes on other Tailnet devices.
 
-## Publish Tailnet services
+### Publish legacy device endpoints
 
 ```bash
 # Studio
@@ -76,7 +134,7 @@ policy, so their dedicated endpoints use HTTPS 8443 on the existing device DNS n
 Capture the current configuration before changing it with
 `tailscale serve status --json`.
 
-## Validation
+### Validate isolated profiles
 
 For each endpoint, verify `/node_id`, `/agents`, `/state`, `/v1/models`, and a short chat
 completion after loading a model. The standalone endpoints must each report exactly one

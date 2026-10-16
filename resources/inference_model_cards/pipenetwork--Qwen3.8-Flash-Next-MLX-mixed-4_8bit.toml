@@ -1,0 +1,19 @@
+# Pinned deployment revision: b2c422f3c643e36f04227a64d61796b44a4b1029
+# Apply the reviewed Qwen4 loader overlay documented in exo-cluster-ops.md.
+model_id = "pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit"
+n_layers = 48
+hidden_size = 2560
+num_key_value_heads = 2
+supports_tensor = true
+trust_remote_code = true
+tasks = ["TextGeneration"]
+family = "qwen"
+quantization = "mixed-4_8bit"
+base_model = "Qwen3.8 Flash Next"
+capabilities = ["text", "thinking", "thinking_toggle"]
+reasoning_dialect = "post_last_user"
+context_length = 262144
+backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
+
+[storage_size]
+in_bytes = 106195031237

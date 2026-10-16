@@ -29,7 +29,7 @@ from exo.worker.runner.llm_inference.batch_generator import (
 )
 from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 
-from .cache import KVPrefixCache
+from .cache import KVPrefixCache, make_kv_cache
 from .generator.coupled_drafter import is_coupled_drafter_dispatchable
 from .generator.drafter import EXO_DRAFT_MODE_ENV, parse_draft_mode
 from .types import Model
@@ -355,10 +355,18 @@ class MlxBuilder(Builder):
                 sock=self.drafter_socket,
             )
 
+        # MLX's batch cache merger converts KVCache subclasses to BatchKVCache
+        # and drops auxiliary sparse-indexer state. Preserve those caches on
+        # the per-request path until the merger supports their complete state.
+        has_cache_sidecars = any(
+            getattr(cache, "indexer", None) is not None
+            for cache in make_kv_cache(self.inference_model)
+        )
         if (
             os.environ.get("EXO_NO_BATCH")
             or force_sequential_for_drafter
             or is_asymmetric
+            or has_cache_sidecars
         ):
             if is_asymmetric:
                 logger.info(
@@ -385,6 +393,10 @@ class MlxBuilder(Builder):
                         f"using SequentialGenerator (draft_mode={configured_draft_mode!r}; "
                         f"BatchGenerator has no spec-decoding hook)"
                     )
+            elif has_cache_sidecars:
+                logger.info(
+                    "using SequentialGenerator (preserving sparse-indexer cache state)"
+                )
             else:
                 logger.info("using SequentialGenerator (batching disabled)")
 

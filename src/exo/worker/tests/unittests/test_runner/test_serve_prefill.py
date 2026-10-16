@@ -2,7 +2,6 @@
 KVPrefixCache for cross-request prefix sharing."""
 
 import io
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -37,6 +36,13 @@ class _FakeModel:
     def __init__(self) -> None:
         self.layers = [object()]
 
+    def __call__(self, tokens: mx.array, cache: list[KVCache]) -> mx.array:
+        # Encoding tokens as KV makes missing or duplicated prefix tokens observable.
+        state = tokens.astype(mx.float32)[:, None, :, None]
+        for entry in cache:
+            entry.update_and_fetch(state, state)
+        return state
+
     def make_cache(self) -> list[KVCache]:
         return [KVCache() for _ in self.layers]
 
@@ -57,20 +63,14 @@ def _patch_prefill(monkeypatch: pytest.MonkeyPatch) -> list[mx.array]:
     """Replace mlx_prefill with a tracker; return the list it appends to."""
     inputs: list[mx.array] = []
 
-    def fake_prefill(**kwargs: object) -> tuple[float, int, list[object]]:
-        pt = cast(mx.array, kwargs["prompt_tokens"])
+    def fake_prefill(_model: object, raw_cache: object, pt: mx.array) -> None:
         inputs.append(pt)
         n = int(pt.shape[0])
-        cache = cast(list[KVCache], kwargs["cache"])
+        cache = cast(list[KVCache], raw_cache)
         existing = int(cache[0].offset) if cache and cache[0].keys is not None else 0
         _populate_cache_in_place(cache, existing + n)
-        return (0.0, n, [])
 
-    def fake_make_sampler(**_: object) -> Callable[[mx.array], mx.array]:
-        return lambda x: x
-
-    monkeypatch.setattr(mlx_serve_mod, "mlx_prefill", fake_prefill)
-    monkeypatch.setattr(mlx_serve_mod, "make_sampler", fake_make_sampler)
+    monkeypatch.setattr(mlx_serve_mod, "fill_cache_prefix", fake_prefill)
     return inputs
 
 
@@ -124,13 +124,13 @@ def test_serve_prefill_runs_full_prefill_when_cache_empty(
     )
 
     assert len(inputs) == 1
-    assert int(inputs[0].shape[0]) == 18
+    assert int(inputs[0].shape[0]) == 19
 
     hdr, chunks, total = _decode(payload)
     assert hdr.start_pos == 0
-    assert total == 18
+    assert total == 19
     assert len(chunks) == 1
-    assert chunks[0].num_tokens == 18
+    assert chunks[0].num_tokens == 19
 
     assert len(cache.prompts) == 1
     assert int(cache.prompts[0].shape[0]) == 20
@@ -178,7 +178,7 @@ def test_serve_prefill_only_runs_suffix_on_partial_match(
 
     assert len(inputs) == 1
     suffix_len = int(inputs[0].shape[0])
-    assert suffix_len < len(extended) - 2
+    assert suffix_len < len(extended) - 1
 
 
 def test_serve_prefill_slices_payload_at_client_start_pos(
@@ -202,7 +202,7 @@ def test_serve_prefill_slices_payload_at_client_start_pos(
 
     hdr, chunks, total = _decode(payload)
     assert hdr.start_pos == client_has
-    expected_sent = (n_tokens - 2) - client_has
+    expected_sent = (n_tokens - 1) - client_has
     assert total == expected_sent
     assert len(chunks) == 1
     assert chunks[0].num_tokens == expected_sent
@@ -221,7 +221,21 @@ def test_serve_prefill_works_without_prefix_cache(
     )
 
     assert len(inputs) == 1
-    assert int(inputs[0].shape[0]) == 18
+    assert int(inputs[0].shape[0]) == 19
 
     _, _, total = _decode(payload)
-    assert total == 18
+    assert total == 19
+
+
+@pytest.mark.parametrize("length", [20, 4100])
+def test_remote_prefix_preserves_every_token_before_decode_seed(length: int) -> None:
+    tokens = list(range(length))
+    payload = _serve(
+        PrefillRequest(request_id="boundary", model_id="m", token_ids=tokens), None
+    )
+    _, chunks, total = _decode(payload)
+    from exo.worker.engines.mlx.disaggregated.adapter import chunk_to_mlx_nhd
+
+    keys, _ = chunk_to_mlx_nhd(chunks[0])
+    assert total == length - 1
+    assert keys.reshape(-1).tolist() == tokens[:-1]

@@ -299,6 +299,67 @@ The verified tensor placement uses `TensorShardMetadata` on both 128 GB M5 Max
 nodes and `MlxJaccl` over the direct `rdma_en2` / `rdma_en1` edge. A warmed
 OpenAI-compatible request produced 42 tokens/s with an exact prefix-cache hit.
 
+### Qwen3.8 Spark prefill cache compatibility
+
+Qwen4-Exp remote prefill requires more than attention K/V. Transfer the sparse
+indexer keys and every recurrent cache slot, retaining empty slots and exact
+integer n-gram history. For tensor decode, split attention heads by rank and
+split the DeltaNet convolution state within each Q/K/V segment; PLE history
+and sparse-indexer keys remain replicated. A decoder must reject incomplete
+streams before mutating its live cache. Multi-rank failures must not cause
+individual ranks to fall back into different collective execution paths.
+
+The remote request contains the complete prompt except its final token. The
+prefill server reserves one further token, because the decoder consumes the
+last two original tokens. Use direct forward passes for this prefix; routing
+it through the generation prefill helper reserves those tokens twice.
+
+The pinned uniform 4-bit checkpoint `aa7c790e804bbf9d491ddb109c3d61bc4a555f7c`
+was used for a CUDA cache-integrity check: 1,024 prefilled tokens, 87,337,465
+serialized bytes, and exactly equal next-token logits after restoring the
+full cache. This is cache correctness evidence, not proof of a live Mac decode
+route. Prefer the publisher's mixed 4/8-bit checkpoint for serving quality;
+its model card reports materially lower quantization error for about 2.4 GB
+additional storage. The serving target is
+`pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit`, pinned at
+`b2c422f3c643e36f04227a64d61796b44a4b1029` (106,195,031,237 weight bytes).
+Apply the same reviewed loader overlay only after checking the loader's
+original hash.
+
+Serialize prefill requests before runner admission: simultaneous requests from
+the two decode ranks otherwise exhaust the second request's three-second pickup
+deadline while the first rank is still being prefilled. Both ranks must complete
+an all-reduce of their success/failure status before entering decode collectives.
+A successful rank must not proceed if its peer received a transfer error.
+
+The batch-engine call site must pass the sharded model, distributed group, and
+full prompt to the same importer as the sequential path. Models with a sparse
+indexer cache sidecar use `SequentialGenerator`: MLX's batch cache merger drops
+that sidecar when converting a `KVCache` subclass to `BatchKVCache`. Do not
+re-enable batching for Qwen4-Exp until the merger preserves the auxiliary state.
+
+JACCL placements prefer a reachable Thunderbolt coordinator address. The
+coordinator still uses TCP; model tensor collectives use JACCL/RDMA. Do not
+claim every control or discovery packet travels over RDMA. A custom model card
+with `prefill_eligible_nodes` containing Spark's persistent node ID makes normal
+placement create its prefill sibling and instance link automatically. Explicit dashboard
+`CreateInstance` commands follow the same policy as `PlaceInstance`. Reuse an
+existing compatible single-rank prefill instance instead of loading a duplicate
+copy of the same model on Spark when another decode placement is launched.
+
+Big Brain's master must start with a fresh event-stream identity while retaining
+its persistent node ID. Reusing `(node ID, election clock 0)` after a restart
+leaves surviving workers waiting for sequence numbers from the previous
+process. Production startup seeds the election clock with Unix microseconds;
+ordinary re-elections in the same process retain the existing session. Check
+that unchanged worker PIDs rejoin after a master restart with fresh telemetry
+and zero pending local-event acknowledgements.
+
+On macOS, model files on removable volumes require access for the background
+Python process, not just successful reads through SSH. A stalled synchronous
+configuration-file open can block the entire control API. Confirm background
+reads before making a removable-volume checkpoint visible to the service.
+
 ### Half-open control-plane recovery
 
 The launchd profile sets `EXO_EVENT_DELIVERY_STALL_SECONDS=15`, below the

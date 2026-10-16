@@ -70,7 +70,12 @@ class _PrefillHandler(socketserver.StreamRequestHandler):
             _send_error(wfile, 400, f"Bad request: {exc}")
             return
         try:
-            picked_up = server.resolve(job, wfile)
+            # A tensor decoder requests the same prefix from several ranks.
+            # Serialize those requests before enqueueing work, so a rank does
+            # not exhaust the runner's short pickup deadline behind another
+            # rank's legitimate GPU prefill.
+            with server.resolve_lock:
+                picked_up = server.resolve(job, wfile)
         except Exception as e:
             logger.opt(exception=e).warning(
                 f"Prefill resolve error for request_id={job.request_id}"
@@ -91,6 +96,7 @@ class PrefillServer(socketserver.ThreadingTCPServer):
     def __init__(self, resolve: ResolveHandler, host: str, port: int) -> None:
         super().__init__((host, port), _PrefillHandler)
         self.resolve = resolve
+        self.resolve_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self.serve_forever, name="prefill-server"
         )

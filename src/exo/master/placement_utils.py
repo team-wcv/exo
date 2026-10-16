@@ -589,9 +589,9 @@ def get_mlx_jaccl_coordinators(
         if n == coordinator:
             return "0.0.0.0"
 
-        ip = find_ip_prioritised(
-            n, coordinator, cycle_digraph, node_network, ring=False
-        )
+        # Keep the coordinator socket on Thunderbolt when available alongside
+        # JACCL's RDMA transport, instead of preferring the same peer's LAN IP.
+        ip = find_ip_prioritised(n, coordinator, cycle_digraph, node_network, ring=True)
         if ip is not None:
             return ip
 

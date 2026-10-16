@@ -17,9 +17,11 @@ def create_node_memory(memory: int) -> MemoryUsage:
 
 
 def create_node_network() -> NodeNetworkInfo:
+    # Generic placement fixtures model LAN connectivity; link-local addresses
+    # require explicit Apple USB NCM metadata under the reachability policy.
     return NodeNetworkInfo(
         interfaces=[
-            NetworkInterfaceInfo(name="en0", ip_address=f"169.254.0.{i}")
+            NetworkInterfaceInfo(name="en0", ip_address=f"192.168.1.{i}")
             for i in range(10)
         ]
     )
@@ -27,7 +29,7 @@ def create_node_network() -> NodeNetworkInfo:
 
 def create_socket_connection(ip: int, sink_port: int = 1234) -> SocketConnection:
     return SocketConnection(
-        sink_multiaddr=Multiaddr(address=f"/ip4/169.254.0.{ip}/tcp/{sink_port}"),
+        sink_multiaddr=Multiaddr(address=f"/ip4/192.168.1.{ip}/tcp/{sink_port}"),
     )
 
 
