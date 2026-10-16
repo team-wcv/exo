@@ -7,11 +7,21 @@ Studio's existing Docker container `watch-gateway-edge` owns the tagged
 `svc:bigbrain` service while its separate device hostname retains the existing
 watch gateway Funnel mapping. Do not add Bigbrain to `AllowFunnel`.
 
-On 2026-10-16 the service configuration was persisted and advertised, and the
-container successfully fetched Studio's `/node_id` through
-`http://host.docker.internal:52415`. Tailscale reported that administrator approval
-was required. Until that approval and an HTTPS request succeed, the named endpoint
-must be described as pending, not restored.
+On 2026-10-16 the operator approved this service host. Its `service-host`
+capability now includes `svc:bigbrain`, and Tailscale provisioned its TLS
+certificate. The HTTPS `/node_id` matches Studio, and `/state`, `/v1/models`,
+`/v1/feature-flags`, and `/v1/instance-links` all succeeded through the named URL.
+A real Qwen3.8 mixed 4/8-bit code-review request used 1,691 uncached input tokens
+and returned 242 output tokens at 40.4 generated tokens/sec. Both Mac ranks logged
+successful remote prefill for 1,689 tokens before decoding the final boundary
+tokens. Initial prefill and transfer took about 52 seconds; generation throughput
+does not include that latency.
+
+Evidence is retained on the operator machine under
+`~/.cache/exo/spark-prefill-validation/tailscale-approved-inference-20261016.json`
+and `tailscale-approved-rank-proof-20261016.json`. Startup configuration, mounted
+configuration, and live service configuration were compared; a shared gateway
+restart was not performed during this verification.
 
 The existing Mac identities remain user-owned. The failed service configuration
 on untagged smbp is not a working ingress path. Neither this gateway nor Tailscale
@@ -58,8 +68,9 @@ its service maintenance.
 
 ## Control-plane approval and verification
 
-In the Tailscale admin console, open **Services → bigbrain** and approve
-`wc-studio-gw` as a host. This is separate from tagging or authorizing the device.
+If a replacement host needs approval, open **Services → bigbrain** in the Tailscale
+admin console and approve it. The current `wc-studio-gw` host is already approved.
+This is separate from tagging or authorizing the device.
 The currently installed Tailscailor MCP exposes no service-host approval action.
 
 Verify the host acceptance and then the actual endpoint:
