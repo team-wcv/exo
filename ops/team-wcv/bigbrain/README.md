@@ -90,6 +90,21 @@ on a nearly full Spark can trigger swapping and leave the UI at zero progress
 while the first chunk evaluates. Validate a long uncached prompt as well as short
 chat, checking memory and cache ingestion on both decode ranks.
 
+Recovery acceptance through the operator URL used the original 5,815-token
+conversation: cold first text took 90.8 seconds and completion took 96.2 seconds.
+Spark computed 5,813 prefix tokens in 84.4 seconds; both Mac ranks imported them
+and decoded the response over JACCL. Spark retained about 14 GiB available with
+no new swap-out in sampled intervals. This is a functional recovery, not a claim
+that cold prefill on this large model is fast. A fresh 29-token story request
+returned first text in 1.7 seconds; a 6,039-token follow-up reused 5,813 cached
+tokens and returned first text in 1.9 seconds. These latency checks used thinking
+disabled. The old demo conversation includes thousands of diagnostic tokens;
+start a fresh conversation for ordinary short chat.
+
+The API registers its response channel before dispatching a generation command,
+so an immediate missing-decoder error is buffered even before SSE consumption
+starts. Tests cover that ordering and cleanup when command dispatch fails.
+
 ## Legacy isolated endpoint profiles
 
 The checked-in profiles below predate the shared four-node deployment. They are
