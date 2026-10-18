@@ -1,3 +1,4 @@
+import os
 import time
 from typing import cast
 
@@ -23,8 +24,18 @@ def fill_cache_prefix(model: Model, cache: KVCacheType, tokens: mx.array) -> Non
     Calling it on an already shortened remote prefix trims twice and loses
     prompt tokens. Direct chunked forwards keep the requested boundary exact.
     """
-    for start in range(0, int(tokens.size), 4096):
-        _ = model(tokens[start : start + 4096][None], cache=cache)
+    configured_chunk_size = os.environ.get("EXO_PREFILL_CHUNK_SIZE", "4096")
+    try:
+        chunk_size = int(configured_chunk_size)
+        if chunk_size <= 0:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError(
+            "EXO_PREFILL_CHUNK_SIZE must be a positive integer; "
+            f"received {configured_chunk_size!r}"
+        ) from exc
+    for start in range(0, int(tokens.size), chunk_size):
+        _ = model(tokens[start : start + chunk_size][None], cache=cache)
         states: list[mx.array] = []
         for entry in cache:
             states.extend(value for value in entry.state if isinstance(value, mx.array))

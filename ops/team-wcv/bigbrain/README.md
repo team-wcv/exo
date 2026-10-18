@@ -14,7 +14,7 @@ when discovery succeeds.
 | Control plane | Studio; inference/control topology uses LAN addresses |
 | Large-model prefill | Spark, MLX CUDA, cache transfer over LAN |
 | Tensor decode | smbp + smbpt, JACCL/RDMA over Thunderbolt |
-| JACCL coordinator | Reachable Thunderbolt IP, `192.168.0.1` or `192.168.0.2` |
+| JACCL coordinator | Reachable Thunderbolt IP, `10.254.42.1` or `10.254.42.2` |
 
 The current serving model is
 `pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit`, pinned at
@@ -25,7 +25,7 @@ The remote path applies to more than 1,000 uncached prompt tokens.
 
 Persisted launchd/systemd settings use `ENABLE_DISAGGREGATION=true`,
 `EXO_HOME=.exo-bigbrain-cluster`, and allowed inference CIDRs
-`192.168.1.0/24,192.168.0.0/30`. Service labels are
+`192.168.1.0/24,192.168.0.0/24,10.254.42.0/30`. Service labels are
 `ai.team-wcv.exo-studio-bigbrain` on Studio, `com.teamwcv.exo.bigbrain` on both
 MacBooks, and `exo-spark-bigbrain.service` on Spark. MacBook jobs hold a
 `caffeinate` assertion. During a bootout/bootstrap maintenance cycle, hold a
@@ -63,6 +63,32 @@ API without changing the ownership/SSH identity of the operator's Macs. The
 host advertisement is approved, TLS is provisioned, and a real Qwen3.8 request
 completed through HTTPS with Spark cache ingestion on both Mac ranks. See the
 [gateway configuration and acceptance procedure](shared/tailscale.md).
+
+## Network recovery and prefill role safety (2026-10-18)
+
+The direct MacBook Thunderbolt subnet is now `10.254.42.0/30`: smbpt uses
+`10.254.42.1` on `RDMA Thunderbolt 1` (`en1`), and smbp uses `10.254.42.2` on
+`RDMA en2` (`en2`). Both have mask `255.255.255.252` and no router. The previous
+`192.168.0.1` Thunderbolt address conflicted with smbpt's Wi-Fi gateway after it
+joined `192.168.0.0/24`. Keep the direct link disjoint from every LAN subnet.
+Backups and rollback values are in each host's
+`~/.orchestraitor/deployments/exo-network-recovery-20261018/`.
+
+Both LAN subnets are allowed for API reachability. Studio offers bootstrap
+addresses `192.168.1.21:52618` and `192.168.0.33:52618`; MacBooks also bootstrap
+over the direct Thunderbolt link. Verify the configured addresses after network
+changes. A healthy Tailscale connection does not prove the inference LAN path.
+
+If a decode instance disappears, its surviving prefill instances retain their
+role in replayable state. New requests return a terminal error until a decoder
+is restored, rather than selecting the prefill server for generation. Explicit
+role reassignment through a new link remains supported.
+
+Spark sets `EXO_PREFILL_CHUNK_SIZE=256` to bound temporary activation memory for
+the large model. The remote-prefill default remains 4096 elsewhere. Large chunks
+on a nearly full Spark can trigger swapping and leave the UI at zero progress
+while the first chunk evaluates. Validate a long uncached prompt as well as short
+chat, checking memory and cache ingestion on both decode ranks.
 
 ## Legacy isolated endpoint profiles
 

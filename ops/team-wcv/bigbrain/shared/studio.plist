@@ -13,7 +13,7 @@
 		<key>EXO_HOME</key>
 		<string>.exo-bigbrain-cluster</string>
 		<key>EXO_REACHABILITY_ALLOWED_CIDRS</key>
-		<string>192.168.1.0/24,192.168.0.0/30</string>
+		<string>192.168.1.0/24,192.168.0.0/24,10.254.42.0/30</string>
 		<key>EXO_ROUTER_SETTLE_SECONDS</key>
 		<string>4</string>
 		<key>PYTHONPATH</key>

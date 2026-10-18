@@ -66,6 +66,8 @@ class State(FrozenModel):
     thunderbolt_bridge_cycles: Sequence[Sequence[NodeId]] = []
 
     instance_links: Mapping[InstanceLinkId, InstanceLink] = {}
+    # Losing a decoder must not silently turn its surviving prefill server into one.
+    orphaned_prefill_instances: frozenset[InstanceId] = frozenset()
     prefill_server_ports: Mapping[RunnerId, int] = {}
 
     # User-added model cards. Workers reconcile this state into their local cache.

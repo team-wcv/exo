@@ -212,7 +212,13 @@ def apply_instance_created(event: InstanceCreated, state: State) -> State:
         **state.instances,
         instance.instance_id: instance,
     }
-    return state.model_copy(update={"instances": new_instances})
+    return state.model_copy(
+        update={
+            "instances": new_instances,
+            "orphaned_prefill_instances": state.orphaned_prefill_instances
+            - {instance.instance_id},
+        }
+    )
 
 
 def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
@@ -222,9 +228,12 @@ def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
     }
 
     new_links: dict[InstanceLinkId, InstanceLink] = {}
+    orphaned_prefill = set(state.orphaned_prefill_instances)
     for link_id, link in state.instance_links.items():
         prefill = [i for i in link.prefill_instances if i != event.instance_id]
         decode = [i for i in link.decode_instances if i != event.instance_id]
+        if not decode:
+            orphaned_prefill.update(prefill)
         if not prefill or not decode:
             continue
         if prefill == list(link.prefill_instances) and decode == list(
@@ -236,9 +245,14 @@ def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
                 update={"prefill_instances": prefill, "decode_instances": decode}
             )
 
+    orphaned_prefill.intersection_update(new_instances)
     if deleted_instance is None:
         return state.model_copy(
-            update={"instances": new_instances, "instance_links": new_links}
+            update={
+                "instances": new_instances,
+                "instance_links": new_links,
+                "orphaned_prefill_instances": frozenset(orphaned_prefill),
+            }
         )
 
     deleted_runner_ids = {
@@ -253,6 +267,7 @@ def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
         update={
             "instances": new_instances,
             "instance_links": new_links,
+            "orphaned_prefill_instances": frozenset(orphaned_prefill),
             "runners": new_runners,
         }
     )
@@ -263,14 +278,27 @@ def apply_instance_link_created(event: InstanceLinkCreated, state: State) -> Sta
         **state.instance_links,
         event.link.link_id: event.link,
     }
-    return state.model_copy(update={"instance_links": new_links})
+    return state.model_copy(
+        update={
+            "instance_links": new_links,
+            "orphaned_prefill_instances": state.orphaned_prefill_instances
+            - set(event.link.decode_instances),
+        }
+    )
 
 
 def apply_instance_link_deleted(event: InstanceLinkDeleted, state: State) -> State:
+    deleted_link = state.instance_links.get(event.link_id)
     new_links: Mapping[InstanceLinkId, InstanceLink] = {
         lid: link for lid, link in state.instance_links.items() if lid != event.link_id
     }
-    return state.model_copy(update={"instance_links": new_links})
+    return state.model_copy(
+        update={
+            "instance_links": new_links,
+            "orphaned_prefill_instances": state.orphaned_prefill_instances
+            - (set(deleted_link.prefill_instances) if deleted_link else set()),
+        }
+    )
 
 
 def apply_runner_status_updated(event: RunnerStatusUpdated, state: State) -> State:
