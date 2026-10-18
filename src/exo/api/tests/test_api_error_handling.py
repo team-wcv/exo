@@ -1,10 +1,62 @@
-# pyright: reportUnusedFunction=false, reportAny=false
+# pyright: reportUnusedFunction=false, reportAny=false, reportPrivateUsage=false
 from typing import Any
+from unittest.mock import AsyncMock
 
+import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from exo.api.main import API
+from exo.shared.types.chunks import ErrorChunk
+from exo.shared.types.commands import ForwarderCommand, TextGeneration
+from exo.shared.types.common import ModelId, SystemId
+from exo.shared.types.text_generation import TextGenerationTaskParams
+
+
+def _streaming_api() -> API:
+    api = object.__new__(API)
+    api.paused = False
+    api._system_id = SystemId()
+    api._text_generation_queues = {}
+    api._text_generation_receivers = {}
+    api.command_sender = AsyncMock()
+    return api
+
+
+@pytest.mark.asyncio
+async def test_immediate_error_is_buffered_before_stream_subscription() -> None:
+    api = _streaming_api()
+    command = TextGeneration(
+        task_params=TextGenerationTaskParams(model=ModelId("lost-decoder"), input=[])
+    )
+    error = ErrorChunk(
+        model=ModelId("lost-decoder"), error_message="No decode instance"
+    )
+
+    async def immediate_reply(forwarded: ForwarderCommand) -> None:
+        if isinstance(forwarded.command, TextGeneration):
+            await api._text_generation_queues[command.command_id].send(error)
+
+    api.command_sender.send = AsyncMock(side_effect=immediate_reply)
+    await api._send(command)
+    assert [chunk async for chunk in api._token_chunk_stream(command.command_id)] == [
+        error
+    ]
+    assert not api._text_generation_queues
+    assert not api._text_generation_receivers
+
+
+@pytest.mark.asyncio
+async def test_failed_command_send_cleans_registered_stream() -> None:
+    api = _streaming_api()
+    api.command_sender.send = AsyncMock(side_effect=RuntimeError("router unavailable"))
+    command = TextGeneration(
+        task_params=TextGenerationTaskParams(model=ModelId("lost-decoder"), input=[])
+    )
+    with pytest.raises(RuntimeError, match="router unavailable"):
+        await api._send(command)
+    assert not api._text_generation_queues
+    assert not api._text_generation_receivers
 
 
 def test_http_exception_handler_formats_openai_style() -> None:
@@ -15,7 +67,7 @@ def test_http_exception_handler_formats_openai_style() -> None:
     # Setup exception handler
     api = object.__new__(API)
     api.app = app
-    api._setup_exception_handlers()  # pyright: ignore[reportPrivateUsage]
+    api._setup_exception_handlers()
 
     # Add test routes that raise HTTPException
     @app.get("/test-error")

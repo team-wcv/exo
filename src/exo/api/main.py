@@ -298,6 +298,10 @@ class API:
             CommandId,
             Sender[TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk],
         ] = {}
+        self._text_generation_receivers: dict[
+            CommandId,
+            Receiver[TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk],
+        ] = {}
         self._image_generation_queues: dict[
             CommandId, Sender[ImageChunk | ErrorChunk]
         ] = {}
@@ -311,6 +315,9 @@ class API:
         self.state = State()
         self._system_id = SystemId()
         self._text_generation_queues = {}
+        for receiver in self._text_generation_receivers.values():
+            receiver.close()
+        self._text_generation_receivers = {}
         self._image_generation_queues = {}
         self.unpause(result_clock)
         self.event_receiver.close()
@@ -1046,9 +1053,11 @@ class API:
         This is the internal low-level stream used by all API adapters.
         """
         try:
-            self._text_generation_queues[command_id], recv = channel[
-                TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
-            ]()
+            recv = self._text_generation_receivers.pop(command_id, None)
+            if recv is None:
+                self._text_generation_queues[command_id], recv = channel[
+                    TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
+                ]()
 
             with recv as token_chunks:
                 async for chunk in token_chunks:
@@ -1066,9 +1075,9 @@ class API:
                 )
             raise
         finally:
+            if sender := self._text_generation_queues.pop(command_id, None):
+                sender.close()
             await self._send(TaskFinished(finished_command_id=command_id))
-            if command_id in self._text_generation_queues:
-                del self._text_generation_queues[command_id]
 
     async def _collect_text_generation_with_stats(
         self, command_id: CommandId
@@ -2378,9 +2387,27 @@ class API:
     async def _send(self, command: Command):
         while self.paused:
             await self.paused_ev.wait()
-        await self.command_sender.send(
-            ForwarderCommand(origin=self._system_id, command=command)
-        )
+        if isinstance(command, TextGeneration):
+            # Selection can fail before the lazy SSE consumer starts iterating.
+            # Keep the receiver alive so an immediate terminal chunk is buffered.
+            sender, receiver = channel[
+                TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
+            ]()
+            self._text_generation_queues[command.command_id] = sender
+            self._text_generation_receivers[command.command_id] = receiver
+        try:
+            await self.command_sender.send(
+                ForwarderCommand(origin=self._system_id, command=command)
+            )
+        except BaseException:
+            if isinstance(command, TextGeneration):
+                if sender := self._text_generation_queues.pop(command.command_id, None):
+                    sender.close()
+                if receiver := self._text_generation_receivers.pop(
+                    command.command_id, None
+                ):
+                    receiver.close()
+            raise
 
     async def _send_download(self, command: DownloadCommand):
         await self.download_command_sender.send(
