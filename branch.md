@@ -6,5 +6,5 @@ scope: Restore four-node Bigbrain networking and prevent orphaned prefill instan
 orchestraitor:
   ticket: 6ad5453ce8f313d4bf1ccaf4
 pr:
-  url: pending
+  url: https://github.com/team-wcv/exo/pull/50
 ---
