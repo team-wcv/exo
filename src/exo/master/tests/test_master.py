@@ -14,6 +14,7 @@ from exo.shared.models.model_cards import ModelCard, ModelTask
 from exo.shared.types.backends import Backend
 from exo.shared.types.commands import (
     CommandId,
+    CreateInstance,
     ForwarderCommand,
     ForwarderDownloadCommand,
     PlaceInstance,
@@ -25,6 +26,7 @@ from exo.shared.types.events import (
     GlobalForwarderEvent,
     IndexedEvent,
     InstanceCreated,
+    InstanceLinkCreated,
     LocalForwarderEvent,
     NodeGatheredInfo,
     TaskCreated,
@@ -523,3 +525,57 @@ def test_text_generation_with_target_model_mismatch_does_not_create_task() -> No
                 target_instance_id=target_instance_id,
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_dashboard_create_reuses_existing_prefill_instance() -> None:
+    model_id = ModelId("test-remote-prefill")
+    prefill = _test_instance(model_id, InstanceId("prefill"))
+    decode = _test_instance(model_id, InstanceId("decode"))
+    prefill_node = prefill.shard_assignments.shards[0].node_id
+    nid, rid, shard = decode.shard_assignments.shards[0]
+    card = shard.model_card.model_copy(
+        update={"prefill_eligible_nodes": [prefill_node]}
+    )
+    decode = decode.model_copy(
+        update={
+            "shard_assignments": decode.shard_assignments.model_copy(
+                update={
+                    "shards": [
+                        ShardWithId(
+                            nid, rid, shard.model_copy(update={"model_card": card})
+                        )
+                    ]
+                }
+            )
+        }
+    )
+    state = State(instances={prefill.instance_id: prefill})
+    state.topology.add_node(nid)
+    state.topology.add_node(prefill_node)
+    master = _master_with_state(state)
+    commands, master.command_receiver = channel[ForwarderCommand]()
+    master.event_sender, events = channel[Event]()
+    observed: list[Event] = []
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(master._command_processor)
+        with anyio.fail_after(2):
+            await commands.send(
+                ForwarderCommand(
+                    origin=SystemId("dashboard"),
+                    command=CreateInstance(instance=decode),
+                )
+            )
+            while not any(isinstance(e, InstanceCreated) for e in observed) or not any(
+                isinstance(e, InstanceLinkCreated) for e in observed
+            ):
+                observed.append(await events.receive())
+        commands.close()
+    links = [e.link for e in observed if isinstance(e, InstanceLinkCreated)]
+    assert len(links) == 1
+    assert links[0].prefill_instances == [prefill.instance_id]
+    assert links[0].decode_instances == [decode.instance_id]
+    created = [
+        e.instance.instance_id for e in observed if isinstance(e, InstanceCreated)
+    ]
+    assert created == [decode.instance_id]

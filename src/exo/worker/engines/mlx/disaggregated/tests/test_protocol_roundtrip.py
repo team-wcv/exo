@@ -81,6 +81,8 @@ def test_arrays_state_roundtrip() -> None:
     assert isinstance(msg, ArraysState)
     assert msg.layer_idx == 9
     assert len(msg.arrays) == 2
+    assert msg.arrays[0] is not None
+    assert msg.arrays[1] is not None
     assert msg.arrays[0].dtype == "float32"
     assert msg.arrays[0].shape == (2, 3)
     assert msg.arrays[0].data == arrs[0].data

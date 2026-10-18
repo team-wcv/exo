@@ -138,9 +138,7 @@ class TestMxBroadcastIntListMultiRank:
         fake_group = cast(mx.distributed.Group, object())
         local_inputs: list[list[int]] = []
 
-        def fake_all_sum(
-            local: mx.array, *, group: mx.distributed.Group
-        ) -> mx.array:
+        def fake_all_sum(local: mx.array, *, group: mx.distributed.Group) -> mx.array:
             assert group is fake_group
             local_values = cast(list[int], local.tolist())
             local_inputs.append([int(value) for value in local_values])
@@ -151,12 +149,8 @@ class TestMxBroadcastIntListMultiRank:
             raise AssertionError("task agreement must not call JACCL send/recv")
 
         monkeypatch.setattr(utils_mlx.mx.distributed, "all_sum", fake_all_sum)
-        monkeypatch.setattr(
-            utils_mlx.mx.distributed, "send", reject_point_to_point
-        )
-        monkeypatch.setattr(
-            utils_mlx.mx.distributed, "recv", reject_point_to_point
-        )
+        monkeypatch.setattr(utils_mlx.mx.distributed, "send", reject_point_to_point)
+        monkeypatch.setattr(utils_mlx.mx.distributed, "recv", reject_point_to_point)
 
         root_result = mx_broadcast_int_list(
             payload, length=len(payload), group=fake_group, is_root=True

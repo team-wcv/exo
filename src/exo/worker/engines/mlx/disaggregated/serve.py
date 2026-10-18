@@ -1,7 +1,7 @@
 import time
+from typing import cast
 
 import mlx.core as mx
-from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.worker.disaggregated.server import PrefillRequest
@@ -11,10 +11,30 @@ from exo.worker.engines.mlx.cache import (
     make_kv_cache,
     snapshot_ssm_states,
 )
-from exo.worker.engines.mlx.generator.generate import prefill as mlx_prefill
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import fix_unmatched_think_end_tokens
 from exo.worker.runner.bootstrap import logger
+
+
+def fill_cache_prefix(model: Model, cache: KVCacheType, tokens: mx.array) -> None:
+    """Evaluate only prefix state, without sampling or rolling back recurrent caches.
+
+    The ordinary generation prefill helper reserves decode seed tokens itself.
+    Calling it on an already shortened remote prefix trims twice and loses
+    prompt tokens. Direct chunked forwards keep the requested boundary exact.
+    """
+    for start in range(0, int(tokens.size), 4096):
+        _ = model(tokens[start : start + 4096][None], cache=cache)
+        states: list[mx.array] = []
+        for entry in cache:
+            states.extend(value for value in entry.state if isinstance(value, mx.array))
+        for entry in cache:
+            indexer = cast(object, getattr(entry, "indexer", None))
+            state = cast(object, getattr(indexer, "state", None))
+            if isinstance(state, mx.array):
+                states.append(state)
+        mx.eval(*states)
+        mx.clear_cache()
 
 
 def run_prefill_for_request(
@@ -25,6 +45,10 @@ def run_prefill_for_request(
     kv_prefix_cache: KVPrefixCache | None,
     request: PrefillRequest,
 ) -> KVCacheType:
+    if group is not None and group.size() > 1:
+        raise ValueError(
+            "Remote prefill serving requires a single-rank prefill instance"
+        )
     prompt_tokens = mx.array(request.token_ids)
     prompt_tokens = fix_unmatched_think_end_tokens(prompt_tokens, tokenizer)
     n_tokens = int(prompt_tokens.shape[0])
@@ -41,21 +65,13 @@ def run_prefill_for_request(
         cache = make_kv_cache(model)
         remaining = prompt_tokens
 
-    target_offset = max(0, n_tokens - 2)
+    # The request excludes the final prompt token. The decode loop consumes
+    # the final two original tokens, so reserve exactly one more here.
+    target_offset = max(0, n_tokens - 1)
     new_tokens = max(0, target_offset - prefix_hit_length)
     prefill_input = remaining[:new_tokens]
     if int(prefill_input.shape[0]) > 0:
-        sampler = make_sampler(temp=1.0)
-        _ = mlx_prefill(
-            model=model,
-            tokenizer=tokenizer,
-            sampler=sampler,
-            prompt_tokens=prefill_input,
-            cache=cache,
-            group=group,
-            on_prefill_progress=None,
-            distributed_prompt_progress_callback=None,
-        )
+        fill_cache_prefix(model, cache, prefill_input)
 
     if kv_prefix_cache is not None:
         try:

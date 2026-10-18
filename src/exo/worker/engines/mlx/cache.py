@@ -34,7 +34,10 @@ if TYPE_CHECKING:
 # Fraction of device memory above which LRU eviction kicks in.
 # Smaller machines need more aggressive eviction.
 def _default_memory_threshold() -> float:
-    total_gb = Memory.from_bytes(psutil.virtual_memory().total).in_gb
+    # Capacity is static. Avoid live VM-statistics calls during import: macOS
+    # betas can reject HOST_VM_INFO64 and prevent the runner from starting.
+    total_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    total_gb = Memory.from_bytes(total_bytes).in_gb
     if total_gb >= 128:
         return 0.85
     if total_gb >= 64:
@@ -247,9 +250,9 @@ def trim_trimmable_cache_entry(
     trimmed = int(trim(num_tokens))
     indexer = getattr(cache, "indexer", None)
     state = getattr(indexer, "state", None)
-    if isinstance(state, mx.array) and state.ndim >= 2:
+    if indexer is not None and isinstance(state, mx.array) and state.ndim >= 2:
         retained = max(0, int(state.shape[1]) - trimmed)
-        setattr(indexer, "state", state[:, :retained])
+        indexer.state = state[:, :retained]
     return trimmed
 
 

@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>ENABLE_DISAGGREGATION</key>
+		<string>true</string>
+		<key>EXO_DASHBOARD_DIR</key>
+		<string>/Users/JJ/.orchestraitor/deployments/exo-qwen38-prefill-20261016/current/dashboard/build</string>
+		<key>EXO_DEFAULT_MODELS_DIR</key>
+		<string>/Users/JJ/.exo/models</string>
+		<key>EXO_ENABLE_ASYMMETRIC_TP_AUTO_UPGRADE</key>
+		<string>1</string>
+		<key>EXO_EVENT_DELIVERY_STALL_SECONDS</key>
+		<string>15</string>
+		<key>EXO_HOME</key>
+		<string>.exo-bigbrain-cluster</string>
+		<key>EXO_PREFERRED_RANK_ZERO_FRIENDLY_NAMES</key>
+		<string>wc-smbp</string>
+		<key>EXO_REACHABILITY_ALLOWED_CIDRS</key>
+		<string>192.168.1.0/24,192.168.0.0/30</string>
+		<key>EXO_ROUTER_SETTLE_SECONDS</key>
+		<string>4</string>
+		<key>PATH</key>
+		<string>/Users/JJ/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>PYTHONPATH</key>
+		<string>/Users/JJ/.orchestraitor/deployments/exo-qwen38-prefill-20261016/current/src:/Users/JJ/.orchestraitor/deployments/exo-qwen38-prefill-20261016/native-current</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.teamwcv.exo.bigbrain</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/caffeinate</string>
+		<string>-dimsu</string>
+		<string>/opt/homebrew/bin/uv</string>
+		<string>run</string>
+		<string>--no-sync</string>
+		<string>--directory</string>
+		<string>/Users/JJ/.orchestraitor/worktrees/exo/spark-prefill-20261016</string>
+		<string>exo</string>
+		<string>--namespace</string>
+		<string>wc-bigbrain</string>
+		<string>--api-port</string>
+		<string>52415</string>
+		<string>--zenoh-port</string>
+		<string>52418</string>
+		<string>--discovery-port</string>
+		<string>52413</string>
+		<string>--peer-download-port</string>
+		<string>52416</string>
+		<string>--trust-remote-code</string>
+		<string>--bootstrap-peers</string>
+		<string>/ip4/192.168.1.21/tcp/52618</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/JJ/.cache/exo/bigbrain-launchd.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/JJ/.cache/exo/bigbrain-launchd.out.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/JJ</string>
+</dict>
+</plist>

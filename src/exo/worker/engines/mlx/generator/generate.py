@@ -1521,16 +1521,22 @@ def mlx_generate(
         if use_remote and task.prefill_endpoint is not None:
             try:
                 prefill_tps, prefill_tokens, ssm_snapshots_list = remote_prefill(
-                    prompt_tokens[:-1],
+                    all_prompt_tokens[:-1],
                     caches,
                     on_prefill_progress,
                     endpoint=task.prefill_endpoint,
                     request_id=str(uuid.uuid4()),
                     model_id=str(task.model),
                     start_pos=prefix_hit_length,
+                    model=model,
+                    group=group,
                 )
                 remote_prefilled = True
             except Exception:
+                if group is not None and group.size() > 1:
+                    # Ranks cannot choose different paths around collective
+                    # operations; independent fallback can deadlock RDMA decode.
+                    raise
                 logger.opt(exception=True).warning(
                     "Remote prefill failed, falling back to local prefill"
                 )

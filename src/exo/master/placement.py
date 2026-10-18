@@ -1697,6 +1697,20 @@ def auto_place_prefill_siblings(
     accumulating_instances: dict[InstanceId, Instance] = dict(current_instances)
 
     for candidate_node in candidates:
+        reusable = next(
+            (
+                iid
+                for iid, instance in accumulating_instances.items()
+                if instance.shard_assignments.model_id == model_card.model_id
+                and instance.drafter_placement is None
+                and len(instance.shard_assignments.shards) == 1
+                and instance.shard_assignments.shards[0].node_id == candidate_node
+            ),
+            None,
+        )
+        if reusable is not None:
+            placed_ids.append(reusable)
+            continue
         sub_command = PlaceInstance(
             model_card=prefill_card,
             sharding=Sharding.Pipeline,

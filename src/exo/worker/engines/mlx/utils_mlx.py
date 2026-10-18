@@ -2062,8 +2062,7 @@ def mx_broadcast_int_list(
     if _BROADCAST_PROBE:
         role = "ROOT" if is_root else "PEER"
         logger.warning(
-            f"mx_broadcast_int_list[collective] {role} recovered {out} "
-            f"(len={length})"
+            f"mx_broadcast_int_list[collective] {role} recovered {out} (len={length})"
         )
     return out
 

@@ -90,17 +90,18 @@ class Election:
         command_receiver: Receiver[ForwarderCommand],
         is_candidate: bool = True,
         seniority: int = 0,
+        initial_clock: int = 0,
     ):
         # If we aren't a candidate, simply don't increment seniority.
         # For reference: This node can be elected master if all nodes are not master candidates
         # Any master candidate will automatically win out over this node.
         self.seniority = seniority if is_candidate else -1
-        self.clock = 0
+        self.clock = initial_clock
         self.node_id = node_id
         self.commands_seen = 0
         # Every node spawns as master
         self.current_session: SessionId = SessionId(
-            master_node_id=node_id, election_clock=0
+            master_node_id=node_id, election_clock=initial_clock
         )
 
         # Highest seniority observed from any peer across all election rounds.

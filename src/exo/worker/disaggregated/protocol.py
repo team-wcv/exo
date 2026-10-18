@@ -1,8 +1,9 @@
+from collections.abc import Sequence
 from typing import BinaryIO, Literal
 
 import msgspec
 
-DType = Literal["bfloat16", "float16", "float32"]
+DType = Literal["bfloat16", "float16", "float32", "int32", "int64"]
 
 
 class ProtocolError(Exception):
@@ -39,7 +40,14 @@ class KVChunk(msgspec.Struct, tag="kv_chunk"):
 
 class ArraysState(msgspec.Struct, tag="arrays_state"):
     layer_idx: int
-    arrays: list[TensorBlob] = []
+    arrays: list[TensorBlob | None] = []
+
+
+class IndexerState(msgspec.Struct, tag="indexer_state"):
+    """Token-aligned sparse-attention keys, separate from the attention KV heads."""
+
+    layer_idx: int
+    tensor: TensorBlob
 
 
 class Done(msgspec.Struct, tag="done"):
@@ -51,7 +59,7 @@ class ErrorMessage(msgspec.Struct, tag="error"):
     message: str
 
 
-Message = KVChunk | ArraysState | Done | ErrorMessage
+Message = KVChunk | ArraysState | IndexerState | Done | ErrorMessage
 
 _msg_encoder = msgspec.msgpack.Encoder()
 _msg_decoder: msgspec.msgpack.Decoder[Message] = msgspec.msgpack.Decoder(Message)
@@ -139,9 +147,9 @@ def write_kv_chunk(
 
 
 def write_arrays_state(
-    stream: BinaryIO, layer_idx: int, arrays: list[TensorBlob]
+    stream: BinaryIO, layer_idx: int, arrays: Sequence[TensorBlob | None]
 ) -> None:
-    write_message(stream, ArraysState(layer_idx=layer_idx, arrays=arrays))
+    write_message(stream, ArraysState(layer_idx=layer_idx, arrays=list(arrays)))
 
 
 def write_done(stream: BinaryIO, total_tokens: int) -> None:

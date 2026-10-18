@@ -1006,3 +1006,36 @@ class TestCfgParallelPlacement:
         # First shard starts at 0, last shard ends at 57
         assert layer_ranges[0][0] == 0
         assert layer_ranges[-1][1] == 57
+
+
+def test_jaccl_coordinator_prefers_thunderbolt_to_same_peer_lan() -> None:
+    coordinator, peer = NodeId("coordinator"), NodeId("peer")
+    topology = Topology()
+    topology.add_node(coordinator)
+    topology.add_node(peer)
+    for address in ["192.168.1.63", "192.168.0.2"]:
+        topology.add_connection(
+            Connection(
+                source=peer,
+                sink=coordinator,
+                edge=SocketConnection(
+                    sink_multiaddr=Multiaddr(address=f"/ip4/{address}/tcp/52415")
+                ),
+            )
+        )
+    network = {
+        coordinator: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="en11", ip_address="192.168.1.63", interface_type="ethernet"
+                ),
+                NetworkInterfaceInfo(
+                    name="en2", ip_address="192.168.0.2", interface_type="thunderbolt"
+                ),
+            ]
+        ),
+        peer: NodeNetworkInfo(interfaces=[]),
+    }
+    addresses = get_mlx_jaccl_coordinators(coordinator, 5000, topology, network)
+    assert addresses[peer] == "192.168.0.2:5000"
+    assert addresses[coordinator] == "0.0.0.0:5000"

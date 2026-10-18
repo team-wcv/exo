@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>ENABLE_DISAGGREGATION</key>
+		<string>true</string>
+		<key>EXO_DASHBOARD_DIR</key>
+		<string>/Users/JJ/.orchestraitor/deployments/exo-qwen38-prefill-20261016/current/dashboard/build</string>
+		<key>EXO_DEFAULT_MODELS_DIR</key>
+		<string>/Users/JJ/.exo-pr44-benchmark-models</string>
+		<key>EXO_HOME</key>
+		<string>.exo-bigbrain-cluster</string>
+		<key>EXO_REACHABILITY_ALLOWED_CIDRS</key>
+		<string>192.168.1.0/24,192.168.0.0/30</string>
+		<key>EXO_ROUTER_SETTLE_SECONDS</key>
+		<string>4</string>
+		<key>PYTHONPATH</key>
+		<string>/Users/JJ/.orchestraitor/deployments/exo-qwen38-prefill-20261016/current/src:/Users/JJ/.orchestraitor/deployments/exo-qwen38-prefill-20261016/native-current</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>ai.team-wcv.exo-studio-bigbrain</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/JJ/.orchestraitor/worktrees/exo/pr44-5380af3e/.venv/bin/exo</string>
+		<string>--namespace</string>
+		<string>wc-bigbrain</string>
+		<string>--api-port</string>
+		<string>52415</string>
+		<string>--zenoh-port</string>
+		<string>52618</string>
+		<string>--discovery-port</string>
+		<string>52413</string>
+		<string>--peer-download-port</string>
+		<string>52416</string>
+		<string>--trust-remote-code</string>
+		<string>--force-master</string>
+		<string>--offline</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/JJ/.cache/exo/studio-bigbrain.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/JJ/.cache/exo/studio-bigbrain.out.log</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/JJ</string>
+</dict>
+</plist>

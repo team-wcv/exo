@@ -165,3 +165,22 @@ def test_server_client_roundtrip_with_start_pos() -> None:
         assert _equal(dst_v, gold_v)
     finally:
         server.stop()
+
+
+@pytest.mark.slow
+def test_truncated_prefill_stream_is_rejected() -> None:
+    def resolve(job: PrefillRequest, stream: BinaryIO) -> bool:
+        write_header(stream, Header(request_id=job.request_id, model_id=job.model_id))
+        return True
+
+    server = PrefillServer(resolve=resolve, host="127.0.0.1", port=52420)
+    try:
+        with pytest.raises(ConnectionError, match="completion frame"):
+            remote_prefill_fetch(
+                "127.0.0.1:52420",
+                PrefillRequest(
+                    model_id="m", token_ids=[1, 2, 3], request_id="truncated"
+                ),
+            )
+    finally:
+        server.stop()
