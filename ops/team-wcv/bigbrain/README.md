@@ -5,7 +5,7 @@
 The operator dashboard at `http://bigbrain.localhost:18888/` serves one shared
 `wc-bigbrain` cluster. Studio is the preferred master; smbp, smbpt, and Spark
 join the same cluster. All four APIs use port `52415`, and peer-file servers use
-`52416`. Using different API ports breaks the deployed reachability probes even
+`24216`. Using different API ports breaks the deployed reachability probes even
 when discovery succeeds.
 
 | Function | Host / transport |
@@ -104,6 +104,22 @@ start a fresh conversation for ordinary short chat.
 The API registers its response channel before dispatching a generation command,
 so an immediate missing-decoder error is buffered even before SSE consumption
 starts. Tests cover that ordering and cleanup when command dispatch fails.
+
+## Peer-download listener recovery (2026-10-18)
+
+The old peer-download port `52416` collided with macOS `rapportd` on smbpt,
+causing EXO to exit and launchd to retry every ten seconds. All four nodes now
+use `24216`, below the observed macOS dynamic range `49152–65535` and Linux
+range `32768–60999`. Keep this port common across the fleet: peer discovery
+currently assumes the local configured port is also the peer's port.
+
+Changing this port also changes EXO's identity-file scope. Copy the previous
+`node_zid.zenoh-<port>.api-52415.peer-52416` into the corresponding
+`peer-24216` path before starting the new configuration, verifying its contents
+match; never overwrite an existing different identity. Preserve the original
+file and the backed-up startup configuration for rollback. Verify `/node_id`,
+the peer server's `/health`, stable launchd PIDs, and four-node topology after
+restart. Do not stop `rapportd` to make EXO's old port available.
 
 ## Legacy isolated endpoint profiles
 

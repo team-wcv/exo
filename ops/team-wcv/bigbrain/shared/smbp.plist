@@ -50,7 +50,7 @@
 		<string>--discovery-port</string>
 		<string>52413</string>
 		<string>--peer-download-port</string>
-		<string>52416</string>
+		<string>24216</string>
 		<string>--trust-remote-code</string>
 		<string>--bootstrap-peers</string>
 		<string>/ip4/192.168.1.21/tcp/52618,/ip4/10.254.42.1/tcp/52418</string>
