@@ -121,6 +121,30 @@ file and the backed-up startup configuration for rollback. Verify `/node_id`,
 the peer server's `/health`, stable launchd PIDs, and four-node topology after
 restart. Do not stop `rapportd` to make EXO's old port available.
 
+## Dashboard asset continuity
+
+An existing Chrome tab can load cached bootstrap code that references a previous
+hashed JavaScript module. On 2026-10-18, requests for
+`/_app/immutable/nodes/2.-Ujo2dWt.js` returned 404 and caused an import/reload loop
+with a blank page, even while fresh browser tests and the API succeeded.
+The original module and its matching immutable dependencies were recovered from
+the prior local build and added to each deployed dashboard without replacing the
+current HTML or any existing asset. Per-host `dashboard-compat-assets.json` in
+the recovery deployment directory records the added file hashes.
+
+Retain the previous `_app/immutable` assets when replacing a dashboard build.
+Merge missing hashed files into the new build; if an existing path has different
+bytes, stop and investigate rather than overwriting it. Preserve the complete
+dependency set, not just the first missing chunk. Check both a fresh bootstrap
+and a previous cached bootstrap against the production URL before declaring a
+dashboard deployment healthy. Existing conversations remain in browser storage.
+
+The checked-in Caddy configuration sends `Cache-Control: no-store` for `/`,
+`/index.html`, and `/_app/version.json`, so future bootstrap documents do not
+remain cached across deployments. Hashed immutable assets remain cacheable.
+Inspect actual failing asset requests in the access log: successful `/state`
+responses alone do not establish that the operator's existing tab can render.
+
 ## Legacy isolated endpoint profiles
 
 The checked-in profiles below predate the shared four-node deployment. They are
