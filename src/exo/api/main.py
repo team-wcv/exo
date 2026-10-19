@@ -4,7 +4,7 @@ import hashlib
 import json
 import random
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Iterable
 from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
@@ -46,7 +46,7 @@ from exo.api.adapters.responses import (
     generate_responses_stream,
     responses_request_to_text_generation,
 )
-from exo.api.keepalive import with_sse_keepalive
+from exo.api.keepalive import FinalizingStreamingResponse, with_sse_keepalive
 from exo.api.types import (
     AddCustomModelParams,
     AdvancedImageParams,
@@ -1043,6 +1043,31 @@ class API:
             command_id=command_id,
         )
 
+    def _text_response(
+        self,
+        command_id: CommandId,
+        content: AsyncIterable[str],
+        *,
+        media_type: str,
+        headers: dict[str, str] | None = None,
+    ) -> StreamingResponse:
+        return FinalizingStreamingResponse(
+            content,
+            finalize=lambda: self._finish_unstarted_text_generation(command_id),
+            media_type=media_type,
+            headers=headers,
+        )
+
+    async def _finish_unstarted_text_generation(self, command_id: CommandId) -> None:
+        receiver = self._text_generation_receivers.pop(command_id, None)
+        if receiver is None:
+            return
+        receiver.close()
+        if sender := self._text_generation_queues.pop(command_id, None):
+            sender.close()
+        await self._send(TaskCancelled(cancelled_command_id=command_id))
+        await self._send(TaskFinished(finished_command_id=command_id))
+
     async def _token_chunk_stream(
         self, command_id: CommandId
     ) -> AsyncGenerator[
@@ -1241,7 +1266,8 @@ class API:
         command = await self._send_routed_text_generation(task_params, route)
 
         if payload.stream:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 with_sse_keepalive(
                     generate_chat_stream(
                         command.command_id,
@@ -1256,7 +1282,8 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 collect_chat_response(
                     command.command_id,
                     self._token_chunk_stream(command.command_id),
@@ -1284,7 +1311,8 @@ class API:
         command = await self._send_text_generation_with_images(task_params)
 
         if payload.stream:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 with_sse_keepalive(
                     generate_chat_stream(
                         command.command_id,
@@ -1859,7 +1887,8 @@ class API:
         command = await self._send_text_generation_with_images(task_params)
 
         if payload.stream:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 with_sse_keepalive(
                     generate_claude_stream(
                         command.command_id,
@@ -1875,7 +1904,8 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 collect_claude_response(
                     command.command_id,
                     payload.model,
@@ -1915,7 +1945,8 @@ class API:
         command = await self._send_routed_text_generation(task_params, route)
 
         if payload.stream:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 with_sse_keepalive(
                     generate_responses_stream(
                         command.command_id,
@@ -1933,7 +1964,8 @@ class API:
             )
 
         else:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 collect_responses_response(
                     command.command_id,
                     route.model_id,
@@ -1974,7 +2006,8 @@ class API:
         command = await self._send_text_generation_with_images(task_params)
 
         if payload.stream:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 generate_ollama_chat_stream(
                     command.command_id,
                     self._token_chunk_stream(command.command_id),
@@ -1987,7 +2020,8 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 collect_ollama_chat_response(
                     command.command_id,
                     self._token_chunk_stream(command.command_id),
@@ -2014,7 +2048,8 @@ class API:
         command = await self._send_text_generation_with_images(task_params)
 
         if payload.stream:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 generate_ollama_generate_stream(
                     command.command_id,
                     self._token_chunk_stream(command.command_id),
@@ -2027,7 +2062,8 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 collect_ollama_generate_response(
                     command.command_id,
                     self._token_chunk_stream(command.command_id),

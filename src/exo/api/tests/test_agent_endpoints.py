@@ -79,6 +79,8 @@ def _api_with_instances(
 ) -> API:
     api = API.__new__(API)
     api.state = State(instances=instances)
+    api._text_generation_queues = {}
+    api._text_generation_receivers = {}
 
     async def _noop_notify(_: API, __: ModelId) -> None:
         return None

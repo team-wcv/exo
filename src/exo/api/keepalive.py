@@ -1,9 +1,34 @@
-from collections.abc import AsyncIterator
-from typing import Final
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
+from typing import Final, override
 
 import anyio
+from starlette.responses import StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 _DONE: Final = object()
+
+
+class FinalizingStreamingResponse(StreamingResponse):
+    """Release resources even when disconnect happens before stream iteration."""
+
+    def __init__(
+        self,
+        content: AsyncIterable[str],
+        *,
+        finalize: Callable[[], Awaitable[None]],
+        media_type: str,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(content, media_type=media_type, headers=headers)
+        self._finalize = finalize
+
+    @override
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self._finalize()
 
 
 async def with_sse_keepalive(

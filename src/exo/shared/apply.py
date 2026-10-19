@@ -274,6 +274,12 @@ def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
 
 
 def apply_instance_link_created(event: InstanceLinkCreated, state: State) -> State:
+    previous = state.instance_links.get(event.link.link_id)
+    released_prefill: set[InstanceId] = (
+        set(previous.prefill_instances) - set(event.link.prefill_instances)
+        if previous is not None
+        else set()
+    )
     new_links: Mapping[InstanceLinkId, InstanceLink] = {
         **state.instance_links,
         event.link.link_id: event.link,
@@ -282,7 +288,8 @@ def apply_instance_link_created(event: InstanceLinkCreated, state: State) -> Sta
         update={
             "instance_links": new_links,
             "orphaned_prefill_instances": state.orphaned_prefill_instances
-            - set(event.link.decode_instances),
+            - set(event.link.decode_instances)
+            - released_prefill,
         }
     )
 
