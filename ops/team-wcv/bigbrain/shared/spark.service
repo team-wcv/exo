@@ -6,14 +6,15 @@ Wants=network-online.target
 [Service]
 Environment=PYTHONPATH=/home/wc-spark/.orchestraitor/deployments/exo-qwen38-prefill-20261016/current/src:/home/wc-spark/.orchestraitor/deployments/exo-qwen38-prefill-20261016/native-current
 Environment=ENABLE_DISAGGREGATION=true
-Environment=EXO_REACHABILITY_ALLOWED_CIDRS=192.168.1.0/24,192.168.0.0/30
+Environment=EXO_REACHABILITY_ALLOWED_CIDRS=192.168.1.0/24,192.168.0.0/24,10.254.42.0/30
+Environment=EXO_PREFILL_CHUNK_SIZE=256
 Type=simple
 Environment=EXO_HOME=.exo-bigbrain-cluster
 Environment=EXO_DEFAULT_MODELS_DIR=/home/wc-spark/.exo-pr44-benchmark-models
 Environment=EXO_DASHBOARD_DIR=/home/wc-spark/.orchestraitor/deployments/exo-qwen38-prefill-20261016/current/dashboard/build
 Environment=EXO_ROUTER_SETTLE_SECONDS=2
 Environment=EXO_DIAGNOSTIC_SNAPSHOT_SECONDS=10
-ExecStart=/home/wc-spark/.orchestraitor/worktrees/exo/pr44-5380af3e/.venv/bin/exo --namespace wc-bigbrain --bootstrap-peers /ip4/192.168.1.21/tcp/52618 --api-port 52415 --libp2p-port 52618 --discovery-port 52413 --peer-download-port 52416 --offline --trust-remote-code
+ExecStart=/home/wc-spark/.orchestraitor/worktrees/exo/pr44-5380af3e/.venv/bin/exo --namespace wc-bigbrain --bootstrap-peers /ip4/192.168.1.21/tcp/52618 --api-port 52415 --libp2p-port 52618 --discovery-port 52413 --peer-download-port 24216 --offline --trust-remote-code
 Restart=on-failure
 RestartSec=10
 OOMScoreAdjust=500

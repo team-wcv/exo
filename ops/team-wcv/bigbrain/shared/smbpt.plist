@@ -19,7 +19,7 @@
 		<key>EXO_PREFERRED_RANK_ZERO_FRIENDLY_NAMES</key>
 		<string>wc-smbp</string>
 		<key>EXO_REACHABILITY_ALLOWED_CIDRS</key>
-		<string>192.168.1.0/24,192.168.0.0/30</string>
+		<string>192.168.1.0/24,192.168.0.0/24,10.254.42.0/30</string>
 		<key>EXO_ROUTER_SETTLE_SECONDS</key>
 		<string>4</string>
 		<key>PATH</key>
@@ -50,10 +50,10 @@
 		<string>--discovery-port</string>
 		<string>52413</string>
 		<string>--peer-download-port</string>
-		<string>52416</string>
+		<string>24216</string>
 		<string>--trust-remote-code</string>
 		<string>--bootstrap-peers</string>
-		<string>/ip4/192.168.1.21/tcp/52618</string>
+		<string>/ip4/192.168.0.33/tcp/52618,/ip4/10.254.42.2/tcp/52418</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

@@ -4,7 +4,7 @@ import hashlib
 import json
 import random
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Iterable
 from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
@@ -46,7 +46,7 @@ from exo.api.adapters.responses import (
     generate_responses_stream,
     responses_request_to_text_generation,
 )
-from exo.api.keepalive import with_sse_keepalive
+from exo.api.keepalive import FinalizingStreamingResponse, with_sse_keepalive
 from exo.api.types import (
     AddCustomModelParams,
     AdvancedImageParams,
@@ -298,6 +298,10 @@ class API:
             CommandId,
             Sender[TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk],
         ] = {}
+        self._text_generation_receivers: dict[
+            CommandId,
+            Receiver[TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk],
+        ] = {}
         self._image_generation_queues: dict[
             CommandId, Sender[ImageChunk | ErrorChunk]
         ] = {}
@@ -311,6 +315,9 @@ class API:
         self.state = State()
         self._system_id = SystemId()
         self._text_generation_queues = {}
+        for receiver in self._text_generation_receivers.values():
+            receiver.close()
+        self._text_generation_receivers = {}
         self._image_generation_queues = {}
         self.unpause(result_clock)
         self.event_receiver.close()
@@ -1036,6 +1043,31 @@ class API:
             command_id=command_id,
         )
 
+    def _text_response(
+        self,
+        command_id: CommandId,
+        content: AsyncIterable[str],
+        *,
+        media_type: str,
+        headers: dict[str, str] | None = None,
+    ) -> StreamingResponse:
+        return FinalizingStreamingResponse(
+            content,
+            finalize=lambda: self._finish_unstarted_text_generation(command_id),
+            media_type=media_type,
+            headers=headers,
+        )
+
+    async def _finish_unstarted_text_generation(self, command_id: CommandId) -> None:
+        receiver = self._text_generation_receivers.pop(command_id, None)
+        if receiver is None:
+            return
+        receiver.close()
+        if sender := self._text_generation_queues.pop(command_id, None):
+            sender.close()
+        await self._send(TaskCancelled(cancelled_command_id=command_id))
+        await self._send(TaskFinished(finished_command_id=command_id))
+
     async def _token_chunk_stream(
         self, command_id: CommandId
     ) -> AsyncGenerator[
@@ -1046,9 +1078,11 @@ class API:
         This is the internal low-level stream used by all API adapters.
         """
         try:
-            self._text_generation_queues[command_id], recv = channel[
-                TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
-            ]()
+            recv = self._text_generation_receivers.pop(command_id, None)
+            if recv is None:
+                self._text_generation_queues[command_id], recv = channel[
+                    TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
+                ]()
 
             with recv as token_chunks:
                 async for chunk in token_chunks:
@@ -1066,9 +1100,9 @@ class API:
                 )
             raise
         finally:
+            if sender := self._text_generation_queues.pop(command_id, None):
+                sender.close()
             await self._send(TaskFinished(finished_command_id=command_id))
-            if command_id in self._text_generation_queues:
-                del self._text_generation_queues[command_id]
 
     async def _collect_text_generation_with_stats(
         self, command_id: CommandId
@@ -1232,7 +1266,8 @@ class API:
         command = await self._send_routed_text_generation(task_params, route)
 
         if payload.stream:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 with_sse_keepalive(
                     generate_chat_stream(
                         command.command_id,
@@ -1247,7 +1282,8 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 collect_chat_response(
                     command.command_id,
                     self._token_chunk_stream(command.command_id),
@@ -1275,7 +1311,8 @@ class API:
         command = await self._send_text_generation_with_images(task_params)
 
         if payload.stream:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 with_sse_keepalive(
                     generate_chat_stream(
                         command.command_id,
@@ -1850,7 +1887,8 @@ class API:
         command = await self._send_text_generation_with_images(task_params)
 
         if payload.stream:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 with_sse_keepalive(
                     generate_claude_stream(
                         command.command_id,
@@ -1866,7 +1904,8 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 collect_claude_response(
                     command.command_id,
                     payload.model,
@@ -1906,7 +1945,8 @@ class API:
         command = await self._send_routed_text_generation(task_params, route)
 
         if payload.stream:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 with_sse_keepalive(
                     generate_responses_stream(
                         command.command_id,
@@ -1924,7 +1964,8 @@ class API:
             )
 
         else:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 collect_responses_response(
                     command.command_id,
                     route.model_id,
@@ -1965,7 +2006,8 @@ class API:
         command = await self._send_text_generation_with_images(task_params)
 
         if payload.stream:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 generate_ollama_chat_stream(
                     command.command_id,
                     self._token_chunk_stream(command.command_id),
@@ -1978,7 +2020,8 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 collect_ollama_chat_response(
                     command.command_id,
                     self._token_chunk_stream(command.command_id),
@@ -2005,7 +2048,8 @@ class API:
         command = await self._send_text_generation_with_images(task_params)
 
         if payload.stream:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 generate_ollama_generate_stream(
                     command.command_id,
                     self._token_chunk_stream(command.command_id),
@@ -2018,7 +2062,8 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
+            return self._text_response(
+                command.command_id,
                 collect_ollama_generate_response(
                     command.command_id,
                     self._token_chunk_stream(command.command_id),
@@ -2378,9 +2423,27 @@ class API:
     async def _send(self, command: Command):
         while self.paused:
             await self.paused_ev.wait()
-        await self.command_sender.send(
-            ForwarderCommand(origin=self._system_id, command=command)
-        )
+        if isinstance(command, TextGeneration):
+            # Selection can fail before the lazy SSE consumer starts iterating.
+            # Keep the receiver alive so an immediate terminal chunk is buffered.
+            sender, receiver = channel[
+                TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
+            ]()
+            self._text_generation_queues[command.command_id] = sender
+            self._text_generation_receivers[command.command_id] = receiver
+        try:
+            await self.command_sender.send(
+                ForwarderCommand(origin=self._system_id, command=command)
+            )
+        except BaseException:
+            if isinstance(command, TextGeneration):
+                if sender := self._text_generation_queues.pop(command.command_id, None):
+                    sender.close()
+                if receiver := self._text_generation_receivers.pop(
+                    command.command_id, None
+                ):
+                    receiver.close()
+            raise
 
     async def _send_download(self, command: DownloadCommand):
         await self.download_command_sender.send(

@@ -20,6 +20,7 @@ from exo.worker.disaggregated.protocol import (
 from exo.worker.disaggregated.server import PrefillRequest
 from exo.worker.engines.mlx.cache import KVPrefixCache
 from exo.worker.engines.mlx.disaggregated.adapter import write_cache_to_wire
+from exo.worker.engines.mlx.types import Model
 
 N_HEADS = 2
 HEAD_DIM = 4
@@ -57,6 +58,39 @@ def _populate_cache_in_place(cache: list[KVCache], n_tokens: int) -> None:
             mx.random.uniform(shape=(1, N_HEADS, n_tokens, HEAD_DIM)) * 10
         ).astype(mx.bfloat16)
         c.offset = n_tokens
+
+
+def test_configured_prefill_chunks_preserve_every_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXO_PREFILL_CHUNK_SIZE", "3")
+    chunks: list[int] = []
+
+    class RecordingModel(_FakeModel):
+        def __call__(self, tokens: mx.array, cache: list[KVCache]) -> mx.array:
+            chunks.append(int(tokens.shape[1]))
+            return super().__call__(tokens, cache)
+
+    model = RecordingModel()
+    cache = model.make_cache()
+    mlx_serve_mod.fill_cache_prefix(
+        cast(Model, cast(object, model)), cache, mx.arange(8)
+    )
+    assert chunks == [3, 3, 2]
+    assert cache[0].offset == 8
+    assert cache[0].keys is not None
+    assert cache[0].keys[:, :, :8].reshape(-1).tolist() == list(range(8))
+
+
+@pytest.mark.parametrize("chunk_size", ["0", "-1", "invalid"])
+def test_invalid_prefill_chunk_size_fails_before_model_evaluation(
+    monkeypatch: pytest.MonkeyPatch, chunk_size: str
+) -> None:
+    monkeypatch.setenv("EXO_PREFILL_CHUNK_SIZE", chunk_size)
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        mlx_serve_mod.fill_cache_prefix(
+            cast(Model, cast(object, _FakeModel())), [KVCache()], mx.arange(8)
+        )
 
 
 def _patch_prefill(monkeypatch: pytest.MonkeyPatch) -> list[mx.array]:

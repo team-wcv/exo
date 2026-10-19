@@ -10,8 +10,10 @@ from loguru import logger
 
 from exo.master.main import _MAX_MASTER_SESSION_LOG_DIRS, Master
 from exo.routing.router import get_node_zid
+from exo.shared.apply import apply_instance_deleted, apply_instance_link_created
 from exo.shared.models.model_cards import ModelCard, ModelTask
 from exo.shared.types.backends import Backend
+from exo.shared.types.chunks import ErrorChunk
 from exo.shared.types.commands import (
     CommandId,
     CreateInstance,
@@ -22,16 +24,19 @@ from exo.shared.types.commands import (
 )
 from exo.shared.types.common import Host, ModelId, NodeId, SessionId, SystemId
 from exo.shared.types.events import (
+    ChunkGenerated,
     Event,
     GlobalForwarderEvent,
     IndexedEvent,
     InstanceCreated,
+    InstanceDeleted,
     InstanceLinkCreated,
     LocalForwarderEvent,
     NodeGatheredInfo,
     TaskCreated,
     TestEvent,
 )
+from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
 from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import (
     MemoryUsage,
@@ -492,6 +497,72 @@ def test_text_generation_with_target_instance_uses_that_instance() -> None:
         )
         == target_instance_id
     )
+
+
+def test_lost_decoder_does_not_promote_orphaned_prefill_server() -> None:
+    model_id = ModelId("split-model")
+    prefill = _test_instance(model_id, InstanceId("prefill"))
+    decode = _test_instance(model_id, InstanceId("decode"))
+    link = InstanceLink(
+        link_id=InstanceLinkId(),
+        prefill_instances=[prefill.instance_id],
+        decode_instances=[decode.instance_id],
+    )
+    state = State(
+        instances={prefill.instance_id: prefill, decode.instance_id: decode},
+        instance_links={link.link_id: link},
+    )
+    state = apply_instance_deleted(
+        InstanceDeleted(instance_id=decode.instance_id), state
+    )
+    assert not state.instance_links
+    # The role survives snapshot transport, not just the current master's memory.
+    state = State.model_validate_json(state.model_dump_json())
+    master = _master_with_state(state)
+    with pytest.raises(ValueError, match="No decode instance available"):
+        master._select_text_generation_instance(_test_text_generation(model_id))
+    with pytest.raises(ValueError, match="prefill-only"):
+        master._select_text_generation_instance(
+            _test_text_generation(model_id, prefill.instance_id)
+        )
+
+    # An explicit role reassignment can still make this instance a decoder.
+    reassigned = InstanceLink(
+        link_id=InstanceLinkId(),
+        prefill_instances=[InstanceId("replacement-prefill")],
+        decode_instances=[prefill.instance_id],
+    )
+    master.state = apply_instance_link_created(
+        InstanceLinkCreated(link=reassigned), state
+    )
+    assert (
+        master._select_text_generation_instance(_test_text_generation(model_id))
+        == prefill.instance_id
+    )
+
+    removed = apply_instance_deleted(
+        InstanceDeleted(instance_id=prefill.instance_id), state
+    )
+    assert not removed.orphaned_prefill_instances
+
+
+@pytest.mark.asyncio
+async def test_missing_decoder_returns_terminal_error_to_waiting_api() -> None:
+    master = _master_with_state(State())
+    sender, master.command_receiver = channel[ForwarderCommand]()
+    master.event_sender, receiver = channel[Event]()
+    command = _test_text_generation(ModelId("unavailable-model"))
+    await sender.send(ForwarderCommand(origin=SystemId(), command=command))
+    sender.close()
+    await master._command_processor()
+    events = receiver.collect()
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, ChunkGenerated)
+    assert event.command_id == command.command_id
+    assert isinstance(event.chunk, ErrorChunk)
+    assert event.chunk.finish_reason == "error"
+    assert "No instance found" in event.chunk.error_message
 
 
 def test_text_generation_with_invalid_target_does_not_create_task() -> None:

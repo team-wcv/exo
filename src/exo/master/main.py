@@ -21,6 +21,7 @@ from exo.routing.event_router import (
 )
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_EVENT_LOG_DIR, EXO_TRACING_ENABLED
+from exo.shared.types.chunks import ErrorChunk
 from exo.shared.types.commands import (
     AddCustomModelCard,
     CreateInstance,
@@ -42,6 +43,7 @@ from exo.shared.types.commands import (
 )
 from exo.shared.types.common import CommandId, NodeId, SessionId, SystemId
 from exo.shared.types.events import (
+    ChunkGenerated,
     CustomModelCardAdded,
     CustomModelCardDeleted,
     DrafterPlacementDegraded,
@@ -202,7 +204,7 @@ class Master:
         self._tg.cancel_tasks()
 
     def _select_text_generation_instance(self, command: TextGeneration) -> InstanceId:
-        prefill_only: set[InstanceId] = set()
+        prefill_only = set(self.state.orphaned_prefill_instances)
         for link in self.state.instance_links.values():
             prefill_only.update(link.prefill_instances)
         for link in self.state.instance_links.values():
@@ -244,6 +246,16 @@ class Master:
                 instance_task_counts[instance.instance_id] = task_count
 
         if not instance_task_counts:
+            if any(
+                instance.instance_id in prefill_only
+                and instance.shard_assignments.model_id == command.task_params.model
+                for instance in self.state.instances.values()
+            ):
+                raise ValueError(
+                    f"No decode instance available for model {command.task_params.model}; "
+                    "only prefill servers remain. Restore the decode devices and "
+                    "create a decode instance before retrying."
+                )
             raise ValueError(f"No instance found for model {command.task_params.model}")
 
         return sorted(
@@ -264,9 +276,23 @@ class Master:
                         case TestCommand():
                             pass
                         case TextGeneration():
-                            decode_instance_id = self._select_text_generation_instance(
-                                command
-                            )
+                            try:
+                                decode_instance_id = (
+                                    self._select_text_generation_instance(command)
+                                )
+                            except ValueError as exc:
+                                # The API may already be streaming when a decoder disappears.
+                                # End that stream instead of leaving the caller waiting.
+                                await self.event_sender.send(
+                                    ChunkGenerated(
+                                        command_id=command.command_id,
+                                        chunk=ErrorChunk(
+                                            model=command.task_params.model,
+                                            error_message=str(exc),
+                                        ),
+                                    )
+                                )
+                                continue
                             task_id = TaskId()
                             params = command.task_params.model_copy(
                                 update={

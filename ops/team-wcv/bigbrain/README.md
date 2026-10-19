@@ -5,7 +5,7 @@
 The operator dashboard at `http://bigbrain.localhost:18888/` serves one shared
 `wc-bigbrain` cluster. Studio is the preferred master; smbp, smbpt, and Spark
 join the same cluster. All four APIs use port `52415`, and peer-file servers use
-`52416`. Using different API ports breaks the deployed reachability probes even
+`24216`. Using different API ports breaks the deployed reachability probes even
 when discovery succeeds.
 
 | Function | Host / transport |
@@ -14,7 +14,7 @@ when discovery succeeds.
 | Control plane | Studio; inference/control topology uses LAN addresses |
 | Large-model prefill | Spark, MLX CUDA, cache transfer over LAN |
 | Tensor decode | smbp + smbpt, JACCL/RDMA over Thunderbolt |
-| JACCL coordinator | Reachable Thunderbolt IP, `192.168.0.1` or `192.168.0.2` |
+| JACCL coordinator | Reachable Thunderbolt IP, `10.254.42.1` or `10.254.42.2` |
 
 The current serving model is
 `pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit`, pinned at
@@ -25,7 +25,7 @@ The remote path applies to more than 1,000 uncached prompt tokens.
 
 Persisted launchd/systemd settings use `ENABLE_DISAGGREGATION=true`,
 `EXO_HOME=.exo-bigbrain-cluster`, and allowed inference CIDRs
-`192.168.1.0/24,192.168.0.0/30`. Service labels are
+`192.168.1.0/24,192.168.0.0/24,10.254.42.0/30`. Service labels are
 `ai.team-wcv.exo-studio-bigbrain` on Studio, `com.teamwcv.exo.bigbrain` on both
 MacBooks, and `exo-spark-bigbrain.service` on Spark. MacBook jobs hold a
 `caffeinate` assertion. During a bootout/bootstrap maintenance cycle, hold a
@@ -63,6 +63,87 @@ API without changing the ownership/SSH identity of the operator's Macs. The
 host advertisement is approved, TLS is provisioned, and a real Qwen3.8 request
 completed through HTTPS with Spark cache ingestion on both Mac ranks. See the
 [gateway configuration and acceptance procedure](shared/tailscale.md).
+
+## Network recovery and prefill role safety (2026-10-18)
+
+The direct MacBook Thunderbolt subnet is now `10.254.42.0/30`: smbpt uses
+`10.254.42.1` on `RDMA Thunderbolt 1` (`en1`), and smbp uses `10.254.42.2` on
+`RDMA en2` (`en2`). Both have mask `255.255.255.252` and no router. The previous
+`192.168.0.1` Thunderbolt address conflicted with smbpt's Wi-Fi gateway after it
+joined `192.168.0.0/24`. Keep the direct link disjoint from every LAN subnet.
+Backups and rollback values are in each host's
+`~/.orchestraitor/deployments/exo-network-recovery-20261018/`.
+
+Both LAN subnets are allowed for API reachability. Studio offers bootstrap
+addresses `192.168.1.21:52618` and `192.168.0.33:52618`; MacBooks also bootstrap
+over the direct Thunderbolt link. Verify the configured addresses after network
+changes. A healthy Tailscale connection does not prove the inference LAN path.
+
+If a decode instance disappears, its surviving prefill instances retain their
+role in replayable state. New requests return a terminal error until a decoder
+is restored, rather than selecting the prefill server for generation. Explicit
+role reassignment through a new link remains supported.
+
+Spark sets `EXO_PREFILL_CHUNK_SIZE=256` to bound temporary activation memory for
+the large model. The remote-prefill default remains 4096 elsewhere. Large chunks
+on a nearly full Spark can trigger swapping and leave the UI at zero progress
+while the first chunk evaluates. Validate a long uncached prompt as well as short
+chat, checking memory and cache ingestion on both decode ranks.
+
+Recovery acceptance through the operator URL used the original 5,815-token
+conversation: cold first text took 90.8 seconds and completion took 96.2 seconds.
+Spark computed 5,813 prefix tokens in 84.4 seconds; both Mac ranks imported them
+and decoded the response over JACCL. Spark retained about 14 GiB available with
+no new swap-out in sampled intervals. This is a functional recovery, not a claim
+that cold prefill on this large model is fast. A fresh 29-token story request
+returned first text in 1.7 seconds; a 6,039-token follow-up reused 5,813 cached
+tokens and returned first text in 1.9 seconds. These latency checks used thinking
+disabled. The old demo conversation includes thousands of diagnostic tokens;
+start a fresh conversation for ordinary short chat.
+
+The API registers its response channel before dispatching a generation command,
+so an immediate missing-decoder error is buffered even before SSE consumption
+starts. Tests cover that ordering and cleanup when command dispatch fails.
+
+## Peer-download listener recovery (2026-10-18)
+
+The old peer-download port `52416` collided with macOS `rapportd` on smbpt,
+causing EXO to exit and launchd to retry every ten seconds. All four nodes now
+use `24216`, below the observed macOS dynamic range `49152–65535` and Linux
+range `32768–60999`. Keep this port common across the fleet: peer discovery
+currently assumes the local configured port is also the peer's port.
+
+Changing this port also changes EXO's identity-file scope. Copy the previous
+`node_zid.zenoh-<port>.api-52415.peer-52416` into the corresponding
+`peer-24216` path before starting the new configuration, verifying its contents
+match; never overwrite an existing different identity. Preserve the original
+file and the backed-up startup configuration for rollback. Verify `/node_id`,
+the peer server's `/health`, stable launchd PIDs, and four-node topology after
+restart. Do not stop `rapportd` to make EXO's old port available.
+
+## Dashboard asset continuity
+
+An existing Chrome tab can load cached bootstrap code that references a previous
+hashed JavaScript module. On 2026-10-18, requests for
+`/_app/immutable/nodes/2.-Ujo2dWt.js` returned 404 and caused an import/reload loop
+with a blank page, even while fresh browser tests and the API succeeded.
+The original module and its matching immutable dependencies were recovered from
+the prior local build and added to each deployed dashboard without replacing the
+current HTML or any existing asset. Per-host `dashboard-compat-assets.json` in
+the recovery deployment directory records the added file hashes.
+
+Retain the previous `_app/immutable` assets when replacing a dashboard build.
+Merge missing hashed files into the new build; if an existing path has different
+bytes, stop and investigate rather than overwriting it. Preserve the complete
+dependency set, not just the first missing chunk. Check both a fresh bootstrap
+and a previous cached bootstrap against the production URL before declaring a
+dashboard deployment healthy. Existing conversations remain in browser storage.
+
+The checked-in Caddy configuration sends `Cache-Control: no-store` for `/`,
+`/index.html`, and `/_app/version.json`, so future bootstrap documents do not
+remain cached across deployments. Hashed immutable assets remain cacheable.
+Inspect actual failing asset requests in the access log: successful `/state`
+responses alone do not establish that the operator's existing tab can render.
 
 ## Legacy isolated endpoint profiles
 

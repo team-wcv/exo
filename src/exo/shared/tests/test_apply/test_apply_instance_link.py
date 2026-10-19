@@ -52,6 +52,18 @@ def test_delete_link() -> None:
     assert new_state.instance_links == {}
 
 
+def test_link_update_releases_removed_orphan_prefill_role() -> None:
+    a, b, c = InstanceId("a"), InstanceId("b"), InstanceId("c")
+    link = _link([a, c], [b])
+    state = State(
+        instance_links={link.link_id: link}, orphaned_prefill_instances=frozenset({a})
+    )
+    updated = link.model_copy(update={"prefill_instances": [c]})
+    new_state = apply_instance_link_created(InstanceLinkCreated(link=updated), state)
+    assert a not in new_state.orphaned_prefill_instances
+    assert new_state.instance_links[link.link_id].prefill_instances == [c]
+
+
 def test_instance_deleted_strips_from_links() -> None:
     a, b, c = InstanceId("a"), InstanceId("b"), InstanceId("c")
     link = _link([a, c], [b])
