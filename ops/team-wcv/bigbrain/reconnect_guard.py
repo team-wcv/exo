@@ -130,15 +130,16 @@ def check(args: argparse.Namespace) -> None:
             now = time.time()
             master_fresh = fresh(local, args.master_id, now)
             reachable = False
-            if not master_fresh:
-                master_id = fetch(args.master_url + "/node_id")
-                master = fetch(args.master_url + "/state")
-                if master_id == args.master_id and fresh(master, args.master_id, now):
-                    host = urlparse(args.master_url).hostname
-                    if host is None:
-                        raise ValueError("Master URL has no hostname")
-                    with socket.create_connection((host, args.master_port), timeout=3):
-                        reachable = True
+            master_id = fetch(args.master_url + "/node_id")
+            master = fetch(args.master_url + "/state")
+            if master_id != args.master_id:
+                raise ValueError("LAN master identity differs from configured master")
+            if fresh(master, args.master_id, now):
+                host = urlparse(args.master_url).hostname
+                if host is None:
+                    raise ValueError("Master URL has no hostname")
+                with socket.create_connection((host, args.master_port), timeout=3):
+                    reachable = True
             status, record = decision(
                 previous,
                 pid=pid,
@@ -182,6 +183,7 @@ def check(args: argparse.Namespace) -> None:
                 {
                     "time": datetime.now(timezone.utc).isoformat(),
                     "status": status,
+                    "master_reachable": reachable,
                     **asdict(record),
                 }
             ),
