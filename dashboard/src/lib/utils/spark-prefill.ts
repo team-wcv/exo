@@ -127,6 +127,41 @@ function allocations(instance: FleetInstance): [string, string][] {
   );
 }
 
+function residentCopy(
+  state: PrefillFleetState,
+  model: string,
+  nodes: string[],
+  kind: "MlxRingInstance" | "MlxJacclInstance",
+  prefill: boolean,
+): boolean {
+  return Object.values(state.instances ?? {}).some((wrapper) => {
+    const instance = wrapper[kind];
+    if (instance?.shardAssignments?.modelId !== model) return false;
+    const shards = allocations(instance);
+    if (
+      shards.length !== nodes.length ||
+      !nodes.every((id) => shards.some(([node]) => node === id))
+    )
+      return false;
+    return shards.every(([, runner]) => {
+      const status = state.runners?.[runner];
+      if (
+        typeof status !== "object" ||
+        status === null ||
+        !("RunnerReady" in status || "RunnerRunning" in status)
+      )
+        return false;
+      const port =
+        state.prefillServerPorts?.[runner] ??
+        ("RunnerReady" in status
+          ? (status.RunnerReady as { prefillServerPort?: number })
+              .prefillServerPort
+          : undefined);
+      return !prefill || (typeof port === "number" && port > 0);
+    });
+  });
+}
+
 function linkedRoute(
   state: PrefillFleetState,
   model: string,
@@ -333,9 +368,24 @@ export function assessSparkRoute(
   const available = nodes.map(
     (id) => state.nodeMemory?.[id]?.ramAvailable?.inBytes ?? 0,
   );
-  const requirements = [bytes, ...decode.map(() => perDecoder)].map(
-    (weights, i) => weights + totals[i] - budgets[i],
+  const reuseSpark = residentCopy(
+    state,
+    model.id,
+    [spark],
+    "MlxRingInstance",
+    true,
   );
+  const reuseDecode = residentCopy(
+    state,
+    model.id,
+    decode,
+    route === "twins" ? "MlxJacclInstance" : "MlxRingInstance",
+    false,
+  );
+  const requirements = [
+    reuseSpark ? 0 : bytes,
+    ...decode.map(() => (reuseDecode ? 0 : perDecoder)),
+  ].map((weights, i) => weights + totals[i] - budgets[i]);
   const fitsFree = requirements.every((needed, i) => available[i] >= needed);
   const note =
     route === "twins"
@@ -344,7 +394,7 @@ export function assessSparkRoute(
   return result(
     "candidate",
     fitsFree ? "Memory candidate" : "Free memory needed",
-    `${fitsFree ? "Fits the current memory estimate." : "Fits total capacity, but other allocations must be freed first."} ${verification ? "Previously verified; create or restore this route to use it." : note}`,
+    `${fitsFree ? "Fits the current memory estimate." : "Fits total capacity, but other allocations must be freed first."} ${reuseSpark ? "Spark's loaded copy can be reused. " : ""}${verification ? "Previously verified; create or restore this route to use it." : note}`,
     true,
   );
 }

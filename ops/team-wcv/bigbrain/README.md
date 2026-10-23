@@ -140,7 +140,9 @@ for **Twins** (smbp + smbpt over RDMA) and **Studio** decode.
   checkpoint; Twins estimates divide weights across two ranks. At least 8 GiB
   or 10% of each device's memory is reserved. Context, cache layout, backend
   model support and replication can require more memory. **Free memory needed**
-  distinguishes total capacity from current availability.
+  distinguishes total capacity from current availability. Matching ready model
+  copies already resident on the required devices are credited rather than
+  counting their weights twice; execution headroom is still reserved.
 - Unsupported cache types, missing tensor support, offline nodes, unavailable
   backends and missing network/RDMA paths are shown explicitly. Unknown models
   are never marked verified merely because they fit.

@@ -103,6 +103,25 @@ test("Studio capacity does not inherit the Twins verification", () => {
   assert.equal(result.label, "Free memory needed");
 });
 
+test("Studio candidates can reuse the full checkpoint already resident on Spark", () => {
+  const state = fleet();
+  state.nodeMemory!.studio.ramAvailable!.inBytes = 125 * GIB;
+  const result = assessSparkRoute(model, "studio", state, true, now);
+  assert.equal(result.label, "Memory candidate");
+  assert.equal(result.verified, false);
+  assert.match(result.detail, /loaded copy can be reused/);
+});
+
+test("resident but unlinked copies are not charged for their weights twice", () => {
+  const state = fleet();
+  state.instanceLinks = {};
+  state.nodeMemory!.a.ramAvailable!.inBytes = 20 * GIB;
+  state.nodeMemory!.b.ramAvailable!.inBytes = 20 * GIB;
+  const result = assessSparkRoute(model, "twins", state, true, now);
+  assert.equal(result.label, "Memory candidate");
+  assert.notEqual(result.status, "ready");
+});
+
 test("verification belongs to the exact quantization variant", () => {
   const result = assessSparkRoute(
     { ...model, id: "pipenetwork/Qwen3.8-Flash-Next-MLX-4bit" },
