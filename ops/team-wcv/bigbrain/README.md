@@ -135,7 +135,10 @@ for **Twins** (smbp + smbpt over RDMA) and **Studio** decode.
   remains explicitly unverified for this variant.
 - **Route ready** requires a matching live prefill/decode link, matching model
   IDs, ready/running runners, an advertised prefill port, fresh nodes, supported
-  node backends, and the required network/RDMA paths.
+  node backends, and the required network/RDMA paths. Shard metadata must prove
+  full-layer tensor decode on the Twins or a full-model single-rank Studio
+  decoder, with matching complete layer coverage on Spark. A JACCL communicator
+  alone is not sufficient: pipeline-over-JACCL and unknown layouts are blocked.
 - **Memory candidate** is only a capacity estimate. Spark must hold the full
   checkpoint; Twins estimates divide weights across two ranks. At least 8 GiB
   or 10% of each device's memory is reserved. Context, cache layout, backend

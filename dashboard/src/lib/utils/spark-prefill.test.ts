@@ -15,6 +15,26 @@ const model: PrefillModel = {
   supports_tensor: true,
 };
 
+function shard(
+  kind: "TensorShardMetadata" | "PipelineShardMetadata",
+  rank: number,
+  worldSize: number,
+  start = 0,
+  end = 48,
+  layers = 48,
+) {
+  return {
+    [kind]: {
+      deviceRank: rank,
+      worldSize,
+      startLayer: start,
+      endLayer: end,
+      nLayers: layers,
+      modelCard: { nLayers: layers },
+    },
+  };
+}
+
 function fleet(): PrefillFleetState {
   const ids = ["spark", "a", "b", "studio"];
   return {
@@ -63,7 +83,7 @@ function fleet(): PrefillFleetState {
         MlxRingInstance: {
           shardAssignments: {
             modelId: model.id,
-            shards: [["spark", "rp", {}]],
+            shards: [["spark", "rp", shard("PipelineShardMetadata", 0, 1)]],
           },
         },
       },
@@ -72,8 +92,8 @@ function fleet(): PrefillFleetState {
           shardAssignments: {
             modelId: model.id,
             shards: [
-              ["a", "ra", {}],
-              ["b", "rb", {}],
+              ["a", "ra", shard("TensorShardMetadata", 0, 2)],
+              ["b", "rb", shard("TensorShardMetadata", 1, 2)],
             ],
           },
         },
@@ -221,7 +241,11 @@ test("a live Studio route is not automatically historical verification", () => {
   const state = fleet();
   state.instances!.decode = {
     MlxRingInstance: {
-      shardAssignments: { modelId: model.id, nodeToRunner: { studio: "rs" } },
+      shardAssignments: {
+        modelId: model.id,
+        nodeToRunner: { studio: "rs" },
+        runnerToShard: { rs: shard("PipelineShardMetadata", 0, 1) },
+      },
     },
   };
   state.runners!.rs = { RunnerReady: {} };
@@ -238,6 +262,10 @@ test("a ready route wins over another matching route still loading", () => {
       shardAssignments: {
         modelId: model.id,
         nodeToRunner: { a: "ra2", b: "rb2" },
+        runnerToShard: {
+          ra2: shard("TensorShardMetadata", 0, 2),
+          rb2: shard("TensorShardMetadata", 1, 2),
+        },
       },
     },
   };
@@ -270,6 +298,68 @@ test("a route with a loading rank or no prefill listener is preparing", () => {
   assert.equal(
     assessSparkRoute(model, "twins", state, true, now).status,
     "ready",
+  );
+});
+
+test("pipeline-over-JACCL is not a supported Twins prefill decoder", () => {
+  const state = fleet();
+  state.instances!.decode.MlxJacclInstance!.shardAssignments!.shards = [
+    ["a", "ra", shard("PipelineShardMetadata", 0, 2, 0, 24)],
+    ["b", "rb", shard("PipelineShardMetadata", 1, 2, 24, 48)],
+  ];
+  const result = assessSparkRoute(model, "twins", state, true, now);
+  assert.equal(result.label, "Unsupported linked layout");
+  assert.equal(result.status, "blocked");
+});
+
+test("missing shard metadata cannot establish readiness or resident credit", () => {
+  const state = fleet();
+  state.instances!.decode.MlxJacclInstance!.shardAssignments!.shards![0][2] =
+    {};
+  assert.equal(
+    assessSparkRoute(model, "twins", state, true, now).label,
+    "Shard layout unavailable",
+  );
+  state.instanceLinks = {};
+  state.nodeMemory!.a.ramAvailable!.inBytes = 20 * GIB;
+  state.nodeMemory!.b.ramAvailable!.inBytes = 20 * GIB;
+  assert.equal(
+    assessSparkRoute(model, "twins", state, true, now).label,
+    "Free memory needed",
+  );
+});
+
+test("partial single-rank prefill and Studio decoders are rejected", () => {
+  const state = fleet();
+  state.instances!.prefill.MlxRingInstance!.shardAssignments!.shards![0][2] =
+    shard("PipelineShardMetadata", 0, 1, 0, 24);
+  assert.equal(
+    assessSparkRoute(model, "twins", state, true, now).label,
+    "Unsupported linked layout",
+  );
+  const studio = fleet();
+  studio.instances!.decode = {
+    MlxRingInstance: {
+      shardAssignments: {
+        modelId: model.id,
+        shards: [["studio", "rs", shard("PipelineShardMetadata", 0, 1, 0, 24)]],
+      },
+    },
+  };
+  studio.runners!.rs = { RunnerReady: {} };
+  assert.equal(
+    assessSparkRoute(model, "studio", studio, true, now).label,
+    "Unsupported linked layout",
+  );
+});
+
+test("prefill and decode must cover the same complete layer count", () => {
+  const state = fleet();
+  state.instances!.prefill.MlxRingInstance!.shardAssignments!.shards![0][2] =
+    shard("PipelineShardMetadata", 0, 1, 0, 64, 64);
+  assert.equal(
+    assessSparkRoute(model, "twins", state, true, now).label,
+    "Unsupported linked layout",
   );
 });
 

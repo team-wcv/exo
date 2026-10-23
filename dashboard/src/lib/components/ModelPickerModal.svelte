@@ -228,6 +228,10 @@
   $effect(() => {
     if (isOpen) {
       sparkView = showSparkGuidance && initialView === "spark";
+      if (showSparkGuidance && initialView === "spark") {
+        selectedFamily = null;
+        clearFilters();
+      }
       searchQuery = "";
       expandedGroups = new Set();
       showFilters = false;

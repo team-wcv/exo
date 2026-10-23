@@ -14,6 +14,7 @@ interface FleetInstance {
     modelId?: string;
     shards?: [string, string, unknown][];
     nodeToRunner?: Record<string, string>;
+    runnerToShard?: Record<string, unknown>;
   };
 }
 
@@ -127,6 +128,79 @@ function allocations(instance: FleetInstance): [string, string][] {
   );
 }
 
+type LayoutStatus = "supported" | "unsupported" | "unknown";
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function shardMetadata(instance: FleetInstance): unknown[] {
+  const assignments = instance.shardAssignments;
+  return (
+    assignments?.shards?.map(([, , shard]) => shard) ??
+    allocations(instance).map(
+      ([, runner]) => assignments?.runnerToShard?.[runner],
+    )
+  );
+}
+
+function layerCount(instance: FleetInstance): unknown {
+  const tagged = record(shardMetadata(instance)[0]);
+  return (
+    record(tagged?.TensorShardMetadata) ?? record(tagged?.PipelineShardMetadata)
+  )?.nLayers;
+}
+
+function layoutStatus(
+  instance: FleetInstance,
+  worldSize: number,
+  tensor: boolean,
+): LayoutStatus {
+  const metadata = shardMetadata(instance);
+  if (metadata.length !== worldSize) return "unknown";
+  const ranks = new Set<number>();
+  const layerCounts = new Set<number>();
+  for (const raw of metadata) {
+    const tagged = record(raw);
+    const tensorShard = record(tagged?.TensorShardMetadata);
+    const pipelineShard = record(tagged?.PipelineShardMetadata);
+    if (tensor && pipelineShard) return "unsupported";
+    const shard = tensorShard ?? pipelineShard;
+    if (!shard) return "unknown";
+    const { startLayer, endLayer, nLayers, deviceRank } = shard;
+    if (
+      typeof nLayers !== "number" ||
+      !Number.isInteger(nLayers) ||
+      nLayers <= 0 ||
+      typeof startLayer !== "number" ||
+      typeof endLayer !== "number" ||
+      typeof deviceRank !== "number" ||
+      !Number.isInteger(deviceRank) ||
+      typeof shard.worldSize !== "number"
+    )
+      return "unknown";
+    // The prefill wire carries every layer; the decoder cannot ingest a layer subset.
+    if (
+      startLayer !== 0 ||
+      endLayer !== nLayers ||
+      shard.worldSize !== worldSize ||
+      deviceRank < 0 ||
+      deviceRank >= worldSize
+    )
+      return "unsupported";
+    const cardLayers = record(shard.modelCard)?.nLayers;
+    if (typeof cardLayers === "number" && cardLayers !== nLayers)
+      return "unsupported";
+    ranks.add(deviceRank);
+    layerCounts.add(nLayers);
+  }
+  return ranks.size === worldSize && layerCounts.size === 1
+    ? "supported"
+    : "unsupported";
+}
+
 function residentCopy(
   state: PrefillFleetState,
   model: string,
@@ -137,6 +211,10 @@ function residentCopy(
   return Object.values(state.instances ?? {}).some((wrapper) => {
     const instance = wrapper[kind];
     if (instance?.shardAssignments?.modelId !== model) return false;
+    if (
+      layoutStatus(instance, nodes.length, nodes.length === 2) !== "supported"
+    )
+      return false;
     const shards = allocations(instance);
     if (
       shards.length !== nodes.length ||
@@ -167,8 +245,9 @@ function linkedRoute(
   model: string,
   spark: string,
   decode: string[],
-): "ready" | "loading" | null {
+): "ready" | "loading" | "unsupported" | "unknown" | null {
   let preparing = false;
+  let invalidLayout: "unsupported" | "unknown" | null = null;
   for (const link of Object.values(state.instanceLinks ?? {})) {
     for (const prefillId of link.prefillInstances) {
       const prefill = state.instances?.[prefillId]?.MlxRingInstance;
@@ -188,6 +267,19 @@ function linkedRoute(
           !decode.every((id) => targets.some(([node]) => node === id))
         )
           continue;
+        const layouts = [
+          layoutStatus(prefill, 1, false),
+          layoutStatus(instance, decode.length, decode.length === 2),
+        ];
+        if (layouts.some((layout) => layout !== "supported")) {
+          if (layouts.includes("unsupported")) invalidLayout = "unsupported";
+          else invalidLayout ??= "unknown";
+          continue;
+        }
+        if (layerCount(prefill) !== layerCount(instance)) {
+          invalidLayout = "unsupported";
+          continue;
+        }
         const runnerStates = [...sources, ...targets].map(
           ([, id]) => state.runners?.[id],
         );
@@ -212,7 +304,7 @@ function linkedRoute(
       }
     }
   }
-  return preparing ? "loading" : null;
+  return preparing ? "loading" : invalidLayout;
 }
 
 export function assessSparkRoute(
@@ -325,6 +417,18 @@ export function assessSparkRoute(
       "The decode devices must be able to reach Spark over the inference LAN.",
     );
   const linked = linkedRoute(state, model.id, spark, decode);
+  if (linked === "unsupported")
+    return result(
+      "blocked",
+      "Unsupported linked layout",
+      "Spark must prefill every layer. Twins require full-layer tensor shards; Studio requires a full-model single-rank decoder. Recreate the incompatible placement before using this route.",
+    );
+  if (linked === "unknown")
+    return result(
+      "blocked",
+      "Shard layout unavailable",
+      "The linked instances do not report enough shard metadata to confirm this route. Readiness cannot be established from the communication backend alone.",
+    );
   if (linked === "ready")
     return result(
       "ready",
