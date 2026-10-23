@@ -114,7 +114,12 @@ async def test_gap_replay_chains_when_buffer_still_has_future_events() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gap_replay_batches_are_capped() -> None:
+@pytest.mark.parametrize(
+    ("gap", "limit", "expected"), [(10, 2, 2), (240000, None, 1000)]
+)
+async def test_gap_replay_batches_are_capped(
+    gap: int, limit: int | None, expected: int
+) -> None:
     command_sender, command_receiver = channel[ForwarderCommand]()
     global_sender, global_receiver = channel[GlobalForwarderEvent]()
     local_sender, local_receiver = channel[LocalForwarderEvent]()
@@ -126,14 +131,15 @@ async def test_gap_replay_batches_are_capped() -> None:
         external_outbound=local_sender,
     )
     router._nack_base_seconds = 0
-    router._nack_max_events = 2
+    if limit is not None:
+        router._nack_max_events = limit
 
     async with anyio.create_task_group() as task_group:
         task_group.start_soon(router.run)
         await global_sender.send(
             GlobalForwarderEvent(
                 origin=NodeId("master"),
-                origin_idx=10,
+                origin_idx=gap,
                 session=session_id,
                 event=TestEvent(),
             )
@@ -142,7 +148,7 @@ async def test_gap_replay_batches_are_capped() -> None:
         command = (await command_receiver.receive()).command
         assert isinstance(command, RequestEventLog)
         assert command.since_idx == 0
-        assert command.max_events == 2
+        assert command.max_events == expected
 
         router.shutdown()
         task_group.cancel_scope.cancel()

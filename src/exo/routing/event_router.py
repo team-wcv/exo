@@ -84,7 +84,9 @@ class EventRouter:
     _nack_attempts: int = field(init=False, default=0)
     _nack_base_seconds: float = field(init=False, default=0.5)
     _nack_cap_seconds: float = field(init=False, default=10.0)
-    _nack_max_events: int = field(init=False, default=64)
+    # Each event remains a separate frame. Use the protocol's bounded window so
+    # reconnecting workers do not spend hours replaying a day's telemetry.
+    _nack_max_events: int = field(init=False, default=1000)
     _last_outbound_warning_size: int = field(init=False, default=0)
     _delivery_stall_seconds: float = field(
         init=False, default_factory=_delivery_stall_seconds
