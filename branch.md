@@ -1,10 +1,10 @@
 ---
-branch: fix/bigbrain-reconnect-20261022
-created: 2026-10-22
+branch: perf/qwen-cuda-prefill-20261023
+created: 2026-10-23
 status: active
-scope: Correct Studio bootstrap, initialize reconnecting workers from current state, and guard idle isolated workers
+scope: Benchmark Spark against RDMA Twins and accelerate Qwen recurrent prefill on CUDA
 orchestraitor:
-  ticket: 6adaf543e6fd293519920057
+  ticket: 6adbc974e6fd29351992d6d5
 pr:
-  url: https://github.com/team-wcv/exo/pull/51
+  url: pending
 ---
