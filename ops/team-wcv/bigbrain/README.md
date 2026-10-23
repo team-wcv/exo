@@ -34,6 +34,11 @@ separate temporary assertion until the replacement job is running.
 The checked-in [shared startup snapshots](shared/) reproduce the verified
 startup configuration and fleet-specific model card. Compare them with live
 files and preserve local overrides; back up before replacing a startup file.
+They refer to the existing validated dependency environments and deployment
+source/native directories, so confirm those paths before installation. The
+model card belongs in `~/.exo-bigbrain-cluster/custom_model_cards/`; the worker
+publishes persisted cards to the cluster on startup.
+
 Studio's dashboard/control-plane job uses `ProcessType=Interactive`. On
 2026-10-23, its former `Background` classification was heavily throttled under
 host load: startup took minutes and API/election responses timed out. After
@@ -42,10 +47,6 @@ four-node cluster synchronized. This classification is for the user-facing EXO
 service; the periodic reconnection guards remain background jobs. The previous
 Studio plist is saved as `studio-before-interactive.plist` in the reconnection
 deployment backup directory.
-They refer to the existing validated dependency environments and deployment
-source/native directories, so confirm those paths before installation. The
-model card belongs in `~/.exo-bigbrain-cluster/custom_model_cards/`; the worker
-publishes persisted cards to the cluster on startup.
 
 The validated deployment is under
 `~/.orchestraitor/deployments/exo-qwen38-prefill-20261016/`: `current/` contains

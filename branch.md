@@ -6,5 +6,5 @@ scope: Prevent background throttling of Studio's interactive EXO control-plane s
 orchestraitor:
   ticket: 6adaf543e6fd293519920057
 pr:
-  url: pending
+  url: https://github.com/team-wcv/exo/pull/52
 ---
