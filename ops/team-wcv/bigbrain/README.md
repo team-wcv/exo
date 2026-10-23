@@ -151,11 +151,17 @@ responses alone do not establish that the operator's existing tab can render.
 After Studio rebooted, both Mac services were running but isolated. Updating
 smbpt's stale bootstrap and reconnecting restored discovery, but worker state
 was still hours behind: a master with roughly 240,000 events was being replayed
-in windows of 64. Workers now request up to the protocol's existing limit of
-1,000 events per bounded window; each event remains a separate transport frame.
-Verify the workers' `lastEventAppliedIdx` and fresh `lastSeen` timestamps as well
+in windows of 64. An initial router can now request a targeted snapshot once the
+master has at least 64 events. The snapshot includes current state, its exact
+global index, and producer acknowledgement watermarks; buffered newer events
+continue in order. Existing consumers keep bounded replay, so active streams
+never skip history. Increasing replay windows alone caused delivery-watchdog
+restarts under load and was rolled back. Verify `lastEventAppliedIdx` and fresh `lastSeen` timestamps as well
 as the master's topology. Being visible at the master is not proof that a worker
-has caught up enough to accept new placements.
+has caught up enough to accept new placements. Snapshot bootstrap introduces a
+new control event: update all Python runtimes together before enabling it.
+The native networking binary does not change. Snapshots are accepted only by
+their target router, in the current master session, before any event is applied.
 
 The [reconnection guard](reconnect_guard.py) is installed on the MacBooks by the
 `com.teamwcv.exo.reconnect` LaunchAgent, using the corresponding

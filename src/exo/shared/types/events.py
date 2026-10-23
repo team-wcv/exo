@@ -1,14 +1,17 @@
+import json
+from collections.abc import Mapping
 from datetime import datetime
 from enum import Enum
 from typing import Literal, final
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from exo.shared.models.model_cards import ModelCard
 from exo.shared.topology import Connection
 from exo.shared.types.chunks import Chunk, InputImageChunk
 from exo.shared.types.common import CommandId, Id, ModelId, NodeId, SessionId, SystemId
 from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
+from exo.shared.types.state import State
 from exo.shared.types.tasks import Task, TaskId, TaskStatus
 from exo.shared.types.worker.downloads import DownloadProgress
 from exo.shared.types.worker.instances import Instance, InstanceId
@@ -27,6 +30,23 @@ class BaseEvent(TaggedModel):
     event_id: EventId = Field(default_factory=EventId)
     # Internal, for debugging. Please don't rely on this field for anything!
     _master_time_stamp: None | datetime = None
+
+
+class StateSnapshot(BaseEvent):
+    """Targeted bootstrap for an empty event router, not a log entry."""
+
+    target: SystemId
+    state: State
+    acknowledged_origins: Mapping[SystemId, int] = {}
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def _decode_state(cls, value: object) -> State:
+        if isinstance(value, State):
+            return value
+        # Tagged-model validation unwraps dictionaries through a Python handler.
+        # Re-enter JSON mode for strict State collections, timestamps, and enums.
+        return State.model_validate_json(json.dumps(value))
 
 
 class TestEvent(BaseEvent):
@@ -201,6 +221,7 @@ class DrafterPlacementDegraded(BaseEvent):
 
 Event = (
     TestEvent
+    | StateSnapshot
     | TaskCreated
     | TaskStatusUpdated
     | TaskFailed

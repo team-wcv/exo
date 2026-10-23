@@ -8,15 +8,18 @@ from exo.routing.event_router import (
     EventRouter,
     _PendingDelivery,
 )
+from exo.shared.apply import apply
 from exo.shared.types.commands import ForwarderCommand, RequestEventLog
 from exo.shared.types.common import NodeId, SessionId, SystemId
 from exo.shared.types.events import (
     Event,
     GlobalForwarderEvent,
     LocalForwarderEvent,
+    StateSnapshot,
     TestEvent,
     TracesCollected,
 )
+from exo.shared.types.state import State
 from exo.shared.types.tasks import TaskId
 from exo.utils.channels import channel
 
@@ -114,9 +117,7 @@ async def test_gap_replay_chains_when_buffer_still_has_future_events() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("gap", "limit", "expected"), [(10, 2, 2), (240000, None, 1000)]
-)
+@pytest.mark.parametrize(("gap", "limit", "expected"), [(10, 2, 2), (240000, None, 64)])
 async def test_gap_replay_batches_are_capped(
     gap: int, limit: int | None, expected: int
 ) -> None:
@@ -149,12 +150,94 @@ async def test_gap_replay_batches_are_capped(
         assert isinstance(command, RequestEventLog)
         assert command.since_idx == 0
         assert command.max_events == expected
+        assert command.allow_initial_snapshot
 
         router.shutdown()
         task_group.cancel_scope.cancel()
 
     global_sender.close()
     local_receiver.close()
+
+
+@pytest.mark.asyncio
+async def test_initial_snapshot_skips_history_and_preserves_live_event_order() -> None:
+    commands, _ = channel[ForwarderCommand]()
+    incoming, receiver = channel[GlobalForwarderEvent]()
+    outgoing, _ = channel[LocalForwarderEvent]()
+    session = SessionId(master_node_id=NodeId("master"), election_clock=3)
+    router = EventRouter(session, commands, receiver, outgoing)
+    internal = router.receiver()
+    pending = _pending_test_event(session)
+    future = _PendingDelivery(
+        first_sent_at=10,
+        last_sent_at=24,
+        event=pending.event.model_copy(update={"origin_idx": 1, "event": TestEvent()}),
+    )
+    router.out_for_delivery = {
+        pending.event.event.event_id: pending,
+        future.event.event.event_id: future,
+    }
+    snapshot = StateSnapshot(
+        target=router._system_id,
+        state=State(last_event_applied_idx=240000),
+        acknowledged_origins={SystemId("worker"): 1},
+    )
+
+    async def send(idx: int, event: Event) -> None:
+        await incoming.send(
+            GlobalForwarderEvent(
+                origin=session.master_node_id,
+                origin_idx=idx,
+                session=session,
+                event=event,
+            )
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(router.run)
+        await send(240001, TestEvent())
+        await send(240000, snapshot.model_copy(update={"target": SystemId("other")}))
+        await send(240000, snapshot)
+        with anyio.fail_after(2):
+            first = await internal.receive()
+            second = await internal.receive()
+        assert isinstance(first.event, StateSnapshot)
+        assert first.idx == 240000 and second.idx == 240001
+        state = apply(apply(State(), first), second)
+        assert state.last_event_applied_idx == 240001
+        assert pending.event.event.event_id not in router.out_for_delivery
+        assert future.event.event.event_id in router.out_for_delivery
+        # A delayed snapshot cannot overwrite a consumer that has already started.
+        await send(240000, snapshot)
+        await send(240002, TestEvent())
+        with anyio.fail_after(2):
+            assert (await internal.receive()).idx == 240002
+        router.shutdown()
+        tg.cancel_scope.cancel()
+
+
+def test_snapshot_round_trip_and_empty_consumer_requirement() -> None:
+    snapshot = StateSnapshot(
+        target=SystemId("worker"),
+        state=State(last_event_applied_idx=2000),
+        acknowledged_origins={SystemId("origin"): 4},
+    )
+    wrapped = GlobalForwarderEvent(
+        origin=NodeId("master"),
+        origin_idx=2000,
+        session=SessionId(master_node_id=NodeId("master"), election_clock=1),
+        event=snapshot,
+    )
+    restored = GlobalForwarderEvent.model_validate_json(wrapped.model_dump_json())
+    assert isinstance(restored.event, StateSnapshot)
+    assert restored.event.acknowledged_origins == {SystemId("origin"): 4}
+    from exo.shared.types.events import IndexedEvent
+
+    indexed = IndexedEvent(idx=2000, event=restored.event)
+    with pytest.raises(ValueError, match="empty consumer"):
+        apply(State(last_event_applied_idx=10), indexed)
+    with pytest.raises(ValueError, match="differs from its envelope"):
+        apply(State(), indexed.model_copy(update={"idx": 1999}))
 
 
 def test_delivery_watchdog_uses_original_send_time() -> None:

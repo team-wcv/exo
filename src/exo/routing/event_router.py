@@ -15,6 +15,7 @@ from exo.shared.types.events import (
     GlobalForwarderEvent,
     IndexedEvent,
     LocalForwarderEvent,
+    StateSnapshot,
     TracesCollected,
 )
 from exo.utils import channels
@@ -84,9 +85,7 @@ class EventRouter:
     _nack_attempts: int = field(init=False, default=0)
     _nack_base_seconds: float = field(init=False, default=0.5)
     _nack_cap_seconds: float = field(init=False, default=10.0)
-    # Each event remains a separate frame. Use the protocol's bounded window so
-    # reconnecting workers do not spend hours replaying a day's telemetry.
-    _nack_max_events: int = field(init=False, default=1000)
+    _nack_max_events: int = field(init=False, default=64)
     _last_outbound_warning_size: int = field(init=False, default=0)
     _delivery_stall_seconds: float = field(
         init=False, default_factory=_delivery_stall_seconds
@@ -195,7 +194,37 @@ class EventRouter:
                 if event.origin != self.session_id.master_node_id:
                     continue
 
-                buf.ingest(event.origin_idx, event.event)
+                if isinstance(event.event, StateSnapshot):
+                    snapshot = event.event
+                    if (
+                        snapshot.target != self._system_id
+                        or buf.next_idx_to_release != 0
+                    ):
+                        continue
+                    if snapshot.state.last_event_applied_idx != event.origin_idx:
+                        logger.warning(
+                            "Ignoring state snapshot with inconsistent index"
+                        )
+                        continue
+                    buf.store = {
+                        idx: item
+                        for idx, item in buf.store.items()
+                        if idx > event.origin_idx
+                    }
+                    buf.next_idx_to_release = event.origin_idx + 1
+                    self.out_for_delivery = {
+                        event_id: pending
+                        for event_id, pending in self.out_for_delivery.items()
+                        if pending.event.origin_idx
+                        >= snapshot.acknowledged_origins.get(pending.event.origin, 0)
+                    }
+                    drained = [(event.origin_idx, snapshot), *buf.drain_indexed()]
+                    logger.info(
+                        f"Initialized cluster state at event {event.origin_idx}"
+                    )
+                else:
+                    buf.ingest(event.origin_idx, event.event)
+                    drained = buf.drain_indexed()
                 event_id = event.event.event_id
                 pending = self.out_for_delivery.pop(event_id, None)
                 if pending is not None:
@@ -206,7 +235,6 @@ class EventRouter:
                         f"remaining_out_for_delivery={len(self.out_for_delivery)}"
                     )
 
-                drained = buf.drain_indexed()
                 if drained:
                     self._nack_attempts = 0
                     if self._nack_cancel_scope:
@@ -300,7 +328,9 @@ class EventRouter:
                     ForwarderCommand(
                         origin=self._system_id,
                         command=RequestEventLog(
-                            since_idx=since_idx, max_events=max_events
+                            since_idx=since_idx,
+                            max_events=max_events,
+                            allow_initial_snapshot=since_idx == 0,
                         ),
                     )
                 )
