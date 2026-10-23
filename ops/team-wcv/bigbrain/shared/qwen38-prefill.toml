@@ -15,7 +15,8 @@ reasoning_dialect = "post_last_user"
 context_length = 262144
 backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
 
-prefill_eligible_nodes = ["ce3c47ad48c97f165efdeba6f47674a7"]
+# Twins-only prefill is faster for this exact variant; Spark can still be linked explicitly.
+prefill_eligible_nodes = []
 
 [storage_size]
 in_bytes = 106195031237

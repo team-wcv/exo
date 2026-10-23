@@ -6,5 +6,5 @@ scope: Benchmark Spark against RDMA Twins and accelerate Qwen recurrent prefill 
 orchestraitor:
   ticket: 6adbc974e6fd29351992d6d5
 pr:
-  url: pending
+  url: https://github.com/team-wcv/exo/pull/54
 ---
