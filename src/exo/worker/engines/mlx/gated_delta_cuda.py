@@ -8,6 +8,7 @@ Unsupported shapes retain MLX LM's reference implementation.
 import os
 import sys
 from functools import lru_cache
+from types import FunctionType
 from typing import Protocol, cast
 
 import mlx.core as mx
@@ -165,12 +166,12 @@ def enable_qwen_cuda_prefill(model: nn.Module) -> bool:
         return False
     if cast(object, getattr(model, "model_type", None)) != "qwen4_exp":
         return False
-    module = sys.modules.get(type(model).__module__)
-    if (
-        module is None
-        or cast(object, getattr(module, "gated_delta_update", None))
-        is not reference_update
-    ):
+    # MLX LM executes trusted checkpoint modules without adding them to sys.modules.
+    call = cast(object, type(model).__call__)
+    if not isinstance(call, FunctionType):
         return False
-    module.gated_delta_update = gated_delta_update
+    namespace = cast(dict[str, object], call.__globals__)
+    if namespace.get("gated_delta_update") is not reference_update:
+        return False
+    namespace["gated_delta_update"] = gated_delta_update
     return True

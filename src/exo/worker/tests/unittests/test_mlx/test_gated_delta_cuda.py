@@ -2,12 +2,18 @@
 
 import math
 import sys
+from collections.abc import Callable
+from typing import cast
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 from mlx_lm.models.gated_delta import gated_delta_update as reference_update
 
-from exo.worker.engines.mlx.gated_delta_cuda import gated_delta_update
+from exo.worker.engines.mlx.gated_delta_cuda import (
+    enable_qwen_cuda_prefill,
+    gated_delta_update,
+)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Requires MLX CUDA")
@@ -56,3 +62,34 @@ def test_masked_inputs_keep_reference_behavior() -> None:
     expected = reference_update(*args)
     for left, right in zip(actual, expected, strict=True):
         assert mx.array_equal(left, right).item()
+
+
+def test_opt_in_handles_unregistered_checkpoint_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trusted checkpoint execution in MLX LM does not populate sys.modules."""
+    namespace: dict[str, object] = {
+        "__name__": "exo_test_unregistered_qwen",
+        "nn": nn,
+        "gated_delta_update": reference_update,
+    }
+    exec(
+        "class Model(nn.Module):\n"
+        "    def __init__(self):\n"
+        "        super().__init__()\n"
+        "        self.model_type = 'qwen4_exp'\n"
+        "    def __call__(self, x):\n"
+        "        return x\n",
+        namespace,
+    )
+    model = cast(Callable[[], nn.Module], namespace["Model"])()
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("EXO_QWEN_CUDA_GATED_DELTA", raising=False)
+    assert not enable_qwen_cuda_prefill(model)
+    monkeypatch.setenv("EXO_QWEN_CUDA_GATED_DELTA", "1")
+    model.model_type = "other_model"
+    assert not enable_qwen_cuda_prefill(model)
+    model.model_type = "qwen4_exp"
+    assert enable_qwen_cuda_prefill(model)
+    assert namespace["gated_delta_update"] is gated_delta_update
+    assert not enable_qwen_cuda_prefill(model)
