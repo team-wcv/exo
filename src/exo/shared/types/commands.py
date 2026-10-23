@@ -67,6 +67,7 @@ class SendInputChunk(BaseCommand):
 class RequestEventLog(BaseCommand):
     since_idx: int
     max_events: int = Field(default=1000, ge=1, le=1000)
+    allow_initial_snapshot: bool = False
 
 
 class PeerEndpoint(FrozenModel):

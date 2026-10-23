@@ -13,7 +13,7 @@ from exo.routing.router import get_node_zid
 from exo.shared.apply import apply_instance_deleted, apply_instance_link_created
 from exo.shared.models.model_cards import ModelCard, ModelTask
 from exo.shared.types.backends import Backend
-from exo.shared.types.chunks import ErrorChunk
+from exo.shared.types.chunks import ErrorChunk, InputImageChunk
 from exo.shared.types.commands import (
     CommandId,
     CreateInstance,
@@ -28,11 +28,13 @@ from exo.shared.types.events import (
     Event,
     GlobalForwarderEvent,
     IndexedEvent,
+    InputChunkReceived,
     InstanceCreated,
     InstanceDeleted,
     InstanceLinkCreated,
     LocalForwarderEvent,
     NodeGatheredInfo,
+    StateSnapshot,
     TaskCreated,
     TestEvent,
 )
@@ -45,6 +47,7 @@ from exo.shared.types.state import State
 from exo.shared.types.tasks import TaskId, TaskStatus
 from exo.shared.types.tasks import TextGeneration as TextGenerationTask
 from exo.shared.types.text_generation import (
+    Base64ImageHash,
     InputMessage,
     InputMessageContent,
     TextGenerationTaskParams,
@@ -387,6 +390,101 @@ async def test_request_event_log_replays_bounded_range(tmp_path: Path):
     assert replayed[0].origin_idx == 2
     assert replayed[0].event == events[2]
 
+    master._event_log.close()
+
+
+@pytest.mark.asyncio
+async def test_new_worker_can_bootstrap_current_state_without_replaying_history(
+    tmp_path: Path,
+):
+    ge_sender, global_receiver = channel[GlobalForwarderEvent]()
+    _, commands = channel[ForwarderCommand]()
+    _, local_events = channel[LocalForwarderEvent]()
+    downloads, _ = channel[ForwarderDownloadCommand]()
+    events, _ = channel[Event]()
+    node = NodeId("master")
+    master = Master(
+        node,
+        SessionId(master_node_id=node, election_clock=1),
+        command_receiver=commands,
+        event_sender=events,
+        local_event_receiver=local_events,
+        global_event_sender=ge_sender,
+        download_command_sender=downloads,
+        event_log_root=tmp_path,
+    )
+    for _ in range(1001):
+        master._event_log.append(TestEvent())
+    master.state = State(last_event_applied_idx=1000)
+    origin = SystemId("producer")
+    master._multi_buffer.ingest(0, TestEvent(), origin)
+    master._multi_buffer.drain()
+    target = SystemId("new-router")
+    await master._replay_event_log(
+        0,
+        64,
+        requester=target,
+        allow_initial_snapshot=True,
+    )
+    sent = global_receiver.collect()
+    assert len(sent) == 1 and sent[0].origin_idx == 1000
+    snapshot = sent[0].event
+    assert isinstance(snapshot, StateSnapshot)
+    assert snapshot.target == target
+    assert snapshot.state == master.state
+    assert snapshot.acknowledged_origins == {origin: 1}
+    # Existing consumers and clients that did not opt in retain ordered replay.
+    await master._replay_event_log(1, 2, requester=target, allow_initial_snapshot=True)
+    assert [e.origin_idx for e in global_receiver.collect()] == [1, 2]
+    await master._replay_event_log(0, 2, requester=target)
+    assert [e.origin_idx for e in global_receiver.collect()] == [0, 1]
+    image_task = TextGenerationTask(
+        instance_id=InstanceId("vision"),
+        command_id=CommandId(),
+        task_status=TaskStatus.Pending,
+        task_params=TextGenerationTaskParams(
+            model=ModelId("vision"),
+            input=[],
+            image_hashes={0: Base64ImageHash("input-image")},
+        ),
+    )
+    master.state = master.state.model_copy(
+        update={"tasks": {image_task.task_id: image_task}}
+    )
+    await master._replay_event_log(0, 2, requester=target, allow_initial_snapshot=True)
+    assert [e.origin_idx for e in global_receiver.collect()] == [0, 1]
+    master.state = master.state.model_copy(update={"tasks": {}})
+    image_input = InputChunkReceived(
+        command_id=image_task.command_id,
+        chunk=InputImageChunk(
+            model=ModelId("vision"),
+            command_id=image_task.command_id,
+            data="image-data",
+            chunk_index=0,
+            total_chunks=1,
+            image_index=0,
+        ),
+    )
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(master._event_processor)
+        await local_events.clone_sender().send(
+            LocalForwarderEvent(
+                origin=SystemId("image-api"),
+                origin_idx=0,
+                session=master.session_id,
+                event=image_input,
+            )
+        )
+        with anyio.fail_after(2):
+            assert isinstance(
+                (await global_receiver.receive()).event, InputChunkReceived
+            )
+        assert master._has_image_inputs
+        await master._replay_event_log(
+            0, 2, requester=target, allow_initial_snapshot=True
+        )
+        assert [e.origin_idx for e in global_receiver.collect()] == [0, 1]
+        tg.cancel_scope.cancel()
     master._event_log.close()
 
 

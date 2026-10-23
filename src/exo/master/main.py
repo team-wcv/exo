@@ -57,6 +57,7 @@ from exo.shared.types.events import (
     LocalForwarderEvent,
     NodeGatheredInfo,
     NodeTimedOut,
+    StateSnapshot,
     TaskCreated,
     TaskDeleted,
     TaskStatusUpdated,
@@ -181,6 +182,7 @@ class Master:
         )
         self._pending_traces: dict[TaskId, dict[int, list[TraceEventData]]] = {}
         self._world_sizes: dict[TaskId, int] = {}
+        self._has_image_inputs = False
 
     async def run(self):
         logger.info("Starting Master")
@@ -606,7 +608,10 @@ class Master:
                             # Replays are intentionally bounded because gap
                             # recovery shares the normal gossipsub path.
                             await self._replay_event_log(
-                                command.since_idx, command.max_events
+                                command.since_idx,
+                                command.max_events,
+                                requester=forwarder_command.origin,
+                                allow_initial_snapshot=command.allow_initial_snapshot,
                             )
                     for event in generated_events:
                         await self.event_sender.send(event)
@@ -702,6 +707,11 @@ class Master:
                     local_event.origin,
                 )
                 for event in self._multi_buffer.drain():
+                    if isinstance(event, StateSnapshot):
+                        logger.warning("Ignoring worker-originated state snapshot")
+                        continue
+                    if isinstance(event, InputChunkReceived):
+                        self._has_image_inputs = True
                     if isinstance(event, TracesCollected):
                         await self._handle_traces_collected(event)
                         continue
@@ -734,7 +744,48 @@ class Master:
             )
         )
 
-    async def _replay_event_log(self, since_idx: int, max_events: int) -> None:
+    async def _replay_event_log(
+        self,
+        since_idx: int,
+        max_events: int,
+        *,
+        requester: SystemId | None = None,
+        allow_initial_snapshot: bool = False,
+    ) -> None:
+        # APIs reuse image hashes even after the original task is deleted.
+        # A session that received image chunks needs replay to rebuild that cache.
+        if (
+            allow_initial_snapshot
+            and requester is not None
+            and since_idx == 0
+            and self.state.last_event_applied_idx >= 64
+            and not self._has_image_inputs
+            and not any(
+                task.task_status in {TaskStatus.Pending, TaskStatus.Running}
+                and (
+                    isinstance(task, ImageEditsTask)
+                    or (
+                        isinstance(task, TextGenerationTask)
+                        and (task.task_params.images or task.task_params.image_hashes)
+                    )
+                )
+                for task in self.state.tasks.values()
+            )
+        ):
+            # Capture the immutable state and producer watermarks without yielding.
+            # Watermarks acknowledge deliveries already represented in the snapshot.
+            snapshot = StateSnapshot(
+                target=requester,
+                state=self.state,
+                acknowledged_origins={
+                    origin: buffer.next_idx_to_release
+                    for origin, buffer in self._multi_buffer.stores.items()
+                },
+            )
+            await self._send_indexed_event(
+                IndexedEvent(idx=snapshot.state.last_event_applied_idx, event=snapshot)
+            )
+            return
         end = min(since_idx + max_events, len(self._event_log))
         for i, event in enumerate(
             self._event_log.read_range(since_idx, end),

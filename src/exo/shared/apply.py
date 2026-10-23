@@ -22,6 +22,7 @@ from exo.shared.types.events import (
     NodeGatheredInfo,
     NodeTimedOut,
     RunnerStatusUpdated,
+    StateSnapshot,
     TaskAcknowledged,
     TaskCreated,
     TaskDeleted,
@@ -78,6 +79,8 @@ def _is_rdma_ctl_enabled(
 def event_apply(event: Event, state: State) -> State:
     """Apply an event to state."""
     match event:
+        case StateSnapshot():
+            return event.state
         case (
             TestEvent()
             | ChunkGenerated()
@@ -123,6 +126,12 @@ def event_apply(event: Event, state: State) -> State:
 
 
 def apply(state: State, event: IndexedEvent) -> State:
+    if isinstance(event.event, StateSnapshot):
+        if state.last_event_applied_idx != -1:
+            raise ValueError("State snapshots may only initialize an empty consumer")
+        if event.event.state.last_event_applied_idx != event.idx:
+            raise ValueError("State snapshot index differs from its envelope")
+        return event.event.state
     # Just to test that events are only applied in correct order
     if state.last_event_applied_idx != event.idx - 1:
         logger.warning(

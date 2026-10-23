@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.teamwcv.exo.reconnect</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/JJ/.orchestraitor/worktrees/exo/spark-prefill-20261016/.venv/bin/python</string>
+		<string>/Users/JJ/.orchestraitor/deployments/exo-reconnect-20261022/reconnect_guard.py</string>
+		<string>--node-id</string>
+		<string>27c331f0966cfaa5dabba385fd62d955</string>
+		<string>--master-id</string>
+		<string>2daac3b5a10447395605eb6d2da516dc</string>
+		<string>--apply</string>
+		<string>--master-url</string>
+		<string>http://100.73.100.108:52415</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/JJ/.cache/exo/reconnect-guard.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/JJ/.cache/exo/reconnect-guard.out.log</string>
+	<key>StartInterval</key>
+	<integer>30</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/JJ</string>
+</dict>
+</plist>
