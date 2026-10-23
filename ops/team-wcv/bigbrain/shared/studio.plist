@@ -24,7 +24,7 @@
 	<key>Label</key>
 	<string>ai.team-wcv.exo-studio-bigbrain</string>
 	<key>ProcessType</key>
-	<string>Background</string>
+	<string>Interactive</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/Users/JJ/.orchestraitor/worktrees/exo/pr44-5380af3e/.venv/bin/exo</string>

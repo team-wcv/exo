@@ -1,10 +1,10 @@
 ---
-branch: fix/bigbrain-reconnect-20261022
-created: 2026-10-22
+branch: fix/bigbrain-studio-qos-20261023
+created: 2026-10-23
 status: active
-scope: Correct Studio bootstrap, initialize reconnecting workers from current state, and guard idle isolated workers
+scope: Prevent background throttling of Studio's interactive EXO control-plane service
 orchestraitor:
   ticket: 6adaf543e6fd293519920057
 pr:
-  url: https://github.com/team-wcv/exo/pull/51
+  url: https://github.com/team-wcv/exo/pull/52
 ---
