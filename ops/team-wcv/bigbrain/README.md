@@ -170,7 +170,12 @@ The [reconnection guard](reconnect_guard.py) is installed on the MacBooks by the
 `com.teamwcv.exo.reconnect` LaunchAgent, using the corresponding
 [smbp](shared/smbp-reconnect.plist) and [smbpt](shared/smbpt-reconnect.plist)
 snapshots. It runs every 30 seconds and checks the local node identity, master
-freshness, master identity over its LAN API, and the master's Zenoh listener.
+freshness, master API identity, and the master's Zenoh listener. These background
+client probes use Studio's existing Tailscale address because smbpt's background
+Python cannot reach the LAN address even while its EXO runner can. Bootstrap,
+inference, and RDMA transports retain their LAN/Thunderbolt addresses. Master
+health over Tailscale establishes service availability, not LAN reachability;
+the cooldown limits unsuccessful recovery attempts during a LAN outage.
 Only a persistently isolated idle worker is restarted after 120 seconds, with a
 10-minute cooldown. A changed process ID gets a new startup grace period.
 Advancing replay from the expected master resets the timer, even when replayed

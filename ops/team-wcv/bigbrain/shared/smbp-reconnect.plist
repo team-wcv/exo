@@ -15,6 +15,8 @@
 		<string>--master-id</string>
 		<string>2daac3b5a10447395605eb6d2da516dc</string>
 		<string>--apply</string>
+		<string>--master-url</string>
+		<string>http://100.73.100.108:52415</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
