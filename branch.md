@@ -6,5 +6,5 @@ scope: Show per-model Spark prefill route evidence and live readiness for Twins 
 orchestraitor:
   ticket: 6adba4e5e6fd29351992a927
 pr:
-  url: pending
+  url: https://github.com/team-wcv/exo/pull/53
 ---
