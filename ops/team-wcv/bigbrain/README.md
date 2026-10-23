@@ -162,6 +162,9 @@ has caught up enough to accept new placements. Snapshot bootstrap introduces a
 new control event: update all Python runtimes together before enabling it.
 The native networking binary does not change. Snapshots are accepted only by
 their target router, in the current master session, before any event is applied.
+Pending image-input work retains ordinary replay because its transient input
+chunks are not part of the state snapshot. Producer watermarks clear only local
+deliveries already accepted by the master, leaving newer deliveries retryable.
 
 The [reconnection guard](reconnect_guard.py) is installed on the MacBooks by the
 `com.teamwcv.exo.reconnect` LaunchAgent, using the corresponding
