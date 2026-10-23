@@ -74,10 +74,11 @@ joined `192.168.0.0/24`. Keep the direct link disjoint from every LAN subnet.
 Backups and rollback values are in each host's
 `~/.orchestraitor/deployments/exo-network-recovery-20261018/`.
 
-Both LAN subnets are allowed for API reachability. Studio offers bootstrap
-addresses `192.168.1.21:52618` and `192.168.0.33:52618`; MacBooks also bootstrap
-over the direct Thunderbolt link. Verify the configured addresses after network
-changes. A healthy Tailscale connection does not prove the inference LAN path.
+Both LAN subnets are allowed for API reachability. Both MacBooks bootstrap through
+Studio's wired address `192.168.1.21:52618` and the direct Thunderbolt link. The
+previous Wi-Fi address `192.168.0.33` was no longer reachable after Studio's
+October 22 update; avoid using a transient Wi-Fi address as the only master peer.
+A healthy Tailscale connection does not prove the inference LAN path.
 
 If a decode instance disappears, its surviving prefill instances retain their
 role in replayable state. New requests return a terminal error until a decoder
@@ -144,6 +145,36 @@ The checked-in Caddy configuration sends `Cache-Control: no-store` for `/`,
 remain cached across deployments. Hashed immutable assets remain cacheable.
 Inspect actual failing asset requests in the access log: successful `/state`
 responses alone do not establish that the operator's existing tab can render.
+
+## Reconnection and replay recovery (2026-10-22)
+
+After Studio rebooted, both Mac services were running but isolated. Updating
+smbpt's stale bootstrap and reconnecting restored discovery, but worker state
+was still hours behind: a master with roughly 240,000 events was being replayed
+in windows of 64. Workers now request up to the protocol's existing limit of
+1,000 events per bounded window; each event remains a separate transport frame.
+Verify the workers' `lastEventAppliedIdx` and fresh `lastSeen` timestamps as well
+as the master's topology. Being visible at the master is not proof that a worker
+has caught up enough to accept new placements.
+
+The [reconnection guard](reconnect_guard.py) is installed on the MacBooks by the
+`com.teamwcv.exo.reconnect` LaunchAgent, using the corresponding
+[smbp](shared/smbp-reconnect.plist) and [smbpt](shared/smbpt-reconnect.plist)
+snapshots. It runs every 30 seconds and checks the local node identity, master
+freshness, master identity over its LAN API, and the master's Zenoh listener.
+Only a persistently isolated idle worker is restarted after 120 seconds, with a
+10-minute cooldown. A changed process ID gets a new startup grace period.
+Advancing replay from the expected master resets the timer, even when replayed
+timestamps are old; local singleton-master events do not count as catch-up.
+Local model assignments, uncertain probes, and an unavailable master prevent
+automatic restart. The guard does not recreate model placements.
+
+The deployed script is in `~/.orchestraitor/deployments/exo-reconnect-20261022/`.
+Decision records and logs are under `~/.cache/exo/reconnect-guard*`. Running the
+script without `--apply` only reports the recovery decision. To disable automatic
+reconnection, boot out `gui/$(id -u)/com.teamwcv.exo.reconnect` and remove its
+LaunchAgent from `~/Library/LaunchAgents` after saving a backup. Leave the main
+`com.teamwcv.exo.bigbrain` job in place.
 
 ## Legacy isolated endpoint profiles
 
