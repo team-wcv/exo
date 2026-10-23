@@ -1,10 +1,10 @@
 ---
-branch: fix/bigbrain-reconnect-20261022
-created: 2026-10-22
+branch: feature/spark-prefill-model-guidance-20261023
+created: 2026-10-23
 status: active
-scope: Correct Studio bootstrap, initialize reconnecting workers from current state, and guard idle isolated workers
+scope: Show per-model Spark prefill route evidence and live readiness for Twins and Studio
 orchestraitor:
-  ticket: 6adaf543e6fd293519920057
+  ticket: 6adba4e5e6fd29351992a927
 pr:
-  url: https://github.com/team-wcv/exo/pull/51
+  url: https://github.com/team-wcv/exo/pull/53
 ---

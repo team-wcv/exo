@@ -8,6 +8,7 @@
  */
 
 import { browser } from "$app/environment";
+import type { PrefillFleetState } from "$lib/utils/spark-prefill";
 
 // UUID generation fallback for browsers without crypto.randomUUID
 function generateUUID(): string {
@@ -220,6 +221,9 @@ export interface TraceListResponse {
 }
 
 interface RawStateResponse {
+  prefillServerPorts?: Record<string, number>;
+  lastSeen?: Record<string, string>;
+  nodeBackends?: Record<string, string[]>;
   topology?: RawTopology;
   instances?: Record<
     string,
@@ -624,6 +628,7 @@ class AppStore {
   previewNodeFilter = $state<Set<string>>(new Set());
   lastUpdate = $state<number | null>(null);
   nodeIdentities = $state<Record<string, RawNodeIdentity>>({});
+  prefillFleetState = $state<PrefillFleetState>({});
   thunderboltBridgeCycles = $state<string[][]>([]);
   nodeThunderbolt = $state<
     Record<
@@ -1403,6 +1408,20 @@ class AppStore {
         throw new Error(`Failed to fetch state: ${response.status}`);
       }
       const data: RawStateResponse = await response.json();
+      this.prefillFleetState = {
+        reachable: true,
+        lastSeen: data.lastSeen,
+        nodeIdentities: data.nodeIdentities,
+        nodeMemory: data.nodeMemory,
+        nodeBackends: data.nodeBackends,
+        nodeRdmaCtl: data.nodeRdmaCtl,
+        topology: data.topology,
+        instances: data.instances,
+        runners: data.runners,
+        prefillServerPorts: data.prefillServerPorts,
+        instanceLinks: data.instanceLinks,
+        downloads: data.downloads,
+      };
 
       if (data.topology) {
         this.topologyData = transformTopology(data.topology, {
@@ -1455,6 +1474,10 @@ class AppStore {
         this.isConnected
       ) {
         this.isConnected = false;
+        this.prefillFleetState = {
+          ...this.prefillFleetState,
+          reachable: false,
+        };
       }
       console.error("Error fetching state:", error);
     }
@@ -3729,6 +3752,7 @@ export const isConnected = () => appStore.isConnected;
 
 // Node identities (for OS version mismatch detection)
 export const nodeIdentities = () => appStore.nodeIdentities;
+export const prefillFleetState = () => appStore.prefillFleetState;
 
 // Thunderbolt & RDMA status
 export const nodeThunderbolt = () => appStore.nodeThunderbolt;
