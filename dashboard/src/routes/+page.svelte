@@ -71,6 +71,7 @@
   import { addToast, dismissByMessage } from "$lib/stores/toast.svelte";
   import HeaderNav from "$lib/components/HeaderNav.svelte";
   import DeviceIcon from "$lib/components/DeviceIcon.svelte";
+  import SparkPrefillSummary from "$lib/components/SparkPrefillSummary.svelte";
   import { fade, fly, slide } from "svelte/transition";
   import { tweened } from "svelte/motion";
   import { cubicInOut, cubicOut } from "svelte/easing";
@@ -959,6 +960,7 @@
 
   // Model picker modal state
   let isModelPickerOpen = $state(false);
+  let modelPickerView = $state<"models" | "spark">("models");
 
   // Advanced options toggle (hides technical jargon for new users)
   let showAdvancedOptions = $state(false);
@@ -4711,6 +4713,7 @@
     <!-- Model Picker Modal (available during onboarding step 4) -->
     {#if onboardingStep === 6}
       <ModelPickerModal
+        showSparkGuidance={false}
         isOpen={isModelPickerOpen}
         {models}
         {selectedModelId}
@@ -5736,6 +5739,17 @@
             </div>
 
             <!-- Advanced Options Toggle -->
+            <SparkPrefillSummary
+              model={models.find(
+                (m) => m.id === (selectedModelId || bestRunningModelId),
+              )}
+              onCompare={() => {
+                modelPickerContext = "dashboard";
+                modelPickerView = "spark";
+                isModelPickerOpen = true;
+              }}
+            />
+
             <div class="flex-shrink-0 mb-4">
               <button
                 type="button"
@@ -6784,6 +6798,7 @@
 {#if !showOnboarding}
   <ModelPickerModal
     isOpen={isModelPickerOpen}
+    initialView={modelPickerView}
     {models}
     {selectedModelId}
     favorites={favoritesSet}
@@ -6805,7 +6820,10 @@
         handleModelPickerSelect(modelId);
       }
     }}
-    onClose={() => (isModelPickerOpen = false)}
+    onClose={() => {
+      isModelPickerOpen = false;
+      modelPickerView = "models";
+    }}
     onToggleFavorite={toggleFavorite}
     onAddModel={addModelFromPicker}
     onDeleteModel={deleteCustomModel}

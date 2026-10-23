@@ -9,6 +9,9 @@
   import { getNodesWithModelDownloaded } from "$lib/utils/downloads";
   import { getRecentEntries } from "$lib/stores/recents.svelte";
   import { addToast } from "$lib/stores/toast.svelte";
+  import SparkPrefillCatalog from "./SparkPrefillCatalog.svelte";
+  import { prefillFleetState } from "$lib/stores/app.svelte";
+  import { hasSparkFleet } from "$lib/utils/spark-prefill";
 
   interface ModelInfo {
     id: string;
@@ -58,6 +61,8 @@
   };
 
   type ModelPickerModalProps = {
+    showSparkGuidance?: boolean;
+    initialView?: "models" | "spark";
     isOpen: boolean;
     models: ModelInfo[];
     selectedModelId: string | null;
@@ -88,6 +93,8 @@
   };
 
   let {
+    showSparkGuidance = true,
+    initialView = "models",
     isOpen,
     models,
     selectedModelId,
@@ -112,6 +119,7 @@
 
   // Local state
   let searchQuery = $state("");
+  let sparkView = $state(false);
   let selectedFamily = $state<string | null>(null);
   let expandedGroups = $state<Set<string>>(new Set());
   let showFilters = $state(false);
@@ -219,6 +227,7 @@
   // Reset transient state when modal opens, but preserve tab selection
   $effect(() => {
     if (isOpen) {
+      sparkView = showSparkGuidance && initialView === "spark";
       searchQuery = "";
       expandedGroups = new Set();
       showFilters = false;
@@ -715,7 +724,7 @@
         </svg>
         <input
           type="search"
-          class="flex-1 bg-transparent border-none outline-none text-sm font-mono text-white placeholder-white/40"
+          class="min-w-0 flex-1 bg-transparent border-none outline-none text-sm font-mono text-white placeholder-white/40"
           placeholder="Search mlx-community models..."
           value={hfSearchQuery}
           oninput={(e) => handleHfSearchInput(e.currentTarget.value)}
@@ -741,7 +750,7 @@
         </svg>
         <input
           type="search"
-          class="flex-1 bg-transparent border-none outline-none text-sm font-mono text-white placeholder-white/40"
+          class="min-w-0 flex-1 bg-transparent border-none outline-none text-sm font-mono text-white placeholder-white/40"
           placeholder="Search models..."
           bind:value={searchQuery}
         />
@@ -792,6 +801,32 @@
       </button>
     </div>
 
+    {#if showSparkGuidance && hasSparkFleet(prefillFleetState())}
+      <div class="flex gap-2 px-3 py-2 border-b border-white/10 bg-black/20">
+        <button
+          type="button"
+          aria-pressed={!sparkView}
+          onclick={() => (sparkView = false)}
+          class="rounded px-3 py-1.5 text-xs font-mono {!sparkView
+            ? 'bg-white/10 text-white'
+            : 'text-white/50 hover:text-white'}">Model library</button
+        >
+        <button
+          type="button"
+          aria-pressed={sparkView}
+          onclick={() => {
+            sparkView = true;
+            selectedFamily = null;
+            showFilters = false;
+            clearFilters();
+          }}
+          class="rounded px-3 py-1.5 text-xs font-mono {sparkView
+            ? 'bg-exo-yellow/15 text-exo-yellow'
+            : 'text-exo-yellow/70 hover:text-exo-yellow'}">Spark prefill</button
+        >
+      </div>
+    {/if}
+
     <!-- Body -->
     <div class="flex flex-1 overflow-hidden">
       <!-- Family sidebar -->
@@ -800,12 +835,24 @@
         {selectedFamily}
         {hasFavorites}
         hasRecents={hasRecentsTab}
-        onSelect={(family) => (selectedFamily = family)}
+        onSelect={(family) => {
+          selectedFamily = family;
+          if (family === "huggingface") sparkView = false;
+        }}
       />
 
       <!-- Model list -->
-      <div class="flex-1 overflow-y-auto scrollbar-hide flex flex-col">
-        {#if selectedFamily === "huggingface"}
+      <div class="min-w-0 flex-1 overflow-y-auto scrollbar-hide flex flex-col">
+        {#if sparkView && selectedFamily !== "huggingface"}
+          <SparkPrefillCatalog
+            models={(selectedFamily === "recents"
+              ? filteredRecentGroups
+              : filteredGroups
+            ).flatMap((g) => g.variants)}
+            onSelect={handleSelect}
+            canSelect={(id) => canModelFit(id) || !!instanceStatuses[id]}
+          />
+        {:else if selectedFamily === "huggingface"}
           <!-- HuggingFace Hub view -->
           <div class="flex-1 flex flex-col min-h-0">
             <!-- Section header -->
