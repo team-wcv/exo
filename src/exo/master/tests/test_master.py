@@ -13,7 +13,7 @@ from exo.routing.router import get_node_zid
 from exo.shared.apply import apply_instance_deleted, apply_instance_link_created
 from exo.shared.models.model_cards import ModelCard, ModelTask
 from exo.shared.types.backends import Backend
-from exo.shared.types.chunks import ErrorChunk
+from exo.shared.types.chunks import ErrorChunk, InputImageChunk
 from exo.shared.types.commands import (
     CommandId,
     CreateInstance,
@@ -28,6 +28,7 @@ from exo.shared.types.events import (
     Event,
     GlobalForwarderEvent,
     IndexedEvent,
+    InputChunkReceived,
     InstanceCreated,
     InstanceDeleted,
     InstanceLinkCreated,
@@ -452,6 +453,38 @@ async def test_new_worker_can_bootstrap_current_state_without_replaying_history(
     )
     await master._replay_event_log(0, 2, requester=target, allow_initial_snapshot=True)
     assert [e.origin_idx for e in global_receiver.collect()] == [0, 1]
+    master.state = master.state.model_copy(update={"tasks": {}})
+    image_input = InputChunkReceived(
+        command_id=image_task.command_id,
+        chunk=InputImageChunk(
+            model=ModelId("vision"),
+            command_id=image_task.command_id,
+            data="image-data",
+            chunk_index=0,
+            total_chunks=1,
+            image_index=0,
+        ),
+    )
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(master._event_processor)
+        await local_events.clone_sender().send(
+            LocalForwarderEvent(
+                origin=SystemId("image-api"),
+                origin_idx=0,
+                session=master.session_id,
+                event=image_input,
+            )
+        )
+        with anyio.fail_after(2):
+            assert isinstance(
+                (await global_receiver.receive()).event, InputChunkReceived
+            )
+        assert master._has_image_inputs
+        await master._replay_event_log(
+            0, 2, requester=target, allow_initial_snapshot=True
+        )
+        assert [e.origin_idx for e in global_receiver.collect()] == [0, 1]
+        tg.cancel_scope.cancel()
     master._event_log.close()
 
 

@@ -83,3 +83,17 @@ def test_node_freshness_does_not_treat_historical_presence_as_connected():
     stamp = guard.datetime.fromisoformat("2026-10-23T00:00:00+00:00").timestamp()
     assert guard.fresh(state, "master", stamp + 10)
     assert not guard.fresh(state, "master", stamp + 100)
+
+
+@pytest.mark.parametrize("status", ["DownloadPending", "DownloadOngoing"])
+def test_local_download_prevents_restart_without_a_model_instance(status):
+    state = {"downloads": {"local": [{status: {}}]}, "instances": {}}
+    assert not guard.idle_worker(state, "local")
+    assert guard.idle_worker(state, "other-node")
+
+
+def test_completed_or_failed_downloads_do_not_block_idle_recovery():
+    state = {
+        "downloads": {"local": [{"DownloadCompleted": {}}, {"DownloadFailed": {}}]}
+    }
+    assert guard.idle_worker(state, "local")

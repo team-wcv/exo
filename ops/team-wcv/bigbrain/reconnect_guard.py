@@ -74,6 +74,9 @@ def fresh(state: dict, node_id: str, now: float) -> bool:
 
 
 def idle_worker(state: dict, node_id: str) -> bool:
+    for download in state.get("downloads", {}).get(node_id, []):
+        if "DownloadPending" in download or "DownloadOngoing" in download:
+            return False
     for tagged in state.get("instances", {}).values():
         if not isinstance(tagged, dict) or len(tagged) != 1:
             return False

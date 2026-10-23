@@ -182,6 +182,7 @@ class Master:
         )
         self._pending_traces: dict[TaskId, dict[int, list[TraceEventData]]] = {}
         self._world_sizes: dict[TaskId, int] = {}
+        self._has_image_inputs = False
 
     async def run(self):
         logger.info("Starting Master")
@@ -709,6 +710,8 @@ class Master:
                     if isinstance(event, StateSnapshot):
                         logger.warning("Ignoring worker-originated state snapshot")
                         continue
+                    if isinstance(event, InputChunkReceived):
+                        self._has_image_inputs = True
                     if isinstance(event, TracesCollected):
                         await self._handle_traces_collected(event)
                         continue
@@ -749,13 +752,14 @@ class Master:
         requester: SystemId | None = None,
         allow_initial_snapshot: bool = False,
     ) -> None:
-        # In-flight image inputs live in transient chunk buffers, not State.
-        # Those consumers still need event replay to reconstruct their inputs.
+        # APIs reuse image hashes even after the original task is deleted.
+        # A session that received image chunks needs replay to rebuild that cache.
         if (
             allow_initial_snapshot
             and requester is not None
             and since_idx == 0
             and self.state.last_event_applied_idx >= 64
+            and not self._has_image_inputs
             and not any(
                 task.task_status in {TaskStatus.Pending, TaskStatus.Running}
                 and (

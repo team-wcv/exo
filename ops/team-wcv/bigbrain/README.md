@@ -162,8 +162,10 @@ has caught up enough to accept new placements. Snapshot bootstrap introduces a
 new control event: update all Python runtimes together before enabling it.
 The native networking binary does not change. Snapshots are accepted only by
 their target router, in the current master session, before any event is applied.
-Pending image-input work retains ordinary replay because its transient input
-chunks are not part of the state snapshot. Producer watermarks clear only local
+Any master session that has received image inputs retains ordinary replay,
+including after the original task is deleted, because APIs can reuse image
+hashes whose transient input chunks are not part of the state snapshot.
+Producer watermarks clear only local
 deliveries already accepted by the master, leaving newer deliveries retryable.
 
 The [reconnection guard](reconnect_guard.py) is installed on the MacBooks by the
@@ -180,7 +182,7 @@ Only a persistently isolated idle worker is restarted after 120 seconds, with a
 10-minute cooldown. A changed process ID gets a new startup grace period.
 Advancing replay from the expected master resets the timer, even when replayed
 timestamps are old; local singleton-master events do not count as catch-up.
-Local model assignments, uncertain probes, and an unavailable master prevent
+Local model assignments, pending/ongoing downloads, uncertain probes, and an unavailable master prevent
 automatic restart. The guard does not recreate model placements.
 
 The deployed script is in `~/.orchestraitor/deployments/exo-reconnect-20261022/`.
