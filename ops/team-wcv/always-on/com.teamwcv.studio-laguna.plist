@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.teamwcv.studio-laguna</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>-u</string>
+    <string>/Users/JJ/.orchestraitor/deployments/always-on-inference-20261024/studio_guard.py</string>
+    <string>/Users/JJ/.orchestraitor/deployments/always-on-inference-20261024/studio.json</string>
+    <string>--watch</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>/Users/JJ/.cache/exo/studio-laguna-guard.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/JJ/.cache/exo/studio-laguna-guard.err.log</string>
+</dict></plist>

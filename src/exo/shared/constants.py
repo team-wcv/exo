@@ -102,6 +102,8 @@ EXO_OFFLINE = os.getenv("EXO_OFFLINE", "false").lower() == "true"
 EXO_TRACING_ENABLED = os.getenv("EXO_TRACING_ENABLED", "false").lower() == "true"
 
 ENABLE_DISAGGREGATION = os.getenv("ENABLE_DISAGGREGATION", "false").lower() == "true"
+# Keep a node visible while its hardware is reserved for an external inference service.
+EXO_INFERENCE_DISABLED = os.getenv("EXO_INFERENCE_DISABLED", "false").lower() == "true"
 
 EXO_MAX_CONCURRENT_REQUESTS = int(os.getenv("EXO_MAX_CONCURRENT_REQUESTS", "8"))
 

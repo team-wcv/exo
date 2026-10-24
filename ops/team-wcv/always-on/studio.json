@@ -1,0 +1,10 @@
+{
+  "lms": "/Users/JJ/.lmstudio/bin/lms",
+  "model_key": "mlx-community/Laguna-S-2.1-oQ5e",
+  "identifier": "laguna-studio",
+  "context_length": 65536,
+  "parallel": 2,
+  "port": 1234,
+  "health_url": "http://127.0.0.1:1234/v1/models",
+  "lock_file": "/Users/JJ/.cache/exo/studio-laguna-guard.lock"
+}

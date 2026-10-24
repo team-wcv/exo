@@ -1,0 +1,48 @@
+# BEGIN team-wcv always-on inference
+:18889 {
+	@bootstrap path / /index.html /_app/version.json
+	header @bootstrap Cache-Control "no-store"
+	@laguna_root path /laguna
+	redir @laguna_root /laguna/ 308
+	@studio_root path /studio
+	redir @studio_root /studio/ 308
+
+	handle_path /laguna/* {
+		handle /v1/* {
+			reverse_proxy 100.95.71.101:8888 {
+				flush_interval -1
+				transport http {
+					dial_timeout 5s
+					response_header_timeout 30m
+				}
+			}
+		}
+		handle {
+			header Cache-Control "no-store"
+			root * /Users/JJ/.orchestraitor/deployments/always-on-inference-20261024/ui/laguna
+			file_server
+		}
+	}
+	handle_path /studio/* {
+		handle /v1/* {
+			reverse_proxy 127.0.0.1:1234 {
+				flush_interval -1
+				transport http {
+					dial_timeout 5s
+					response_header_timeout 30m
+				}
+			}
+		}
+		handle {
+			header Cache-Control "no-store"
+			root * /Users/JJ/.orchestraitor/deployments/always-on-inference-20261024/ui/studio
+			file_server
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:52415 {
+			flush_interval -1
+		}
+	}
+}
+# END team-wcv always-on inference
