@@ -1,10 +1,10 @@
 ---
-branch: fix/bigbrain-reconnect-20261022
-created: 2026-10-22
+branch: feat/always-on-studio-spark-20261024
+created: 2026-10-24
 status: active
-scope: Correct Studio bootstrap, initialize reconnecting workers from current state, and guard idle isolated workers
+scope: Deploy persistent Spark and Studio inference services with dedicated ingress and workflow integration
 orchestraitor:
-  ticket: 6adaf543e6fd293519920057
+  ticket: 6add337b4629a8fa0cf41674
 pr:
-  url: https://github.com/team-wcv/exo/pull/51
+  url: pending
 ---
