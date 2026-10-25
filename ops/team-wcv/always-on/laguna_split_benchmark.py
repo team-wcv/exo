@@ -25,7 +25,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import psutil
 from mlx_lm.generate import generate_step
-from mlx_lm.utils import load_model, load_tokenizer
+from mlx_lm.utils import load_model
+from transformers import PreTrainedTokenizerFast
 
 from exo.worker.disaggregated.protocol import (
     Done,
@@ -62,6 +63,23 @@ def save_new(path, value):
         json.dump(value, stream, indent=2)
 
 
+def load_benchmark_tokenizer(path):
+    """Read the exact tokenizer without instantiating an unrelated HF model config.
+
+    Transformers' AutoTokenizer validates nested RoPE settings even though this
+    experiment loads the MLX model independently. The checkpoint's tokenizer JSON
+    and chat template suffice; no model configuration or installed package patch
+    is needed.
+    """
+    config = json.loads((path / "tokenizer_config.json").read_text())
+    special = {k: v for k, v in config.items() if k.endswith("_token")}
+    return PreTrainedTokenizerFast(
+        tokenizer_file=str(path / "tokenizer.json"),
+        chat_template=(path / "chat_template.jinja").read_text(),
+        **special,
+    )
+
+
 def load_laguna(path, smoke=False):
     """Load inspected, pinned model code through MLX-LM's public class hook."""
     code = path / "laguna.py"
@@ -74,6 +92,7 @@ def load_laguna(path, smoke=False):
     spec.loader.exec_module(module)
     if smoke:
         mx.set_default_device(mx.cpu)
+        mx.disable_compile()
         args = module.ModelArgs(
             model_type="laguna",
             hidden_size=128,
@@ -333,7 +352,7 @@ def main():
     args = parser.parse_args()
     os.environ["EXO_PREFILL_CHUNK_SIZE"] = str(args.chunk)
     if args.mode == "prepare":
-        tokenizer = load_tokenizer(args.checkpoint)
+        tokenizer = load_benchmark_tokenizer(args.checkpoint)
         text = args.corpus.read_text()
         marker = "__BENCHMARK_SOURCE_BUNDLE__"
         rendered = tokenizer.apply_chat_template(
@@ -413,14 +432,14 @@ def main():
         prompt = json.loads(args.prompt_file.read_text())
         if (prompt["model"], prompt["revision"]) != (MODEL, REVISION):
             raise ValueError("Prompt was prepared for a different checkpoint")
-        tokenizer = load_tokenizer(args.checkpoint)
+        tokenizer = load_benchmark_tokenizer(args.checkpoint)
         result = measure(
             model,
             prompt["tokens"],
             args.output_tokens,
             args.endpoint,
             token,
-            tokenizer.eos_token_ids,
+            {tokenizer.eos_token_id},
         )
         result.update(
             {
