@@ -6,6 +6,6 @@ scope: Validate matched Laguna prefill/decode split and correct wrapped sliding-
 orchestraitor:
   ticket: 6add8369eefa6a0557b4b368
 pr:
-  url: pending
+  url: https://github.com/team-wcv/exo/pull/57
   depends_on: https://github.com/team-wcv/exo/pull/55
 ---
