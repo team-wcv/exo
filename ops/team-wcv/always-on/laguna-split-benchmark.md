@@ -50,7 +50,7 @@ Laguna's sliding layers retain only 512 tokens while its full-attention layers
 retain the complete prefix. The transport fix preserves chronological sliding
 windows and logical offsets, including wrapped and incremental transfers.
 
-The 37 transport regression tests pass (six unrelated cases deselected by the
+The 40 transport regression tests pass (six unrelated cases deselected by the
 repository test configuration), as do targeted strict type checking and Ruff.
 An authenticated HTTP round trip on each host produced exactly the same next
 eight tokens as local prefill using a tiny Laguna architecture. These checks
@@ -58,15 +58,39 @@ prove transport correctness for those cases, not full-model hardware performance
 
 ## Maintenance boundary
 
-The user authorized continuation on October 24. Both native engines are paused
-under isolated maintenance controllers with restoration in cleanup. Do not load
-the full benchmark alongside the native engines. The 64K baseline completed with
-439.30 seconds to first token, 438.06 seconds in prefill, and 24.72 tokens/sec for
-256 output tokens. The matched split run is in progress. Spark took 295.19
-seconds for its first 16K tokens versus Studio's 59.78 seconds. This pass is
-limited to the matched 64K comparison to bound the service interruption; the
-prepared 245K prompt is not being benchmarked. A finish watcher requests both
-controllers to restore the native providers once the 64K split receipt is saved.
+The user authorized continuation on October 24. The matched 64K comparison is
+complete; native-provider restoration is being verified. The 245K prompt was
+prepared but not run, to bound the interruption after the 64K split showed a
+substantial compute regression. Do not load the benchmark alongside native engines.
+
+| Same 65,536-token prompt, 256 generated tokens | Studio alone | Spark prefill → Studio decode |
+| --- | ---: | ---: |
+| Time to first token | 439.30 s | 1,198.23 s |
+| Prefill compute | 438.06 s | 1,186.56 s |
+| Cache serialization/transfer overhead | — | 9.77 s |
+| Cache ingestion | — | 0.56 s |
+| Decode throughput | 24.72 tokens/s | 27.05 tokens/s |
+| Total request time | 449.62 s | 1,207.66 s |
+
+Both runs used the same prompt token hash, checkpoint revision, greedy sampling,
+512-token prefill chunks, fresh prefix state, and warm weights. All 65,535
+remote-prefix tokens were imported; remote errors have no local fallback. The
+cache payload contained 3,296,673,792 bytes. Both outputs were coherent engineering
+review text but not token-identical across the two GPU backends; this was not a
+code-quality evaluation. These are single-run measurements, not confidence bounds.
+
+The split took 2.73 times as long to first token, adding 758.93 seconds. Most of
+that difference was CUDA prefill compute, not transfer. For this Laguna MLX4 path,
+keep the native Spark NVFP4/DFlash and Studio oQ5e services separate. This result
+must not be generalized to other models or to an unimplemented native-vLLM to
+oMLX cache bridge. The machine-readable receipt is `laguna-64k-results.json`.
+
+The cleanup watcher restored Studio after the result was saved. Its LAN SSH call
+to Spark failed with "No route to host"; the operator connection sent Spark's
+cleanup sentinel over Tailscale instead. Spark's controller stopped its benchmark
+process and submitted the native service restart. Verify native readiness, not
+just the controller exit or systemd's active state, before closing maintenance.
+
 Do not stop the Studio EXO master or the Twins to run this test.
 
 For the approved window, record native PIDs/configuration, verify no active or
