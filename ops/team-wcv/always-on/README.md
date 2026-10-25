@@ -36,13 +36,23 @@ Install `Caddyfile.bigbrain-alias.fragment` on the operator and Studio, with
 Compare existing site blocks, back them up, validate the combined candidate,
 and hot-reload Caddy. Do not append duplicate Bigbrain site definitions.
 
+## Current context limits (October 25)
+
+Spark now serves 294,912 tokens (288K); Studio serves 262,144 tokens (256K).
+Studio runs one active request at a time within its unchanged 100 GiB guard.
+The context update was applied through its live settings API without restarting
+Studio or the EXO master. Spark's user-authorized native engine reload kept its
+GPU allocation unchanged; startup reported 316,212 tokens of KV capacity and
+11.5 GiB of KV memory. Its legacy `*-256k` unit/script names are retained for
+compatibility. The Twins' serving instance and RDMA transport are unchanged.
+
 ## Models and ownership
 
 | Item | Pinned revision | Capacity |
 | --- | --- | --- |
-| Spark target `poolside/Laguna-S-2.1-NVFP4` | `826aacdf6d8b2699d4e367def6f17c83b06044c2` | 262,144 token context, one active sequence |
+| Spark target `poolside/Laguna-S-2.1-NVFP4` | `826aacdf6d8b2699d4e367def6f17c83b06044c2` | 294,912 token context, one active sequence |
 | Spark draft `poolside/Laguna-S-2.1-DFlash-NVFP4` | `b3b5921a900b9e0a1e27e50bdaeb480692a6d19b` | 7 speculative tokens |
-| Studio `mlx-community/Laguna-S-2.1-oQ5e` | `70eb70f56f89ae90dfc415c35547bc31fe4a083a` | 65,536 token context, two active requests |
+| Studio `mlx-community/Laguna-S-2.1-oQ5e` | `70eb70f56f89ae90dfc415c35547bc31fe4a083a` | 262,144 token context, one active request |
 | Studio oMLX v0.7.2 | `23b671f64f0a64f532e38d692a6c480ea704418d` | Separate Python 3.13 environment |
 
 Spark's actual cached target is approximately 92.85 GiB, plus 2.08 GiB draft;
@@ -71,8 +81,8 @@ an arbitrary newer vLLM wheel into EXO.
 Studio uses `~/Library/LaunchAgents/com.teamwcv.studio-laguna.plist`. It starts
 after JJ logs in, keeps oMLX resident, restarts on exit, and holds a `caffeinate`
 assertion. The loaded model is pinned with no idle eviction. The memory guard
-is 100 GiB and the SSD cache is limited to 20 GB. The 64K context is a configured
-ceiling, not a promise that every two-request 64K workload fits simultaneously.
+is 100 GiB and the SSD cache is limited to 20 GB. The configured context ceiling is 256K with one active request. This keeps
+long-context KV allocations inside the existing memory guard.
 
 The deployment root contains `omlx-venv`, `omlx-state`, `models`, `checkpoints`,
 UI assets, current template snapshots, and a manifest. Use

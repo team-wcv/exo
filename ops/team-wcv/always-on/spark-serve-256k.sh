@@ -59,7 +59,7 @@ exec "$VENV/bin/vllm" serve "$TARGET" \
   --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":2}' \
   --max-num-seqs 1 \
   --max-num-batched-tokens 8192 \
-  --max-model-len 262144 \
+  --max-model-len 294912 \
   --gpu-memory-utilization 0.905 \
   --host 0.0.0.0 \
   --port 8888

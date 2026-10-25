@@ -16,9 +16,9 @@
     "memory_guard_custom_ceiling_gb": 100,
     "prefill_memory_guard": true
   },
-  "scheduler": { "max_concurrent_requests": 2, "chunked_prefill": true },
+  "scheduler": { "max_concurrent_requests": 1, "chunked_prefill": true },
   "cache": { "ssd_cache_max_size": "20GB", "hot_cache_max_size": "0" },
   "auth": { "skip_api_key_verification": true },
-  "sampling": { "max_context_window_policy": 65536 },
+  "sampling": { "max_context_window_policy": 262144 },
   "idle_timeout": { "idle_timeout_seconds": null }
 }
