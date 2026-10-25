@@ -27,9 +27,9 @@ Both hosts have isolated dependency copies and source under:
 ~/.orchestraitor/deployments/laguna-split-20261025-d6aed88e
 ```
 
-The staged entrypoint is `benchmark-eed1dcb1.py`; its source is
+The active staged entrypoint is `benchmark-loader-fix.py` (commit `b0ab8859`); its source is
 `laguna_split_benchmark.py` in this directory. Source and resources were archived
-from commit `d6aed88e`, with the entrypoint updated to `eed1dcb1`. The cache fix is
+from commit `d6aed88e`, with the entrypoint updated through `b0ab8859`. The cache fix is
 commit `c10dbaf8`. The deployment contains a private bearer-token file; never
 copy that token into documentation, command arguments, or a PR.
 
@@ -58,9 +58,15 @@ prove transport correctness for those cases, not full-model hardware performance
 
 ## Maintenance boundary
 
-The full benchmark is **not yet run**. User confirmation for the native-provider
-maintenance window is pending. Both native engines currently occupy memory
-needed by the experiment; do not load the full benchmark alongside them.
+The user authorized continuation on October 24. Both native engines are paused
+under isolated maintenance controllers with restoration in cleanup. Do not load
+the full benchmark alongside the native engines. The 64K baseline completed with
+439.30 seconds to first token, 438.06 seconds in prefill, and 24.72 tokens/sec for
+256 output tokens. The matched split run is in progress. Spark took 295.19
+seconds for its first 16K tokens versus Studio's 59.78 seconds. This pass is
+limited to the matched 64K comparison to bound the service interruption; the
+prepared 245K prompt is not being benchmarked. A finish watcher requests both
+controllers to restore the native providers once the 64K split receipt is saved.
 Do not stop the Studio EXO master or the Twins to run this test.
 
 For the approved window, record native PIDs/configuration, verify no active or
@@ -75,5 +81,10 @@ returning HTTP 503. Both MacBook EXO processes remained alive after an
 `EventDeliveryStalledError`, but neither API listened on port 52415; their
 reconnect guards reported connection refusal. Studio's master was reachable
 with no active instances. No service was stopped by benchmark preparation.
-This was recorded as Orchestraitor report `report-1792906062967`; restoring the
-Twins requires a separate scoped recovery action, not a benchmark side effect.
+This was recorded as Orchestraitor report `report-1792906062967`. The user then
+requested root-cause repair. Live Python stack sampling identified an exit-time
+multiprocessing queue feeder join after its runner consumer had exited. The
+fix was deployed on both Twins and merged as EXO PR #56. Both tensor/JACCL/RDMA
+ranks are ready, and a real request through `/twins/v1` returned the expected
+`TWINS_RECOVERY_OK` response in 1.72 seconds. The native Studio/Spark maintenance
+remains separate from the restored Twins route.
