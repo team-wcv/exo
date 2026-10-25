@@ -278,6 +278,16 @@ class MpSender[T]:
             self._state.buffer.put_nowait(_MpEndOfStream())
         self._state.buffer.close()
 
+    def abort(self) -> None:
+        """Discard pending delivery after the peer exits, without an exit-time join.
+
+        A queue feeder can remain blocked on a full pipe after its consumer dies.
+        Closing the queue alone leaves multiprocessing's unbounded atexit join
+        registered. Only use this once delivery to the peer is no longer needed.
+        """
+        self._state.buffer.cancel_join_thread()
+        self.close()
+
     # == unique to Mp channels ==
     def join(self) -> None:
         """Ensure any queued messages are resolved before continuing"""
@@ -356,6 +366,11 @@ class MpReceiver[T]:
         with contextlib.suppress(Exception):
             self._state.buffer.put_nowait(_MpEndOfStream())
         self._state.buffer.close()
+
+    def abort(self) -> None:
+        """Release a stopped peer's queue without waiting for undeliverable data."""
+        self._state.buffer.cancel_join_thread()
+        self.close()
 
     # == unique to Mp channels ==
     def join(self) -> None:
