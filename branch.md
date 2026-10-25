@@ -1,10 +1,10 @@
 ---
-branch: fix/bigbrain-reconnect-20261022
-created: 2026-10-22
+branch: fix/runner-queue-shutdown-20261025
+created: 2026-10-24
 status: active
-scope: Correct Studio bootstrap, initialize reconnecting workers from current state, and guard idle isolated workers
+scope: Prevent dead runner queues from blocking EXO process exit and launchd recovery
 orchestraitor:
-  ticket: 6adaf543e6fd293519920057
+  ticket: 6add8369eefa6a0557b4b368
 pr:
-  url: https://github.com/team-wcv/exo/pull/51
+  url: pending
 ---
