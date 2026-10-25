@@ -357,3 +357,28 @@ def test_rotating_export_refuses_an_evicted_earlier_boundary() -> None:
         rotating.update_and_fetch(values, values)
     with pytest.raises(ValueError, match="Cannot reconstruct rotating cache"):
         send_mlx_kv_cache(io.BytesIO(), [rotating], dtype="bfloat16", max_tokens=60)
+
+
+@pytest.mark.parametrize(
+    "start_pos,seq_len,window", [(0, 67, 8), (4, 6, 16), (60, 67, 8)]
+)
+def test_rotating_only_transfer_uses_logical_offset(
+    start_pos: int, seq_len: int, window: int
+) -> None:
+    source = RotatingKVCache(max_size=window, keep=0)
+    for position in range(seq_len):
+        value = mx.full((1, 2, 1, 4), position, dtype=mx.bfloat16)
+        source.update_and_fetch(value, value + 100)
+    buf = io.BytesIO()
+    write_header(buf, Header(num_layers=1, dtype="bfloat16", start_pos=start_pos))
+    count = send_mlx_kv_cache(buf, [source], dtype="bfloat16", start_pos=start_pos)
+    write_done(buf, count)
+    result = _decode_payload(buf.getvalue())
+    assert count == seq_len - start_pos
+    destination = RotatingKVCache(max_size=window, keep=0)
+    assert ingest_into_mlx_cache(result, [destination], start_pos=start_pos) == seq_len
+    assert destination.keys is not None
+    assert destination.values is not None
+    expected = mx.arange(max(0, seq_len - window), seq_len, dtype=mx.bfloat16)
+    assert _equal(destination.keys[0, 0, :, 0], expected)
+    assert _equal(destination.values[0, 0, :, 0], expected + 100)

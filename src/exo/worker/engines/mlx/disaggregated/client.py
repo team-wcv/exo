@@ -176,24 +176,22 @@ def ingest_into_mlx_cache(
             and (cache.keys is None or cache.values is None or cache.offset < start_pos)
         ):
             raise ValueError(f"Decoder layer {i} lacks the requested cached prefix")
-    max_received = max(
-        (sum(c.num_tokens for c in chunks) for chunks in result.kv_chunks.values()),
-        default=0,
-    )
     full_lengths = [
         sum(chunk.num_tokens for chunk in result.kv_chunks[i])
         for i, cache in enumerate(caches)
         if isinstance(cache, KVCache)
     ]
-    # Full-history layers anchor the logical prefix length when sliding layers
-    # carry fewer physical tokens. Keep the old check for rotating-only models.
+    # Full-history layers anchor the logical prefix length when present. Sliding
+    # layers carry complete retained windows even for incremental transfers, so
+    # validate their physical lengths against the final offset below instead.
+    # The caller also checks the logical boundary against its requested prefix.
     if (
         result.total_tokens < 0
         or (
             full_lengths
             and any(length != result.total_tokens for length in full_lengths)
         )
-        or (not full_lengths and result.total_tokens != max_received)
+        or (not result.kv_chunks and result.total_tokens != 0)
     ):
         raise ValueError(
             "Remote prefill completion count differs from received KV tokens"
