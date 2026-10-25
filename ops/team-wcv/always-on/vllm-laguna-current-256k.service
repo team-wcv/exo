@@ -1,0 +1,19 @@
+[Unit]
+Description=Current Poolside Laguna S 2.1 NVFP4 DFlash 256K single-stream profile
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/wc-spark/.local/share/laguna-vllm-current/serve-256k.sh
+Restart=no
+OOMScoreAdjust=500
+MemoryHigh=114G
+MemoryMax=120G
+LimitNOFILE=1048576
+TimeoutStartSec=30min
+TimeoutStopSec=60
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

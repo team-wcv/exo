@@ -1,6 +1,19 @@
 # Bigbrain EXO fleet
 
-## Current shared deployment (2026-10-16)
+## Current service allocation (2026-10-24)
+
+The Twins serve Qwen with local prefill and RDMA tensor decode. Bigbrain’s root
+and `/twins/` now choose a healthy API on smbp or smbpt; `/spark/` serves native
+Laguna and `/studio/` serves Studio. The `/laguna/` path remains compatible. Spark and Studio
+now provide independent, persistent 118B Laguna workers with dedicated browser
+and API paths. Spark remains visible in EXO as a reserved observer with no
+inference backend. See the [always-on service runbook](../always-on/README.md)
+for the current allocation, startup pins, client profiles, and acceptance.
+
+The original disaggregated configuration below records the October 16–18
+validation and its recovery procedure. It is not the current default placement.
+
+## Original shared deployment (2026-10-16)
 
 The operator dashboard at `http://bigbrain.localhost:18888/` serves one shared
 `wc-bigbrain` cluster. Studio is the preferred master; smbp, smbpt, and Spark
@@ -47,9 +60,9 @@ source overlay hashes. Startup files select both with `PYTHONPATH`; preserve
 that pairing during upgrades. Prior startup configurations and source revisions
 are backed up alongside the deployment.
 
-The standalone Spark Laguna unit `vllm-laguna-current-256k.service` is stopped and
-disabled with operator approval to make memory available to EXO. Its restore
-configuration is recorded in the earlier `exo-qwen27b-20261016` deployment backup.
+The standalone Spark Laguna unit was stopped for this original EXO validation.
+It is now enabled and running with failure recovery, and Spark is reserved from
+EXO inference. The October 24 runbook above supersedes the former stopped state.
 
 Validation must use the operator URL: inspect `/state`, `/v1/feature-flags`, and
 `/v1/instance-links`, then send a long uncached prompt and verify successful remote

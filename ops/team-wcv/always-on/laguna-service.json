@@ -1,0 +1,25 @@
+{
+  "id": "laguna-spark",
+  "title": "Laguna on Spark",
+  "description": "Large-model coding and long-context reasoning on DGX Spark.",
+  "model_id": "poolside/Laguna-S-2.1-NVFP4",
+  "model_label": "Laguna S 2.1 \u00b7 118B \u00b7 288K context",
+  "health_path": "health",
+  "links": [
+    {
+      "label": "Bigbrain \u00b7 Twins",
+      "local": "http://bigbrain.localhost:18888/",
+      "tailnet": "https://bigbrain.taile43e67.ts.net/twins/"
+    },
+    {
+      "label": "Laguna \u00b7 Spark",
+      "local": "http://spark.localhost:18888/",
+      "tailnet": "https://bigbrain.taile43e67.ts.net/spark/"
+    },
+    {
+      "label": "Laguna \u00b7 Studio",
+      "local": "http://studio-ai.localhost:18888/",
+      "tailnet": "https://bigbrain.taile43e67.ts.net/studio/"
+    }
+  ]
+}

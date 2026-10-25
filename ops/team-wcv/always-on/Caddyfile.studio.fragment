@@ -1,0 +1,75 @@
+# BEGIN team-wcv always-on inference
+:18889 {
+	@bootstrap path / /index.html /_app/version.json /twins/ /twins/index.html
+	header @bootstrap Cache-Control "no-store"
+	@spark_root path /spark
+	redir @spark_root /spark/ 308
+	@laguna_root path /laguna
+	redir @laguna_root /spark/ 308
+	@laguna_compat path /laguna/*
+	uri @laguna_compat replace /laguna /spark 1
+	@twins_root path /twins
+	redir @twins_root /twins/ 308
+	@studio_root path /studio
+	redir @studio_root /studio/ 308
+
+	handle_path /spark/* {
+		handle /health {
+			reverse_proxy 100.95.71.101:8888
+		}
+		handle /v1/* {
+			reverse_proxy 100.95.71.101:8888 {
+				flush_interval -1
+				transport http {
+					dial_timeout 5s
+					response_header_timeout 30m
+				}
+			}
+		}
+		handle {
+			header Cache-Control "no-store"
+			root * /Users/JJ/.orchestraitor/deployments/always-on-inference-20261024/ui/laguna
+			file_server
+		}
+	}
+	handle_path /studio/* {
+		handle /health {
+			reverse_proxy 127.0.0.1:1235
+		}
+		handle /v1/* {
+			reverse_proxy 127.0.0.1:1235 {
+				flush_interval -1
+				transport http {
+					dial_timeout 5s
+					response_header_timeout 30m
+				}
+			}
+		}
+		handle {
+			header Cache-Control "no-store"
+			root * /Users/JJ/.orchestraitor/deployments/always-on-inference-20261024/ui/studio
+			file_server
+		}
+	}
+	handle_path /twins/* {
+		reverse_proxy 100.82.178.117:52415 100.80.253.10:52415 {
+			lb_policy first
+			health_uri /node_id
+			health_interval 10s
+			health_timeout 2s
+			lb_try_duration 3s
+			flush_interval -1
+		}
+	}
+	handle {
+		reverse_proxy 100.82.178.117:52415 100.80.253.10:52415 {
+			lb_policy first
+			health_uri /node_id
+			health_interval 10s
+			health_timeout 2s
+			lb_try_duration 3s
+			flush_interval -1
+		}
+	}
+}
+# END team-wcv always-on inference
