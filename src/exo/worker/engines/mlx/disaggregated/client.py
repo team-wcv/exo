@@ -176,20 +176,39 @@ def ingest_into_mlx_cache(
             and (cache.keys is None or cache.values is None or cache.offset < start_pos)
         ):
             raise ValueError(f"Decoder layer {i} lacks the requested cached prefix")
-    max_received = max(
-        (sum(c.num_tokens for c in chunks) for chunks in result.kv_chunks.values()),
-        default=0,
-    )
-    if result.total_tokens != max_received:
+    full_lengths = [
+        sum(chunk.num_tokens for chunk in result.kv_chunks[i])
+        for i, cache in enumerate(caches)
+        if isinstance(cache, KVCache)
+    ]
+    # Full-history layers anchor the logical prefix length when present. Sliding
+    # layers carry complete retained windows even for incremental transfers, so
+    # validate their physical lengths against the final offset below instead.
+    # The caller also checks the logical boundary against its requested prefix.
+    if (
+        result.total_tokens < 0
+        or (
+            full_lengths
+            and any(length != result.total_tokens for length in full_lengths)
+        )
+        or (not result.kv_chunks and result.total_tokens != 0)
+    ):
         raise ValueError(
             "Remote prefill completion count differs from received KV tokens"
         )
+    final_offset = start_pos + result.total_tokens
     for i, chunks in result.kv_chunks.items():
-        if sum(chunk.num_tokens for chunk in chunks) != max_received:
+        cache = caches[i]
+        expected = (
+            min(final_offset, int(cache.max_size))
+            if isinstance(cache, RotatingKVCache)
+            else result.total_tokens
+        )
+        if sum(chunk.num_tokens for chunk in chunks) != expected:
             raise ValueError(
-                f"Remote attention layer {i} has an incomplete token sequence"
+                f"Remote attention layer {i} has an incomplete token sequence: "
+                f"expected {expected} retained tokens"
             )
-    final_offset = start_pos + max_received
 
     # Validate and materialize every layer before replacing any live cache. A
     # malformed transfer must not leave a mixture of old and imported state.
