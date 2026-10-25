@@ -125,6 +125,19 @@ defaults and existing permissions. Orchestraitor's provider list shows both
 named providers. Its legacy fleet inference registry is separate and was not
 changed. Use the profiles or the explicit OpenAI-compatible API bases above.
 
+Actual Codex testing exposed a separate messaging boundary: the installed MCP
+credential resolver rejects `--profile` sessions before scoped check-in, and
+Messaiger refuses their join. Provider visibility is not evidence of working
+agent messaging. The native model services and shell tools work independently
+of that authentication failure; no credential or identity bypass was applied.
+
+The new Twins route was tested by temporarily replacing only Caddy's preferred
+smbp dial address with an unreachable loopback address. The real HTTPS
+`/twins/` path selected smbpt and returned `TWINS_FAILOVER_OK` in 2.98 seconds.
+The original configuration was restored in `finally`, and `/twins/node_id`
+returned smbp again. Neither EXO worker was stopped. Both local and HTTPS
+`/spark/`, `/studio/`, and `/twins/` pages passed browser loading checks.
+
 Both models passed real chat, function-tool/result, and Responses requests;
 both passed streaming Responses function-call/result round trips. Studio also
 served two concurrent 1,721-token coding prompts with 160 output tokens each,

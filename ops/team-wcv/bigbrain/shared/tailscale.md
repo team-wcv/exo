@@ -91,7 +91,8 @@ curl --fail --max-time 15 https://bigbrain.taile43e67.ts.net/v1/models
 ```
 
 The status must include accepted `service-host` capability, and `/node_id` must
-match Studio's live API. Check `/state` and `/v1/feature-flags`, then send a model
+match the selected healthy Twin's live API (smbp or smbpt). Studio still owns
+the EXO master and gateway. Check `/state` and `/v1/feature-flags`, then send a model
 request. For remote-prefill proof use more than 1,000 uncached prompt tokens and
 verify successful ingestion on both Mac decode ranks. Repeat endpoint acceptance
 after the next approved gateway restart. Do not equate stored configuration or
