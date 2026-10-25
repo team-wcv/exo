@@ -152,6 +152,37 @@ Spark mislabeled a custom call as a function call. The Codex profiles therefore
 use JSON function tools and shell editing. Do not claim a complete autonomous
 Codex coding evaluation from these protocol checks alone.
 
+### Coding and peer-review evaluation
+
+On October 24, both actual Codex CLI profiles attempted the same async TTL-cache
+repair with cancellation, coalescing, expiration, and invalidation requirements.
+They used shell tools, but the default thinking-mode run did not produce a fix:
+Studio exhausted 8,192 output tokens after 312 seconds in its final request;
+Spark was interrupted after running for over six minutes without an edit.
+
+A bounded Chat Completions request with `chat_template_kwargs.enable_thinking`
+set to `false` returned code quickly. Twelve independently authored behavioral
+checks, not shown to the models, evaluated the results:
+
+| Worker | First content | Complete response | First pass | After one peer-review round |
+| --- | --- | --- | --- | --- |
+| Spark | 0.79 s | 8.13 s | 9/12 | 11/12 |
+| Studio | 1.33 s | 9.39 s | 8/12 | 8/12 |
+
+Each model reviewed the other's code with the failing test names, then repaired
+its own code using that review. This was an explicitly mediated API exchange,
+not a Messaiger conversation: both real messaging joins were refused by runtime
+identity checks. Spark still failed in-flight invalidation after repair; Studio
+also retained cancellation/failure cleanup defects. These are single-workload
+results, not a broad model ranking. Neither unattended coding nor native agent
+messaging is accepted by this evaluation.
+
+Reproducible inputs, independent checks, model outputs, reviews, and receipts
+are retained on the operator at
+`~/.cache/exo/laguna-collaboration-20261024-181905/`. `acceptance.py` takes a
+candidate directory containing `cache.py`. The `*-bounded` and `*-repaired`
+directories retain first-pass and revised outputs and test logs separately.
+
 ## Rollback
 
 Backups are under each affected deployment's `before/` and the operator's
