@@ -316,7 +316,16 @@ class RunnerSupervisor:
                 self._cancel_sender.close()
 
             with anyio.CancelScope(shield=True):
-                await self.runner_process.stop()
+                try:
+                    await self.runner_process.stop()
+                finally:
+                    # Closing queues does not unregister their atexit feeder
+                    # joins. No runner remains to drain buffered tasks after
+                    # teardown; waiting for those pipes prevents launchd from
+                    # seeing the dead EXO process and starting its replacement.
+                    self._ev_recv.abort()
+                    self._task_sender.abort()
+                    self._cancel_sender.abort()
                 logger.info(
                     "Runner process successfully terminated "
                     f"{self._runner_context()} exitcode={self.runner_process.exitcode} "
