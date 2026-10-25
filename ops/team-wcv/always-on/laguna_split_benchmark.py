@@ -139,7 +139,7 @@ def load_laguna(path, smoke=False):
     mx.set_cache_limit(512 * 1024**2)
     start = time.perf_counter()
     model, _ = load_model(
-        path, strict=True, get_model_classes=lambda _: (module.Model, module.ModelArgs)
+        path, strict=True, get_model_classes=lambda config: (module.Model, module.ModelArgs)
     )
     record(
         "model_loaded",
