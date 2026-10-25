@@ -6,13 +6,13 @@ It does not transport KV cache between native vLLM and oMLX.
 
 | Worker | Browser | Private API base | Runtime / model |
 | --- | --- | --- | --- |
-| Spark | `http://laguna.localhost:18888/` or [tailnet](https://bigbrain.taile43e67.ts.net/laguna/) | `https://bigbrain.taile43e67.ts.net/laguna/v1` | vLLM, Laguna S 2.1 NVFP4 118B + DFlash |
+| Spark | `http://spark.localhost:18888/` or [tailnet](https://bigbrain.taile43e67.ts.net/spark/) | `https://bigbrain.taile43e67.ts.net/spark/v1` | vLLM, Laguna S 2.1 NVFP4 118B + DFlash |
 | Studio | `http://studio-ai.localhost:18888/` or [tailnet](https://bigbrain.taile43e67.ts.net/studio/) | `https://bigbrain.taile43e67.ts.net/studio/v1` | oMLX, Laguna S 2.1 oQ5e 118B |
 | Twins | `http://bigbrain.localhost:18888/` or [tailnet](https://bigbrain.taile43e67.ts.net/) | `https://bigbrain.taile43e67.ts.net/v1` | EXO, Qwen3.8 Flash Next mixed 4/8-bit, RDMA |
 
 Localhost aliases are installed on the operator Mac and Studio. Other clients
 use the private tailnet URLs. Caddy on Studio listens on 18889, dispatching
-`/laguna/` to Spark:8888, `/studio/` to loopback:1235, and the root to EXO:52415.
+`/spark/` to Spark:8888, `/studio/` to loopback:1235, and both `/twins/` and the root to healthy smbp/smbpt APIs on 52415.
 The `svc:bigbrain` route in `watch-gateway-edge` now targets
 `http://host.docker.internal:18889`. Preserve the unrelated Watch Funnel route
 to 18809. No inference route is advertised through Funnel.
@@ -22,6 +22,19 @@ access to Studio:18889 was unreachable. They must not be restored to that direct
 upstream. Browser configuration/assets are served with `no-store`; readiness
 checks the native health endpoint as well as the model list. Studio is only
 shown ready after its pinned engine is loaded.
+
+The legacy `/laguna/` API path and `laguna.localhost` alias remain compatible.
+The canonical Spark path is `/spark/`; `spark.localhost:18888` is the matching
+short alias. Bigbrain's root and `/twins/` prefer smbp and fail over to smbpt
+using active `/node_id` health checks. Both Mac APIs expose the shared cluster.
+This is API failover, not automatic model resharding: the current two-rank
+Qwen instance still requires both Twins for inference. Studio remains EXO's
+control-plane master. No EXO process restart is needed to change ingress.
+
+Install `Caddyfile.bigbrain-alias.fragment` on the operator and Studio, with
+`Caddyfile.aliases.fragment`; Studio additionally needs `Caddyfile.studio.fragment`.
+Compare existing site blocks, back them up, validate the combined candidate,
+and hot-reload Caddy. Do not append duplicate Bigbrain site definitions.
 
 ## Models and ownership
 
@@ -88,7 +101,7 @@ systemctl --user show vllm-laguna-current-256k.service -p ActiveState -p MainPID
 curl -fsS http://127.0.0.1:8888/health
 # Any authorized tailnet client
 curl -fsS https://bigbrain.taile43e67.ts.net/studio/health
-curl -fsS https://bigbrain.taile43e67.ts.net/laguna/v1/models
+curl -fsS https://bigbrain.taile43e67.ts.net/spark/v1/models
 curl -fsS https://bigbrain.taile43e67.ts.net/state
 ```
 

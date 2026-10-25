@@ -2,7 +2,9 @@
 
 ## Current service allocation (2026-10-24)
 
-The Twins serve Qwen with local prefill and RDMA tensor decode. Spark and Studio
+The Twins serve Qwen with local prefill and RDMA tensor decode. Bigbrain’s root
+and `/twins/` now choose a healthy API on smbp or smbpt; `/spark/` serves native
+Laguna and `/studio/` serves Studio. The `/laguna/` path remains compatible. Spark and Studio
 now provide independent, persistent 118B Laguna workers with dedicated browser
 and API paths. Spark remains visible in EXO as a reserved observer with no
 inference backend. See the [always-on service runbook](../always-on/README.md)

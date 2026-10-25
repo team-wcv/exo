@@ -9,12 +9,12 @@
     {
       "label": "Bigbrain \u00b7 Twins",
       "local": "http://bigbrain.localhost:18888/",
-      "tailnet": "https://bigbrain.taile43e67.ts.net/"
+      "tailnet": "https://bigbrain.taile43e67.ts.net/twins/"
     },
     {
       "label": "Laguna \u00b7 Spark",
-      "local": "http://laguna.localhost:18888/",
-      "tailnet": "https://bigbrain.taile43e67.ts.net/laguna/"
+      "local": "http://spark.localhost:18888/",
+      "tailnet": "https://bigbrain.taile43e67.ts.net/spark/"
     },
     {
       "label": "Laguna \u00b7 Studio",

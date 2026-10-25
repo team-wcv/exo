@@ -30,7 +30,8 @@ changes EXO's LAN prefill or Thunderbolt/JACCL tensor transport.
 ## Persistence and recovery
 
 Since October 24 the private service targets Studio's Caddy dispatcher on 18889.
-Its root still serves EXO:52415; `/laguna/` and `/studio/` serve the independent
+Its root and `/twins/` select a healthy MacBook EXO API on 52415; `/spark/`
+(and legacy `/laguna/`) and `/studio/` serve the independent
 native inference workers. See the [current service runbook](../../always-on/README.md).
 The mounted file was edited in place to preserve its bind-mounted inode, and
 the live service was reapplied without restarting the shared gateway.

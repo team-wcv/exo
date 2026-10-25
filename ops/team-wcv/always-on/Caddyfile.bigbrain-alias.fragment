@@ -1,0 +1,41 @@
+# BEGIN team-wcv Bigbrain alias
+http://bigbrain.localhost:18888, http://bigbrain-local.localhost:18888 {
+	@bootstrap path / /index.html /_app/version.json /twins/ /twins/index.html
+	header @bootstrap Cache-Control "no-store"
+	@native path /spark /spark/* /laguna /laguna/* /studio /studio/*
+	handle @native {
+		reverse_proxy https://bigbrain.taile43e67.ts.net {
+			header_up Host bigbrain.taile43e67.ts.net
+			flush_interval -1
+		}
+	}
+	@twins_root path /twins
+	redir @twins_root /twins/ 308
+	handle_path /twins/* {
+		reverse_proxy 100.82.178.117:52415 100.80.253.10:52415 {
+			lb_policy first
+			health_uri /node_id
+			health_interval 10s
+			health_timeout 2s
+			lb_try_duration 3s
+			flush_interval -1
+		}
+	}
+	handle {
+		reverse_proxy 100.82.178.117:52415 100.80.253.10:52415 {
+			lb_policy first
+			health_uri /node_id
+			health_interval 10s
+			health_timeout 2s
+			lb_try_duration 3s
+			flush_interval -1
+		}
+	}
+	log {
+		output file /opt/homebrew/var/log/caddy/bigbrain.log {
+			roll_size 10mb
+			roll_keep 3
+		}
+	}
+}
+# END team-wcv Bigbrain alias

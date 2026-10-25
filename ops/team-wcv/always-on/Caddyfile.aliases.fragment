@@ -1,6 +1,6 @@
 # BEGIN team-wcv inference aliases
-http://laguna.localhost:18888 {
-	rewrite * /laguna{uri}
+http://spark.localhost:18888, http://laguna.localhost:18888 {
+	rewrite * /spark{uri}
 	reverse_proxy https://bigbrain.taile43e67.ts.net {
 		header_up Host bigbrain.taile43e67.ts.net
 		flush_interval -1
