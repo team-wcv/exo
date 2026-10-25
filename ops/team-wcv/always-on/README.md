@@ -115,8 +115,8 @@ curl -fsS https://bigbrain.taile43e67.ts.net/spark/v1/models
 curl -fsS https://bigbrain.taile43e67.ts.net/state
 ```
 
-Only the idle Studio LM Studio process and Spark EXO observer were approved for
-restart during this deployment. Studio's EXO master, the Twins, and the native
+During the initial October 24 deployment, only the idle Studio LM Studio
+process and Spark EXO observer were approved for restart. Studio's EXO master, the Twins, and the native
 Spark engine remained running. Future maintenance still follows the installed
 restart protocol. No host reboot or deliberate inference-engine crash was
 performed as an acceptance test; recovery settings were read back from the

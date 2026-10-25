@@ -33,7 +33,21 @@ function scroll() {
   el.scrollTop = el.scrollHeight;
 }
 function save() {
-  localStorage.setItem(`local-inference-${config.id}`, JSON.stringify(history));
+  try {
+    localStorage.setItem(`local-inference-${config.id}`, JSON.stringify(history));
+    byId("history-note")?.remove();
+  } catch {
+    // Long conversations can exceed browser storage while inference still works.
+    if (!byId("history-note")) {
+      const note = document.createElement("p");
+      note.id = "history-note";
+      note.className = "error";
+      note.setAttribute("role", "status");
+      note.textContent =
+        "This conversation is available in this tab, but could not be saved for reopening.";
+      byId("conversation").before(note);
+    }
+  }
 }
 
 async function health() {
