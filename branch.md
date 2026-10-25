@@ -6,5 +6,5 @@ scope: Prevent dead runner queues from blocking EXO process exit and launchd rec
 orchestraitor:
   ticket: 6add8369eefa6a0557b4b368
 pr:
-  url: pending
+  url: https://github.com/team-wcv/exo/pull/56
 ---
