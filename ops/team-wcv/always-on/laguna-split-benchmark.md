@@ -59,7 +59,7 @@ prove transport correctness for those cases, not full-model hardware performance
 ## Maintenance boundary
 
 The user authorized continuation on October 24. The matched 64K comparison is
-complete; native-provider restoration is being verified. The 245K prompt was
+complete; both native providers have been restored and verified with real requests. The 245K prompt was
 prepared but not run, to bound the interruption after the 64K split showed a
 substantial compute regression. Do not load the benchmark alongside native engines.
 
@@ -88,8 +88,10 @@ oMLX cache bridge. The machine-readable receipt is `laguna-64k-results.json`.
 The cleanup watcher restored Studio after the result was saved. Its LAN SSH call
 to Spark failed with "No route to host"; the operator connection sent Spark's
 cleanup sentinel over Tailscale instead. Spark's controller stopped its benchmark
-process and submitted the native service restart. Verify native readiness, not
-just the controller exit or systemd's active state, before closing maintenance.
+process and restarted its native service. Real requests through the dedicated
+BigBrain endpoints returned `SPARK_RESTORED_OK` in 0.93 seconds and
+`STUDIO_RESTORED_OK` in 2.12 seconds. Both Twins tensor/RDMA ranks remained ready,
+and the temporary Spark benchmark listener on port 52425 was closed.
 
 Do not stop the Studio EXO master or the Twins to run this test.
 
@@ -112,3 +114,21 @@ fix was deployed on both Twins and merged as EXO PR #56. Both tensor/JACCL/RDMA
 ranks are ready, and a real request through `/twins/v1` returned the expected
 `TWINS_RECOVERY_OK` response in 1.72 seconds. The native Studio/Spark maintenance
 remains separate from the restored Twins route.
+
+## Correction to the earlier Qwen Studio/Spark comparison
+
+The October 23 timing receipts under `studio-ab-20261023/steady-inference` were
+re-audited after the operator asked about Qwen3.8 Flash Next. All five recorded
+Spark-to-Studio trials (three 1,617-token and two 6,369-token trials) contain
+`!!!!!!!!!!!!!!!!` as their generated answer. Studio-only trials contain
+readable engineering text. The original median first-token timings are real,
+but they do not establish a usable split-inference speedup. Do not repeat the
+previous 4x / 1.8x recommendation without a new output-correctness validation.
+
+The mixed 4/8-bit Qwen checkpoint is 106,195,031,237 bytes (98.90 GiB) and remains
+working on the Twins with tensor/RDMA. It is a candidate for another Studio/Spark
+experiment, not an accepted joint service. A prefill/decode split needs a full
+model copy on each device plus runtime/cache headroom; it does not pool their
+memory. Diagnose prefill numerical correctness and cache handoff before using
+its split timings for a deployment decision. No additional Qwen maintenance
+window was started as part of this audit.
