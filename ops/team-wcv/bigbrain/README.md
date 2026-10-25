@@ -271,3 +271,32 @@ existing Qwen runners `RunnerReady`.
 
 Do not add bootstrap peers to the standalone profiles unless cross-host placement is an
 intentional, reviewed change.
+
+## Dead runner queue recovery (2026-10-24)
+
+An event-delivery watchdog failure exposed a shutdown defect on both Twins:
+their APIs closed, but Python remained in
+`multiprocessing.util._exit_function -> Queue._finalize_join -> Thread.join`.
+A live `py-spy dump` showed a feeder blocked writing to a runner that had already
+exited. The process had logged `EXO Shutdown complete`, but launchd still saw a
+live job, so its existing KeepAlive policy could not recover it.
+
+Runner teardown now aborts its interprocess channels after stopping the runner.
+This unregisters the unbounded multiprocessing feeder join for messages that
+can no longer be delivered. Ordinary channel close/join behavior is unchanged.
+The regression test starts a real consumer, lets it exit, queues a 2 MiB message,
+and checks that the producer interpreter exits after aborting either endpoint.
+
+The pure-Python patch was installed on smbp and smbpt after verifying that both
+original files matched the source base. Original files and the deployment hash
+manifest are preserved in
+`~/.orchestraitor/deployments/exo-runner-queue-shutdown-20261025/` on each host.
+The matching native networking artifact and launchd configurations were retained.
+
+Both workers rejoined the Studio master. The large Qwen model was restored as
+instance `8cd6efb5-df5d-4e7b-bb23-31db99e2f0e2`, with two tensor ranks covering
+all 48 layers, JACCL devices `rdma_en1`/`rdma_en2`, and Thunderbolt coordinator
+`10.254.42.1:52930`. An actual request through
+`https://bigbrain.taile43e67.ts.net/twins/v1/chat/completions` returned the expected
+`TWINS_RECOVERY_OK` response in 1.72 seconds. This validates recovery and serving;
+the tiny response is not a throughput benchmark.
