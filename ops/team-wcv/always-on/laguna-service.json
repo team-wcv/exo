@@ -4,6 +4,7 @@
   "description": "Large-model coding and long-context reasoning on DGX Spark.",
   "model_id": "poolside/Laguna-S-2.1-NVFP4",
   "model_label": "Laguna S 2.1 \u00b7 118B \u00b7 256K context",
+  "health_path": "health",
   "links": [
     {
       "label": "Bigbrain \u00b7 Twins",

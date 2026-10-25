@@ -38,13 +38,23 @@ function save() {
 
 async function health() {
   try {
-    const response = await fetch(new URL("models", apiBase), {
-      signal: AbortSignal.timeout(6000),
-      cache: "no-store",
-    });
+    const [response, readiness] = await Promise.all([
+      fetch(new URL("models", apiBase), {
+        signal: AbortSignal.timeout(6000),
+        cache: "no-store",
+      }),
+      fetch(new URL(config.health_path, window.location.href), {
+        signal: AbortSignal.timeout(6000),
+        cache: "no-store",
+      }),
+    ]);
     const result = await response.json();
+    const ready = await readiness.json().catch(() => ({}));
     online =
-      response.ok && (result.data || []).some((m) => m.id === config.model_id);
+      response.ok &&
+      readiness.ok &&
+      (result.data || []).some((m) => m.id === config.model_id) &&
+      (!config.require_loaded_model || ready.engine_pool?.loaded_count > 0);
   } catch {
     online = false;
   }

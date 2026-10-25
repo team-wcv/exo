@@ -5,16 +5,21 @@
   <key>ProgramArguments</key><array>
     <string>/usr/bin/caffeinate</string>
     <string>-i</string>
-    <string>/opt/homebrew/bin/python3</string>
-    <string>-u</string>
-    <string>/Users/JJ/.orchestraitor/deployments/always-on-inference-20261024/studio_guard.py</string>
-    <string>/Users/JJ/.orchestraitor/deployments/always-on-inference-20261024/studio.json</string>
-    <string>--watch</string>
+    <string>/Users/JJ/.orchestraitor/deployments/always-on-inference-20261024/omlx-venv/bin/omlx</string>
+    <string>serve</string>
+    <string>--base-path</string>
+    <string>/Users/JJ/.orchestraitor/deployments/always-on-inference-20261024/omlx-state</string>
+    <string>--model-dir</string>
+    <string>/Users/JJ/.orchestraitor/deployments/always-on-inference-20261024/models</string>
+    <string>--host</string><string>127.0.0.1</string>
+    <string>--port</string><string>1235</string>
+    <string>--headless</string><string>--no-hf-cache</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
   <key>ProcessType</key><string>Interactive</string>
-  <key>StandardOutPath</key><string>/Users/JJ/.cache/exo/studio-laguna-guard.out.log</string>
-  <key>StandardErrorPath</key><string>/Users/JJ/.cache/exo/studio-laguna-guard.err.log</string>
+  <key>ExitTimeOut</key><integer>120</integer>
+  <key>StandardOutPath</key><string>/Users/JJ/.cache/exo/studio-laguna.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/JJ/.cache/exo/studio-laguna.err.log</string>
 </dict></plist>

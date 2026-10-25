@@ -1,14 +1,16 @@
 # BEGIN team-wcv inference aliases
 http://laguna.localhost:18888 {
 	rewrite * /laguna{uri}
-	reverse_proxy 100.73.100.108:18889 {
+	reverse_proxy https://bigbrain.taile43e67.ts.net {
+		header_up Host bigbrain.taile43e67.ts.net
 		flush_interval -1
 	}
 }
 
 http://studio-ai.localhost:18888 {
 	rewrite * /studio{uri}
-	reverse_proxy 100.73.100.108:18889 {
+	reverse_proxy https://bigbrain.taile43e67.ts.net {
+		header_up Host bigbrain.taile43e67.ts.net
 		flush_interval -1
 	}
 }

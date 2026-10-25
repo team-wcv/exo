@@ -4,6 +4,8 @@
   "description": "A dedicated large-model worker for coding, review, and parallel tasks.",
   "model_id": "laguna-studio",
   "model_label": "Laguna S 2.1 \u00b7 118B \u00b7 5-bit \u00b7 64K context",
+  "health_path": "health",
+  "require_loaded_model": true,
   "links": [
     {
       "label": "Bigbrain \u00b7 Twins",

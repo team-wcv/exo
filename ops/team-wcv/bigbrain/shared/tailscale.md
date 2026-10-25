@@ -29,6 +29,12 @@ changes EXO's LAN prefill or Thunderbolt/JACCL tensor transport.
 
 ## Persistence and recovery
 
+Since October 24 the private service targets Studio's Caddy dispatcher on 18889.
+Its root still serves EXO:52415; `/laguna/` and `/studio/` serve the independent
+native inference workers. See the [current service runbook](../../always-on/README.md).
+The mounted file was edited in place to preserve its bind-mounted inode, and
+the live service was reapplied without restarting the shared gateway.
+
 The container has `restart: unless-stopped`, persistent Tailscale state at
 `~/.orchestraitor/watch-gateway/state`, and a read-only bind mount of
 `~/.orchestraitor/watch-gateway/serve.json` at `/config/serve.json`.
@@ -41,7 +47,7 @@ only this member to the top-level `Services` object:
   "TCP": {"443": {"HTTPS": true}},
   "Web": {
     "bigbrain.taile43e67.ts.net:443": {
-      "Handlers": {"/": {"Proxy": "http://host.docker.internal:52415"}}
+      "Handlers": {"/": {"Proxy": "http://host.docker.internal:18889"}}
     }
   }
 }
@@ -58,7 +64,7 @@ The [service-only snapshot](bigbrain-service.json) is the output of
 To reapply the live configuration from Studio, use the verified CLI command:
 
 ```bash
-docker exec watch-gateway-edge tailscale serve --service=svc:bigbrain --https=443 --bg --yes http://host.docker.internal:52415
+docker exec watch-gateway-edge tailscale serve --service=svc:bigbrain --https=443 --bg --yes http://host.docker.internal:18889
 ```
 
 CLI configuration also needs the `Services` entry in the mounted file so startup
