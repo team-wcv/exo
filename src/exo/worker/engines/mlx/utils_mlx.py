@@ -1212,7 +1212,10 @@ def load_mlx_items(
         start_time = time.perf_counter()
         model, _ = load_model(model_path, lazy=True, strict=False)
         if enable_qwen_cuda_prefill(model):
-            logger.info("Enabled Qwen CUDA gated-delta kernel")
+            logger.warning(
+                "Enabled experimental Qwen CUDA gated-delta kernel; "
+                "split-route output correctness is not verified"
+            )
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -1337,7 +1340,10 @@ def shard_and_load(
 
     model, _ = load_model(model_path, lazy=True, strict=False)
     if enable_qwen_cuda_prefill(model):
-        logger.info("Enabled Qwen CUDA gated-delta kernel")
+        logger.warning(
+            "Enabled experimental Qwen CUDA gated-delta kernel; "
+            "split-route output correctness is not verified"
+        )
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
         pass

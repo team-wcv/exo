@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping, Sequence
 
+from exo.shared.constants import EXO_INFERENCE_DISABLED
 from exo.shared.types.chunks import InputImageChunk
 from exo.shared.types.common import CommandId, ModelId, NodeId
 from exo.shared.types.tasks import (
@@ -37,6 +38,8 @@ from exo.shared.types.worker.runners import (
     RunnerLoading,
     RunnerReady,
     RunnerRunning,
+    RunnerShutdown,
+    RunnerShuttingDown,
     RunnerStatus,
     RunnerWarmingUp,
 )
@@ -57,6 +60,14 @@ def plan(
     instance_backoff: KeyedBackoff[InstanceId],
     download_backoff: KeyedBackoff[ModelId],
 ) -> Task | None:
+    if EXO_INFERENCE_DISABLED:
+        for runner in runners.values():
+            if not isinstance(runner.status, (RunnerShutdown, RunnerShuttingDown)):
+                return Shutdown(
+                    instance_id=runner.bound_instance.instance.instance_id,
+                    runner_id=runner.bound_instance.bound_runner_id,
+                )
+        return None
     # Python short circuiting OR logic should evaluate these sequentially.
     return (
         _cancel_tasks(runners, tasks)

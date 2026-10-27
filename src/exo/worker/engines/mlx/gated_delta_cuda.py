@@ -1,8 +1,10 @@
-"""Opt-in CUDA recurrent attention for the Qwen4 experimental model.
+"""Experimental opt-in CUDA recurrent attention for Qwen4.
 
 MLX LM 0.31.3 uses a Python token loop on CUDA. Keeping the recurrent matrix
 in registers avoids materializing that matrix between every token operation.
-Unsupported shapes retain MLX LM's reference implementation.
+Unsupported shapes retain MLX LM's reference implementation. Kernel parity tests
+do not establish end-to-end correctness: accelerated fleet split-route receipts
+produced invalid text. Keep this disabled in normal service configurations.
 """
 
 import os

@@ -1,0 +1,49 @@
+{
+  "date_utc": "2026-10-25",
+  "controls": {
+    "warm_weights": true,
+    "fresh_prefix_cache": true,
+    "sampling": "greedy",
+    "trials_per_route": 1,
+    "prompt": "EXO source-review corpus",
+    "studio_checkpoint_volume": "/Volumes/wc-ssd",
+    "load_time_excluded": true
+  },
+  "measurements": [
+    {
+      "route": "studio-only",
+      "prompt_tokens": 65536,
+      "output_tokens": 256,
+      "ttft_seconds": 439.3026555409888,
+      "total_seconds": 449.6184848330158,
+      "local_prefill_seconds": 438.0588696250052,
+      "decode_tokens_per_second": 24.719292340082223,
+      "finish_reason": "length",
+      "peak_bytes": 70248808612,
+      "prompt_sha256": "abf600d22dc14d0731f0600f6987f5384d6f09ce5aaa3816d99708df4c2c06a7",
+      "model": "pipenetwork/Laguna-S-2.1-MLX-4bit",
+      "revision": "5544297f819d50330bc3616dd15cbc7edb598b2f",
+      "chunk": 512
+    },
+    {
+      "route": "spark-studio",
+      "prompt_tokens": 65536,
+      "output_tokens": 256,
+      "ttft_seconds": 1198.231889082992,
+      "total_seconds": 1207.659766333003,
+      "spark_prefill_seconds": 1186.562457527034,
+      "fetch_seconds": 1196.3360773750173,
+      "transport_overhead_seconds": 9.773619847983355,
+      "ingest_seconds": 0.56038091701339,
+      "cache_bytes": 3296673792,
+      "imported_tokens": 65535,
+      "decode_tokens_per_second": 27.047445913628156,
+      "finish_reason": "length",
+      "peak_bytes": 69755069324,
+      "prompt_sha256": "abf600d22dc14d0731f0600f6987f5384d6f09ce5aaa3816d99708df4c2c06a7",
+      "model": "pipenetwork/Laguna-S-2.1-MLX-4bit",
+      "revision": "5544297f819d50330bc3616dd15cbc7edb598b2f",
+      "chunk": 512
+    }
+  ]
+}

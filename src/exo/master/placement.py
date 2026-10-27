@@ -227,6 +227,32 @@ def place_instance(
             if set(cycle.node_ids).issubset(allowed_nodes)
         ]
 
+    # Filter availability before memory and cycle-size preferences so a reserved
+    # singleton cannot hide a usable multi-node inference placement.
+    required_backends = set(INSTANCE_META_BACKENDS[command.instance_meta]) & set(
+        command.model_card.backends
+    )
+    if not required_backends:
+        raise ValueError(
+            f"Model {command.model_card.model_id} backends "
+            f"{sorted(b.value for b in command.model_card.backends)} cannot satisfy engine "
+            f"{command.instance_meta.value} which requires "
+            f"{sorted(b.value for b in INSTANCE_META_BACKENDS[command.instance_meta])}"
+        )
+    candidate_cycles = [
+        cycle
+        for cycle in candidate_cycles
+        if all(
+            set((node_backends or {}).get(node_id, list(Backend))) & required_backends
+            for node_id in cycle
+        )
+    ]
+    if not candidate_cycles:
+        raise ValueError(
+            f"No cycle where every node supports a backend in "
+            f"{sorted(b.value for b in required_backends)} for {command.model_card.model_id}"
+        )
+
     # Reserve drafter-eligible nodes for the drafter rank when possible, so
     # the placement layer doesn't accidentally pull a drafter-eligible node
     # into the target cycle and then degrade because no eligible host
@@ -376,29 +402,6 @@ def place_instance(
             )
 
     smallest_cycles = get_smallest_cycles(cycles_with_sufficient_memory)
-    required_backends = set(INSTANCE_META_BACKENDS[command.instance_meta]) & set(
-        command.model_card.backends
-    )
-    if not required_backends:
-        raise ValueError(
-            f"Model {command.model_card.model_id} backends "
-            f"{sorted(b.value for b in command.model_card.backends)} cannot satisfy engine "
-            f"{command.instance_meta.value} which requires "
-            f"{sorted(b.value for b in INSTANCE_META_BACKENDS[command.instance_meta])}"
-        )
-    smallest_cycles = [
-        cycle
-        for cycle in smallest_cycles
-        if all(
-            set((node_backends or {}).get(node_id, list(Backend))) & required_backends
-            for node_id in cycle
-        )
-    ]
-    if not smallest_cycles:
-        raise ValueError(
-            f"No cycle where every node supports a backend in "
-            f"{sorted(b.value for b in required_backends)} for {command.model_card.model_id}"
-        )
 
     rdma_ctl_status = node_rdma_ctl or {}
 
@@ -548,6 +551,7 @@ def place_instance(
         on_drafter_placement_degraded=on_drafter_placement_degraded,
         download_status=download_status or {},
         resolved_eligible_nodes=resolved_eligible_nodes,
+        node_backends=node_backends,
     )
 
     # Codex P1.4: under the V3+ wire, single-rank target cycles always
@@ -644,6 +648,7 @@ def _select_drafter_placement(
     on_drafter_placement_degraded: (Callable[[DrafterPlacementDegraded], None] | None),
     download_status: Mapping[NodeId, Sequence[DownloadProgress]],
     resolved_eligible_nodes: list[NodeId] | None = None,
+    node_backends: Mapping[NodeId, list[Backend]] | None = None,
 ) -> DrafterPlacement | None:
     """Pick a drafter-eligible node for asymmetric drafter placement.
 
@@ -686,7 +691,11 @@ def _select_drafter_placement(
     fallback = _drafter_fallback(target_node_ids)
 
     alive_in_topology = set(topology.list_nodes())
-    alive_eligible = [n for n in eligible_nodes if n in alive_in_topology]
+    alive_eligible = [
+        n
+        for n in eligible_nodes
+        if n in alive_in_topology and (node_backends or {}).get(n, list(Backend))
+    ]
     if not alive_eligible:
         _emit_drafter_degraded(
             on_drafter_placement_degraded,

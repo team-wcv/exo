@@ -8,7 +8,6 @@ Environment=PYTHONPATH=/home/wc-spark/.orchestraitor/deployments/exo-qwen38-pref
 Environment=ENABLE_DISAGGREGATION=true
 Environment=EXO_REACHABILITY_ALLOWED_CIDRS=192.168.1.0/24,192.168.0.0/24,10.254.42.0/30
 Environment=EXO_PREFILL_CHUNK_SIZE=256
-Environment=EXO_QWEN_CUDA_GATED_DELTA=1
 Type=simple
 Environment=EXO_HOME=.exo-bigbrain-cluster
 Environment=EXO_DEFAULT_MODELS_DIR=/home/wc-spark/.exo-pr44-benchmark-models
