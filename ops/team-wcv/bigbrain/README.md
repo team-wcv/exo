@@ -153,6 +153,48 @@ file and the backed-up startup configuration for rollback. Verify `/node_id`,
 the peer server's `/health`, stable launchd PIDs, and four-node topology after
 restart. Do not stop `rapportd` to make EXO's old port available.
 
+## Spark prefill model guidance
+
+The dashboard's **Load Model → Compare Spark prefill models** link opens the
+model picker's **Spark prefill** view. Each exact variant has separate columns
+for **Twins** (smbp + smbpt over RDMA) and **Studio** decode.
+
+- **Verified** records a successful inference on this fleet for that exact
+  variant and route. It is independent of current availability and is not a
+  performance recommendation. The current verified entry is Qwen3.8 Flash Next
+  mixed 4/8-bit on the Twins, backed by readable output from the October 23
+  reference-recurrence run. The experimental CUDA recurrence is unverified;
+  its accelerated split-route receipts returned invalid text. Studio remains
+  explicitly unverified for this variant.
+- **Route ready** requires a matching live prefill/decode link, matching model
+  IDs, ready/running runners, an advertised prefill port, fresh nodes, supported
+  node backends, and the required network/RDMA paths. Shard metadata must prove
+  full-layer tensor decode on the Twins or a full-model single-rank Studio
+  decoder, with matching complete layer coverage on Spark. A JACCL communicator
+  alone is not sufficient: pipeline-over-JACCL and unknown layouts are blocked.
+- **Memory candidate** is only a capacity estimate. Spark must hold the full
+  checkpoint; Twins estimates divide weights across two ranks. At least 8 GiB
+  or 10% of each device's memory is reserved. Context, cache layout, backend
+  model support and replication can require more memory. **Free memory needed**
+  distinguishes total capacity from current availability. Matching ready model
+  copies already resident on the required devices are credited rather than
+  counting their weights twice; execution headroom is still reserved.
+- Unsupported cache types, missing tensor support, offline nodes, unavailable
+  backends and missing network/RDMA paths are shown explicitly. Unknown models
+  are never marked verified merely because they fit.
+
+Selecting a model retains the normal checkpoint-selection behavior; this view
+does not create placements, change prefill policy, or claim an untested route
+works. Existing active inference is preserved while the dashboard is deployed.
+Verification evidence is curated in `dashboard/src/lib/utils/spark-prefill.ts`;
+extend it only after a real production request with useful output and
+cache-ingestion confirmation on every decode rank. Revalidate after changing the checkpoint or runtime.
+
+Run `npm run test:spark-prefill` in `dashboard/` (validated with Node 25.9) to check route
+classification, plus `npm run check` and `npm run build`. Browser acceptance
+covers the live route, stale/offline transitions, search/filter behavior,
+selection without API mutations, and the mobile layout.
+
 ## Dashboard asset continuity
 
 An existing Chrome tab can load cached bootstrap code that references a previous
