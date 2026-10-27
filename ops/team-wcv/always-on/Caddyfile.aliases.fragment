@@ -1,0 +1,17 @@
+# BEGIN team-wcv inference aliases
+http://spark.localhost:18888, http://laguna.localhost:18888 {
+	rewrite * /spark{uri}
+	reverse_proxy https://bigbrain.taile43e67.ts.net {
+		header_up Host bigbrain.taile43e67.ts.net
+		flush_interval -1
+	}
+}
+
+http://studio-ai.localhost:18888 {
+	rewrite * /studio{uri}
+	reverse_proxy https://bigbrain.taile43e67.ts.net {
+		header_up Host bigbrain.taile43e67.ts.net
+		flush_interval -1
+	}
+}
+# END team-wcv inference aliases

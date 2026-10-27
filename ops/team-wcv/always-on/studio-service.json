@@ -1,0 +1,26 @@
+{
+  "id": "laguna-studio",
+  "title": "Laguna on Studio",
+  "description": "A dedicated large-model worker for coding and review.",
+  "model_id": "laguna-studio",
+  "model_label": "Laguna S 2.1 \u00b7 118B \u00b7 5-bit \u00b7 256K context",
+  "health_path": "health",
+  "require_loaded_model": true,
+  "links": [
+    {
+      "label": "Bigbrain \u00b7 Twins",
+      "local": "http://bigbrain.localhost:18888/",
+      "tailnet": "https://bigbrain.taile43e67.ts.net/twins/"
+    },
+    {
+      "label": "Laguna \u00b7 Spark",
+      "local": "http://spark.localhost:18888/",
+      "tailnet": "https://bigbrain.taile43e67.ts.net/spark/"
+    },
+    {
+      "label": "Laguna \u00b7 Studio",
+      "local": "http://studio-ai.localhost:18888/",
+      "tailnet": "https://bigbrain.taile43e67.ts.net/studio/"
+    }
+  ]
+}

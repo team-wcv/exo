@@ -25,7 +25,6 @@ from exo.worker.disaggregated.protocol import (
     write_message,
 )
 from exo.worker.engines.mlx.types import KVCacheType
-from exo.worker.runner.bootstrap import logger
 
 _STR_TO_MX: dict[DType, mx.Dtype] = {
     "bfloat16": mx.bfloat16,
@@ -101,6 +100,52 @@ def nhd_to_bhsd(t: mx.array) -> mx.array:
     return mx.expand_dims(mx.transpose(t, (1, 0, 2)), 0)
 
 
+def _rotating_prefix_window(
+    cache: RotatingKVCache, offset: int
+) -> tuple[mx.array, mx.array]:
+    """Normalize the retained ring window without confusing storage with position."""
+    if cache.keys is None or cache.values is None:
+        raise ValueError("Cannot export an empty rotating attention cache")
+
+    def ordered(values: mx.array) -> mx.array:
+        if cache._idx == int(values.shape[2]):
+            return values
+        if cache._idx < cache.offset:
+            return mx.concatenate(
+                [
+                    values[:, :, : cache.keep, :],
+                    values[:, :, cache._idx :, :],
+                    values[:, :, cache.keep : cache._idx, :],
+                ],
+                axis=2,
+            )
+        return values[:, :, : cache._idx, :]
+
+    keys = ordered(cache.keys)
+    values = ordered(cache.values)
+    stored = int(keys.shape[2])
+    if int(values.shape[2]) != stored:
+        raise ValueError("Rotating cache key/value lengths differ")
+    retained = min(offset, int(cache.max_size))
+    kept = min(int(cache.keep), retained)
+    stored_keep = min(int(cache.keep), stored)
+    tail_start = int(cache.offset) - (stored - stored_keep)
+    needed_start = offset - (retained - kept)
+    if offset > cache.offset or (retained > kept and needed_start < tail_start):
+        raise ValueError(
+            f"Cannot reconstruct rotating cache at offset {offset}: "
+            f"available tail starts at {tail_start}, needed {needed_start}"
+        )
+    begin = stored_keep + needed_start - tail_start
+    end = stored_keep + offset - tail_start
+    if retained == kept:
+        return keys[:, :, :kept, :], values[:, :, :kept, :]
+    return (
+        mx.concatenate([keys[:, :, :kept, :], keys[:, :, begin:end, :]], axis=2),
+        mx.concatenate([values[:, :, :kept, :], values[:, :, begin:end, :]], axis=2),
+    )
+
+
 def send_mlx_kv_cache(
     stream: BinaryIO,
     caches: KVCacheType,
@@ -124,9 +169,22 @@ def send_mlx_kv_cache(
                     offset = min(offset, max_tokens)
                 if offset <= start_pos:
                     continue
+                logical_tokens = offset - start_pos
+                if tokens_sent and logical_tokens != tokens_sent:
+                    raise ValueError(
+                        f"Attention cache layer {layer_idx} covers {logical_tokens} "
+                        f"new tokens; expected {tokens_sent}"
+                    )
+                tokens_sent = logical_tokens
                 with mx.stream(mx.Device(mx.cpu)):
-                    k = mx.array(keys[:, :, start_pos:offset, :])
-                    v = mx.array(values[:, :, start_pos:offset, :])
+                    if isinstance(c, RotatingKVCache):
+                        # A sliding layer sends its complete retained window,
+                        # including on an incremental full-cache transfer.
+                        k, v = _rotating_prefix_window(c, offset)
+                        k, v = mx.array(k), mx.array(v)
+                    else:
+                        k = mx.array(keys[:, :, start_pos:offset, :])
+                        v = mx.array(values[:, :, start_pos:offset, :])
                     k_nhd = bhsd_to_nhd(k)
                     v_nhd = bhsd_to_nhd(v)
                     mx.eval(k_nhd, v_nhd)
@@ -143,11 +201,6 @@ def send_mlx_kv_cache(
                     keys=array_to_bytes(k_nhd),
                     values=array_to_bytes(v_nhd),
                 )
-                if tokens_sent != 0 and num_tokens != tokens_sent:
-                    logger.critical(
-                        f"Unexpected number of tokens sent {num_tokens} != {tokens_sent}"
-                    )
-                tokens_sent = num_tokens
                 indexer = getattr(c, "indexer", None)
                 indexer_state: object = getattr(indexer, "state", None)
                 if isinstance(indexer_state, mx.array):

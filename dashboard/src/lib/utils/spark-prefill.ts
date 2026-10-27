@@ -77,7 +77,7 @@ export interface RouteAssessment {
 const VERIFIED: Record<string, Partial<Record<DecodeRoute, string>>> = {
   "pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit": {
     twins:
-      "Verified 23 Oct 2026 on this fleet, with the mixed 4/8-bit checkpoint. Both Mac decode ranks imported Spark's cache.",
+      "Verified 23 Oct 2026 on this fleet using the reference recurrence and mixed 4/8-bit checkpoint. Both Mac decode ranks imported Spark's cache and returned readable text. Experimental CUDA recurrence is not verified.",
   },
 };
 
