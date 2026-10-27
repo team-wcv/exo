@@ -13,7 +13,11 @@ from anyio.streams.buffered import BufferedByteReceiveStream
 from loguru import logger
 from pydantic import ValidationError
 
-from exo.shared.constants import EXO_CONFIG_FILE, EXO_DEFAULT_MODELS_DIR
+from exo.shared.constants import (
+    EXO_CONFIG_FILE,
+    EXO_DEFAULT_MODELS_DIR,
+    EXO_INFERENCE_DISABLED,
+)
 from exo.shared.types.backends import Backend
 from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import (
@@ -374,6 +378,8 @@ class NodeBackends(TaggedModel):
 
     @classmethod
     async def gather(cls) -> Self:
+        if EXO_INFERENCE_DISABLED:
+            return cls(backends=[])
         backends: list[Backend] = [Backend.MlxCpu]
         if IS_DARWIN:
             backends.append(Backend.MlxMetal)

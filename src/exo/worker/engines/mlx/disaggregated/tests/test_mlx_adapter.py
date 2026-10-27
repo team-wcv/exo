@@ -2,6 +2,7 @@ import io
 
 import mlx.core as mx
 import numpy as np
+import pytest
 from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
 from exo.worker.disaggregated.protocol import (
@@ -268,3 +269,116 @@ def test_mixed_cache_roundtrip() -> None:
     assert _equal(s1, arr_b)
     _ = inject_rotating_kv_chunk
     _ = nhd_to_bhsd
+
+
+@pytest.mark.parametrize("keep", [0, 2])
+@pytest.mark.parametrize("start_pos", [0, 60])
+def test_wrapped_rotating_transfer_preserves_position_and_next_update(
+    keep: int, start_pos: int
+) -> None:
+    seq_len, window = 67, 8
+    full = _make_kv_cache(seq_len, 2, 4)
+    assert full.keys is not None and full.values is not None
+    rotating = RotatingKVCache(max_size=window, keep=keep)
+    for position in range(seq_len):
+        values = mx.full((1, 2, 1, 4), position, dtype=mx.bfloat16)
+        rotating.update_and_fetch(values, values + 100)
+    positions = [*range(keep), *range(seq_len - (window - keep), seq_len)]
+    expected_keys = mx.broadcast_to(
+        mx.array(positions, dtype=mx.bfloat16).reshape(1, 1, window, 1),
+        (1, 2, window, 4),
+    )
+    expected_values = expected_keys + 100
+    buf = io.BytesIO()
+    write_header(buf, Header(num_layers=2, dtype="bfloat16", start_pos=start_pos))
+    logical_tokens = send_mlx_kv_cache(
+        buf, [full, rotating], dtype="bfloat16", start_pos=start_pos
+    )
+    write_done(buf, logical_tokens)
+    result = _decode_payload(buf.getvalue())
+    assert logical_tokens == seq_len - start_pos
+    assert result.kv_chunks[1][0].num_tokens == window
+    destination_full = _make_kv_cache(start_pos, 2, 4) if start_pos else KVCache()
+    if start_pos:
+        destination_full.keys = full.keys[:, :, :start_pos, :]
+        destination_full.values = full.values[:, :, :start_pos, :]
+    destination_rotating = RotatingKVCache(max_size=window, keep=keep)
+    offset = ingest_into_mlx_cache(
+        result, [destination_full, destination_rotating], start_pos=start_pos
+    )
+    assert offset == seq_len
+    assert destination_rotating.offset == seq_len
+    assert destination_rotating._idx == window
+    assert destination_rotating.keys is not None
+    assert destination_rotating.values is not None
+    assert destination_full.keys is not None
+    assert _equal(destination_rotating.keys, expected_keys)
+    assert _equal(destination_rotating.values, expected_values)
+    assert _equal(destination_full.keys, full.keys)
+    next_value = mx.full((1, 2, 1, 4), seq_len, dtype=mx.bfloat16)
+    rotating.update_and_fetch(next_value, next_value + 100)
+    destination_rotating.update_and_fetch(next_value, next_value + 100)
+    assert rotating.keys is not None
+    next_positions = mx.array(
+        [*range(keep), *range(seq_len + 1 - (window - keep), seq_len + 1)],
+        dtype=mx.bfloat16,
+    )
+    assert _equal(mx.sort(rotating.keys[0, 0, :, 0]), next_positions)
+    assert _equal(mx.sort(destination_rotating.keys[0, 0, :, 0]), next_positions)
+
+
+def test_truncated_sliding_window_is_rejected_before_any_cache_mutation() -> None:
+    full = _make_kv_cache(64, 2, 4)
+    rotating = RotatingKVCache(max_size=8, keep=0)
+    rotating.keys = _rand((1, 2, 8, 4), mx.bfloat16)
+    rotating.values = _rand((1, 2, 8, 4), mx.bfloat16)
+    rotating.offset = 64
+    rotating._idx = 8
+    buf = io.BytesIO()
+    write_header(buf, Header(num_layers=2, dtype="bfloat16"))
+    count = send_mlx_kv_cache(buf, [full, rotating], dtype="bfloat16")
+    write_done(buf, count)
+    result = _decode_payload(buf.getvalue())
+    result.kv_chunks[1][0].num_tokens -= 1
+    target_full = _make_kv_cache(3, 2, 4)
+    target_rotating = RotatingKVCache(max_size=8, keep=0)
+    original_keys = target_full.keys
+    with pytest.raises(ValueError, match="incomplete token sequence"):
+        ingest_into_mlx_cache(result, [target_full, target_rotating])
+    assert target_full.keys is original_keys
+    assert target_full.offset == 3
+    assert target_rotating.keys is None
+
+
+def test_rotating_export_refuses_an_evicted_earlier_boundary() -> None:
+    rotating = RotatingKVCache(max_size=8, keep=0)
+    for position in range(64):
+        values = mx.full((1, 2, 1, 4), position, dtype=mx.bfloat16)
+        rotating.update_and_fetch(values, values)
+    with pytest.raises(ValueError, match="Cannot reconstruct rotating cache"):
+        send_mlx_kv_cache(io.BytesIO(), [rotating], dtype="bfloat16", max_tokens=60)
+
+
+@pytest.mark.parametrize(
+    "start_pos,seq_len,window", [(0, 67, 8), (4, 6, 16), (60, 67, 8)]
+)
+def test_rotating_only_transfer_uses_logical_offset(
+    start_pos: int, seq_len: int, window: int
+) -> None:
+    source = RotatingKVCache(max_size=window, keep=0)
+    for position in range(seq_len):
+        value = mx.full((1, 2, 1, 4), position, dtype=mx.bfloat16)
+        source.update_and_fetch(value, value + 100)
+    buf = io.BytesIO()
+    write_header(buf, Header(num_layers=1, dtype="bfloat16", start_pos=start_pos))
+    count = send_mlx_kv_cache(buf, [source], dtype="bfloat16", start_pos=start_pos)
+    write_done(buf, count)
+    result = _decode_payload(buf.getvalue())
+    assert count == seq_len - start_pos
+    destination = RotatingKVCache(max_size=window, keep=0)
+    assert ingest_into_mlx_cache(result, [destination], start_pos=start_pos) == seq_len
+    assert destination.keys is not None
+    assert destination.values is not None
+    expected = mx.arange(max(0, seq_len - window), seq_len, dtype=mx.bfloat16)
+    assert _equal(destination.keys[0, 0, :, 0], expected)
+    assert _equal(destination.values[0, 0, :, 0], expected + 100)

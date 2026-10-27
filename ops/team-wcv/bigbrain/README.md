@@ -1,6 +1,19 @@
 # Bigbrain EXO fleet
 
-## Current shared deployment (2026-10-16)
+## Current service allocation (2026-10-24)
+
+The Twins serve Qwen with local prefill and RDMA tensor decode. Bigbrain’s root
+and `/twins/` now choose a healthy API on smbp or smbpt; `/spark/` serves native
+Laguna and `/studio/` serves Studio. The `/laguna/` path remains compatible. Spark and Studio
+now provide independent, persistent 118B Laguna workers with dedicated browser
+and API paths. Spark remains visible in EXO as a reserved observer with no
+inference backend. See the [always-on service runbook](../always-on/README.md)
+for the current allocation, startup pins, client profiles, and acceptance.
+
+The original disaggregated configuration below records the October 16–18
+validation and its recovery procedure. It is not the current default placement.
+
+## Original shared deployment (2026-10-16)
 
 The operator dashboard at `http://bigbrain.localhost:18888/` serves one shared
 `wc-bigbrain` cluster. Studio is the preferred master; smbp, smbpt, and Spark
@@ -56,9 +69,9 @@ source overlay hashes. Startup files select both with `PYTHONPATH`; preserve
 that pairing during upgrades. Prior startup configurations and source revisions
 are backed up alongside the deployment.
 
-The standalone Spark Laguna unit `vllm-laguna-current-256k.service` is stopped and
-disabled with operator approval to make memory available to EXO. Its restore
-configuration is recorded in the earlier `exo-qwen27b-20261016` deployment backup.
+The standalone Spark Laguna unit was stopped for this original EXO validation.
+It is now enabled and running with failure recovery, and Spark is reserved from
+EXO inference. The October 24 runbook above supersedes the former stopped state.
 
 Validation must use the operator URL: inspect `/state`, `/v1/feature-flags`, and
 `/v1/instance-links`, then send a long uncached prompt and verify successful remote
@@ -280,3 +293,32 @@ existing Qwen runners `RunnerReady`.
 
 Do not add bootstrap peers to the standalone profiles unless cross-host placement is an
 intentional, reviewed change.
+
+## Dead runner queue recovery (2026-10-24)
+
+An event-delivery watchdog failure exposed a shutdown defect on both Twins:
+their APIs closed, but Python remained in
+`multiprocessing.util._exit_function -> Queue._finalize_join -> Thread.join`.
+A live `py-spy dump` showed a feeder blocked writing to a runner that had already
+exited. The process had logged `EXO Shutdown complete`, but launchd still saw a
+live job, so its existing KeepAlive policy could not recover it.
+
+Runner teardown now aborts its interprocess channels after stopping the runner.
+This unregisters the unbounded multiprocessing feeder join for messages that
+can no longer be delivered. Ordinary channel close/join behavior is unchanged.
+The regression test starts a real consumer, lets it exit, queues a 2 MiB message,
+and checks that the producer interpreter exits after aborting either endpoint.
+
+The pure-Python patch was installed on smbp and smbpt after verifying that both
+original files matched the source base. Original files and the deployment hash
+manifest are preserved in
+`~/.orchestraitor/deployments/exo-runner-queue-shutdown-20261025/` on each host.
+The matching native networking artifact and launchd configurations were retained.
+
+Both workers rejoined the Studio master. The large Qwen model was restored as
+instance `8cd6efb5-df5d-4e7b-bb23-31db99e2f0e2`, with two tensor ranks covering
+all 48 layers, JACCL devices `rdma_en1`/`rdma_en2`, and Thunderbolt coordinator
+`10.254.42.1:52930`. An actual request through
+`https://bigbrain.taile43e67.ts.net/twins/v1/chat/completions` returned the expected
+`TWINS_RECOVERY_OK` response in 1.72 seconds. This validates recovery and serving;
+the tiny response is not a throughput benchmark.

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Local coding service</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <nav aria-label="Inference services" id="navigation"></nav>
+      <header>
+        <div>
+          <p class="eyebrow">ORCHESTRAITOR · LOCAL INFERENCE</p>
+          <h1 id="title">Connecting…</h1>
+          <p id="description"></p>
+        </div>
+        <span id="status" role="status">Checking service</span>
+      </header>
+      <div class="toolbar">
+        <span id="model"></span
+        ><button id="clear" type="button">New chat</button>
+      </div>
+      <section id="conversation" aria-label="Conversation" aria-live="polite">
+        <p class="empty">
+          Ask for an implementation, a code review, or help debugging a problem.
+        </p>
+      </section>
+      <form id="composer">
+        <label class="sr-only" for="prompt">Message</label
+        ><textarea
+          id="prompt"
+          rows="3"
+          placeholder="Describe the task or paste code…"
+          required
+        ></textarea>
+        <div class="composer-actions">
+          <span id="metrics" role="status"></span
+          ><button id="cancel" type="button" hidden>Cancel</button
+          ><button id="send" type="submit" disabled>Send</button>
+        </div>
+      </form>
+      <details class="connection">
+        <summary>Connect an agent or application</summary>
+        <p>OpenAI-compatible API base URL</p>
+        <code id="base-url"></code>
+        <p>Model identifier</p>
+        <code id="model-id"></code>
+        <p>
+          Access is private to your local machine or tailnet. Configure tools in
+          the calling agent.
+        </p>
+      </details>
+    </main>
+  </body>
+</html>
