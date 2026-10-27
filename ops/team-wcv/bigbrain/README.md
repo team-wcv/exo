@@ -52,6 +52,15 @@ source/native directories, so confirm those paths before installation. The
 model card belongs in `~/.exo-bigbrain-cluster/custom_model_cards/`; the worker
 publishes persisted cards to the cluster on startup.
 
+Studio's dashboard/control-plane job uses `ProcessType=Interactive`. On
+2026-10-23, its former `Background` classification was heavily throttled under
+host load: startup took minutes and API/election responses timed out. After
+changing the classification, API probes returned in 0.05–0.43 seconds and the
+four-node cluster synchronized. This classification is for the user-facing EXO
+service; the periodic reconnection guards remain background jobs. The previous
+Studio plist is saved as `studio-before-interactive.plist` in the reconnection
+deployment backup directory.
+
 The validated deployment is under
 `~/.orchestraitor/deployments/exo-qwen38-prefill-20261016/`: `current/` contains
 source based on `2c707493` plus the recorded overlay, and `native-current/`
