@@ -25,16 +25,20 @@ when discovery succeeds.
 |---|---|
 | Dashboard/API ingress | Local Caddy, Studio preferred, health-checked MacBook fallbacks |
 | Control plane | Studio; inference/control topology uses LAN addresses |
-| Large-model prefill | Spark, MLX CUDA, cache transfer over LAN |
+| Large-model prefill | Twins by default for the current Qwen variant; Spark available through an explicit link |
 | Tensor decode | smbp + smbpt, JACCL/RDMA over Thunderbolt |
 | JACCL coordinator | Reachable Thunderbolt IP, `10.254.42.1` or `10.254.42.2` |
 
 The current serving model is
 `pipenetwork/Qwen3.8-Flash-Next-MLX-mixed-4_8bit`, pinned at
-`b2c422f3c643e36f04227a64d61796b44a4b1029`. Its fleet-specific custom card names
-Spark in `prefill_eligible_nodes`; both automatic placement and explicit dashboard
-placement create or reuse a compatible prefill instance and link it to decode.
-The remote path applies to more than 1,000 uncached prompt tokens.
+`b2c422f3c643e36f04227a64d61796b44a4b1029`. Its fleet-specific custom card leaves
+`prefill_eligible_nodes` empty: October 23 measurements found local tensor prefill
+on the Twins substantially faster for this exact checkpoint. Automatic placement
+therefore does not force a Spark prefill link. Spark remains available for an
+explicit compatible link; the remote path applies to more than 1,000 uncached
+prompt tokens. The retained Spark source-only link has an empty decode list so
+normal chat selects the Twins and Spark does not become an accidental decoder.
+See the [prefill comparison and CUDA tuning report](prefill-performance-20261023.md).
 
 Persisted launchd/systemd settings use `ENABLE_DISAGGREGATION=true`,
 `EXO_HOME=.exo-bigbrain-cluster`, and allowed inference CIDRs
@@ -107,11 +111,16 @@ role in replayable state. New requests return a terminal error until a decoder
 is restored, rather than selecting the prefill server for generation. Explicit
 role reassignment through a new link remains supported.
 
-Spark sets `EXO_PREFILL_CHUNK_SIZE=256` to bound temporary activation memory for
-the large model. The remote-prefill default remains 4096 elsewhere. Large chunks
-on a nearly full Spark can trigger swapping and leave the UI at zero progress
-while the first chunk evaluates. Validate a long uncached prompt as well as short
-chat, checking memory and cache ingestion on both decode ranks.
+The historical Spark EXO startup snapshot sets `EXO_PREFILL_CHUNK_SIZE=256`
+to bound temporary activation memory. The experimental
+`EXO_QWEN_CUDA_GATED_DELTA=1` optimization is disabled in that snapshot: its
+October 23 accelerated split-route receipts contain repeated exclamation marks,
+so they do not establish useful inference or a speedup. Leave the flag unset for
+normal service use. Unsupported shapes and other models retain the reference
+implementation even when explicitly opted in. The remote-prefill default
+remains 4096 elsewhere. Large chunks on a nearly full Spark can trigger swapping
+and leave the UI at zero progress while the first chunk evaluates. Validate
+readable output as well as memory and cache ingestion on both decode ranks.
 
 Recovery acceptance through the operator URL used the original 5,815-token
 conversation: cold first text took 90.8 seconds and completion took 96.2 seconds.

@@ -74,6 +74,7 @@ from exo.worker.engines.mlx.auto_parallel import (
     pipeline_auto_parallel,
     tensor_auto_parallel,
 )
+from exo.worker.engines.mlx.gated_delta_cuda import enable_qwen_cuda_prefill
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.vendor.qwen3_5_dflash_hooks import (
     DFlashHooksNotImplementedError as _DFlashHooksNotImplementedError,
@@ -1210,6 +1211,11 @@ def load_mlx_items(
         model_path = build_model_path(target_card.model_id)
         start_time = time.perf_counter()
         model, _ = load_model(model_path, lazy=True, strict=False)
+        if enable_qwen_cuda_prefill(model):
+            logger.warning(
+                "Enabled experimental Qwen CUDA gated-delta kernel; "
+                "split-route output correctness is not verified"
+            )
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -1333,6 +1339,11 @@ def shard_and_load(
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
     model, _ = load_model(model_path, lazy=True, strict=False)
+    if enable_qwen_cuda_prefill(model):
+        logger.warning(
+            "Enabled experimental Qwen CUDA gated-delta kernel; "
+            "split-route output correctness is not verified"
+        )
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
         pass
