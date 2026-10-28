@@ -6,6 +6,7 @@ let config,
   online = false,
   selectedModel = null;
 const apiBase = new URL("v1/", window.location.href);
+const histories = new Map();
 
 function message(role, content = "") {
   byId("conversation").querySelector(".empty")?.remove();
@@ -40,24 +41,31 @@ function historyKey() {
 }
 
 function restoreHistory() {
-  history = [];
-  try {
-    const saved = JSON.parse(localStorage.getItem(historyKey()) || "[]");
-    if (Array.isArray(saved))
-      history = saved.filter(
-        (m) =>
-          m &&
-          ["user", "assistant"].includes(m.role) &&
-          typeof m.content === "string",
-      );
-  } catch {
+  const key = historyKey();
+  if (histories.has(key)) {
+    history = histories.get(key);
+  } else {
     history = [];
+    try {
+      const saved = JSON.parse(localStorage.getItem(key) || "[]");
+      if (Array.isArray(saved))
+        history = saved.filter(
+          (m) =>
+            m &&
+            ["user", "assistant"].includes(m.role) &&
+            typeof m.content === "string",
+        );
+    } catch {
+      history = [];
+    }
+    histories.set(key, history);
   }
   byId("conversation").replaceChildren();
   for (const item of history) message(item.role, item.content);
 }
 
 function save() {
+  histories.set(historyKey(), history);
   try {
     localStorage.setItem(historyKey(), JSON.stringify(history));
     byId("history-note")?.remove();
