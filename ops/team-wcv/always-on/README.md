@@ -46,6 +46,14 @@ GPU allocation unchanged; startup reported 316,212 tokens of KV capacity and
 11.5 GiB of KV memory. Its legacy `*-256k` unit/script names are retained for
 compatibility. The Twins' serving instance and RDMA transport are unchanged.
 
+## Studio model catalog update (October 28)
+
+Studio additionally serves Muse Glimmer 30B and Qwen3.8 27B through the existing
+`/studio/v1` API and a browser model selector. Laguna remains the default but
+is no longer pinned: all three are available on demand within the existing
+memory guard. This supersedes the original pinned-only Studio allocation below.
+See [the pinned revisions, settings, measured comparison and rollback](studio-models-20261028.md).
+
 ## Models and ownership
 
 | Item | Pinned revision | Capacity |

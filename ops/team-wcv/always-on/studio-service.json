@@ -1,11 +1,11 @@
 {
   "id": "laguna-studio",
-  "title": "Laguna on Studio",
-  "description": "A dedicated large-model worker for coding and review.",
+  "title": "Local models on Studio",
+  "description": "Select a local assistant for conversation, planning, coding, or review.",
   "model_id": "laguna-studio",
   "model_label": "Laguna S 2.1 \u00b7 118B \u00b7 5-bit \u00b7 256K context",
   "health_path": "health",
-  "require_loaded_model": true,
+  "require_loaded_model": false,
   "links": [
     {
       "label": "Bigbrain \u00b7 Twins",
@@ -21,6 +21,21 @@
       "label": "Laguna \u00b7 Studio",
       "local": "http://studio-ai.localhost:18888/",
       "tailnet": "https://bigbrain.taile43e67.ts.net/studio/"
+    }
+  ],
+  "load_on_demand": true,
+  "models": [
+    {
+      "id": "laguna-studio",
+      "label": "Laguna S 2.1 \u00b7 118B \u00b7 5-bit \u00b7 256K"
+    },
+    {
+      "id": "Muse-Glimmer-30B-4bit",
+      "label": "Muse Glimmer \u00b7 30B \u00b7 4-bit \u00b7 128K"
+    },
+    {
+      "id": "Qwen3.8-27B-4bit",
+      "label": "Qwen3.8 \u00b7 27B \u00b7 4-bit \u00b7 256K"
     }
   ]
 }

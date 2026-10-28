@@ -3,8 +3,10 @@ const byId = (id) => document.getElementById(id);
 let config,
   history = [],
   controller = null,
-  online = false;
+  online = false,
+  selectedModel = null;
 const apiBase = new URL("v1/", window.location.href);
+const histories = new Map();
 
 function message(role, content = "") {
   byId("conversation").querySelector(".empty")?.remove();
@@ -32,9 +34,40 @@ function scroll() {
   const el = byId("conversation");
   el.scrollTop = el.scrollHeight;
 }
+function historyKey() {
+  return selectedModel.id === config.model_id
+    ? `local-inference-${config.id}`
+    : `local-inference-${config.id}-${selectedModel.id}`;
+}
+
+function restoreHistory() {
+  const key = historyKey();
+  if (histories.has(key)) {
+    history = histories.get(key);
+  } else {
+    history = [];
+    try {
+      const saved = JSON.parse(localStorage.getItem(key) || "[]");
+      if (Array.isArray(saved))
+        history = saved.filter(
+          (m) =>
+            m &&
+            ["user", "assistant"].includes(m.role) &&
+            typeof m.content === "string",
+        );
+    } catch {
+      history = [];
+    }
+    histories.set(key, history);
+  }
+  byId("conversation").replaceChildren();
+  for (const item of history) message(item.role, item.content);
+}
+
 function save() {
+  histories.set(historyKey(), history);
   try {
-    localStorage.setItem(`local-inference-${config.id}`, JSON.stringify(history));
+    localStorage.setItem(historyKey(), JSON.stringify(history));
     byId("history-note")?.remove();
   } catch {
     // Long conversations can exceed browser storage while inference still works.
@@ -51,6 +84,8 @@ function save() {
 }
 
 async function health() {
+  const modelId = selectedModel.id;
+  let available = false;
   try {
     const [response, readiness] = await Promise.all([
       fetch(new URL("models", apiBase), {
@@ -64,15 +99,21 @@ async function health() {
     ]);
     const result = await response.json();
     const ready = await readiness.json().catch(() => ({}));
-    online =
+    available =
       response.ok &&
       readiness.ok &&
-      (result.data || []).some((m) => m.id === config.model_id) &&
+      (result.data || []).some((m) => m.id === modelId) &&
       (!config.require_loaded_model || ready.engine_pool?.loaded_count > 0);
   } catch {
-    online = false;
+    available = false;
   }
-  byId("status").textContent = online ? "Ready" : "Starting or unavailable";
+  if (modelId !== selectedModel.id) return;
+  online = available;
+  byId("status").textContent = online
+    ? config.load_on_demand
+      ? "Available · loads on request"
+      : "Ready"
+    : "Starting or unavailable";
   byId("status").className = online ? "ready" : "";
   byId("send").disabled = !online || controller !== null;
 }
@@ -89,6 +130,7 @@ byId("composer").addEventListener("submit", async (event) => {
   controller = new AbortController();
   byId("send").disabled = true;
   byId("clear").disabled = true;
+  byId("model-picker").disabled = true;
   byId("cancel").hidden = false;
   const started = performance.now();
   let first = null,
@@ -106,7 +148,7 @@ byId("composer").addEventListener("submit", async (event) => {
       headers: { "Content-Type": "application/json" },
       signal: controller.signal,
       body: JSON.stringify({
-        model: config.model_id,
+        model: selectedModel.id,
         messages: history,
         stream: true,
         stream_options: { include_usage: true },
@@ -186,6 +228,7 @@ byId("composer").addEventListener("submit", async (event) => {
     controller = null;
     byId("cancel").hidden = true;
     byId("clear").disabled = false;
+    byId("model-picker").disabled = false;
     await health();
     byId("prompt").focus();
     scroll();
@@ -213,9 +256,37 @@ byId("prompt").addEventListener("keydown", (event) => {
   byId("title").textContent = config.title;
   document.title = config.title;
   byId("description").textContent = config.description;
-  byId("model").textContent = config.model_label;
+  const models = config.models || [
+    { id: config.model_id, label: config.model_label },
+  ];
+  selectedModel = models.find((m) => m.id === config.model_id) || models[0];
+  const picker = byId("model-picker");
+  for (const model of models) {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = model.label;
+    picker.append(option);
+  }
+  picker.value = selectedModel.id;
+  picker.hidden = models.length < 2;
+  byId("model").hidden = models.length > 1;
+  byId("model").textContent = selectedModel.label;
+  picker.addEventListener("change", async () => {
+    if (controller) {
+      picker.value = selectedModel.id;
+      return;
+    }
+    save();
+    selectedModel = models.find((m) => m.id === picker.value) || selectedModel;
+    online = false;
+    byId("send").disabled = true;
+    byId("model-id").textContent = selectedModel.id;
+    byId("metrics").textContent = "";
+    restoreHistory();
+    await health();
+  });
   byId("base-url").textContent = apiBase.href;
-  byId("model-id").textContent = config.model_id;
+  byId("model-id").textContent = selectedModel.id;
   const local = location.hostname.endsWith(".localhost");
   for (const link of config.links) {
     const a = document.createElement("a");
@@ -223,20 +294,7 @@ byId("prompt").addEventListener("keydown", (event) => {
     a.href = local ? link.local : link.tailnet;
     byId("navigation").append(a);
   }
-  try {
-    const saved = JSON.parse(
-      localStorage.getItem(`local-inference-${config.id}`) || "[]",
-    );
-    if (Array.isArray(saved))
-      history = saved.filter(
-        (m) =>
-          ["user", "assistant"].includes(m.role) &&
-          typeof m.content === "string",
-      );
-  } catch {
-    history = [];
-  }
-  for (const item of history) message(item.role, item.content);
+  restoreHistory();
   await health();
   setInterval(health, 15000);
 })().catch((error) => {
