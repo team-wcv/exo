@@ -236,3 +236,14 @@ textarea {
     overflow-wrap: anywhere;
   }
 }
+
+#model-picker {
+  min-width: 0;
+  max-width: 100%;
+  color: #e6edf3;
+  background: #18222c;
+  border: 1px solid #405266;
+  border-radius: 6px;
+  padding: 8px;
+  font: inherit;
+}
