@@ -36,6 +36,48 @@ Install `Caddyfile.bigbrain-alias.fragment` on the operator and Studio, with
 Compare existing site blocks, back them up, validate the combined candidate,
 and hot-reload Caddy. Do not append duplicate Bigbrain site definitions.
 
+## Studio Caddy startup source (October 31 repair)
+
+Studio's `homebrew.mxcl.caddy` LaunchAgent starts Caddy with
+`--config /Users/JJ/.config/caddy/Caddyfile.bigbrain`. The full fleet routes are
+maintained in `/opt/homebrew/etc/Caddyfile`. The startup file must therefore
+contain the [import wrapper](Caddyfile.studio-launcher), not an older standalone
+Bigbrain site definition. Read and back up both files before changing either;
+check symlinks and preserve unrelated sites.
+
+The October 29 Caddy restart exposed this mismatch: prior live reloads had used
+the full configuration, but launchd read the legacy file at startup. That file
+only proxied the localhost alias to obsolete `192.168.1.63:52415`; it never
+opened port 18889. The private Bigbrain gateway still targeted that missing
+listener, returning 502 for the Twins and native model routes even though the
+upstream inference services were healthy.
+
+The repair made the existing startup file import the full configuration. Caddy
+was validated and hot-reloaded through that same startup path, retaining its
+PID and ongoing inference. Use that path for subsequent validation and reloads:
+
+```sh
+caddy validate --config "$HOME/.config/caddy/Caddyfile.bigbrain" --adapter caddyfile
+caddy reload --config "$HOME/.config/caddy/Caddyfile.bigbrain" --adapter caddyfile
+```
+
+Verify the loaded LaunchAgent's `ProgramArguments`, the contents of the actual
+startup file, and Caddy's effective listeners from
+`http://127.0.0.1:2019/config/`: both `:18888` and `:18889` must be present.
+Checking a successful one-off reload alone does not establish restart recovery.
+If launchd's configured path changes later, reconcile that path explicitly.
+No intentional service restart was used for this repair's acceptance.
+The repaired `/twins/node_id`, root `/node_id`, `/studio/health`, `/spark/health`
+and localhost `/twins/node_id` returned HTTP 200. A real request through
+`https://bigbrain.taile43e67.ts.net/twins/v1/chat/completions` returned
+`TWINS_ROUTE_OK` in 2.9 seconds while both tensor ranks remained available.
+
+Backups and effective configuration snapshots are on Studio under
+`~/.orchestraitor/deployments/bigbrain-caddy-startup-20261031/`. The original
+startup file is `Caddyfile.bigbrain.before`; restoring it reintroduces the old
+routing failure, so use it only for diagnosis, not routine rollback. Keep
+Tailscale Serve/Funnel ownership and the inference service jobs unchanged.
+
 ## Current context limits (October 25)
 
 Spark now serves 294,912 tokens (288K); Studio serves 262,144 tokens (256K).
