@@ -2297,7 +2297,7 @@ _MX_TASK_ID_BYTES: Final[int] = 36
 # each task_id slot is ``_MX_TASK_ID_BYTES`` ints (one ASCII char per
 # int32 slot). A char fits trivially in int32, and using one slot per
 # char avoids endian / packing concerns at the cost of ~4x bandwidth --
-# acceptable since this only runs at admit boundaries, not per-token.
+# a small, fixed control message at admission and cancellation checks.
 _MX_AGREE_BUFFER_LEN: Final[int] = 1 + _MX_AGREE_MAX_TASKS * _MX_TASK_ID_BYTES
 
 
@@ -2359,10 +2359,9 @@ def mx_all_gather_tasks(
       task is trivially "agreed".
 
     Cost:
-      Two collectives per call (one broadcast + one all-sum), each
-      on small int32 buffers (~600 bytes). On Apple Silicon JACCL
-      this is sub-millisecond and runs only at admit boundaries,
-      not per token.
+      Two collectives per call: a 577-element int32 broadcast and a
+      16-element vote sum. Admission and token callbacks both use this
+      protocol; the synchronization fence can wait for a queued forward pass.
     """
     if group is None:
         return list(tasks), []
