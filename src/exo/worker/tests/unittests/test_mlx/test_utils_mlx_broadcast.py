@@ -131,6 +131,37 @@ class TestMxBroadcastIntListSingleRank:
 class TestMxBroadcastIntListMultiRank:
     """Task admission must stay on collectives for every MLX backend."""
 
+    def test_task_agreement_waits_for_queued_model_collectives(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class Group:
+            def rank(self) -> int:
+                return 0
+
+            def size(self) -> int:
+                return 2
+
+        pending: list[object] = [utils_mlx.mlx_lm_generation_stream, None]
+
+        def synchronize(stream: object = None) -> None:
+            if stream in pending:
+                pending.remove(stream)
+
+        def all_sum(value: mx.array, *, group: object) -> mx.array:
+            # An undrained float collective can be consumed as the int32
+            # task header. This is the invalid count seen on the Twins.
+            if pending:
+                return mx.full(value.shape, 1001667840, dtype=mx.int32)
+            return value
+
+        monkeypatch.setattr(mx, "synchronize", synchronize)
+        monkeypatch.setattr(mx.distributed, "all_sum", all_sum)
+        group = cast(mx.distributed.Group, cast(object, Group()))
+        agreed, leftover = mx_all_gather_tasks([], group)
+        assert agreed == []
+        assert leftover == []
+        assert pending == []
+
     def test_uses_all_sum_and_never_point_to_point(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

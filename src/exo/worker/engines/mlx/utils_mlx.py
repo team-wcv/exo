@@ -28,6 +28,7 @@ try:
 except ImportError:
     pass  # transformers < 5.0 or bytes_to_unicode not available
 
+from mlx_lm.generate import generation_stream as mlx_lm_generation_stream
 from mlx_lm.models.cache import KVCache
 from mlx_lm.models.deepseek_v3 import DeepseekV3Model
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -1953,9 +1954,21 @@ def mlx_cleanup(
     gc.collect()
 
 
+def _synchronize_before_control_collective() -> None:
+    """Finish queued model work before reusing its group for control messages.
+
+    MLX LM queues the next token before yielding the current one. Admission,
+    cancellation and completion barriers can therefore run while that forward
+    pass still has tensor collectives pending, including on another stream.
+    """
+    mx.synchronize(mlx_lm_generation_stream)
+    mx.synchronize()
+
+
 def mx_any(bool_: bool, group: mx.distributed.Group | None) -> bool:
     if group is None:
         return bool_
+    _synchronize_before_control_collective()
     num_true = mx.distributed.all_sum(mx.array(bool_), group=group)
     mx.eval(num_true)
     return num_true.item() > 0
@@ -1964,6 +1977,7 @@ def mx_any(bool_: bool, group: mx.distributed.Group | None) -> bool:
 def mx_barrier(group: mx.distributed.Group | None):
     if group is None:
         return
+    _synchronize_before_control_collective()
     mx.eval(mx.distributed.all_sum(mx.array(1.0), group=group))
 
 
@@ -2006,10 +2020,9 @@ def mx_broadcast_int_list(
 
     The per-token speculative-decoding hot path does not use this
     helper; it uses :func:`target_peer_broadcast_int_list` over a
-    dedicated TCP fanout. Consequently the historical int/float
-    collective cross-talk that motivated the point-to-point branch
-    cannot occur here: this helper runs only at task admission and
-    cancellation boundaries, before model forward collectives.
+    dedicated TCP fanout. Task admission and cancellation also run from token
+    callbacks and between generator steps. Queued model work must finish
+    before issuing their integer collectives on the same distributed group.
 
     The fixed-length contract means the caller pads to ``length`` on
     root and both ranks agree on ``length`` ahead of time, which keeps
@@ -2063,6 +2076,7 @@ def mx_broadcast_int_list(
         # ``cast`` for the type-checker: validated above.
         _validate_broadcast_values(cast(list[int], values))
 
+    _synchronize_before_control_collective()
     if is_root:
         local = mx.array(cast(list[int], values), dtype=mx.int32)
     else:
@@ -2203,13 +2217,8 @@ def mx_all_sum_int_list(
     _validate_broadcast_values(values)
     if group is None:
         return list(values)
+    _synchronize_before_control_collective()
     buffer = mx.array(values, dtype=mx.int32)
-    # ``all_sum`` is acceptable here because :func:`mx_all_sum_int_list`
-    # is only called from the task agreement protocol, which fires at
-    # admit boundaries -- not on the per-token spec-decode hot path.
-    # The thrash that broke the broadcast helper (interleaving with
-    # the model's TP all-reduce 100+ times per round) does not apply
-    # at this call frequency.
     summed = mx.distributed.all_sum(buffer, group=group)
     mx.eval(summed)
     return [int(v) for v in cast(list[int], summed.tolist())]

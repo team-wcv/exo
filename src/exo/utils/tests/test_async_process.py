@@ -1,8 +1,10 @@
 import contextlib
 import os
 import signal
+import subprocess
 import sys
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 
 import pytest
 from _pytest.capture import CaptureFixture
@@ -12,6 +14,51 @@ from exo.utils.async_process import (
     AsyncProcess,
 )
 from exo.utils.channels import MpSender, Receiver, mp_channel
+
+
+def test_spawn_stdio_does_not_require_resource_sharer(tmp_path: Path) -> None:
+    """A broken FD-sharing connection must not prevent replacement runners."""
+    script = tmp_path / "broken_resource_sharer.py"
+    script.write_text(
+        """
+import multiprocessing as mp
+from multiprocessing import resource_sharer
+import anyio
+from exo.utils.async_process import AsyncProcess
+
+def unavailable(*args, **kwargs):
+    raise ConnectionAbortedError('resource sharing is unavailable')
+
+# Also applied when spawn imports this module in the child, before its target.
+resource_sharer._resource_sharer.get_connection = unavailable
+
+def child():
+    print('replacement-runner-ready', flush=True)
+
+async def main():
+    process = AsyncProcess(child)
+    async with anyio.create_task_group() as tg:
+        await tg.start(process.run)
+        with anyio.fail_after(10):
+            output = b''
+            async for chunk in process.stdout:
+                output += chunk
+            assert await process.wait() == 0
+            assert b'replacement-runner-ready' in output
+
+if __name__ == '__main__':
+    mp.set_start_method('spawn')
+    anyio.run(main)
+"""
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[3])},
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _write_to_stdio(prefix: str, *, stderr_suffix: str) -> None:
