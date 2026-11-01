@@ -47,16 +47,28 @@ The Python suite passed 1,264 tests, with 15 skipped and 212 deselected.
 Basedpyright and Ruff pass; changed files pass Ruff formatting. Nix is not
 installed on the operator machine.
 
-The patched deployment passed a controlled fault test: after streamed generation
+The initial Python-patched deployment passed a controlled fault test: after streamed generation
 started, one known model child was terminated with SIGTERM. The request received
 an explicit error; both ranks automatically reconnected, loaded and returned
 ready after 40.39 seconds, retaining the instance. Parent EXO launchd PIDs were
 unchanged. No manual instance recreation or parent restart was used during
 this recovery test.
 
-Sustained request, cancellation and concurrency acceptance is recorded separately
-in the operator receipts; consult the final status rather than assuming a
-started soak completed successfully.
+The final native profile passed a 1,619-second soak through the public
+`/twins/v1/chat/completions` route: 54 requests, comprising 24 long generations
+of 1,024 tokens, 16 requests in four-way bursts, eight known-answer probes,
+four explicit cancellations, and two client disconnects. It reported 25,566
+output tokens, excluding unreported tokens from cancelled streams. Every
+known-answer probe was correct, no request reported a runtime error, and the
+mapped model runners returned ready. A separate eight-request concurrent burst
+also passed all exact-answer checks in 27.4 seconds.
+
+Four additional cancel-and-follow-up cycles passed on the final runtime. An
+uncached 15,532-input-token lookup returned the exact expected value in 20.64
+seconds while the soak was active. Unique-data JACCL checks passed 120 cases
+per rank across float32, float16 and bfloat16, including buffers up to 64 MB.
+These are bounded acceptance checks, not proof of indefinite uptime or every
+context length. Failed earlier runs remain preserved separately.
 
 ## Cancellation race found by the initial soak
 
@@ -74,7 +86,7 @@ The fix schedules cancellation delivery when the ordered event is applied and
 makes supervisor delivery idempotent so the planner cannot enqueue a duplicate.
 This change does not depend on retaining a deleted task or delaying cleanup.
 
-## Native runtime finding and candidate
+## Native runtime finding and rollout
 
 The updated cancellation soak reproduced the native broadcast error again at
 its second four-request burst (count `1039154603`). Python fences alone are
@@ -96,14 +108,16 @@ were relocated, the original environments remain untouched, and `uv run
 --no-sync` was checked with `UV_PROJECT_ENVIRONMENT` selecting the candidate.
 The candidate passes GPU arithmetic and 2,000-round JACCL tests. The deployment
 snapshot selects the candidate environment and sets `EXO_FAST_SYNCH=false` to
-use the standard CPU/GPU synchronization path. Full-model acceptance is required
-before treating this candidate as the final runtime. The first full-model
+use the standard CPU/GPU synchronization path. Full-model acceptance is recorded above. The first full-model
 probe produced a coherent answer; the candidate took 6.14 seconds versus
 3.91 seconds for the previous profile (78 versus 80 generated tokens; reported
 decode rates 19.28 versus 40.26 tok/s). This is one short sample, not a general
 benchmark. The conservative synchronization setting trades throughput for
 removing the custom fast-fence path. Four explicit cancel-and-follow-up cycles
-also passed; the longer native-runtime soak is still pending.
+also passed. The same full-model soak that failed on the custom runtime
+completed on this profile. The effects of the MLX upgrade and synchronization
+setting have not been isolated from each other; retain this tested combination
+until any performance change passes equivalent acceptance.
 
 ## Deployment and rollback
 
@@ -111,7 +125,7 @@ Four Python files were overlaid on the existing deployed baseline:
 `src/exo/utils/async_process.py`, the control-collective sections of
 `src/exo/worker/engines/mlx/utils_mlx.py`, `src/exo/worker/main.py`, and
 `src/exo/worker/runner/supervisor.py`. The EXO Rust/native artifact and model
-weights remain unchanged. The native-runtime candidate now selects MLX and
+weights remain unchanged. The selected native runtime uses MLX and
 mlx-metal 0.32.4 in a private environment; the original development environment
 is retained for rollback. MLX LM remains 0.31.3.
 
@@ -153,10 +167,24 @@ and preserve unrelated subsequent edits. Do not mix arbitrary source/native
 builds or change tensor/RDMA to pipeline/TCP as a workaround.
 
 Receipts on the operator: `~/.cache/exo/twins-stability-20261031/`, including
-`fault-probe-result.json`, `soak-status.json` and `soak-requests.jsonl`.
+`fault-probe-result.json` and the failed initial `soak-status.json`;
+`validation-v2/` preserves the second native failure, and `validation-v3/`
+contains the final successful soak, cancellation, capacity and context checks.
 The fault-probe script contains the one-time child PID used for that run and
 must not be rerun unchanged. Task: `6ae678a63e53081e51971459`.
 PR: https://github.com/team-wcv/exo/pull/60.
+
+The final runtime also passed a second controlled fault test, this time
+terminating the smbp model child during generation. Both ranks rebuilt under
+the same instance in 26.86 seconds, with parent launchd PIDs unchanged. A fresh
+request then returned `TWINS_STABILITY_VERIFIED`. Final startup settings and
+native library paths were read back on both hosts, and the Twins localhost
+alias plus Studio/Spark health endpoints remained available. These checks are
+in `validation-v3/fault-probe-result.json` and `final-request.json`.
+
+When inspecting state, assess only the runner IDs referenced by the current
+model instance. Historical status entries from deleted instances can remain in
+the event state and do not establish the current placement's readiness.
 
 Both Macs are required for this sharded model. API upstream failover does not
 provide single-Mac inference; a failed rank can interrupt its current request
