@@ -43,7 +43,7 @@ integer control collectives passed on the original implementation. It did not
 reproduce the original corruption. The ordering fence closes an exposed hazard;
 it is not proof that every native RDMA failure is eliminated.
 
-The Python suite passed 1,260 tests, with 15 skipped and 212 deselected.
+The Python suite passed 1,264 tests, with 15 skipped and 212 deselected.
 Basedpyright and Ruff pass; changed files pass Ruff formatting. Nix is not
 installed on the operator machine.
 
@@ -57,6 +57,47 @@ this recovery test.
 Sustained request, cancellation and concurrency acceptance is recorded separately
 in the operator receipts; consult the final status rather than assuming a
 started soak completed successfully.
+
+## Cancellation race found by the initial soak
+
+After six 1,024-token requests and a known-answer probe, the first explicit
+cancellation closed its client stream but did not stop either model rank.
+The readiness check timed out after 30 seconds; both ranks subsequently finished
+all 1,024 tokens and returned ready. This was a failed cancellation acceptance,
+not a permanent model hang. The failed run is preserved in `soak-status.json`.
+
+The API sends `TaskCancelled`, closes its response, then cleanup sends
+`TaskFinished`. Workers could consume the resulting Cancelled and Deleted
+events before the planner's next tick, losing the cancellation intent. A
+regression test reproduces that event ordering and fails on the old worker.
+The fix schedules cancellation delivery when the ordered event is applied and
+makes supervisor delivery idempotent so the planner cannot enqueue a duplicate.
+This change does not depend on retaining a deleted task or delaying cleanup.
+
+## Native runtime finding and candidate
+
+The updated cancellation soak reproduced the native broadcast error again at
+its second four-request burst (count `1039154603`). Python fences alone are
+therefore insufficient. The runner rebuilt automatically after this real fault.
+
+The deployed MLX was a custom `rltakashige/mlx-jaccl-fix-small-recv` build at
+`cc3f3e60`, including altered CPU/GPU fence and RDMA mesh code. Its shipped
+`Device`/`Stream` ordering operators contain the defect documented in upstream
+[MLX issue 4083](https://github.com/ml-explore/mlx/issues/4083). A C++ probe
+compiled against the installed headers returned both `cpu < gpu` and `gpu < cpu`
+as true. The same probe against official MLX 0.32.4 returns a strict ordering.
+This proves an affected native component, not that this comparator alone caused
+the observed EXO header corruption.
+
+Private APFS clones of the existing environments were prepared under
+`~/.orchestraitor/deployments/twins-mlx-stable-20261031/venv` on both Macs.
+Only MLX and mlx-metal change to 0.32.4; MLX LM stays 0.31.3. Entry-point shebangs
+were relocated, the original environments remain untouched, and `uv run
+--no-sync` was checked with `UV_PROJECT_ENVIRONMENT` selecting the candidate.
+The candidate passes GPU arithmetic and 2,000-round JACCL tests. The deployment
+snapshot selects the candidate environment and sets `EXO_FAST_SYNCH=false` to
+use the standard CPU/GPU synchronization path. Full-model acceptance is required
+before treating this candidate as the final runtime.
 
 ## Deployment and rollback
 
