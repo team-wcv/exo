@@ -13,6 +13,13 @@ for the current allocation, startup pins, client profiles, and acceptance.
 The original disaggregated configuration below records the October 16–18
 validation and its recovery procedure. It is not the current default placement.
 
+## Twins runtime stability (2026-10-31)
+
+The Twins' task-cancellation, runner-recovery, and native-runtime changes are
+recorded in [the runtime stability runbook](twins-stability-20261031.md), including
+pinned environments, acceptance receipts, performance tradeoffs, and rollback.
+Use the recorded runtime and startup settings when maintaining this deployment.
+
 ## Original shared deployment (2026-10-16)
 
 The operator dashboard at `http://bigbrain.localhost:18888/` serves one shared

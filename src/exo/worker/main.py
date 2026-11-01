@@ -225,6 +225,21 @@ class Worker:
                 self.state = apply(self.state, event=event)
                 event = event.event
 
+                if (
+                    isinstance(event, TaskStatusUpdated)
+                    and event.task_status == TaskStatus.Cancelled
+                    and (task := self.state.tasks.get(event.task_id)) is not None
+                ):
+                    # API stream cleanup can delete this task before the next
+                    # planner tick. Preserve the cancellation as an effect of
+                    # the ordered event, rather than polling transient state.
+                    for runner in self.runners.values():
+                        if (
+                            runner.bound_instance.instance.instance_id
+                            == task.instance_id
+                        ):
+                            self._tg.start_soon(runner.cancel_task, task.task_id)
+
                 if isinstance(event, InstanceDeleted):
                     self._instance_backoff.reset(event.instance_id)
 

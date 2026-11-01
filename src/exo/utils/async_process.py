@@ -6,8 +6,8 @@ import multiprocessing as mp
 import os
 import sys
 from collections.abc import Callable, Iterable, Mapping
+from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
-from multiprocessing.resource_sharer import DupFd
 from typing import final
 
 from anyio import (
@@ -73,6 +73,8 @@ class AsyncProcess:
         stdout_write_fd: int | None = None
         stderr_read_fd: int | None = None
         stderr_write_fd: int | None = None
+        stdout_handle: Connection | None = None
+        stderr_handle: Connection | None = None
 
         def cleanup_stdio_fd() -> None:
             nonlocal stdout_read_fd, stdout_write_fd, stderr_read_fd, stderr_write_fd
@@ -86,13 +88,21 @@ class AsyncProcess:
                 self._run_cancel_scope = run_cancel_scope
                 stdout_read_fd, stdout_write_fd = os.pipe()
                 stderr_read_fd, stderr_write_fd = os.pipe()
+                # Connection's spawn reducer transfers these descriptors with
+                # the child bootstrap. DupFd created here instead depends on a
+                # long-lived resource_sharer server, which can be broken after
+                # a runner fault and prevent every replacement from starting.
+                stdout_handle = Connection(stdout_write_fd, readable=False)
+                stdout_write_fd = None
+                stderr_handle = Connection(stderr_write_fd, readable=False)
+                stderr_write_fd = None
 
                 process = mp.Process(
                     target=_run_with_captured_stdio,
                     name=self._name,
                     args=(
-                        DupFd(stdout_write_fd),
-                        DupFd(stderr_write_fd),
+                        stdout_handle,
+                        stderr_handle,
                         self._target,
                         *self._args,
                     ),
@@ -105,8 +115,8 @@ class AsyncProcess:
                     raise RuntimeError("started process has no pid")
 
                 # important to close parent write-side FD to prevent hangs
-                stdout_write_fd = _close_fd(stdout_write_fd)
-                stderr_write_fd = _close_fd(stderr_write_fd)
+                stdout_handle.close()
+                stderr_handle.close()
 
                 self._process = process
                 self._pid = pid
@@ -130,6 +140,9 @@ class AsyncProcess:
                     await self._terminate_if_still_alive()
             finally:
                 cleanup_stdio_fd()
+                for handle in (stdout_handle, stderr_handle):
+                    if handle is not None:
+                        handle.close()
                 for tx in (self._stdout_tx, self._stderr_tx):
                     with contextlib.suppress(Exception):
                         await tx.aclose()
@@ -245,22 +258,19 @@ class AsyncProcess:
 
 # Spawn-mode multiprocessing requires a module-level target that can be pickled.
 def _run_with_captured_stdio(
-    stdout: DupFd,
-    stderr: DupFd,
+    stdout: Connection,
+    stderr: Connection,
     target: Callable[..., object] | None,
     *target_args: object,
     **target_kwargs: object,
 ) -> None:
-    stdout_fd = stdout.detach()
-    stderr_fd = stderr.detach()
-
     try:
-        os.dup2(stdout_fd, STDOUT_FD)
-        os.dup2(stderr_fd, STDERR_FD)
+        os.dup2(stdout.fileno(), STDOUT_FD)
+        os.dup2(stderr.fileno(), STDERR_FD)
     finally:
-        for fd in (stdout_fd, stderr_fd):
-            if fd not in STDIO_FDS:
-                _close_fd(fd)
+        for handle in (stdout, stderr):
+            if handle.fileno() not in STDIO_FDS:
+                handle.close()
 
     faulthandler.enable(file=sys.stderr, all_threads=True)
     if target is not None:

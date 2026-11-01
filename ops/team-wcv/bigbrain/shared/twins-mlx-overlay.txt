@@ -1,0 +1,3 @@
+# Apply only to a private clone of the validated Twins environment.
+mlx==0.32.4
+mlx-metal==0.32.4

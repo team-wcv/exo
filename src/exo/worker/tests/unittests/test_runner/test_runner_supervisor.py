@@ -38,6 +38,33 @@ class _DeadProcess:
 
 
 @pytest.mark.anyio
+async def test_repeated_cancellation_is_sent_to_runner_once() -> None:
+    class Sender:
+        def __init__(self) -> None:
+            self.sent: list[TaskId] = []
+
+        async def send_async(self, task_id: TaskId) -> None:
+            self.sent.append(task_id)
+            await anyio.sleep(0)
+
+    sender = Sender()
+
+    class CancellationState:
+        def __init__(self) -> None:
+            self.completed: set[TaskId] = set()
+            self.cancelled: set[TaskId] = set()
+            self._cancel_sender = sender
+
+    state = CancellationState()
+    supervisor = cast(RunnerSupervisor, cast(object, state))
+    task_id = TaskId("cancel-once")
+    async with anyio.create_task_group() as tasks:
+        tasks.start_soon(RunnerSupervisor.cancel_task, supervisor, task_id)
+        tasks.start_soon(RunnerSupervisor.cancel_task, supervisor, task_id)
+    assert sender.sent == [task_id]
+
+
+@pytest.mark.anyio
 async def test_check_runner_emits_error_chunk_for_inflight_text_generation() -> None:
     event_sender, event_receiver = channel[Event]()
     task_sender, _ = mp_channel[Task]()

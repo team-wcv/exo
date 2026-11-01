@@ -397,6 +397,9 @@ class RunnerSupervisor:
         self.completed.add(task_id)
 
     async def cancel_task(self, task_id: TaskId):
+        # The event applier and planner can observe the same cancellation.
+        if task_id in self.cancelled:
+            return
         if task_id in self.completed:
             logger.info(f"Unable to cancel {task_id} as it has been completed")
             self.cancelled.add(task_id)
