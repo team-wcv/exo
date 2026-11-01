@@ -117,9 +117,27 @@ Both EXO workers were restarted under the user's explicit approval after the
 old model instance was idle and removed; a fresh two-rank tensor instance was
 then created. Studio and Spark services were not deliberately restarted.
 
-Rollback must restore both source files and the saved manifest together, then
-reload idle Twin workers and recreate the two-rank model. Do not mix arbitrary
-source/native builds or change the transport to pipeline/TCP as a workaround.
+Before activating the native candidate, each host's actual
+`~/Library/LaunchAgents/com.teamwcv.exo.bigbrain.plist` is backed up to
+`twins-mlx-stable-20261031/com.teamwcv.exo.bigbrain.before.plist`. Candidate
+activation changes only `UV_PROJECT_ENVIRONMENT` and `EXO_FAST_SYNCH`; the
+original environment is retained intact.
+
+For a native-runtime rollback, wait for idle inference, remove the current
+model placement, restore that host's saved launchd plist, and bootout/bootstrap
+the same job so launchd actually reloads its environment. This explicitly
+restores the prior environment selection and synchronization setting (removing
+the new overrides when they were previously absent). Verify the loaded job's
+settings and Python/MLX paths before recreating the tensor model. A kickstart
+alone does not reload a changed plist. The Python recovery fixes may remain
+installed during a runtime-only rollback.
+
+For a full rollback, additionally restore the four changed Python files from
+`twins-cancellation-20261031/before/` and `twins-stability-20261031/before/`, and
+restore the deployment manifest from the first overlay's backup. Restore the
+saved launchd plist as above before restarting. Compare against current files
+and preserve unrelated subsequent edits. Do not mix arbitrary source/native
+builds or change tensor/RDMA to pipeline/TCP as a workaround.
 
 Receipts on the operator: `~/.cache/exo/twins-stability-20261031/`, including
 `fault-probe-result.json`, `soak-status.json` and `soak-requests.jsonl`.
