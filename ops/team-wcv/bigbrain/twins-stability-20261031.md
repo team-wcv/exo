@@ -97,22 +97,31 @@ were relocated, the original environments remain untouched, and `uv run
 The candidate passes GPU arithmetic and 2,000-round JACCL tests. The deployment
 snapshot selects the candidate environment and sets `EXO_FAST_SYNCH=false` to
 use the standard CPU/GPU synchronization path. Full-model acceptance is required
-before treating this candidate as the final runtime.
+before treating this candidate as the final runtime. The first full-model
+probe produced a coherent answer; the candidate took 6.14 seconds versus
+3.91 seconds for the previous profile (78 versus 80 generated tokens; reported
+decode rates 19.28 versus 40.26 tok/s). This is one short sample, not a general
+benchmark. The conservative synchronization setting trades throughput for
+removing the custom fast-fence path. Four explicit cancel-and-follow-up cycles
+also passed; the longer native-runtime soak is still pending.
 
 ## Deployment and rollback
 
-Only `src/exo/utils/async_process.py` and the control-collective changes in
-`src/exo/worker/engines/mlx/utils_mlx.py` were overlaid on both Twins. The latter
-was applied to each deployed baseline so unrelated source changes were not
-introduced. Existing native artifacts, dependency environments and model weights
-remain unchanged. The deployed MLX build is `0.32.0.dev20260507+cc3f3e60` and
-MLX LM is 0.31.3; this is not an upgrade to a new native communication library.
+Four Python files were overlaid on the existing deployed baseline:
+`src/exo/utils/async_process.py`, the control-collective sections of
+`src/exo/worker/engines/mlx/utils_mlx.py`, `src/exo/worker/main.py`, and
+`src/exo/worker/runner/supervisor.py`. The EXO Rust/native artifact and model
+weights remain unchanged. The native-runtime candidate now selects MLX and
+mlx-metal 0.32.4 in a private environment; the original development environment
+is retained for rollback. MLX LM remains 0.31.3.
 
 On both Macs, backups, staged files and a receipt are under
 `~/.orchestraitor/deployments/twins-stability-20261031/`.
 `before/` preserves the two source files and prior deployment manifest.
 The live deployment manifest records commit `2937a1a3`, before/after source
 hashes and unchanged native hashes in `twins_stability_20261031`.
+The cancellation overlay has its own backups and receipt under
+`twins-cancellation-20261031/` and records commit `01149ef7` in the manifest.
 Both EXO workers were restarted under the user's explicit approval after the
 old model instance was idle and removed; a fresh two-rank tensor instance was
 then created. Studio and Spark services were not deliberately restarted.
@@ -129,7 +138,11 @@ the same job so launchd actually reloads its environment. This explicitly
 restores the prior environment selection and synchronization setting (removing
 the new overrides when they were previously absent). Verify the loaded job's
 settings and Python/MLX paths before recreating the tensor model. A kickstart
-alone does not reload a changed plist. The Python recovery fixes may remain
+alone does not reload a changed plist. Wait for the unloaded job and old API
+listener to disappear before bootstrap: an immediate bootstrap during teardown
+returned launchctl error 5 during this rollout, then succeeded after teardown
+completed. Hold a temporary caffeinate assertion through that transition.
+The Python recovery fixes may remain
 installed during a runtime-only rollback.
 
 For a full rollback, additionally restore the four changed Python files from
