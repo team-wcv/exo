@@ -113,7 +113,7 @@ class CatModeController:
             raise
         except Exception as exc:
             self.status.state = "error"
-            self.status.error = str(exc)[:300]
+            self.status.error = (str(exc) or type(exc).__name__)[:300]
         finally:
             self._scope = None
             self.status.active = False

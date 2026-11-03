@@ -118,7 +118,9 @@
             ? "Cat mode finished"
             : status.state === "stopped"
               ? "Cat mode stopped"
-              : "Warm the loaded model for 10 minutes"}</span
+              : status.state === "error"
+                ? "Cat mode stopped after an error"
+                : "Warm the loaded model for 10 minutes"}</span
         >
       {/if}
       <small title={status.active ? (status.model_id ?? "") : (modelId ?? "")}

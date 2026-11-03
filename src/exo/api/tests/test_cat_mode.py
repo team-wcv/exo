@@ -234,3 +234,52 @@ async def test_generation_pins_route_and_cleans_up_on_cancellation(complete: boo
     assert isinstance((await commands.receive()).command, TaskFinished)
     assert not api._text_generation_queues
     assert not api._text_generation_receivers
+
+
+def test_prefill_only_and_orphaned_instances_cannot_run_cat_mode():
+    from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
+
+    api = ready_api()
+    link_id = InstanceLinkId("prefill-link")
+    api.state = api.state.model_copy(
+        update={
+            "instance_links": {
+                link_id: InstanceLink(
+                    link_id=link_id,
+                    prefill_instances=[INSTANCE],
+                    decode_instances=[InstanceId("other")],
+                )
+            }
+        }
+    )
+    assert api._cat_mode_readiness(INSTANCE) == "unavailable"
+    api.state = api.state.model_copy(
+        update={
+            "instance_links": {},
+            "orphaned_prefill_instances": frozenset({INSTANCE}),
+        }
+    )
+    assert api._cat_mode_readiness(INSTANCE) == "unavailable"
+
+
+async def test_api_shutdown_cancels_controller():
+    entered = anyio.Event()
+
+    async def generate(_model: ModelId, _instance: InstanceId, _number: int):
+        entered.set()
+        await anyio.sleep_forever()
+
+    controller: CatModeController | None = None
+    async with anyio.create_task_group() as group:
+        controller = CatModeController(
+            enabled=True,
+            generate=generate,
+            readiness=lambda _: "ready",
+            spawn=group.start_soon,
+        )
+        controller.start(MODEL, INSTANCE)
+        await entered.wait()
+        group.cancel_scope.cancel()
+    assert controller is not None
+    assert controller.status.state == "stopped"
+    assert controller.status.active is False
