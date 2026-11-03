@@ -70,6 +70,7 @@
   } from "$lib/stores/app.svelte";
   import { addToast, dismissByMessage } from "$lib/stores/toast.svelte";
   import HeaderNav from "$lib/components/HeaderNav.svelte";
+  import CatModeControl from "$lib/components/CatModeControl.svelte";
   import DeviceIcon from "$lib/components/DeviceIcon.svelte";
   import SparkPrefillSummary from "$lib/components/SparkPrefillSummary.svelte";
   import { fade, fly, slide } from "svelte/transition";
@@ -4763,6 +4764,11 @@
       {mobileRightOpen}
       onToggleMobileRight={toggleMobileRightSidebar}
       downloadProgress={activeDownloadSummary}
+    />
+    <CatModeControl
+      modelId={hasRunningInstance(selectedChatModel())
+        ? selectedChatModel()
+        : bestRunningModelId}
     />
   {/if}
 

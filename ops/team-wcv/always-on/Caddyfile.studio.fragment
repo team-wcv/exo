@@ -12,6 +12,12 @@
 	redir @twins_root /twins/ 308
 	@studio_root path /studio
 	redir @studio_root /studio/ 308
+	@cat_mode path /v1/cat-mode /twins/v1/cat-mode
+	handle @cat_mode {
+		rewrite * /v1/cat-mode
+		header Cache-Control "no-store"
+		reverse_proxy 127.0.0.1:52415
+	}
 
 	handle_path /spark/* {
 		handle /health {
