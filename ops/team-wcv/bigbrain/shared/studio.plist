@@ -8,6 +8,8 @@
 		<string>true</string>
 		<key>EXO_DASHBOARD_DIR</key>
 		<string>/Users/JJ/.orchestraitor/deployments/exo-qwen38-prefill-20261016/current/dashboard/build</string>
+		<key>EXO_CAT_MODE_ENABLED</key>
+		<string>1</string>
 		<key>EXO_DEFAULT_MODELS_DIR</key>
 		<string>/Users/JJ/.exo-pr44-benchmark-models</string>
 		<key>EXO_HOME</key>

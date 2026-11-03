@@ -2,6 +2,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import os
 import random
 import time
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Iterable
@@ -46,6 +47,7 @@ from exo.api.adapters.responses import (
     generate_responses_stream,
     responses_request_to_text_generation,
 )
+from exo.api.cat_mode import CatModeController, CatModeRequest, CatModeStatus, Readiness
 from exo.api.keepalive import FinalizingStreamingResponse, with_sse_keepalive
 from exo.api.types import (
     AddCustomModelParams,
@@ -199,10 +201,13 @@ from exo.shared.types.tasks import (
 )
 from exo.shared.types.text_generation import (
     Base64ImageHash,
+    InputMessage,
+    InputMessageContent,
     TextGenerationTaskParams,
 )
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import Instance, InstanceId, InstanceMeta
+from exo.shared.types.worker.runners import RunnerReady, RunnerRunning
 from exo.shared.types.worker.shards import AsymmetricTensorShardMetadata, Sharding
 from exo.utils.banner import print_startup_banner
 from exo.utils.channels import Receiver, Sender, channel
@@ -307,9 +312,16 @@ class API:
         ] = {}
         self._image_store = ImageStore(EXO_IMAGE_CACHE_DIR)
         self._tg: TaskGroup = TaskGroup()
+        self._cat_mode = CatModeController(
+            enabled=os.environ.get("EXO_CAT_MODE_ENABLED") == "1",
+            generate=self._cat_mode_generate,
+            readiness=self._cat_mode_readiness,
+            spawn=self._tg.start_soon,
+        )
 
     def reset(self, result_clock: int, event_receiver: Receiver[IndexedEvent]):
         logger.info("Resetting API State")
+        self._cat_mode.stop()
         self._event_log.close()
         self._event_log = DiskEventLog(_API_EVENT_LOG_DIR)
         self.state = State()
@@ -357,6 +369,9 @@ class API:
         )
 
     def _setup_routes(self) -> None:
+        self.app.get("/v1/cat-mode")(self.get_cat_mode)
+        self.app.post("/v1/cat-mode")(self.start_cat_mode)
+        self.app.delete("/v1/cat-mode")(self.stop_cat_mode)
         self.app.get("/node_id")(lambda: self.node_id)
         self.app.post("/instance")(self.create_instance)
         self.app.post("/place_instance")(self.place_instance)
@@ -659,6 +674,140 @@ class API:
                 status_code=404,
                 detail=f"No instance found for model {route.model_id}",
             )
+
+    def get_cat_mode(self) -> CatModeStatus:
+        return self._cat_mode.status
+
+    async def start_cat_mode(self, payload: CatModeRequest) -> CatModeStatus:
+        if not self._cat_mode.status.enabled:
+            raise HTTPException(404, "Cat mode is not enabled on this API")
+        if self._cat_mode.status.active:
+            raise HTTPException(409, "Cat mode is already active")
+        candidates = [
+            instance_id
+            for instance_id, instance in self.state.instances.items()
+            if instance.shard_assignments.model_id == payload.model_id
+            and self._cat_mode_readiness(instance_id) != "unavailable"
+        ]
+        if len(candidates) != 1:
+            raise HTTPException(
+                409, "Cat mode needs exactly one loaded, available text model instance"
+            )
+        return self._cat_mode.start(payload.model_id, candidates[0])
+
+    async def stop_cat_mode(self) -> CatModeStatus:
+        return self._cat_mode.stop()
+
+    def _cat_mode_readiness(self, instance_id: InstanceId) -> Readiness:
+        instance = self.state.instances.get(instance_id)
+        if self.paused or instance is None:
+            return "unavailable"
+        shards = instance.shard_assignments.shards
+        if (
+            not shards
+            or ModelTask.TextGeneration not in shards[0].shard.model_card.tasks
+        ):
+            return "unavailable"
+        prefill = {
+            i
+            for link in self.state.instance_links.values()
+            for i in link.prefill_instances
+        }
+        decode = {
+            i
+            for link in self.state.instance_links.values()
+            for i in link.decode_instances
+        }
+        if instance_id in (prefill - decode) | self.state.orphaned_prefill_instances:
+            return "unavailable"
+        for node_id in instance.all_node_to_runner:
+            seen = self.state.last_seen.get(node_id)
+            if (
+                not self.state.topology.contains_node(node_id)
+                or seen is None
+                or (datetime.now(timezone.utc) - seen).total_seconds() > 45
+            ):
+                return "unavailable"
+        statuses = [self.state.runners.get(rid) for rid in instance.all_runner_ids]
+        if not all(
+            isinstance(status, (RunnerReady, RunnerRunning)) for status in statuses
+        ):
+            return "unavailable"
+        return (
+            "busy"
+            if any(isinstance(status, RunnerRunning) for status in statuses)
+            else "ready"
+        )
+
+    async def _cat_mode_generate(
+        self, model_id: ModelId, instance_id: InstanceId, sequence: int
+    ) -> None:
+        # Keep ownership of the command and receiver across cancellation/reset.
+        origin = self._system_id
+        command = TextGeneration(
+            task_params=TextGenerationTaskParams(
+                model=model_id,
+                input=[
+                    InputMessage(
+                        role="user",
+                        content=InputMessageContent(
+                            f"Write a playful 250-word story about a cat exploring a space station. "
+                            f"Give adventure number {sequence} a different ending."
+                        ),
+                    )
+                ],
+                max_output_tokens=512,
+                temperature=0.85,
+                enable_thinking=False,
+                stream=True,
+            ),
+            target_instance_id=instance_id,
+        )
+        finished = False
+        try:
+            await self._send(command)
+            receiver = self._text_generation_receivers.pop(command.command_id)
+            with receiver:
+                while True:
+                    if self._cat_mode_readiness(instance_id) == "unavailable":
+                        raise RuntimeError("The selected model instance is unavailable")
+                    chunk = None
+                    with anyio.move_on_after(2) as receive_scope:
+                        chunk = await receiver.receive()
+                    if receive_scope.cancel_called:
+                        continue
+                    if isinstance(chunk, ErrorChunk):
+                        raise RuntimeError(chunk.error_message)
+                    if (
+                        isinstance(chunk, TokenChunk)
+                        and chunk.finish_reason is not None
+                    ):
+                        finished = True
+                        break
+        finally:
+            if sender := self._text_generation_queues.pop(command.command_id, None):
+                sender.close()
+            if receiver := self._text_generation_receivers.pop(
+                command.command_id, None
+            ):
+                receiver.close()
+            # Bypass election pause: shutdown must not strand a warm-up request.
+            with anyio.move_on_after(5, shield=True):
+                if not finished:
+                    await self.command_sender.send(
+                        ForwarderCommand(
+                            origin=origin,
+                            command=TaskCancelled(
+                                cancelled_command_id=command.command_id
+                            ),
+                        )
+                    )
+                await self.command_sender.send(
+                    ForwarderCommand(
+                        origin=origin,
+                        command=TaskFinished(finished_command_id=command.command_id),
+                    )
+                )
 
     async def _send_routed_text_generation(
         self, task_params: TextGenerationTaskParams, route: TextRoute
@@ -2303,6 +2452,7 @@ class API:
                     await anyio.sleep_forever()
                 finally:
                     with anyio.CancelScope(shield=True):
+                        self._cat_mode.stop()
                         # IMPORTANT: when new queues are added, update this (for proper shutdown semantics)
                         self._shutdown_queues(self._text_generation_queues)
                         self._shutdown_queues(self._image_generation_queues)
