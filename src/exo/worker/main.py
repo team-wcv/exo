@@ -33,6 +33,7 @@ from exo.shared.types.events import (
     InstanceDeleted,
     NodeDownloadProgress,
     NodeGatheredInfo,
+    RunnerStatusUpdated,
     TaskCreated,
     TaskStatusUpdated,
     TopologyEdgeCreated,
@@ -56,7 +57,7 @@ from exo.shared.types.text_generation import Base64Image, Base64ImageHash
 from exo.shared.types.topology import Connection, SocketConnection
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import DrafterPlacement, InstanceId
-from exo.shared.types.worker.runners import RunnerId
+from exo.shared.types.worker.runners import RunnerId, RunnerShutdown, RunnerShuttingDown
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.info_gatherer.info_gatherer import GatheredInfo, InfoGatherer
 from exo.utils.info_gatherer.net_profile import check_reachable
@@ -66,6 +67,8 @@ from exo.worker.plan import plan
 from exo.worker.runner.supervisor import RunnerSupervisor
 
 DEFAULT_SOCKET_PROBE_FAILURE_THRESHOLD = 3
+ORPHAN_RUNNER_REAP_INTERVAL_SECONDS = 15
+ORPHAN_RUNNER_GRACE_SECONDS = 60
 EXO_SOCKET_PROBE_FAILURE_THRESHOLD_ENV = "EXO_SOCKET_PROBE_FAILURE_THRESHOLD"
 
 
@@ -194,6 +197,7 @@ class Worker:
                 tg.start_soon(self._reconcile_instance_backoff)
                 tg.start_soon(self._poll_connection_updates)
                 tg.start_soon(self._reconcile_custom_cards)
+                tg.start_soon(self._reap_orphan_runners)
         except* (EventRouterBrokenResourceError, EventRouterClosedResourceError):
             # Event router has been closed (try-star syntax handles error groups)
             pass
@@ -305,6 +309,53 @@ class Worker:
                 and card.model_id not in pending_startup_cards
             ):
                 await card_cache.pop(card.model_id)
+
+    async def _reap_orphan_runners(self) -> None:
+        """Clear runners stuck at RunnerShuttingDown with no instance left.
+
+        Cluster state drops a runner only when RunnerShutdown arrives. A runner
+        killed outright (exo restarted, process killed) or whose final update was
+        lost never sends it, so it stays at RunnerShuttingDown forever with no
+        instance referencing it. Once such an orphan has been seen for a minute
+        and is not supervised here, report RunnerShutdown for it. Every node
+        applies that event the same way, and a duplicate from another node is a
+        no-op, so any node may do this.
+        """
+        orphan_since: dict[RunnerId, float] = {}
+        while True:
+            await anyio.sleep(ORPHAN_RUNNER_REAP_INTERVAL_SECONDS)
+            try:
+                await self._reap_orphan_runners_pass(anyio.current_time(), orphan_since)
+            except Exception as exc:  # never let the reaper take the worker down
+                logger.warning(f"Orphan runner reaper skipped a pass: {exc!r}")
+
+    async def _reap_orphan_runners_pass(
+        self, now: float, orphan_since: dict[RunnerId, float]
+    ) -> None:
+        """One reaper pass; ``orphan_since`` carries first-seen times between passes."""
+        # Any mention of the runner id inside an instance (shard assignments,
+        # drafter placement, ...) means it still belongs to something live.
+        referenced = "".join(
+            inst.model_dump_json() for inst in self.state.instances.values()
+        )
+        orphans = {
+            rid
+            for rid, status in self.state.runners.items()
+            if isinstance(status, RunnerShuttingDown)
+            and rid not in self.runners
+            and str(rid) not in referenced
+        }
+        for rid in list(orphan_since):
+            if rid not in orphans:
+                del orphan_since[rid]
+        for rid in orphans:
+            since = orphan_since.setdefault(rid, now)
+            if now - since >= ORPHAN_RUNNER_GRACE_SECONDS:
+                logger.info(f"Reaping orphan runner {rid} stuck at RunnerShuttingDown")
+                await self.event_sender.send(
+                    RunnerStatusUpdated(runner_id=rid, runner_status=RunnerShutdown())
+                )
+                del orphan_since[rid]
 
     async def _reconcile_instance_backoff(self) -> None:
         while True:

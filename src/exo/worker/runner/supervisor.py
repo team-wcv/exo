@@ -43,6 +43,7 @@ from exo.shared.types.worker.runners import (
     RunnerLoading,
     RunnerReady,
     RunnerRunning,
+    RunnerShutdown,
     RunnerShuttingDown,
     RunnerStatus,
     RunnerWarmingUp,
@@ -304,6 +305,21 @@ class RunnerSupervisor:
             )
             if not self._cancel_watch_runner.cancel_called:
                 self._cancel_watch_runner.cancel()
+            # The runner's own final RunnerShutdown can be lost when its event pipe
+            # closes on exit, which leaves the runner stuck at RunnerShuttingDown in
+            # cluster state forever (state only drops a runner on RunnerShutdown).
+            # Report it here unless a terminal status was already sent.
+            if not isinstance(self.status, (RunnerShutdown, RunnerFailed)):
+                with anyio.CancelScope(shield=True), contextlib.suppress(
+                    ClosedResourceError, BrokenResourceError
+                ):
+                    self.status = RunnerShutdown()
+                    await self._event_sender.send(
+                        RunnerStatusUpdated(
+                            runner_id=self.bound_instance.bound_runner_id,
+                            runner_status=self.status,
+                        )
+                    )
             with contextlib.suppress(ClosedResourceError):
                 self._ev_recv.close()
             with contextlib.suppress(ClosedResourceError):
