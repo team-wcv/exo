@@ -56,7 +56,7 @@ async def test_reaper_reports_only_true_orphans_after_grace_period() -> None:
             ready: RunnerReady(),
         },
     )
-    worker.runners = {supervised: cast(RunnerSupervisor, cast(object, object()))}
+    worker.runners = {supervised: cast(RunnerSupervisor, object())}
 
     orphan_since: dict[RunnerId, float] = {}
     await worker._reap_orphan_runners_pass(100.0, orphan_since)

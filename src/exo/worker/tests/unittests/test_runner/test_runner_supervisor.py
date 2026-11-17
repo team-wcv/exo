@@ -18,6 +18,7 @@ from exo.shared.types.worker.instances import BoundInstance, InstanceId
 from exo.shared.types.worker.runners import (
     RunnerFailed,
     RunnerId,
+    RunnerReady,
     RunnerShutdown,
     RunnerShuttingDown,
     RunnerStatus,
@@ -159,16 +160,19 @@ class _ExitedProcess:
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("last_runner_status", "expected_statuses"),
+    ("status_before_exit", "expected_statuses"),
     [
-        # The runner's own RunnerShutdown never arrived: the supervisor reports it.
-        (RunnerShuttingDown(), [RunnerShuttingDown, RunnerShutdown]),
-        # The runner already reported RunnerShutdown: no duplicate.
-        (RunnerShutdown(), [RunnerShutdown]),
+        # The runner's own RunnerShutdown was lost with its event pipe: the
+        # supervisor reports it so cluster state can drop the runner.
+        (RunnerShuttingDown(), [RunnerShutdown]),
+        (RunnerReady(), [RunnerShutdown]),
+        # A terminal status already went out: no duplicate.
+        (RunnerShutdown(), []),
+        (RunnerFailed(error_message="boom", diagnostics=[]), []),
     ],
 )
 async def test_run_reports_runner_shutdown_when_runner_exits_without_one(
-    last_runner_status: RunnerStatus,
+    status_before_exit: RunnerStatus,
     expected_statuses: list[type[RunnerStatus]],
 ) -> None:
     event_sender, event_receiver = channel[Event]()
@@ -198,10 +202,8 @@ async def test_run_reports_runner_shutdown_when_runner_exits_without_one(
         _event_sender=event_sender,
         _cancel_sender=cancel_sender,
     )
-
-    ev_send.send(
-        RunnerStatusUpdated(runner_id=runner_id, runner_status=last_runner_status)
-    )
+    # The last status the supervisor saw before the runner's pipe closed.
+    supervisor.status = status_before_exit
     ev_send.close()
 
     statuses: list[RunnerStatus] = []
@@ -212,8 +214,5 @@ async def test_run_reports_runner_shutdown_when_runner_exits_without_one(
                 assert isinstance(event, RunnerStatusUpdated)
                 assert event.runner_id == runner_id
                 statuses.append(event.runner_status)
-                if len(statuses) == 1:
-                    # The runner has exited; stop supervising as the worker would.
-                    supervisor.shutdown()
 
     assert [type(status) for status in statuses] == expected_statuses

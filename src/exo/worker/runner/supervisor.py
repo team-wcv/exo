@@ -310,8 +310,9 @@ class RunnerSupervisor:
             # cluster state forever (state only drops a runner on RunnerShutdown).
             # Report it here unless a terminal status was already sent.
             if not isinstance(self.status, (RunnerShutdown, RunnerFailed)):
-                with anyio.CancelScope(shield=True), contextlib.suppress(
-                    ClosedResourceError, BrokenResourceError
+                with (
+                    anyio.CancelScope(shield=True),
+                    contextlib.suppress(ClosedResourceError, BrokenResourceError),
                 ):
                     self.status = RunnerShutdown()
                     await self._event_sender.send(
