@@ -1,6 +1,6 @@
----
-branch: feature/cat-mode-ui-20261102
-scope: Bounded Cat mode API controller, EXO dashboard controls, and fleet routing
-ticket: 6ae938e9f69692f892b58941
-pr: https://github.com/team-wcv/exo/pull/61
----
+# fix/glm47-8bit-model-card
+
+- Repo: team-wcv/exo
+- Scope: repoint the GLM-4.7 8-bit model card from the removed mlx-community/GLM-4.7-8bit-gs32 repo to mlx-community/GLM-4.7-8bit
+- Ticket: 6afbd780c14d0af38a2cc876 (storage cleanup follow-up)
+- PR: TBD
