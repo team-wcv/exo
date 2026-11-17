@@ -177,7 +177,7 @@ model = "mlx-community/GLM-4.7-6bit"
 extra_constraints = ["All(Memory(>=512GiB))"]
 
 [[benchmark]]
-model = "mlx-community/GLM-4.7-8bit-gs32"
+model = "mlx-community/GLM-4.7-8bit"
 extra_constraints = ["All(Memory(>=512GiB))"]
 
 [[benchmark]]
