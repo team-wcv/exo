@@ -1,6 +1,6 @@
 ---
-branch: feature/cat-mode-ui-20261102
-scope: Bounded Cat mode API controller, EXO dashboard controls, and fleet routing
-ticket: 6ae938e9f69692f892b58941
-pr: https://github.com/team-wcv/exo/pull/61
+branch: fix/runner-shutdown-report-20261117
+scope: Report RunnerShutdown when a supervised runner exits without one, and reap orphan runners stuck at RunnerShuttingDown; upstreams the fixes live on the twins since 2026-11-17
+ticket: 6af9360c9c3109f23b8787f8
+pr: pending
 ---
