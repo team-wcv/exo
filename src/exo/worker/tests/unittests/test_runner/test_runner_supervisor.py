@@ -2,6 +2,7 @@ from typing import cast
 
 import anyio
 import pytest
+from anyio.abc import TaskStatus
 
 from exo.shared.models.model_cards import ModelId
 from exo.shared.types.chunks import ErrorChunk
@@ -14,7 +15,13 @@ from exo.shared.types.text_generation import (
     TextGenerationTaskParams,
 )
 from exo.shared.types.worker.instances import BoundInstance, InstanceId
-from exo.shared.types.worker.runners import RunnerFailed, RunnerId
+from exo.shared.types.worker.runners import (
+    RunnerFailed,
+    RunnerId,
+    RunnerShutdown,
+    RunnerShuttingDown,
+    RunnerStatus,
+)
 from exo.utils.async_process import AsyncProcess
 from exo.utils.channels import channel, mp_channel
 from exo.worker.runner.bootstrap import RunnerTerminationError
@@ -124,3 +131,89 @@ async def test_check_runner_emits_error_chunk_for_inflight_text_generation() -> 
     event_sender.close()
     with anyio.move_on_after(0.1):
         await event_receiver.aclose()
+
+
+class _ExitedProcess:
+    """A runner process that starts, has already exited cleanly, and has no output."""
+
+    pid = 0
+    exitcode = 0
+
+    def __init__(self) -> None:
+        stdout_tx, self.stdout = channel[bytes]()
+        stderr_tx, self.stderr = channel[bytes]()
+        stdout_tx.close()
+        stderr_tx.close()
+
+    async def run(
+        self, *, task_status: TaskStatus[None] = anyio.TASK_STATUS_IGNORED
+    ) -> None:
+        task_status.started()
+
+    async def stop(self) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("last_runner_status", "expected_statuses"),
+    [
+        # The runner's own RunnerShutdown never arrived: the supervisor reports it.
+        (RunnerShuttingDown(), [RunnerShuttingDown, RunnerShutdown]),
+        # The runner already reported RunnerShutdown: no duplicate.
+        (RunnerShutdown(), [RunnerShutdown]),
+    ],
+)
+async def test_run_reports_runner_shutdown_when_runner_exits_without_one(
+    last_runner_status: RunnerStatus,
+    expected_statuses: list[type[RunnerStatus]],
+) -> None:
+    event_sender, event_receiver = channel[Event]()
+    task_sender, _ = mp_channel[Task]()
+    cancel_sender, _ = mp_channel[TaskId]()
+    ev_send, ev_recv = mp_channel[Event | RunnerTerminationError]()
+
+    runner_id = RunnerId("runner-a")
+    bound_instance = get_bound_mlx_ring_instance(
+        instance_id=InstanceId("instance-a"),
+        model_id=ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit"),
+        runner_id=runner_id,
+        node_id=NodeId("node-a"),
+    )
+    proc = cast(AsyncProcess, cast(object, _ExitedProcess()))
+    handler = await RunnerStdioHandler.create(
+        stdout_rx=proc.stdout, stderr_rx=proc.stderr
+    )
+    supervisor = RunnerSupervisor(
+        shard_metadata=bound_instance.bound_shard,
+        bound_instance=bound_instance,
+        runner_process=proc,
+        _runner_stdio_handler=handler,
+        initialize_timeout=400,
+        _ev_recv=ev_recv,
+        _task_sender=task_sender,
+        _event_sender=event_sender,
+        _cancel_sender=cancel_sender,
+    )
+
+    ev_send.send(
+        RunnerStatusUpdated(runner_id=runner_id, runner_status=last_runner_status)
+    )
+    ev_send.close()
+
+    statuses: list[RunnerStatus] = []
+    with anyio.fail_after(10):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(supervisor.run)
+            async for event in event_receiver:
+                assert isinstance(event, RunnerStatusUpdated)
+                assert event.runner_id == runner_id
+                statuses.append(event.runner_status)
+                if len(statuses) == 1:
+                    # The runner has exited; stop supervising as the worker would.
+                    supervisor.shutdown()
+
+    assert [type(status) for status in statuses] == expected_statuses
