@@ -1,13 +1,20 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { catModeRunKey, showCatModeResult } from "$lib/utils/cat-mode";
 
-  let { modelId }: { modelId: string | null } = $props();
+  let {
+    modelId,
+    liveInstanceIds = null,
+  }: { modelId: string | null; liveInstanceIds?: readonly string[] | null } =
+    $props();
   type Status = {
     enabled: boolean;
     active: boolean;
     state: "idle" | "running" | "stopped" | "finished" | "error";
     phase: "waiting" | "generating" | "stopping" | null;
     model_id: string | null;
+    instance_id: string | null;
+    started_at: number | null;
     stop_at: number | null;
     completed_requests: number;
     error: string | null;
@@ -28,6 +35,43 @@
   );
   // Relative paths preserve /twins/ when the dashboard is mounted there.
   const endpoint = "./v1/cat-mode";
+  // Per browser, so a dismissal survives reloads even against an API that
+  // predates server-side dismissal.
+  const dismissedStorageKey = "exo-cat-mode-dismissed-run";
+  let dismissedRun = $state<string | null>(readDismissedRun());
+  const showResult = $derived(
+    status !== null && showCatModeResult(status, dismissedRun, liveInstanceIds),
+  );
+  const shownError = $derived(
+    error || (showResult && status?.state === "error" ? status.error : null),
+  );
+
+  function readDismissedRun(): string | null {
+    try {
+      return localStorage.getItem(dismissedStorageKey);
+    } catch {
+      return null;
+    }
+  }
+
+  function dismiss() {
+    error = "";
+    const key = status ? catModeRunKey(status) : null;
+    if (key === null || status?.active) return;
+    dismissedRun = key;
+    try {
+      localStorage.setItem(dismissedStorageKey, key);
+    } catch {
+      // Storage can be unavailable; the server-side dismissal still applies.
+    }
+    // Best effort: older APIs ignore the body and just return the status.
+    void fetch(endpoint, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dismiss: true }),
+      signal: AbortSignal.timeout(10000),
+    }).catch(() => {});
+  }
 
   async function refresh() {
     if (polling || pending) return;
@@ -112,6 +156,8 @@
               ? "Stopping…"
               : "Waiting for model"}</span
         >
+      {:else if !showResult}
+        <span>Warm the loaded model for 10 minutes</span>
       {:else}
         <span
           >{status.state === "finished"
@@ -128,8 +174,14 @@
           ? status.model_id
           : (modelId ?? "Load a text model to enable Cat mode")}</small
       >
-      {#if error || status.error}<span class="error"
-          >{error || status.error}</span
+      {#if shownError}<span class="error"
+          >{shownError}<button
+            type="button"
+            class="dismiss"
+            onclick={dismiss}
+            aria-label="Dismiss Cat mode error"
+            title="Dismiss">×</button
+          ></span
         >{/if}
     </div>
     <button
@@ -174,7 +226,7 @@
     white-space: nowrap;
     max-width: 32rem;
   }
-  button {
+  button:not(.dismiss) {
     color: #facc15;
     border: 1px solid #72601d;
     border-radius: 4px;
@@ -198,6 +250,23 @@
     color: #f88;
     max-width: 32rem;
     overflow-wrap: anywhere;
+  }
+  .dismiss {
+    margin-left: 0.5rem;
+    padding: 0 0.3rem;
+    color: #f88;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    cursor: pointer;
+    line-height: 1.2;
+  }
+  .dismiss:hover {
+    border-color: #f88;
+  }
+  .dismiss:focus-visible {
+    outline: 2px solid #f88;
+    outline-offset: 2px;
   }
   @media (max-width: 600px) {
     .cat-mode {

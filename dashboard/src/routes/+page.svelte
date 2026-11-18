@@ -4769,6 +4769,7 @@
       modelId={hasRunningInstance(selectedChatModel())
         ? selectedChatModel()
         : bestRunningModelId}
+      liveInstanceIds={update === null ? null : Object.keys(instanceData)}
     />
   {/if}
 

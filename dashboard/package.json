@@ -9,7 +9,8 @@
 		"preview": "vite preview",
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-		"test:spark-prefill": "node --test src/lib/utils/spark-prefill.test.ts"
+		"test:spark-prefill": "node --test src/lib/utils/spark-prefill.test.ts",
+		"test:cat-mode": "node --test src/lib/utils/cat-mode.test.ts"
 	},
 	"devDependencies": {
 		"@sveltejs/adapter-static": "^3.0.10",
