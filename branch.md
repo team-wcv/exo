@@ -1,32 +1,12 @@
 ---
-branch: feature/6a961781-apple-usb-ncm-prefill
-created: 2026-08-31
-owner: codex-agent
+branch: chore/exo-py315-20261117
+created: 2026-11-17
+owner: claude-agent
 status: active
-scope: "Admit verified Apple CDC-NCM link-local paths for an isolated Studio/Spark prefill benchmark"
+scope: "Run the bigbrain exo nodes on uv-managed CPython 3.15.2 so Homebrew Python upgrades cannot swap the interpreter"
+base: chore/spark-prefill-20261016
 orchestraitor:
-  ticket: 6a961781e6b6efd51fc859bf
-  task_url: orchestraitor://task/6a961781e6b6efd51fc859bf
-pr:
-  url: https://github.com/team-wcv/exo/pull/44
-  state: open
-cleanup:
-  merged_into: team-wcv/fix/6a95c4b0-resilient-downloads-vq
-  archived_after: null
-  successor_branch: null
-source_branches:
-  - fix/6a95c4b0-resilient-downloads-vq (stack base at 920e64aa, PR #43)
-  - torvalds/linux a5148bc2fa27092862ac4b9e7b5c8340d60cff34 (Apple CDC-NCM device match reference)
+  ticket: 6afd01ea3e896bda5f5f13b8
+  plan: none
+pr: pending (deployment branch; not intended for upstream)
 ---
-
-- Why this branch exists: Exo sees the patched Apple USB CDC-NCM interface but rejects every IPv4 link-local address before probing, so the physical Studio/Spark link cannot enter topology.
-- Intended changes: classify only Apple 05ac:1905 CDC-NCM interfaces, admit IPv4 link-local probing only for that verified type, prefer 10GbE over the measured USB path and USB over Wi-Fi, add focused tests and operator documentation, then benchmark the isolated Studio/Spark pair over both routes.
-- Safety boundary: do not relax link-local filtering for generic interfaces and do not alter the production smbp/smbpt services during benchmarking.
-- Validation pending: focused tests, type checking, lint/format checks, isolated route proof and A/B benchmark, production post-test health, hosted checks, and current-head Codex review.
-
-
-# Spark prefill deployment 2026-10-16
-Branch: chore/spark-prefill-20261016
-Scope: isolated deployment of existing 0e9c429f for four-node EXO cluster; no source changes
-Ticket: 6ad1cd9ae8f313d4bf1ace4c
-PR: not planned (runtime deployment ledger)
