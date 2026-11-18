@@ -17,6 +17,11 @@ shutdown. A controller restart leaves Cat mode off; runs are not auto-resumed.
 The countdown, request count, selected model, and connection errors are visible
 in the dashboard. A lost connection never reports a confirmed stop.
 
+The API keeps the last run's result in memory. It forgets it when the run's
+instance is gone, and forgets an error once the same model completes a
+generation. The **×** beside an error dismisses it (`DELETE /v1/cat-mode` with
+`{"dismiss":true}`); the dashboard also remembers the dismissed run per browser.
+
 ## Single controller
 
 Enable `EXO_CAT_MODE_ENABLED=1` only on Studio's existing EXO API service

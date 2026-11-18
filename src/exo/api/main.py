@@ -47,7 +47,13 @@ from exo.api.adapters.responses import (
     generate_responses_stream,
     responses_request_to_text_generation,
 )
-from exo.api.cat_mode import CatModeController, CatModeRequest, CatModeStatus, Readiness
+from exo.api.cat_mode import (
+    CatModeController,
+    CatModeRequest,
+    CatModeStatus,
+    CatModeStopRequest,
+    Readiness,
+)
 from exo.api.keepalive import FinalizingStreamingResponse, with_sse_keepalive
 from exo.api.types import (
     AddCustomModelParams,
@@ -676,6 +682,7 @@ class API:
             )
 
     def get_cat_mode(self) -> CatModeStatus:
+        self._cat_mode.forget_stale(self.state.instances, None)
         return self._cat_mode.status
 
     async def start_cat_mode(self, payload: CatModeRequest) -> CatModeStatus:
@@ -695,7 +702,11 @@ class API:
             )
         return self._cat_mode.start(payload.model_id, candidates[0])
 
-    async def stop_cat_mode(self) -> CatModeStatus:
+    async def stop_cat_mode(
+        self, payload: CatModeStopRequest | None = None
+    ) -> CatModeStatus:
+        if payload is not None and payload.dismiss:
+            return self._cat_mode.dismiss()
         return self._cat_mode.stop()
 
     def _cat_mode_readiness(self, instance_id: InstanceId) -> Readiness:
@@ -2505,6 +2516,13 @@ class API:
                 event = i_event.event
 
                 if isinstance(event, ChunkGenerated):
+                    if (
+                        isinstance(event.chunk, TokenChunk)
+                        and event.chunk.finish_reason is not None
+                    ):
+                        self._cat_mode.forget_stale(
+                            self.state.instances, event.chunk.model
+                        )
                     if queue := self._image_generation_queues.get(
                         event.command_id, None
                     ):

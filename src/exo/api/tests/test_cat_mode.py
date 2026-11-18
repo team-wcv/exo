@@ -7,7 +7,12 @@ import anyio
 import pytest
 from fastapi import HTTPException
 
-from exo.api.cat_mode import CatModeController, CatModeRequest, Readiness
+from exo.api.cat_mode import (
+    CatModeController,
+    CatModeRequest,
+    CatModeStopRequest,
+    Readiness,
+)
 from exo.api.main import API
 from exo.api.tests.test_agent_endpoints import _api_with_instances, _instance
 from exo.shared.types.chunks import TokenChunk
@@ -283,3 +288,47 @@ async def test_api_shutdown_cancels_controller():
     assert controller is not None
     assert controller.status.state == "stopped"
     assert controller.status.active is False
+
+
+async def failed_controller() -> CatModeController:
+    async def generate(_model: ModelId, _instance: InstanceId, _number: int):
+        raise RuntimeError("GPU timeout")
+
+    controller: CatModeController | None = None
+    async with anyio.create_task_group() as group:
+        controller = CatModeController(
+            enabled=True,
+            generate=generate,
+            readiness=lambda _: "ready",
+            spawn=group.start_soon,
+        )
+        controller.start(MODEL, INSTANCE)
+    assert controller is not None
+    assert controller.status.state == "error"
+    return controller
+
+
+async def test_dismiss_clears_a_failed_run_and_keeps_the_flag():
+    api = ready_api()
+    api._cat_mode = await failed_controller()
+    status = await api.stop_cat_mode(CatModeStopRequest(dismiss=True))
+    assert status.enabled
+    assert status.state == "idle"
+    assert status.error is None
+    assert api.get_cat_mode().state == "idle"
+
+
+async def test_error_is_forgotten_when_its_instance_is_gone():
+    api = ready_api()
+    api._cat_mode = await failed_controller()
+    assert api.get_cat_mode().state == "error"
+    api.state = api.state.model_copy(update={"instances": {}})
+    assert api.get_cat_mode().error is None
+
+
+async def test_error_is_forgotten_after_the_model_generates_successfully():
+    controller = await failed_controller()
+    controller.forget_stale({INSTANCE}, ModelId("other/model"))
+    assert controller.status.state == "error"
+    controller.forget_stale({INSTANCE}, MODEL)
+    assert controller.status.state == "idle"

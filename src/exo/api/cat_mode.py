@@ -1,7 +1,7 @@
 """One bounded, server-owned warm-up job, independent of dashboard lifetime."""
 
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Container
 from typing import Literal
 
 import anyio
@@ -16,6 +16,11 @@ Readiness = Literal["ready", "busy", "unavailable"]
 class CatModeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model_id: ModelId
+
+
+class CatModeStopRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    dismiss: bool = False
 
 
 class CatModeStatus(BaseModel):
@@ -83,6 +88,25 @@ class CatModeController:
             if self._scope is not None:
                 self._scope.cancel()
         return self.status
+
+    def dismiss(self) -> CatModeStatus:
+        """Forget the last run's result; it otherwise stays until restart."""
+        if not self.status.active:
+            self.status = CatModeStatus(enabled=self.status.enabled)
+        return self.status
+
+    def forget_stale(
+        self, live_instances: Container[InstanceId], succeeded_model: ModelId | None
+    ) -> None:
+        """Drop a result whose instance is gone, or an error the model has since
+        recovered from with a successful generation."""
+        status = self.status
+        if status.active or status.instance_id is None:
+            return
+        if status.instance_id not in live_instances or (
+            status.state == "error" and status.model_id == succeeded_model
+        ):
+            self.dismiss()
 
     async def _run(self) -> None:
         assert self.status.model_id is not None
