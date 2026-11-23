@@ -17,7 +17,7 @@ async def run(base: str, request: Path, expected: Path, output: Path) -> None:
     result = {"input": metadata, "text": "", "progress": {}, "usage": None}
     baseline_swap: dict[str, int] = {}
     minimum_free: dict[str, float] = {}
-    timeout = aiohttp.ClientTimeout(total=2400, sock_connect=10, sock_read=180)
+    timeout = aiohttp.ClientTimeout(total=7200, sock_connect=10, sock_read=180)
     with (output / "events.jsonl").open("x") as events:
         async with aiohttp.ClientSession(timeout=timeout) as session:
 
