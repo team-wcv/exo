@@ -12,6 +12,8 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from exo.worker.engines.mlx.qwen_yarn import (
     QwenYarnRotaryEmbedding,
     apply_qwen_yarn,
+    qwen_yarn_prefill_limits,
+    thin_prefill_snapshots,
 )
 
 
@@ -116,6 +118,21 @@ def test_yarn_replaces_shared_rotary_without_changing_weights() -> None:
     assert isinstance(model.model.rope, QwenYarnRotaryEmbedding)
     assert model.model.rope.dim == 64
     assert model.parameters() == before
+    assert qwen_yarn_prefill_limits(model) == (512, 64)
+
+
+def test_checkpoint_thinning_preserves_replay_and_final_rollback_positions() -> None:
+    snapshots: list[int] = []
+    for position in range(1000):
+        snapshots.append(position)
+        thin_prefill_snapshots(snapshots, 64)
+        assert len(snapshots) <= 64
+        assert snapshots[0] == 0
+        assert snapshots[-1] == position
+        if position:
+            assert snapshots[-2] == position - 1
+        assert sorted(set(snapshots)) == snapshots
+    assert qwen_yarn_prefill_limits(Model()) == (4096, None)
 
 
 @pytest.mark.parametrize(

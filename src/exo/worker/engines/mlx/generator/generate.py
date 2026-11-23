@@ -80,6 +80,10 @@ from exo.worker.engines.mlx.generator.ssm_rollback import (
     is_target_ssm_trim_unsafe,
     supports_ssm_rollback,
 )
+from exo.worker.engines.mlx.qwen_yarn import (
+    qwen_yarn_prefill_limits,
+    thin_prefill_snapshots,
+)
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     CoupledDrafter,
@@ -383,6 +387,7 @@ def prefill(
     start_time = time.perf_counter()
     has_ssm = has_non_kv_caches(cache)
     snapshots: list[CacheSnapshot] = []
+    prefill_step_size, snapshot_limit = qwen_yarn_prefill_limits(model)
 
     # TODO(evan): kill the callbacks/runner refactor
     def progress_callback(processed: int, total: int) -> None:
@@ -393,6 +398,7 @@ def prefill(
         )
         if has_ssm:
             snapshots.append(snapshot_ssm_states(cache))
+            thin_prefill_snapshots(snapshots, snapshot_limit)
 
         if on_prefill_progress is not None:
             on_prefill_progress(processed, total)
@@ -408,8 +414,6 @@ def prefill(
     logger.info("Starting prefill")
 
     is_pipeline = _has_pipeline_communication_layer(model)
-
-    prefill_step_size = 4096
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:

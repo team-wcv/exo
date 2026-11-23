@@ -94,6 +94,24 @@ class _RotaryOwner(Protocol):
     rope: object
 
 
+def qwen_yarn_prefill_limits(model: object) -> tuple[int, int | None]:
+    """Bound dense masked-attention scratch space for the extended Qwen path."""
+    inner = cast(object, getattr(model, "model", None))
+    if isinstance(getattr(inner, "rope", None), QwenYarnRotaryEmbedding):
+        return 512, 64
+    return 4096, None
+
+
+def thin_prefill_snapshots[T](snapshots: list[T], limit: int | None) -> None:
+    """Retain exact sparse checkpoints plus both states needed for rollback.
+
+    Missing intermediate positions reduce prefix-cache reuse, not correctness:
+    the cache restores an earlier exact snapshot and replays the suffix.
+    """
+    if limit is not None and len(snapshots) > limit:
+        snapshots[:] = snapshots[:-2:2] + snapshots[-2:]
+
+
 def apply_qwen_yarn(model: nn.Module, config: Mapping[str, object]) -> bool:
     """Install explicit Qwen4-Exp YaRN before sharding or allocating KV caches."""
     if config.get("model_type") != "qwen4_exp":
