@@ -76,6 +76,7 @@ from exo.worker.engines.mlx.auto_parallel import (
     tensor_auto_parallel,
 )
 from exo.worker.engines.mlx.gated_delta_cuda import enable_qwen_cuda_prefill
+from exo.worker.engines.mlx.qwen_yarn import apply_qwen_yarn
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.vendor.qwen3_5_dflash_hooks import (
     DFlashHooksNotImplementedError as _DFlashHooksNotImplementedError,
@@ -1211,7 +1212,9 @@ def load_mlx_items(
         logger.info(f"Single device used for {bound_instance.instance}")
         model_path = build_model_path(target_card.model_id)
         start_time = time.perf_counter()
-        model, _ = load_model(model_path, lazy=True, strict=False)
+        model, model_config = load_model(model_path, lazy=True, strict=False)
+        if apply_qwen_yarn(model, model_config):
+            logger.info("Enabled checkpoint-configured Qwen4-Exp YaRN rotary scaling")
         if enable_qwen_cuda_prefill(model):
             logger.warning(
                 "Enabled experimental Qwen CUDA gated-delta kernel; "
@@ -1339,7 +1342,9 @@ def shard_and_load(
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
-    model, _ = load_model(model_path, lazy=True, strict=False)
+    model, model_config = load_model(model_path, lazy=True, strict=False)
+    if apply_qwen_yarn(model, model_config):
+        logger.info("Enabled checkpoint-configured Qwen4-Exp YaRN rotary scaling")
     if enable_qwen_cuda_prefill(model):
         logger.warning(
             "Enabled experimental Qwen CUDA gated-delta kernel; "
