@@ -11,6 +11,8 @@ runtime and its operational glue live together.
 - `caddy/`: `bigbrain.localhost:18888` Caddy alias for the active EXO master.
 - `docs/`: local fleet topology, proxy, and onboarding notes.
 
+- `bigbrain/qwen-yarn-512k.md`: opt-in Twins context extension, acceptance and rollback.
+
 ## Boundaries
 
 EXO owns model serving, placement, tensor/RDMA behavior, dashboard state, and

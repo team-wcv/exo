@@ -45,7 +45,7 @@ evaluation and inference remain on the model's MLX device.
 
 Extended Qwen tensor/single-node prefill adapts from 4,096 down to 512-token
 chunks as the cached prefix grows, bounding the query-by-context working set
-while amortizing early prefill. Pipeline prefill uses the conservative512-token
+while amortizing early prefill. Pipeline prefill uses the conservative 512-token
 chunk. Recurrent checkpoint
 history is thinned above 64 records while retaining the first and latest two
 exact states. Prefix-cache reuse may replay a longer suffix; rollback never
@@ -101,3 +101,26 @@ remove the newly introduced helper only when its hash matches this deployment,
 and restore any fleet-specific model-card override to 262,144. Recreate the
 two-rank instance, restore the watcher state and verify a real request. Do not
 restore old weights, erase event history or restart unrelated services.
+
+## Live acceptance — 2026-11-23
+
+The operator approved merging after a completed 300K retrieval. The final run
+processed **300,055 uncached prompt tokens**, generated 55 tokens, and returned
+all three exact synthetic codes correctly. First token: 5676.09 seconds; full
+request: 5712.55 seconds (about 95.2 minutes). Minimum available memory was 28.44 GiB
+on smbpt and 27.62 GiB on smbp, with no additional swap. This is a capacity and
+retrieval result, not a low-latency claim. A full 524,288-token request has not
+been validated; the configured target remains 512K.
+
+Earlier 500K runs were intentionally interrupted during prefill tuning. The
+first 300K attempt was interrupted by smbpt's existing event-delivery watchdog
+(EventDeliveryStalledError after 15 seconds without a NodeGatheredInfo ACK), not
+by out-of-memory. Its service supervisor rebuilt the pair before the successful
+retry. Do not count those interrupted runs as full-window acceptance.
+
+Receipts on BMBP: `~/.cache/qwen-yarn-512k-20261122/run-300k-retry/`.
+Both Twins retain matching applied source/config hashes in their deployment
+`applied.json`. The active data home is `~/.exo-bigbrain-cluster`; model-card
+publication uses its `custom_model_cards/` directory, with backups and a
+`publication.json` receipt. The Studio EXO coordinator gets the matching catalog
+override; its separate inference service is unchanged.
