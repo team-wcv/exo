@@ -32,7 +32,11 @@ async def run(base: str, request: Path, expected: Path, output: Path) -> None:
                     name = identity["friendlyName"]
                     if name not in ("wc-smbp", "wc-smbpt"):
                         continue
-                    node = state["nodeMemory"][node_id]
+                    node = state.get("nodeMemory", {}).get(node_id)
+                    if node is None:
+                        raise RuntimeError(
+                            f"No current memory sample for {name}; the node may have disconnected or restarted"
+                        )
                     free = node["ramAvailable"]["inBytes"] / 1024**3
                     swap = (
                         node["swapTotal"]["inBytes"] - node["swapAvailable"]["inBytes"]
@@ -109,8 +113,9 @@ async def run(base: str, request: Path, expected: Path, output: Path) -> None:
             except (Exception, asyncio.CancelledError) as error:
                 result["error"] = str(error) or type(error).__name__
                 result["retrieval_passed"] = False
-                if task and not task.done():
-                    task.cancel()
+                if task:
+                    if not task.done():
+                        task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
             finally:
                 result["elapsed_s"] = round(time.monotonic() - started, 2)
