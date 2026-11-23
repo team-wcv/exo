@@ -12,6 +12,7 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from exo.worker.engines.mlx.qwen_yarn import (
     QwenYarnRotaryEmbedding,
     apply_qwen_yarn,
+    qwen_yarn_chunk_size,
     qwen_yarn_prefill_limits,
     thin_prefill_snapshots,
 )
@@ -133,6 +134,17 @@ def test_checkpoint_thinning_preserves_replay_and_final_rollback_positions() -> 
             assert snapshots[-2] == position - 1
         assert sorted(set(snapshots)) == snapshots
     assert qwen_yarn_prefill_limits(Model()) == (4096, None)
+
+
+def test_adaptive_chunks_bound_scratch_through_512k() -> None:
+    position = 0
+    sizes: set[int] = set()
+    while position < 524288:
+        size = qwen_yarn_chunk_size(position)
+        assert size * (position + size) <= 268435456 or size == 512
+        sizes.add(size)
+        position += size
+    assert sizes == {512, 1024, 2048, 4096}
 
 
 @pytest.mark.parametrize(

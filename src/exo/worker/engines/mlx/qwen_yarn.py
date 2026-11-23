@@ -112,6 +112,14 @@ def thin_prefill_snapshots[T](snapshots: list[T], limit: int | None) -> None:
         snapshots[:] = snapshots[:-2:2] + snapshots[-2:]
 
 
+def qwen_yarn_chunk_size(cache_tokens: int) -> int:
+    """Keep query-by-context scratch bounded while amortizing short-prefix work."""
+    step = 4096
+    while step > 512 and step * (cache_tokens + step) > 268_435_456:
+        step //= 2
+    return step
+
+
 def apply_qwen_yarn(model: nn.Module, config: Mapping[str, object]) -> bool:
     """Install explicit Qwen4-Exp YaRN before sharding or allocating KV caches."""
     if config.get("model_type") != "qwen4_exp":

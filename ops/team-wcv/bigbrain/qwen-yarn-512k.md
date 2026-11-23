@@ -43,8 +43,10 @@ The tiny float32 frequency table is initialized on the CPU because Metal fast
 power rounding can produce phase error at long absolute positions. Rotary
 evaluation and inference remain on the model's MLX device.
 
-Extended Qwen prefill uses 512-token chunks instead of 4,096, bounding the
-dense masked-attention working set at long contexts. Recurrent checkpoint
+Extended Qwen tensor/single-node prefill adapts from 4,096 down to 512-token
+chunks as the cached prefix grows, bounding the query-by-context working set
+while amortizing early prefill. Pipeline prefill uses the conservative512-token
+chunk. Recurrent checkpoint
 history is thinned above 64 records while retaining the first and latest two
 exact states. Prefix-cache reuse may replay a longer suffix; rollback never
 uses interpolated or fabricated states. Other models retain existing settings.

@@ -7,6 +7,7 @@ from typing import Any, Callable, Generator, Literal, cast, get_args
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 from mlx_lm.generate import (
     PromptProcessingBatch,
     maybe_quantize_kv_cache,
@@ -45,6 +46,7 @@ from exo.worker.engines.mlx.auto_parallel import (
 from exo.worker.engines.mlx.cache import (
     CacheSnapshot,
     KVPrefixCache,
+    cache_length,
     copy_snapshot_entry,
     encode_prompt,
     has_non_kv_caches,
@@ -81,6 +83,7 @@ from exo.worker.engines.mlx.generator.ssm_rollback import (
     supports_ssm_rollback,
 )
 from exo.worker.engines.mlx.qwen_yarn import (
+    qwen_yarn_chunk_size,
     qwen_yarn_prefill_limits,
     thin_prefill_snapshots,
 )
@@ -431,19 +434,63 @@ def prefill(
                 group=group,
             )
         else:
+            # The Qwen remote model constructs query-by-context indexer/mask
+            # tensors. Amortize early chunks, then bound that working set as
+            # the prefix grows. Leave the final seed/rollback to mlx_lm.
+            consumed = 0
+            if snapshot_limit is not None:
+                original_offset = cache_length(cache)
+                with mx.stream(generation_stream):
+                    combined_progress_callback(0, num_tokens)
+                    while True:
+                        prefill_step_size = qwen_yarn_chunk_size(
+                            original_offset + consumed
+                        )
+                        if num_tokens - consumed <= prefill_step_size + 1:
+                            break
+                        model(
+                            prompt_tokens[consumed : consumed + prefill_step_size][
+                                None
+                            ],
+                            cache=cache,
+                        )
+                        maybe_quantize_kv_cache(
+                            cache,
+                            quantized_kv_start=0,
+                            kv_group_size=KV_GROUP_SIZE,
+                            kv_bits=KV_BITS,
+                        )
+                        cache_state = cast(
+                            list[tuple[str, object]],
+                            tree_flatten([entry.state for entry in cache]),
+                        )
+                        mx.eval(
+                            [
+                                value
+                                for _, value in cache_state
+                                if isinstance(value, mx.array)
+                            ]
+                        )
+                        consumed += prefill_step_size
+                        combined_progress_callback(consumed, num_tokens)
+                        mx.clear_cache()
+
+            def tail_progress(processed: int, total: int) -> None:
+                combined_progress_callback(consumed + processed, num_tokens)
+
             # Use max_tokens=1 because max_tokens=0 does not work.
             # We just throw away the generated token - we only care about filling the cache
             for _ in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
-                prompt=prompt_tokens,
+                prompt=prompt_tokens[consumed:],
                 max_tokens=1,
                 sampler=sampler,
                 prompt_cache=cache,
                 prefill_step_size=prefill_step_size,
                 kv_group_size=KV_GROUP_SIZE,
                 kv_bits=KV_BITS,
-                prompt_progress_callback=combined_progress_callback,
+                prompt_progress_callback=tail_progress,
             ):
                 break  # Stop after first iteration - cache is now filled
     except PrefillCancelled:
