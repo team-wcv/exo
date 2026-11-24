@@ -2554,6 +2554,19 @@ class API:
             ):
                 continue
             if sender := self._text_generation_queues.pop(task.command_id, None):
+                if isinstance(task, TextGenerationTask):
+                    # Closing an otherwise empty queue looks like normal EOF to
+                    # adapters. Tell the client why its inference disappeared.
+                    with contextlib.suppress(BrokenResourceError, ClosedResourceError):
+                        sender.send_nowait(
+                            ErrorChunk(
+                                model=task.task_params.model,
+                                error_message=(
+                                    f"Inference instance {instance_id} was removed "
+                                    "before the request completed"
+                                ),
+                            )
+                        )
                 sender.close()
             if sender := self._image_generation_queues.pop(task.command_id, None):
                 sender.close()

@@ -3,8 +3,16 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from exo.api.main import API
 from exo.api.types import ImageGenerationTaskParams
+from exo.shared.types.chunks import (
+    ErrorChunk,
+    PrefillProgressChunk,
+    TokenChunk,
+    ToolCallChunk,
+)
 from exo.shared.types.common import CommandId, ModelId
 from exo.shared.types.state import State
 from exo.shared.types.tasks import ImageGeneration, TextGeneration
@@ -14,6 +22,7 @@ from exo.shared.types.text_generation import (
     TextGenerationTaskParams,
 )
 from exo.shared.types.worker.instances import InstanceId
+from exo.utils.channels import channel
 
 
 def _make_api_with_state(state: State) -> API:
@@ -53,6 +62,41 @@ def test_close_streams_for_deleted_instance() -> None:
     api._close_streams_for_instance(instance_id)  # pyright: ignore[reportPrivateUsage]
 
     sender.close.assert_called_once()
+    assert command_id not in api._text_generation_queues  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_deleted_instance_reports_error_before_closing_text_stream() -> None:
+    instance_id = InstanceId("lost-instance")
+    command_id = CommandId("interrupted-request")
+    task = _make_text_gen_task(instance_id, command_id)
+    api = _make_api_with_state(State(tasks={task.task_id: task}))
+    sender, receiver = channel[
+        TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
+    ]()
+    api._text_generation_queues[command_id] = sender  # pyright: ignore[reportPrivateUsage]
+
+    api._close_streams_for_instance(instance_id)  # pyright: ignore[reportPrivateUsage]
+
+    chunks = [chunk async for chunk in receiver]
+    assert len(chunks) == 1
+    assert isinstance(chunks[0], ErrorChunk)
+    assert chunks[0].model == ModelId("test-model")
+    assert "lost-instance" in chunks[0].error_message
+    assert command_id not in api._text_generation_queues  # pyright: ignore[reportPrivateUsage]
+
+
+def test_deleted_instance_tolerates_already_disconnected_text_client() -> None:
+    instance_id = InstanceId("lost-instance")
+    command_id = CommandId("disconnected-client")
+    task = _make_text_gen_task(instance_id, command_id)
+    api = _make_api_with_state(State(tasks={task.task_id: task}))
+    sender, receiver = channel[
+        TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
+    ]()
+    api._text_generation_queues[command_id] = sender  # pyright: ignore[reportPrivateUsage]
+    receiver.close()
+    api._close_streams_for_instance(instance_id)  # pyright: ignore[reportPrivateUsage]
     assert command_id not in api._text_generation_queues  # pyright: ignore[reportPrivateUsage]
 
 

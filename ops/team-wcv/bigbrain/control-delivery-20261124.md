@@ -36,6 +36,9 @@ structured error details when a runner reports `ErrorChunk`. It does not emit
 explicit failed response rather than raising after streaming headers were sent
 and leaving an empty HTTP 200. That collected path still uses HTTP 200 with
 `status: failed` in the body; it preserves disconnect cancellation behavior.
+Instance deletion also queues an explicit inference error before closing an
+active text stream. Without that signal, a lost shard could still produce an
+empty completion even with the adapter's `ErrorChunk` handling corrected.
 
 ## Deployment acceptance
 
