@@ -39,6 +39,8 @@ from exo.api.types.openai_responses import (
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
+    ResponseError,
+    ResponseFailedEvent,
     ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallArgumentsDoneEvent,
     ResponseFunctionCallItem,
@@ -471,7 +473,19 @@ async def collect_responses_response(
         accumulated_text += chunk.text
 
     if error_message is not None:
-        raise ValueError(error_message)
+        # The JSON response is also streamed so cancellation cleans up inference.
+        # Its headers may already be sent: raising here would leave an empty 200.
+        yield ResponsesResponse(
+            id=response_id,
+            model=model,
+            status="failed",
+            output=[],
+            output_text=accumulated_text,
+            usage=_build_response_usage(last_usage) if last_usage else None,
+            reasoning=reasoning,
+            error=ResponseError(code="server_error", message=error_message),
+        ).model_dump_json()
+        return
 
     # Create usage from usage data if available
     usage = _build_response_usage(last_usage) if last_usage is not None else None
@@ -566,7 +580,20 @@ async def generate_responses_stream(
             continue
 
         if isinstance(chunk, ErrorChunk):
-            break
+            failed_response = ResponsesResponse(
+                id=response_id,
+                model=model,
+                status="failed",
+                output=[],
+                output_text=accumulated_text,
+                usage=_build_response_usage(last_usage) if last_usage else None,
+                reasoning=reasoning,
+                error=ResponseError(code="server_error", message=chunk.error_message),
+            )
+            yield _format_sse(
+                ResponseFailedEvent(sequence_number=next(seq), response=failed_response)
+            )
+            return
 
         last_usage = chunk.usage or last_usage
 

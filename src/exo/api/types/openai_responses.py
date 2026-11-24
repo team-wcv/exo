@@ -429,6 +429,13 @@ class ResponseUsage(BaseModel, frozen=True):
     total_tokens: int
 
 
+class ResponseError(BaseModel, frozen=True):
+    """Failure details carried by a terminal failed response."""
+
+    code: str
+    message: str
+
+
 class ResponsesResponse(BaseModel, frozen=True):
     """Response body for OpenAI Responses API."""
 
@@ -441,6 +448,7 @@ class ResponsesResponse(BaseModel, frozen=True):
     output_text: str
     usage: ResponseUsage | None = None
     reasoning: Reasoning | None = None
+    error: ResponseError | None = None
 
 
 # Streaming event types
@@ -599,6 +607,14 @@ class ResponseReasoningSummaryPartDoneEvent(BaseModel, frozen=True):
     part: ResponseReasoningSummaryText
 
 
+class ResponseFailedEvent(BaseModel, frozen=True):
+    """Terminal runner failure, never a successful empty completion."""
+
+    type: Literal["response.failed"] = "response.failed"
+    sequence_number: int
+    response: ResponsesResponse
+
+
 class ResponseCompletedEvent(BaseModel, frozen=True):
     """Event sent when response is completed."""
 
@@ -623,4 +639,5 @@ ResponsesStreamEvent = (
     | ResponseReasoningSummaryTextDoneEvent
     | ResponseReasoningSummaryPartDoneEvent
     | ResponseCompletedEvent
+    | ResponseFailedEvent
 )

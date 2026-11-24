@@ -6,4 +6,6 @@
 - Plan: b7c44d90-0829-4807-a45b-6f766a8ec1e0
 - Base: 43bfab7 origin/main
 - PR: pending
-- Status: investigating, no root cause or deployment claimed.
+- Status: candidate validated locally; production activation and agent rerun pending.
+- Validation: 1,312 Python tests pass, 15 skipped, 212 slow tests deselected; 5 Rust networking tests pass; full basedpyright 1.37.1 and Ruff checks pass. Nix unavailable; cargo fmt and Ruff formatting checked directly.
+- Evidence boundary: receive starvation during blocked publishing is reproduced by the regression; it is not asserted as the sole cause of all live GPU/control failures.
