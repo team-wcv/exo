@@ -20,6 +20,12 @@ recorded in [the runtime stability runbook](twins-stability-20261031.md), includ
 pinned environments, acceptance receipts, performance tradeoffs, and rollback.
 Use the recorded runtime and startup settings when maintaining this deployment.
 
+## Control delivery (2026-11-24)
+
+The [November 24 control-delivery repair](control-delivery-20261124.md) documents
+receive starvation during blocked native publishing, explicit Responses error
+propagation, and the required production acceptance checks.
+
 ## Original shared deployment (2026-10-16)
 
 The operator dashboard at `http://bigbrain.localhost:18888/` serves one shared

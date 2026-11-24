@@ -186,9 +186,7 @@ class ArchSpec:
 ARCHITECTURES: list[ArchSpec] = [
     ArchSpec("llama", "Llama-3.2-1B-Instruct-4bit", "llama"),
     ArchSpec("glm_moe_dsa", "GLM-5-MXFP4-Q8", "glm_moe_dsa"),
-    ArchSpec(
-        "glm4_moe", "GLM-4.5-Air-8bit", "glm4_moe", tokenizer_hub="GLM-4.7-8bit"
-    ),
+    ArchSpec("glm4_moe", "GLM-4.5-Air-8bit", "glm4_moe", tokenizer_hub="GLM-4.7-8bit"),
     ArchSpec(
         "glm4_moe_lite",
         "GLM-4.7-Flash-8bit",

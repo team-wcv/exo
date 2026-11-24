@@ -1,9 +1,10 @@
 //! Compat shim for the old libp2p code
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 
-use futures_lite::Stream;
+use futures_lite::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -69,49 +70,99 @@ impl Swarm {
         } = self;
         let stream = async_stream::stream! {
             let mut session = session;
-            let (mut to_topics, mut from_topics) = mpsc::channel(1024);
+            let (mut to_topics, from_topics) = mpsc::channel(1024);
             let mut topics = Topics::new();
             let namespace_prefix = session.namespace_prefix.clone();
             let Ok((_token, discovery)) = register_liveness(&mut session.z, &namespace_prefix).await else { return; };
+            let mut incoming = Box::pin(inbound_events(from_topics, discovery, namespace_prefix));
             loop {
                 tokio::select! {
                     msg = from_client.recv() => {
                         let Some(msg) = msg else { break };
-                        on_message(
+                        let operation = on_message(
                             &mut session.z,
                             &session.namespace_prefix,
                             &mut topics,
                             &mut to_topics,
                             msg,
-                        ).await;
-                    }
-                    event = from_topics.recv() => {
-                        if let Some(event) = event {
-                            yield event
+                        );
+                        // CongestionControl::Block can suspend a publish. Keep
+                        // receiving acknowledgements and liveness while the
+                        // operation waits, without reordering client commands.
+                        let mut events = Box::pin(forward_events_during(operation, &mut incoming));
+                        while let Some(event) = events.next().await {
+                            yield event;
                         }
                     }
-                    token = discovery.recv_async() => {
-                        if let Ok(token) = token {
-                            let key_expr = token.key_expr().as_str().to_owned();
-                            if let Some(peer_id) = key_expr.strip_prefix(&live_prefix(&namespace_prefix)) {
-                                yield match token.kind() {
-                                    SampleKind::Put => {
-                                        log::info!("discovered: {peer_id}");
-                                        FromSwarm::Discovered { peer_id: peer_id.to_owned() }
-                                    }
-                                    SampleKind::Delete => {
-                                        log::info!("expired: {peer_id}");
-                                        FromSwarm::Expired { peer_id: peer_id.to_owned() }
-                                    }
-                                }
-                            }
-                        }
-
+                    event = incoming.next() => {
+                        let Some(event) = event else { break };
+                        yield event;
                     }
                 }
             }
         };
         Box::pin(stream)
+    }
+}
+
+fn inbound_events(
+    mut from_topics: mpsc::Receiver<FromSwarm>,
+    discovery: Subscriber<FifoChannelHandler<Sample>>,
+    namespace_prefix: String,
+) -> impl Stream<Item = FromSwarm> + Send {
+    async_stream::stream! {
+        let prefix = live_prefix(&namespace_prefix);
+        loop {
+            tokio::select! {
+                event = from_topics.recv() => {
+                    let Some(event) = event else { break };
+                    yield event;
+                }
+                token = discovery.recv_async() => {
+                    let Ok(token) = token else { break };
+                    if let Some(peer_id) = token.key_expr().as_str().strip_prefix(&prefix) {
+                        let peer_id = peer_id.to_owned();
+                        yield match token.kind() {
+                            SampleKind::Put => {
+                                log::info!("discovered: {peer_id}");
+                                FromSwarm::Discovered { peer_id }
+                            }
+                            SampleKind::Delete => {
+                                log::info!("expired: {peer_id}");
+                                FromSwarm::Expired { peer_id }
+                            }
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn forward_events_during<'a, F, S>(
+    operation: F,
+    incoming: &'a mut S,
+) -> impl Stream<Item = FromSwarm> + Send + 'a
+where
+    F: Future<Output = ()> + Send + 'a,
+    S: Stream<Item = FromSwarm> + Unpin + Send + 'a,
+{
+    async_stream::stream! {
+        tokio::pin!(operation);
+        loop {
+            tokio::select! {
+                () = &mut operation => break,
+                event = incoming.next() => match event {
+                    Some(event) => yield event,
+                    None => {
+                        // The transport cannot deliver further control traffic.
+                        // Dropping the operation also closes its result sender,
+                        // so the waiting Python caller observes cancellation.
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -265,7 +316,71 @@ fn should_enable_discovery(connect_endpoints: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{live_prefix, should_enable_discovery, topic_key};
+    use super::{
+        FromSwarm, forward_events_during, live_prefix, should_enable_discovery, topic_key,
+    };
+    use futures_lite::{StreamExt, stream};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn blocked_publish_still_delivers_incoming_acknowledgement() {
+        let (release, wait) = oneshot::channel::<()>();
+        let operation = async {
+            wait.await.expect("publish released");
+        };
+        let mut incoming = stream::iter([FromSwarm::Message {
+            topic: "global_events".to_owned(),
+            data: b"ack".to_vec(),
+        }]);
+        let mut events = Box::pin(forward_events_during(operation, &mut incoming));
+        let event = timeout(Duration::from_secs(1), events.next())
+            .await
+            .expect("incoming acknowledgement must not wait for publish");
+        assert!(matches!(event, Some(FromSwarm::Message { data, .. }) if data == b"ack"));
+        release.send(()).expect("publish still pending");
+        assert!(
+            timeout(Duration::from_secs(1), events.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_publish_does_not_wait_for_incoming_traffic() {
+        let mut incoming = stream::pending::<FromSwarm>();
+        let mut events = Box::pin(forward_events_during(async {}, &mut incoming));
+        assert!(
+            timeout(Duration::from_secs(1), events.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_inbound_cancels_pending_network_operation() {
+        let (result_sender, result_receiver) = oneshot::channel::<()>();
+        let operation = async move {
+            let _result_sender = result_sender;
+            std::future::pending::<()>().await;
+        };
+        let mut incoming = stream::empty::<FromSwarm>();
+        let mut events = Box::pin(forward_events_during(operation, &mut incoming));
+        assert!(
+            timeout(Duration::from_secs(1), events.next())
+                .await
+                .expect("closed ingress must not wait for a blocked publish")
+                .is_none()
+        );
+        drop(events);
+        assert!(
+            result_receiver.await.is_err(),
+            "caller must observe cancellation"
+        );
+    }
 
     #[test]
     fn zenoh_keys_are_scoped_by_namespace() {

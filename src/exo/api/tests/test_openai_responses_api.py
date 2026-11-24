@@ -24,10 +24,52 @@ from exo.api.types.openai_responses import (
     ResponsesResponse,
     ResponseUsage,
 )
-from exo.shared.types.chunks import TokenChunk
+from exo.shared.types.chunks import ErrorChunk, TokenChunk
 from exo.shared.types.common import CommandId, ModelId
 
 _TEST_MODEL = ModelId("test-model")
+
+
+@pytest.mark.parametrize("partial", [False, True])
+async def test_runner_failure_never_becomes_successful_completion(partial: bool):
+    async def chunks() -> AsyncGenerator[TokenChunk | ErrorChunk, None]:
+        if partial:
+            yield TokenChunk(model=_TEST_MODEL, token_id=1, text="Partial", usage=None)
+        yield ErrorChunk(model=_TEST_MODEL, error_message="Runner GPU timeout")
+
+    events = [
+        cast(dict[str, Any], json.loads(line.removeprefix("data: ")))
+        async for event in generate_responses_stream(
+            CommandId("failed-runner"), "test-model", chunks()
+        )
+        for line in event.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert events[-1]["type"] == "response.failed"
+    assert events[-1]["response"]["status"] == "failed"
+    assert events[-1]["response"]["error"] == {
+        "code": "server_error",
+        "message": "Runner GPU timeout",
+    }
+    assert all(event["type"] != "response.completed" for event in events)
+
+
+async def test_collected_runner_failure_returns_explicit_failed_body():
+    async def chunks() -> AsyncGenerator[ErrorChunk, None]:
+        yield ErrorChunk(model=_TEST_MODEL, error_message="Runner disconnected")
+
+    bodies = [
+        part
+        async for part in collect_responses_response(
+            CommandId("failed-collection"), "test-model", chunks()
+        )
+    ]
+    assert len(bodies) == 1
+    response = ResponsesResponse.model_validate_json(bodies[0])
+    assert response.status == "failed"
+    assert response.error is not None
+    assert response.error.message == "Runner disconnected"
+    assert response.output == []
 
 
 class TestResponsesRequestValidation:
