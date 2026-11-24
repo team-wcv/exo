@@ -26,6 +26,9 @@ spawning, message dropping, watchdog disablement, or context change is added.
 The regression holds an operation pending and verifies that an incoming
 acknowledgement arrives before the operation is released. This closes a
 reachable starvation path, not proof of the sole cause of every live failure.
+If the incoming stream closes, the pending operation is cancelled; its result
+channel closes so the caller receives an error. A separate regression covers
+this edge case identified by the Spark agent's read-only peer review.
 
 The Responses streaming adapter now emits terminal `response.failed` with
 structured error details when a runner reports `ErrorChunk`. It does not emit

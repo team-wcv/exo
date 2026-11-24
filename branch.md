@@ -7,5 +7,6 @@
 - Base: 43bfab7 origin/main
 - PR: pending
 - Status: candidate validated locally; production activation and agent rerun pending.
-- Validation: 1,312 Python tests pass, 15 skipped, 212 slow tests deselected; 5 Rust networking tests pass; full basedpyright 1.37.1 and Ruff checks pass. Nix unavailable; cargo fmt and Ruff formatting checked directly.
-- Evidence boundary: receive starvation during blocked publishing is reproduced by the regression; it is not asserted as the sole cause of all live GPU/control failures.
+- Validation: 1,312 Python tests pass, 15 skipped, 212 slow tests deselected; native regressions cover receiving while publishing is blocked and ingress closure; full basedpyright 1.37.1 and Ruff checks pass. Nix unavailable; cargo fmt and Ruff formatting checked directly.
+- Evidence boundary: the regression verifies continued receive during blocked publishing; it is not asserted as the sole cause of all live GPU/control failures.
+- Peer review: Spark identified that awaiting a blocked operation after ingress closes can hang. A regression failed before the correction; ingress closure now cancels the operation and its caller sees the closed result channel.

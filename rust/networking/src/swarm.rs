@@ -155,7 +155,9 @@ where
                 event = incoming.next() => match event {
                     Some(event) => yield event,
                     None => {
-                        operation.await;
+                        // The transport cannot deliver further control traffic.
+                        // Dropping the operation also closes its result sender,
+                        // so the waiting Python caller observes cancellation.
                         break;
                     }
                 }
@@ -355,6 +357,28 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_inbound_cancels_pending_network_operation() {
+        let (result_sender, result_receiver) = oneshot::channel::<()>();
+        let operation = async move {
+            let _result_sender = result_sender;
+            std::future::pending::<()>().await;
+        };
+        let mut incoming = stream::empty::<FromSwarm>();
+        let mut events = Box::pin(forward_events_during(operation, &mut incoming));
+        assert!(
+            timeout(Duration::from_secs(1), events.next())
+                .await
+                .expect("closed ingress must not wait for a blocked publish")
+                .is_none()
+        );
+        drop(events);
+        assert!(
+            result_receiver.await.is_err(),
+            "caller must observe cancellation"
         );
     }
 
