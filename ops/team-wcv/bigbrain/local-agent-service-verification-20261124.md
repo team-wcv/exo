@@ -11,6 +11,7 @@ authenticated agent identities to perform task, plan and messaging operations.
 The agents ran their Codex tools on BMBP; inference ran on Spark or the Twins.
 This does not sign off autonomous reliability, interactive latency, full-window
 quality, recovery/failover, or the Assistant-panel product experience.
+It is not an exhaustive qualification of every enabled tool.
 
 | Surface | Recorded result |
 | --- | --- |
