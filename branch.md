@@ -1,3 +1,14 @@
+# Local-agent verification closeout
+
+- Branch: docs/6b05093f-local-agent-closeout
+- Scope: document the verified Spark/Twins service workflow, acceptance limits, and deduplicated follow-up tickets. Documentation only; no runtime changes.
+- Task: 6b05093f3e896bda5f64206d
+- Base: 7574cc5 origin/main
+- PR: pending
+- Status: preparing closeout documentation and ticket map.
+
+## Prior repair ledger (historical)
+
 # Twins control delivery and inference errors
 
 - Branch: fix/6b053e26-control-delivery
