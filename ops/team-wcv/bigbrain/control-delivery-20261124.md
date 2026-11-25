@@ -95,4 +95,6 @@ The resumed agent request still needed about 338 seconds to prefill 47,523
 tokens, with 4,096 cached. Control traffic continued while it ran. Separate CDX
 client repairs address missing model metadata and executable removal during a
 Homebrew upgrade; those are not EXO inference changes. The task/plan/messaging
-acceptance run remains in progress and is tracked in the linked plan.
+run later reached a guided pass with recorded corrections. Its final coverage,
+limitations and follow-up tickets are in the
+[local-agent verification closeout](local-agent-service-verification-20261124.md).

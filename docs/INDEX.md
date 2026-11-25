@@ -3,9 +3,9 @@
 <a id="branch-state"></a>
 ## Branch State
 
-Team-wcv operational repair branch: `fix/6b053e26-control-delivery`, based on
-`main` commit `43bfab7`. Refreshed November 24, 2026. Production acceptance is
-recorded in the linked operational task, separately from source validation.
+Team-wcv operational documentation integrates on `main`. The control-delivery
+repair merged in EXO #68. Refreshed November 25, 2026; the local-agent closeout
+records verified coverage and separate open acceptance work.
 
 <a id="quick-entry-points"></a>
 ## Quick Entry Points
@@ -14,6 +14,7 @@ recorded in the linked operational task, separately from source validation.
 - [Fleet operations](../ops/team-wcv/README.md)
 - [Bigbrain deployment](../ops/team-wcv/bigbrain/README.md)
 - [Control-delivery repair](../ops/team-wcv/bigbrain/control-delivery-20261124.md)
+- [Local-agent verification closeout and follow-ups](../ops/team-wcv/bigbrain/local-agent-service-verification-20261124.md)
 
 <a id="documentation-surface-map"></a>
 ## Documentation Surface Map

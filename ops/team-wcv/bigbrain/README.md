@@ -26,6 +26,13 @@ The [November 24 control-delivery repair](control-delivery-20261124.md) document
 receive starvation during blocked native publishing, explicit Responses error
 propagation, and the required production acceptance checks.
 
+## Local-agent service verification (2026-11-24–25)
+
+The [Spark/Twins closeout record](local-agent-service-verification-20261124.md)
+documents the guided task, plan and messaging pass, the corrections it required,
+and the follow-up ticket map. It distinguishes serving health from autonomous
+reliability, recovery/failover and Assistant-panel acceptance.
+
 ## Original shared deployment (2026-10-16)
 
 The operator dashboard at `http://bigbrain.localhost:18888/` serves one shared
